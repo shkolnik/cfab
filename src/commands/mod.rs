@@ -4,6 +4,8 @@
 pub mod common;
 pub mod down;
 pub mod fwd_watchdog;
+pub mod measure_cap;
+pub mod policy_teeth;
 pub mod shape_daemon;
 pub mod up;
 pub mod verify;
