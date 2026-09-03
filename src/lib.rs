@@ -6,3 +6,8 @@
 //! traffic-class marking, HTB shaping trees, FRR configuration), and applies, verifies, and
 //! tears down the result on the host. Everything that touches the system goes through the
 //! `sys` layer, so every imperative branch is unit-testable.
+
+pub mod error;
+pub mod sys;
+
+pub use error::{Error, Result};
