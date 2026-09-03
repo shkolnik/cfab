@@ -4,8 +4,8 @@
 //! read-backs → fail-closed watchdog.
 
 use crate::commands::common::{
-    conf_interfaces, ensure_rule, frr_ctl, frr_interface_block, link_exists, link_kind_is,
-    proc_sysctl,
+    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, conf_interfaces, ensure_rule,
+    frr_ctl, frr_interface_block, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::derive::View;
 use crate::emit;
@@ -351,13 +351,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
 
     // ---- FRR -------------------------------------------------------------------
-    if sys.exists("/etc/frr/frr.conf") && !sys.exists("/etc/frr/frr.conf.pre-cfab") {
-        let orig = sys.read("/etc/frr/frr.conf")?;
-        sys.write("/etc/frr/frr.conf.pre-cfab", &orig)?;
-    }
+    adopt_frr_conf(sys)?;
     edit_daemons(sys, view)?;
     let frr_conf = emit::frr::generate(view)?;
-    sys.write("/etc/frr/frr.conf", &frr_conf)?;
+    sys.write(FRR_CONF, &frr_conf)?;
     frr_ctl(sys, "restart")?;
 
     // ---- read-backs: the load-bearing config must be in the daemons ------------
@@ -653,11 +650,47 @@ fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
+/// Overwrite /etc/frr/frr.conf only when it is provably ours to replace: absent, carrying the
+/// generated-by-cfab marker, or byte-identical to the recorded backup. Anything else is another
+/// owner's routing config — an admin's, or a manager like Proxmox SDN that regenerates the file
+/// on every apply — and destroying it can cut the host's own connectivity. The remedy `mv` is
+/// both the operator's consent and the backup `cfab down` restores.
+fn adopt_frr_conf(sys: &mut dyn Sys) -> Result<()> {
+    if !sys.exists(FRR_CONF) {
+        return Ok(());
+    }
+    let cur = sys.read(FRR_CONF)?;
+    if cur.contains(emit::frr::OWNERSHIP_MARKER) {
+        return Ok(());
+    }
+    if sys.exists(FRR_CONF_BACKUP) {
+        if sys.read(FRR_CONF_BACKUP)? == cur {
+            return Ok(()); // the backed-up original, unchanged — still restorable
+        }
+        return Err(Error::fatal(format!(
+            "{FRR_CONF} is not cfab-generated and differs from the {FRR_CONF_BACKUP} backup — \
+             refusing to overwrite; something else edited or regenerated it since the backup \
+             was taken; reconcile the two by hand, then rerun `cfab up`"
+        )));
+    }
+    Err(Error::fatal(format!(
+        "{FRR_CONF} exists and is not cfab-generated — refusing to overwrite; cfab takes \
+         exclusive ownership of this file (a routed Proxmox SDN setup cannot coexist with \
+         cfab yet); if the existing config is yours to retire, review it, then \
+         `mv {FRR_CONF} {FRR_CONF_BACKUP}` and rerun `cfab up` (`cfab down` restores it)"
+    )))
+}
+
 /// /etc/frr/daemons: enable ospfd+bfdd, vrrpd/bgpd per role, one ospfd instance per zone.
+/// The first edit on a host records the original file, so `down` can put the managed keys
+/// back instead of guessing.
 fn edit_daemons(sys: &mut dyn Sys, view: &View) -> Result<()> {
     let f = view.fabric;
-    let path = "/etc/frr/daemons";
+    let path = FRR_DAEMONS;
     let text = sys.read(path)?;
+    if !sys.exists(FRR_DAEMONS_SNAPSHOT) {
+        sys.write(FRR_DAEMONS_SNAPSHOT, &text)?;
+    }
     let want_vrrp = view.kind() == MemberKind::Host && f.vrrp_gw;
     let want_bgp = !view.gw_rows().is_empty();
     let instances = f
@@ -690,4 +723,79 @@ fn edit_daemons(sys: &mut dyn Sys, view: &View) -> Result<()> {
         out.push(format!("ospfd_instances=\"{instances}\""));
     }
     sys.write(path, &(out.join("\n") + "\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::mock::MockSys;
+
+    #[test]
+    fn adopt_frr_conf_accepts_absent_or_cfab_generated() {
+        let mut sys = MockSys::default();
+        adopt_frr_conf(&mut sys).unwrap();
+        let mut sys = MockSys::default().file(
+            FRR_CONF,
+            &format!(
+                "frr defaults traditional\n{}\n",
+                emit::frr::OWNERSHIP_MARKER
+            ),
+        );
+        adopt_frr_conf(&mut sys).unwrap();
+    }
+
+    #[test]
+    fn adopt_frr_conf_refuses_a_foreign_file_and_names_the_remedy() {
+        let mut sys = MockSys::default().file(FRR_CONF, "router bgp 65100\n");
+        let e = adopt_frr_conf(&mut sys).unwrap_err().to_string();
+        assert!(e.contains("not cfab-generated"), "{e}");
+        assert!(
+            e.contains(&format!("mv {FRR_CONF} {FRR_CONF_BACKUP}")),
+            "{e}"
+        );
+        assert!(
+            sys.files.get(FRR_CONF).unwrap() == "router bgp 65100\n",
+            "the foreign file is untouched"
+        );
+    }
+
+    #[test]
+    fn adopt_frr_conf_accepts_a_file_identical_to_its_backup() {
+        let mut sys = MockSys::default()
+            .file(FRR_CONF, "log syslog informational\n")
+            .file(FRR_CONF_BACKUP, "log syslog informational\n");
+        adopt_frr_conf(&mut sys).unwrap();
+    }
+
+    #[test]
+    fn adopt_frr_conf_refuses_when_the_file_drifted_from_its_backup() {
+        let mut sys = MockSys::default()
+            .file(FRR_CONF, "router bgp 65100\n")
+            .file(FRR_CONF_BACKUP, "log syslog informational\n");
+        let e = adopt_frr_conf(&mut sys).unwrap_err().to_string();
+        assert!(e.contains("differs from"), "{e}");
+    }
+
+    #[test]
+    fn edit_daemons_records_the_original_once() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        let fabric =
+            crate::model::Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap())
+                .unwrap();
+        let view = View::new(&fabric, "pve1-tb").unwrap();
+        let orig = "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=no\n";
+        let mut sys = MockSys::default().file(FRR_DAEMONS, orig);
+        edit_daemons(&mut sys, &view).unwrap();
+        assert_eq!(
+            sys.files.get(FRR_DAEMONS_SNAPSHOT).unwrap(),
+            orig,
+            "first edit snapshots the pre-cfab file"
+        );
+        assert!(sys.files.get(FRR_DAEMONS).unwrap().contains("ospfd=yes"));
+        // A second run must not overwrite the record with the already-edited file.
+        edit_daemons(&mut sys, &view).unwrap();
+        assert_eq!(sys.files.get(FRR_DAEMONS_SNAPSHOT).unwrap(), orig);
+    }
 }

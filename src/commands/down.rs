@@ -3,7 +3,8 @@
 //! netdevs. Prove-ownership: only deletes cfab-* netdevs of the expected kind.
 
 use crate::commands::common::{
-    conf_interfaces, drop_rules, frr_ctl_stop_ignore, link_exists, link_kind_is,
+    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, conf_interfaces, drop_rules,
+    frr_ctl_stop_ignore, link_exists, link_kind_is,
 };
 use crate::derive::View;
 use crate::error::{Error, Result};
@@ -92,23 +93,10 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         )?;
     }
     sys.remove(&f.run_dir)?;
-    if sys.exists("/etc/frr/frr.conf.pre-cfab") {
-        sys.rename("/etc/frr/frr.conf.pre-cfab", "/etc/frr/frr.conf")?;
+    if sys.exists(FRR_CONF_BACKUP) {
+        sys.rename(FRR_CONF_BACKUP, FRR_CONF)?;
     }
-    if sys.exists("/etc/frr/daemons") {
-        let daemons = sys.read("/etc/frr/daemons")?;
-        let restored: String = daemons
-            .lines()
-            .map(|l| match l {
-                "vrrpd=yes" => "vrrpd=no".to_string(),
-                "bgpd=yes" => "bgpd=no".to_string(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        sys.write("/etc/frr/daemons", &restored)?;
-    }
+    restore_daemons(sys)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
     if link_exists(sys, &f.vrrp_if)? {
@@ -177,4 +165,117 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     }
     msg.push_str(&format!("teardown OK on {}\n", view.member.name));
     Ok(msg)
+}
+
+/// The daemons keys `up` manages. One spelling, shared by edit and restore.
+const MANAGED_DAEMON_KEYS: [&str; 5] = ["ospfd", "bfdd", "vrrpd", "bgpd", "ospfd_instances"];
+
+/// Put the managed daemons keys back to their pre-cfab values (recorded by `up` at its first
+/// edit), then drop the record. Key-wise, not whole-file: unrelated daemons edits made while
+/// the fabric was up are not ours to destroy. Without a snapshot (an install first upped by an
+/// older cfab) fall back to the historical guess — vrrpd/bgpd off, ospfd/bfdd left enabled.
+fn restore_daemons(sys: &mut dyn Sys) -> Result<()> {
+    if !sys.exists(FRR_DAEMONS) {
+        return Ok(());
+    }
+    let cur = sys.read(FRR_DAEMONS)?;
+    if !sys.exists(FRR_DAEMONS_SNAPSHOT) {
+        let restored: String = cur
+            .lines()
+            .map(|l| match l {
+                "vrrpd=yes" => "vrrpd=no".to_string(),
+                "bgpd=yes" => "bgpd=no".to_string(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        return sys.write(FRR_DAEMONS, &restored);
+    }
+    let snap = sys.read(FRR_DAEMONS_SNAPSHOT)?;
+    fn managed(line: &str) -> Option<&str> {
+        let (key, _) = line.split_once('=')?;
+        MANAGED_DAEMON_KEYS.contains(&key).then_some(key)
+    }
+    let orig: std::collections::BTreeMap<&str, &str> = snap
+        .lines()
+        .filter_map(|l| managed(l).map(|k| (k, l)))
+        .collect();
+    let mut out: Vec<&str> = Vec::new();
+    for line in cur.lines() {
+        match managed(line) {
+            None => out.push(line),
+            // A managed line the snapshot never had (e.g. the appended ospfd_instances) is
+            // dropped; otherwise the original line replaces ours.
+            Some(key) => {
+                if let Some(o) = orig.get(key) {
+                    out.push(o);
+                }
+            }
+        }
+    }
+    sys.write(FRR_DAEMONS, &(out.join("\n") + "\n"))?;
+    sys.remove(FRR_DAEMONS_SNAPSHOT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::mock::MockSys;
+
+    #[test]
+    fn restore_daemons_puts_managed_keys_back_from_snapshot() {
+        let mut sys = MockSys::default()
+            .file(
+                FRR_DAEMONS,
+                "zebra=yes\nospfd=yes\nbfdd=yes\nvrrpd=yes\nbgpd=no\nstaticd=no\n\
+                 ospfd_instances=\"100,200,250\"\n",
+            )
+            .file(
+                FRR_DAEMONS_SNAPSHOT,
+                "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=yes\nstaticd=no\n",
+            );
+        restore_daemons(&mut sys).unwrap();
+        let got = sys.files.get(FRR_DAEMONS).unwrap();
+        assert_eq!(
+            got, "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=yes\nstaticd=no\n",
+            "managed keys back to pre-cfab values (bgpd back ON), appended instances line \
+             dropped, unmanaged lines untouched"
+        );
+        assert!(
+            !sys.files.contains_key(FRR_DAEMONS_SNAPSHOT),
+            "snapshot consumed"
+        );
+    }
+
+    #[test]
+    fn restore_daemons_keeps_operator_edits_to_unmanaged_keys() {
+        let mut sys = MockSys::default()
+            .file(FRR_DAEMONS, "ospfd=yes\nripd=yes\n")
+            .file(FRR_DAEMONS_SNAPSHOT, "ospfd=no\nripd=no\n");
+        restore_daemons(&mut sys).unwrap();
+        assert_eq!(
+            sys.files.get(FRR_DAEMONS).unwrap(),
+            "ospfd=no\nripd=yes\n",
+            "ripd is not cfab's — the operator's mid-lifecycle edit survives"
+        );
+    }
+
+    #[test]
+    fn restore_daemons_without_snapshot_uses_historical_fallback() {
+        let mut sys =
+            MockSys::default().file(FRR_DAEMONS, "ospfd=yes\nbfdd=yes\nvrrpd=yes\nbgpd=yes\n");
+        restore_daemons(&mut sys).unwrap();
+        assert_eq!(
+            sys.files.get(FRR_DAEMONS).unwrap(),
+            "ospfd=yes\nbfdd=yes\nvrrpd=no\nbgpd=no\n"
+        );
+    }
+
+    #[test]
+    fn restore_daemons_no_file_is_a_noop() {
+        let mut sys = MockSys::default();
+        restore_daemons(&mut sys).unwrap();
+        assert!(sys.files.is_empty());
+    }
 }

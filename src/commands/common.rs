@@ -3,6 +3,15 @@
 use crate::error::Result;
 use crate::sys::{Sys, run_ignore, run_ok};
 
+pub const FRR_CONF: &str = "/etc/frr/frr.conf";
+/// The original frr.conf, restored by `down`. Created by the operator's `mv` (the guard in
+/// `up` names it), or by legacy `up` runs that backed the file up themselves.
+pub const FRR_CONF_BACKUP: &str = "/etc/frr/frr.conf.pre-cfab";
+pub const FRR_DAEMONS: &str = "/etc/frr/daemons";
+/// The daemons file as found before cfab's first edit; `down` restores the managed keys
+/// from it and removes it.
+pub const FRR_DAEMONS_SNAPSHOT: &str = "/etc/frr/daemons.pre-cfab";
+
 /// FRR is driven by systemd where there is one; a container has no systemd → the package's own
 /// init. Probed, not declared (fabric.conf's frr_ctl).
 pub fn frr_ctl(sys: &mut dyn Sys, action: &str) -> Result<()> {
