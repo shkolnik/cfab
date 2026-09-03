@@ -4,3 +4,4 @@
 pub mod common;
 pub mod down;
 pub mod up;
+pub mod verify;
