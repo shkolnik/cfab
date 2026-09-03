@@ -58,6 +58,18 @@ enum Command {
     },
     /// One fail-closed forwarding-posture check (run by the cfab-fwd-watchdog timer)
     FwdWatchdog,
+    /// Flood a fabric peer on one NIC and record the wire's measured capacity
+    MeasureCap {
+        /// The physical NIC (a CLASS_TABLE wire)
+        dev: String,
+        /// Peer address to flood (a fabric segment address on that wire)
+        peer: String,
+        /// Flood duration in seconds
+        #[arg(default_value_t = 6)]
+        secs: u64,
+    },
+    /// Prove the forward policy in throwaway netnses — and prove the proof bites (root)
+    PolicyTeeth,
 }
 
 #[derive(Subcommand)]
@@ -232,6 +244,32 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     Ok(ExitCode::FAILURE)
                 }
             }
+        }
+        Command::MeasureCap { dev, peer, secs } => {
+            let mut sys = RealSys;
+            let summary = commands::measure_cap::run(
+                &mut sys,
+                &view,
+                &cfab::cluster::Pmxcfs::new(),
+                &dev,
+                &peer,
+                secs,
+                &commands::measure_cap::native_flood,
+            )?;
+            println!("{summary}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::PolicyTeeth => {
+            let mut sys = RealSys;
+            let conf_text = std::fs::read_to_string(&path)
+                .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
+            let report = commands::policy_teeth::run(&mut sys, &view, &conf_text)?;
+            print!("{}", report.output);
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
     }
 }
