@@ -7,6 +7,8 @@
 //! tears down the result on the host. Everything that touches the system goes through the
 //! `sys` layer, so every imperative branch is unit-testable.
 
+pub mod caps;
+pub mod cluster;
 pub mod config;
 pub mod derive;
 pub mod emit;
