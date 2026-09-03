@@ -30,6 +30,9 @@ jobs:
           if [ -n "$out" ]; then echo "$out"; exit 1; fi
 
   deb:
+    # On main pushes the release workflow builds and publishes the deb;
+    # this job proves packaging before merge.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
