@@ -58,6 +58,8 @@ enum Command {
     },
     /// One fail-closed forwarding-posture check (run by the cfab-fwd-watchdog timer)
     FwdWatchdog,
+    /// Cluster config-sync daemon (started by `up` as cfab-conf-sync.service when clustered)
+    ConfSync,
     /// Flood a fabric peer on one NIC and record the wire's measured capacity
     MeasureCap {
         /// The physical NIC (a CLASS_TABLE wire)
@@ -70,6 +72,28 @@ enum Command {
     },
     /// Prove the forward policy in throwaway netnses — and prove the proof bites (root)
     PolicyTeeth,
+    /// Cluster coordination over pmxcfs (/etc/pve); clean "not clustered" when absent
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+    /// Cluster-wide fabric.conf distribution
+    Conf {
+        #[command(subcommand)]
+        action: ConfAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClusterAction {
+    /// Report pmxcfs presence, quorum, members, and the published conf state
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ConfAction {
+    /// Validate the local fabric.conf and publish it to /etc/pve/cfab/ (lock + gen bump)
+    Publish,
 }
 
 #[derive(Subcommand)]
@@ -150,12 +174,37 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    if let Command::Cluster {
+        action: ClusterAction::Status,
+    } = cli.command
+    {
+        // Status is about the cluster, not the declaration — no config file needed.
+        print!(
+            "{}",
+            commands::cluster::status(&cfab::cluster::Pmxcfs::new())?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let fabric = load_fabric(&path)?;
     let member = member_name(&cli.host)?;
     let view = View::new(&fabric, &member)?;
 
     match cli.command {
-        Command::Schema => unreachable!("handled above"),
+        Command::Schema | Command::Cluster { .. } => unreachable!("handled above"),
+        Command::Conf {
+            action: ConfAction::Publish,
+        } => {
+            // load_fabric + View::new above are the full validation gate: a conf that does
+            // not validate for this member never reaches the cluster.
+            let mut sys = RealSys;
+            let conf_text = std::fs::read_to_string(&path)
+                .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
+            print!(
+                "{}",
+                commands::cluster::publish(&mut sys, &cfab::cluster::Pmxcfs::new(), &conf_text)?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Check => {
             let kind = match view.kind() {
                 MemberKind::Host => "host",
@@ -244,6 +293,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     Ok(ExitCode::FAILURE)
                 }
             }
+        }
+        Command::ConfSync => {
+            let mut sys = RealSys;
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
+                .to_string_lossy()
+                .into_owned();
+            commands::conf_sync::run(&mut sys, &view.member.name, &fabric.run_dir, &exe)?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::MeasureCap { dev, peer, secs } => {
             let mut sys = RealSys;
