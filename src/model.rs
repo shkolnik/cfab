@@ -279,7 +279,8 @@ pub struct Fabric {
     pub bgp_keepalive_s: u32,
     pub bgp_hold_s: u32,
     pub bgp_connect_s: u32,
-    pub usb_eth9_hosts: Vec<String>,
+    /// `(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.
+    pub usb_nics: Vec<(String, String)>,
     /// Runtime state dir written by `up`, read by `verify` and the daemons (CFAB_RUN).
     pub run_dir: String,
     pub fabric_domain: String,
@@ -313,7 +314,7 @@ pub const CONSUMED_KEYS: &[&str] = &[
     "BGP_KEEPALIVE_S",
     "BGP_HOLD_S",
     "BGP_CONNECT_S",
-    "USB_ETH9_HOSTS",
+    "USB_NICS",
     "CFAB_RUN",
 ];
 
@@ -373,11 +374,19 @@ impl Fabric {
             bgp_keepalive_s: parse_num(raw, "BGP_KEEPALIVE_S")?,
             bgp_hold_s: parse_num(raw, "BGP_HOLD_S")?,
             bgp_connect_s: parse_num(raw, "BGP_CONNECT_S")?,
-            usb_eth9_hosts: raw
-                .require("USB_ETH9_HOSTS")?
+            usb_nics: raw
+                .require("USB_NICS")?
                 .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+                .map(|entry| {
+                    entry
+                        .split_once(':')
+                        .filter(|(m, d)| !m.is_empty() && !d.is_empty())
+                        .map(|(m, d)| (m.to_string(), d.to_string()))
+                        .ok_or_else(|| {
+                            Error::config(format!("USB_NICS entry '{entry}' is not member:dev"))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
             run_dir: raw.require("CFAB_RUN")?.to_string(),
             fabric_domain: raw.require("FABRIC_DOMAIN")?.to_string(),
         };
@@ -444,6 +453,18 @@ impl Fabric {
                         "FORWARD_ALLOW '{from}>{to}': unknown zone '{z}'"
                     )));
                 }
+            }
+        }
+        for (m, dev) in &self.usb_nics {
+            let member = self
+                .members
+                .iter()
+                .find(|mm| mm.name == *m)
+                .ok_or_else(|| Error::config(format!("USB_NICS names unknown member '{m}'")))?;
+            if !member.wires.iter().flatten().any(|w| w.name == *dev) {
+                return Err(Error::config(format!(
+                    "USB_NICS {m}:{dev}: '{dev}' is not one of {m}'s wires"
+                )));
             }
         }
         for z in &self.zones {
@@ -663,6 +684,34 @@ mod tests {
         let mut text = real_conf();
         edit(&mut text);
         Fabric::from_raw(&RawConfig::parse(&text).unwrap())
+    }
+
+    #[test]
+    fn usb_nics_entry_without_dev_fails() {
+        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve1-tb")).unwrap_err();
+        assert!(
+            err.to_string().contains("'pve1-tb' is not member:dev"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn usb_nics_unknown_member_fails() {
+        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve9-tb:eth9")).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown member 'pve9-tb'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn usb_nics_non_wire_dev_fails() {
+        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve1-tb:eth5")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'eth5' is not one of pve1-tb's wires"),
+            "{err}"
+        );
     }
 
     #[test]

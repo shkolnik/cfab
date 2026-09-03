@@ -121,8 +121,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
 
     // ---- NIC safe mode ---------------------------------------------------------
     let mut warnings = Vec::new();
-    if f.usb_eth9_hosts.iter().any(|h| h == host) {
-        let out = run_ok(sys, &["ethtool", "-i", "eth9"])?;
+    for (_, dev) in f.usb_nics.iter().filter(|(m, _)| m == host) {
+        let out = run_ok(sys, &["ethtool", "-i", dev])?;
         let drv = out
             .stdout
             .lines()
@@ -134,12 +134,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             run_ok(
                 sys,
                 &[
-                    "ethtool", "-K", "eth9", "sg", "off", "tso", "off", "gso", "off",
+                    "ethtool", "-K", dev, "sg", "off", "tso", "off", "gso", "off",
                 ],
             )?;
         } else {
             warnings.push(format!(
-                "WARNING: eth9 on {host} is driven by '{drv}', not r8152 (RTL8157 re-enumerated \
+                "WARNING: {dev} on {host} is driven by '{drv}', not r8152 (RTL8157 re-enumerated \
                  as CDC?) — SG mitigation skipped, link speed unverified"
             ));
         }
