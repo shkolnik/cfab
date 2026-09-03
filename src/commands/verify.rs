@@ -287,7 +287,7 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 c.bad("chain forward is not policy drop");
             }
             if let Some(admin) = view.admin_if() {
-                for counter in ["I4-admin-in", "I4-admin-out"] {
+                for counter in ["admin-in", "admin-out"] {
                     match counter_packets(&chain, counter) {
                         Some(0) => {}
                         Some(n) => c.bad(&format!(
@@ -721,9 +721,9 @@ mod tests {
 
     #[test]
     fn counter_parse() {
-        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"I4-admin-in\"\n\
+        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
                      counter packets 42 bytes 999 comment \"default-deny\"";
-        assert_eq!(counter_packets(chain, "I4-admin-in"), Some(0));
+        assert_eq!(counter_packets(chain, "admin-in"), Some(0));
         assert_eq!(counter_packets(chain, "default-deny"), Some(42));
         assert_eq!(counter_packets(chain, "nope"), None);
     }
