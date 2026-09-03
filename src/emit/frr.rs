@@ -15,8 +15,12 @@ pub fn generate(view: &View) -> Result<String> {
     let f = view.fabric;
     let n = view.node();
     let mut out = String::new();
+    // `log syslog informational`: FRR without a configured log target drops the events that
+    // matter most here (BFD session and OSPF adjacency transitions), and this file replaces
+    // the distro default that carried the same line.
     out.push_str(&format!(
         "frr defaults traditional\nhostname {}\n{OWNERSHIP_MARKER}\n\
+         log syslog informational\n\
          bfd\n profile cfab-fast\n  receive-interval {}\n  transmit-interval {}\n  \
          detect-multiplier {}\n exit\nexit\n",
         view.member.name, f.bfd_rx_ms, f.bfd_tx_ms, f.bfd_mult
@@ -179,6 +183,7 @@ mod tests {
             conf.contains(OWNERSHIP_MARKER),
             "up's ownership guard keys on this"
         );
+        assert!(conf.contains("\nlog syslog informational\n"));
         assert!(conf.contains("router bgp 65000"));
         assert!(conf.contains(" bgp router-id 10.249.0.1\n"));
         assert!(conf.contains(" neighbor 192.168.249.254 update-source 192.168.249.1\n"));
