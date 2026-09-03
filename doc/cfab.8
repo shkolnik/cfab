@@ -258,7 +258,13 @@ retried, even across a daemon restart.
 Written by
 .BR up ,
 restored by
-.BR down .
+.B down
+from
+.IR /etc/frr/frr.conf.pre\-cfab .
+.B up
+refuses to overwrite a file that is not cfab\-generated (a hand\-written
+config, or another manager's, such as Proxmox SDN); reviewing it and moving
+it to the backup path is the operator's consent to hand it over.
 .TP
 .I /etc/pve/cfab/fabric.conf
 The cluster-published declaration (pmxcfs; written by
