@@ -72,7 +72,7 @@ jobs:
       - name: Attest build provenance
         # Runs before SHA256SUMS is added, so every file in dist/ is a
         # build subject.
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       - name: Publish formal release
