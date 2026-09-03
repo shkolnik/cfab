@@ -7,7 +7,23 @@
 //! tears down the result on the host. Everything that touches the system goes through the
 //! `sys` layer, so every imperative branch is unit-testable.
 
+pub mod config;
 pub mod error;
+pub mod model;
 pub mod sys;
 
+use std::path::Path;
+
 pub use error::{Error, Result};
+
+/// Load + type + validate the declaration; warn (stderr) about literal keys the model does not
+/// know, so a declaration added for shell tooling is never silently ignored here.
+pub fn load_fabric(path: &Path) -> Result<model::Fabric> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
+    let raw = config::RawConfig::parse(&text)?;
+    for key in raw.unconsumed(model::CONSUMED_KEYS) {
+        eprintln!("cfab: warning: fabric.conf declares {key}, which this binary does not consume");
+    }
+    model::Fabric::from_raw(&raw)
+}
