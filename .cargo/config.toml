@@ -1,0 +1,6 @@
+# Fabric hosts are x86_64 Linux. Static musl + rust-lld gives one self-contained binary that
+# runs on any of them, with no cross C toolchain needed (all dependencies are pure Rust).
+# Build: cargo build --release --target x86_64-unknown-linux-musl
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
