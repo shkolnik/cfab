@@ -85,6 +85,17 @@ jobs:
             --verify-tag \
             --title "cfab $GITHUB_REF_NAME" \
             --generate-notes
+      - name: Notify package repository
+        # Dispatches shkolnik/pkg's check-releases workflow, which opens a
+        # review PR proposing this release for the apt repo. The token is a
+        # fine-grained PAT scoped to Actions:write on that repo only — it can
+        # start the check, nothing else. Never fail a release over this: the
+        # pkg repo's weekly cron catches a missed dispatch.
+        if: steps.meta.outputs.channel == 'formal'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
+        run: gh workflow run check-releases.yml -R shkolnik/pkg
       - name: Publish rolling dev release
         if: steps.meta.outputs.channel == 'dev'
         env:
