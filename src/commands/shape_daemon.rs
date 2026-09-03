@@ -51,8 +51,36 @@ pub fn event_loop(
     }
 }
 
-/// One reconvergence: read the up-set, derive and apply each up wire's tree.
-pub fn reconverge(sys: &mut dyn Sys, view: &View, devs: &[String]) -> Result<String> {
+/// One line per wire whose carrier state changed between reconverges — the log entry that
+/// matters for cluster debugging is the transition, not the resulting up-set. `prev` is None
+/// on the first reconverge (only wires already down are worth a line then). A burst that
+/// changed nothing (the down and the up both landed inside one debounce window) is still
+/// reported: an invisible flap is the failure mode this exists to catch.
+pub fn transitions(prev: Option<&[String]>, now: &[String], devs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in devs {
+        let was = prev.map(|p| p.iter().any(|x| x == d));
+        let is = now.iter().any(|x| x == d);
+        match (was, is) {
+            (None, false) => out.push(format!("shape-daemon: wire {d} DOWN at start")),
+            (Some(false), true) => out.push(format!("shape-daemon: wire {d} UP")),
+            (Some(true), false) => out.push(format!("shape-daemon: wire {d} DOWN")),
+            (None, true) | (Some(true), true) | (Some(false), false) => {}
+        }
+    }
+    if prev.is_some() && out.is_empty() {
+        out.push("shape-daemon: link event on fabric wires, up-set unchanged (flap?)".to_string());
+    }
+    out
+}
+
+/// One reconvergence: read the up-set, derive and apply each up wire's tree. Returns the
+/// summary line and the up-set (for the caller's transition log).
+pub fn reconverge(
+    sys: &mut dyn Sys,
+    view: &View,
+    devs: &[String],
+) -> Result<(String, Vec<String>)> {
     let up: Vec<String> = devs
         .iter()
         .filter(|d| {
@@ -90,10 +118,8 @@ pub fn reconverge(sys: &mut dyn Sys, view: &View, devs: &[String]) -> Result<Str
         }
     }
     let dt = t0.elapsed().as_millis();
-    Ok(format!(
-        "shape-daemon: reconverge dt={dt}ms up=[{}]",
-        up.join(" ")
-    ))
+    let msg = format!("shape-daemon: reconverge dt={dt}ms up=[{}]", up.join(" "));
+    Ok((msg, up))
 }
 
 /// The shared cap chain (local file → cluster-published → declared). The cluster fallback
@@ -131,8 +157,15 @@ pub fn run(sys: &mut dyn Sys, view: &View, debounce: Duration) -> Result<()> {
         devs.join(" "),
         debounce.as_secs_f64()
     );
+    let mut prev_up: Option<Vec<String>> = None;
     match reconverge(sys, view, &devs) {
-        Ok(msg) => println!("{msg}"),
+        Ok((msg, up)) => {
+            for line in transitions(None, &up, &devs) {
+                println!("{line}");
+            }
+            println!("{msg}");
+            prev_up = Some(up);
+        }
         Err(e) => eprintln!("shape-daemon: initial reconverge failed: {e}"),
     }
 
@@ -172,7 +205,13 @@ pub fn run(sys: &mut dyn Sys, view: &View, debounce: Duration) -> Result<()> {
         debounce,
         &stop,
         &mut |sys: &mut dyn Sys| match reconverge(sys, view, &devs) {
-            Ok(msg) => println!("{msg}"),
+            Ok((msg, up)) => {
+                for line in transitions(prev_up.as_deref(), &up, &devs) {
+                    println!("{line}");
+                }
+                println!("{msg}");
+                prev_up = Some(up);
+            }
             Err(e) => eprintln!("shape-daemon: reconverge failed: {e}"),
         },
         sys,
@@ -256,14 +295,52 @@ mod tests {
             .file("/sys/class/net/eth9/carrier", "1\n")
             .file("/sys/class/net/eth1/carrier", "0\n")
             .file("/sys/class/net/eth0/carrier", "1\n");
-        let msg = reconverge(&mut sys, &view, &view.wires()).unwrap();
+        let (msg, up) = reconverge(&mut sys, &view, &view.wires()).unwrap();
         assert!(msg.contains("up=[eth0 eth9]"), "{msg}"); // wires() is sorted
+        assert_eq!(up, vec!["eth0".to_string(), "eth9".to_string()]);
         assert!(sys.ran("tc qdisc add dev eth9 root handle 1: htb"));
         assert!(sys.ran("tc qdisc add dev eth0 root handle 1: htb"));
         assert!(
             !sys.ran("tc qdisc add dev eth1 root handle 1: htb"),
             "down wire left alone"
         );
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn transitions_report_the_delta_per_wire() {
+        let devs = s(&["eth9", "eth1", "eth0"]);
+        let lines = transitions(Some(&s(&["eth9", "eth1", "eth0"])), &s(&["eth1"]), &devs);
+        assert_eq!(
+            lines,
+            vec![
+                "shape-daemon: wire eth9 DOWN",
+                "shape-daemon: wire eth0 DOWN"
+            ]
+        );
+        let lines = transitions(Some(&s(&["eth1"])), &s(&["eth1", "eth9"]), &devs);
+        assert_eq!(lines, vec!["shape-daemon: wire eth9 UP"]);
+    }
+
+    #[test]
+    fn transitions_flag_a_flap_hidden_by_the_debounce() {
+        let devs = s(&["eth9"]);
+        let lines = transitions(Some(&s(&["eth9"])), &s(&["eth9"]), &devs);
+        assert_eq!(
+            lines,
+            vec!["shape-daemon: link event on fabric wires, up-set unchanged (flap?)"]
+        );
+    }
+
+    #[test]
+    fn first_reconverge_reports_only_wires_already_down() {
+        let devs = s(&["eth9", "eth1"]);
+        let lines = transitions(None, &s(&["eth9"]), &devs);
+        assert_eq!(lines, vec!["shape-daemon: wire eth1 DOWN at start"]);
+        assert!(transitions(None, &s(&["eth9", "eth1"]), &devs).is_empty());
     }
 
     #[test]
