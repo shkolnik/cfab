@@ -50,6 +50,14 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         timeout: u64,
     },
+    /// Membership-reactive shaping daemon (started by `up` as cfab-shape.service)
+    ShapeDaemon {
+        /// Quiet-gap debounce after a link event burst, in seconds
+        #[arg(long, default_value_t = 0.5)]
+        debounce: f64,
+    },
+    /// One fail-closed forwarding-posture check (run by the cfab-fwd-watchdog timer)
+    FwdWatchdog,
 }
 
 #[derive(Subcommand)]
@@ -204,6 +212,26 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let report = commands::verify::run(&mut sys, &view, timeout)?;
             print!("{}", report.output);
             Ok(ExitCode::from(report.code))
+        }
+        Command::ShapeDaemon { debounce } => {
+            let mut sys = RealSys;
+            commands::shape_daemon::run(
+                &mut sys,
+                &view,
+                std::time::Duration::from_secs_f64(debounce),
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::FwdWatchdog => {
+            let mut sys = RealSys;
+            let report = commands::fwd_watchdog::run(&mut sys, &view)?;
+            match report.failed {
+                None => Ok(ExitCode::SUCCESS),
+                Some(reason) => {
+                    eprintln!("cfab fwd-watchdog: FAIL-CLOSED: {reason}");
+                    Ok(ExitCode::FAILURE)
+                }
+            }
         }
     }
 }

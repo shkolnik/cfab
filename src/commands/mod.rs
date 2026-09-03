@@ -3,5 +3,7 @@
 
 pub mod common;
 pub mod down;
+pub mod fwd_watchdog;
+pub mod shape_daemon;
 pub mod up;
 pub mod verify;
