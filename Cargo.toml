@@ -7,6 +7,7 @@ description = "Per-host runtime of a resilient converged network fabric for smal
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
