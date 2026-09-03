@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Man page lint
+        # groff -z exits 0 even on warnings; fail on any diagnostic output.
+        run: |
+          sudo apt-get install -y --no-install-recommends groff
+          out=$(groff -man -z doc/cfab.8 2>&1)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+      - name: Build Debian package (static musl)
+        run: cargo deb --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfab-deb
+          path: target/x86_64-unknown-linux-musl/debian/*.deb
