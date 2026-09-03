@@ -8,6 +8,7 @@
 //! `sys` layer, so every imperative branch is unit-testable.
 
 pub mod config;
+pub mod derive;
 pub mod error;
 pub mod model;
 pub mod sys;
