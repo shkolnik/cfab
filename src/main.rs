@@ -44,6 +44,12 @@ enum Command {
     Up,
     /// Remove everything `up` created, restore FRR to the pre-fabric state (root)
     Down,
+    /// Full health check: posture, drift, convergence. Exit 0 OK / 2 degraded / 1 failed
+    Verify {
+        /// Seconds to wait for BFD/route convergence before failing
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,6 +198,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let mut sys = RealSys;
             print!("{}", commands::down::run(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Verify { timeout } => {
+            let mut sys = RealSys;
+            let report = commands::verify::run(&mut sys, &view, timeout)?;
+            print!("{}", report.output);
+            Ok(ExitCode::from(report.code))
         }
     }
 }
