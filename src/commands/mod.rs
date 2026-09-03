@@ -1,7 +1,9 @@
 //! Imperative subcommands. All host access goes through the `Sys` trait so the imperative
 //! branches are testable against `MockSys`.
 
+pub mod cluster;
 pub mod common;
+pub mod conf_sync;
 pub mod down;
 pub mod fwd_watchdog;
 pub mod measure_cap;
