@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.98"
 description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.conf declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/shkolnik/cfab"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -16,6 +17,20 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "James Shkolnik <jshkolnik@gmail.com>"
+copyright = "2026 James Shkolnik"
+extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / FRR config from it, applies and verifies the fabric on this member, and tears it down. Installing this package pulls in the full runtime chain (FRR, nftables)."
+section = "net"
+priority = "optional"
+depends = "frr (>= 8.0), nftables, iproute2, ethtool"
+assets = [
+    ["target/release/cfab", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/cfab/", "644"],
+    ["doc/cfab.8", "usr/share/man/man8/", "644"],
+    ["examples/fabric.conf", "usr/share/doc/cfab/examples/fabric.conf.example", "644"],
+]
 
 [lints.rust]
 unsafe_code = "forbid"
