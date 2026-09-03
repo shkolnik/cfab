@@ -1,0 +1,26 @@
+[package]
+name = "cfab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.conf declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Closed sets are matched exhaustively — a `_ =>` arm on our own enums is the
+# stale-branch bug the compiler exists to catch.
+wildcard_enum_match_arm = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+strip = true
+lto = true
