@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod derive;
+pub mod emit;
 pub mod error;
 pub mod model;
 pub mod sys;
