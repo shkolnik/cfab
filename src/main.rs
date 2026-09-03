@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use cfab::derive::View;
 use cfab::model::MemberKind;
 use cfab::sys::RealSys;
-use cfab::{Error, emit, load_fabric};
+use cfab::{Error, commands, emit, load_fabric};
 
 /// cfab — the per-host runtime of the resilient converged fabric.
 ///
@@ -40,6 +40,10 @@ enum Command {
         #[command(subcommand)]
         artifact: GenArtifact,
     },
+    /// Apply the fabric on this member (idempotent; root)
+    Up,
+    /// Remove everything `up` created, restore FRR to the pre-fabric state (root)
+    Down,
 }
 
 #[derive(Subcommand)]
@@ -166,6 +170,27 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     }
                 }
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Up => {
+            let mut sys = RealSys;
+            let opts = commands::up::UpOpts {
+                exe: std::env::current_exe()
+                    .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
+                    .to_string_lossy()
+                    .into_owned(),
+                config: std::fs::canonicalize(&path)
+                    .map_err(|e| Error::fatal(format!("cannot resolve {}: {e}", path.display())))?
+                    .to_string_lossy()
+                    .into_owned(),
+                pmxcfs_root: "/etc/pve".to_string(),
+            };
+            print!("{}", commands::up::run(&mut sys, &view, &opts)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Down => {
+            let mut sys = RealSys;
+            print!("{}", commands::down::run(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
     }

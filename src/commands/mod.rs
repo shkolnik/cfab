@@ -1,0 +1,6 @@
+//! Imperative subcommands. All host access goes through the `Sys` trait so the imperative
+//! branches are testable against `MockSys`.
+
+pub mod common;
+pub mod down;
+pub mod up;
