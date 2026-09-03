@@ -1,0 +1,41 @@
+# === OS / editor cruft ===
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+
+# === Secrets / local env — never commit ===
+# This project handles an at-rest encryption key ("identity capsule").
+# Keep keys and env files out of history by default.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+
+# === Local scratch & logs ===
+/scratch/
+# Session scratch used during M1 spikes/dev (keypair working files, extracted
+# chrome, .deb, profiles — hundreds of MB). Keep out of history; the private
+# .pem is also covered by *.pem above, but the dir must never be `git add`-ed.
+/scratchpad/
+*.log
+
+# === Build artifacts (Rust workspace, G1/D15) ===
+/target/
+**/target/
+/dist/
+
+# Node deps and caches, ANYWHERE in the tree. crates/extension-dist/.gitignore
+# already covers its own; this rule exists because running vitest from the wrong
+# working directory drops a stray `node_modules/.vite` cache at the repo ROOT,
+# where nothing was ignoring it (seen 2026-07-27).
+node_modules/
+
+# === Generated docs (never commit — regenerate via `cargo xtask docs`) ===
+# Rust docs land in /target/doc/, already covered by /target/ above.
+/crates/extension-dist/api-docs/
+
+# Ignore execution progress tracking files from the superpowers skill - considered ephemeral
+.superpowers/
