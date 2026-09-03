@@ -7,6 +7,7 @@ description = "Per-host runtime of a resilient converged network fabric for smal
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+thiserror = "2"
 
 [dev-dependencies]
 
