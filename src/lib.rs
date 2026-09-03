@@ -9,6 +9,7 @@
 
 pub mod caps;
 pub mod cluster;
+pub mod commands;
 pub mod config;
 pub mod derive;
 pub mod emit;
