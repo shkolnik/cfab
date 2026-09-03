@@ -10,7 +10,7 @@
 //!
 //! Teeth: (1) regress — re-generate from a MODEL with an extra allowed pair (storage>cluster)
 //! through the real parser+generator: the negative test for that pair must go RED. (2) mutate —
-//! strip the I4 admin rules and splice the admin NIC into the storage set: the admin negative
+//! strip the admin drop rules and splice the admin NIC into the storage set: the admin negative
 //! test must go RED (proves it is those rules, not the default policy, protecting the admin NIC).
 
 use std::fmt::Write as _;
@@ -203,14 +203,14 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
 
     let _ = writeln!(
         out,
-        "== 3. teeth: strip the I4 admin rules from the ruleset -> the admin negative must go RED"
+        "== 3. teeth: strip the admin drop rules from the ruleset -> the admin negative must go RED"
     );
     let admin = view
         .admin_if()
         .ok_or_else(|| Error::fatal("policy-teeth: no admin NIC on this member (host only)"))?;
     let noadmin: String = prod
         .lines()
-        .filter(|l| !l.contains("I4-admin"))
+        .filter(|l| !l.contains("comment \"admin-"))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
@@ -224,7 +224,7 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     let r3 = if got == 0 {
         let _ = writeln!(
             out,
-            "  NO TEETH: admin test did not notice the missing I4 rules"
+            "  NO TEETH: admin test did not notice the missing admin rules"
         );
         false
     } else {
