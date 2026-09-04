@@ -90,12 +90,18 @@ pub fn run(
         .parse()
         .map_err(|_| Error::fatal(format!("measure-cap: {statfile} is not a number")))?;
 
-    let bfd_count = |sys: &mut dyn Sys| -> Result<Option<usize>> {
-        let o = sys.run(&["vtysh", "-c", "show bfd peers brief"])?;
-        Ok(o.ok()
-            .then(|| o.stdout.lines().filter(|l| l.contains(" up ")).count()))
+    // Warn-only: an engine that is not running is not this command's business.
+    let bfd_count = |sys: &mut dyn Sys| -> Option<usize> {
+        let doc = crate::commands::engine_ctl::state(sys, view.fabric).ok()?;
+        Some(
+            doc["bfd"]
+                .as_array()?
+                .iter()
+                .filter(|s| s["state"] == "up")
+                .count(),
+        )
     };
-    if let Some(n) = bfd_count(sys)? {
+    if let Some(n) = bfd_count(sys) {
         out.push_str(&format!(
             "measure-cap: BFD up-count before: {n} (warn-only sanity check)\n"
         ));
@@ -136,7 +142,7 @@ pub fn run(
     flooded?;
     released?;
 
-    if let Some(n) = bfd_count(sys)? {
+    if let Some(n) = bfd_count(sys) {
         out.push_str(&format!(
             "measure-cap: BFD up-count after: {n} (warn-only sanity check)\n"
         ));

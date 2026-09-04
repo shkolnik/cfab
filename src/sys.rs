@@ -35,6 +35,12 @@ pub trait Sys {
     /// One request, one reply over a Unix stream socket: connect to `path`, write `line`, read
     /// until the peer closes. The engine's state socket speaks exactly this shape.
     fn unix_request(&mut self, path: &str, line: &str) -> Result<String>;
+    /// Start a long-lived process in its own session, stdin from /dev/null, stdout+stderr
+    /// appended to `log`, and return as soon as it is launched — never waiting on it. This
+    /// is the only way to start a daemon from here: `run` captures the child's output
+    /// through pipes and reads them to EOF, so a detached child that keeps its stderr open
+    /// (the engine logs there for life) would block `run` forever.
+    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()>;
 }
 
 /// Run and require exit 0.
@@ -123,6 +129,35 @@ impl Sys for RealSys {
 
     fn sleep(&mut self, d: Duration) {
         std::thread::sleep(d);
+    }
+
+    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(|e| Error::fatal(format!("cannot open {log}: {e}")))?;
+        let err_file = log_file
+            .try_clone()
+            .map_err(|e| Error::fatal(format!("cannot dup {log}: {e}")))?;
+        // `setsid -f` forks the child into a new session and exits at once; the child keeps
+        // only the log fds, so `status()` returns as soon as the fork is done.
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .args(argv)
+            .stdin(std::process::Stdio::null())
+            .stdout(log_file)
+            .stderr(err_file)
+            .status()
+            .map_err(|e| Error::fatal(format!("cannot exec setsid: {e}")))?;
+        if !status.success() {
+            return Err(Error::Cmd {
+                cmd: format!("setsid -f {}", argv.join(" ")),
+                status: status.code().unwrap_or(-1),
+                stderr: format!("see {log}"),
+            });
+        }
+        Ok(())
     }
 
     fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
@@ -294,6 +329,12 @@ pub mod mock {
             }
         }
 
+        fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
+            self.calls
+                .push(format!("spawn_detached {} >> {log}", argv.join(" ")));
+            Ok(())
+        }
+
         fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
             self.calls
                 .push(format!("unix_request {path} {}", line.trim_end()));
@@ -309,6 +350,7 @@ pub mod mock {
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::time::Duration;
 
     use super::mock::MockSys;
     use super::{RealSys, Sys};
@@ -352,6 +394,45 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(reply, "got state\n");
+    }
+
+    /// The launcher must return while the child lives and keeps the log open: a child that
+    /// sleeps 30 s and holds stderr must not hold `spawn_detached` (the `run`-through-pipes
+    /// hang this method exists to avoid).
+    #[test]
+    fn real_spawn_detached_returns_while_the_child_lives_and_logs_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("cfab-spawn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("engine.log");
+        let pid_file = dir.join("child.pid");
+        let script = "echo $$ >\"$1\"; echo hello-from-stderr >&2; exec sleep 30";
+        let started = std::time::Instant::now();
+        RealSys
+            .spawn_detached(
+                &["sh", "-c", script, "sh", pid_file.to_str().unwrap()],
+                log.to_str().unwrap(),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "blocked for {elapsed:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut pid = String::new();
+        while pid.trim().is_empty() && std::time::Instant::now() < deadline {
+            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            std::thread::yield_now();
+        }
+        let pid = pid.trim().to_string();
+        assert!(!pid.is_empty(), "child never wrote its pid");
+        // Still alive after the launcher returned, and its stderr landed in the log.
+        assert!(std::path::Path::new(&format!("/proc/{pid}/status")).exists());
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("hello-from-stderr"), "{logged:?}");
+        let killed = std::process::Command::new("sh")
+            .args(["-c", "kill \"$1\"", "sh", &pid])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

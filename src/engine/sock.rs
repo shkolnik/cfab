@@ -50,7 +50,18 @@ fn is_cfab_engine(pid: u32) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    cmdline.split(|b| *b == 0).any(|arg| arg == b"engine")
+    is_engine_cmdline(&cmdline)
+}
+
+/// Does a `/proc/<pid>/cmdline` (NUL-separated argv) name a `cfab … engine` process? The one
+/// ownership test for every signal cfab ever sends an engine pid (here, and `up`/`down`
+/// through `engine_ctl`): an argument whose file name is `cfab` and the `engine` subcommand.
+pub fn is_engine_cmdline(cmdline: &[u8]) -> bool {
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+    let named_cfab = args
+        .iter()
+        .any(|a| a.rsplit(|b| *b == b'/').next() == Some(b"cfab"));
+    named_cfab && args.iter().any(|a| *a == b"engine")
 }
 
 /// Bind the socket. A leftover path is unlinked ONLY when nothing answers on it; a live
@@ -161,7 +172,7 @@ mod tests {
         // A pid that cannot be alive (beyond pid_max).
         std::fs::write(&pid, "4194305\n").unwrap();
         refuse_if_live(&sock, &pid).unwrap();
-        // Our own live pid, but its cmdline carries no `engine` argument: foreign, not ours.
+        // Our own live pid, but its cmdline carries no `cfab … engine`: foreign, not ours.
         std::fs::write(&pid, format!("{}\n", std::process::id())).unwrap();
         assert!(!is_cfab_engine(std::process::id()));
         refuse_if_live(&sock, &pid).unwrap();
@@ -169,13 +180,13 @@ mod tests {
         // shell's builtin `read` blocks on the piped stdin, so sh itself stays alive with
         // its argv intact (no exec) until it is killed.
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "read _", "sh", "engine"])
+            .args(["-c", "read _", "cfab", "engine"])
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         std::fs::write(&pid, format!("{}\n", child.id())).unwrap();
         // Until the forked child execs sh, /proc shows OUR argv; once it has, the argv
-        // stays `sh -c … sh engine` for good, so waiting for it is race-free.
+        // stays `sh -c … cfab engine` for good, so waiting for it is race-free.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !is_cfab_engine(child.id()) && std::time::Instant::now() < deadline {
             std::thread::yield_now();
