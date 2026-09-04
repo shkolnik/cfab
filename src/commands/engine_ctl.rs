@@ -21,6 +21,9 @@ const PROTO_RANGE: std::ops::RangeInclusive<u8> = PROTO_BASE..=PROTO_BASE + 3;
 const STOP_WAIT_MS: u64 = 10_000;
 const START_WAIT_MS: u64 = 30_000;
 const POLL_MS: u64 = 500;
+/// How long `up` re-reads the state document before believing a configured interface really
+/// is operationally down (see `settled_down_ifs`).
+pub const SETTLE_MS: u64 = 3_000;
 /// Route type words `ip route show` prints before the prefix (RTN_* other than unicast).
 const ROUTE_TYPES: [&str; 10] = [
     "unreachable",
@@ -272,10 +275,22 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             )));
         }
         for ifn in configured_ifs(view, z) {
-            if inst["interfaces"][&ifn].is_null() {
+            let got = &inst["interfaces"][&ifn];
+            if got.is_null() {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' does not list interface {ifn}",
                     z.name
+                )));
+            }
+            // A listed interface always carries an ietf-ospf state; a document without one
+            // is malformed (no wiring fault can produce it) and would read as healthy to the
+            // operational check `up` runs on top of this one.
+            if if_state(got).is_none() {
+                return Err(Error::fatal(format!(
+                    "engine readback: ospf '{}' interface {ifn} reports no state (got {}); the \
+                     engine's state document is malformed — a cfab/holo defect, not a wiring \
+                     fault",
+                    z.name, got["state"]
                 )));
             }
         }
@@ -323,6 +338,54 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An interface's ietf-ospf state as a bare word (`down` `loopback` `waiting`
+/// `point-to-point` `dr-other` `backup` `dr`), with any module prefix dropped.
+fn if_state(i: &Value) -> Option<&str> {
+    i["state"]
+        .as_str()
+        .map(|s| s.rsplit(':').next().unwrap_or(s))
+}
+
+/// The configured OSPF interfaces this document reports operationally `down`, as
+/// `zone/ifname`. `waiting` is not down: a passive identity interface never leaves it
+/// (gate-0 evidence §8.2).
+fn down_ifs(view: &View, doc: &Value) -> Vec<String> {
+    let mut down = Vec::new();
+    for z in &view.fabric.zones {
+        for ifn in configured_ifs(view, z) {
+            if if_state(&doc["ospf"][&z.name]["interfaces"][&ifn]) == Some("down") {
+                down.push(format!("{}/{ifn}", z.name));
+            }
+        }
+    }
+    down
+}
+
+/// The operational companion to `readback`, for `up`: the configured OSPF interfaces the
+/// engine still reports `down` after a bounded settle, `zone/ifname`. Empty is healthy.
+///
+/// Two reasons for the settle rather than one read. holo-ospf creates every interface in
+/// state `down` and leaves it only once its ibus subscription round trip to holo-interface
+/// delivers the netlink view — that lands on another task, after the commit returns and the
+/// state socket binds — so the first document a fresh engine answers can show a healthy
+/// interface `down`. And a link that is merely slow to come up is worth those seconds.
+///
+/// Never fatal, by design: a wire with no carrier at `up` time is a genuine `down` (a VLAN
+/// over a carrier-less lower wire is IFF_UP but not IFF_RUNNING, which is what holo reads),
+/// and refusing the apply for it would leave the host with no fabric at all where it would
+/// otherwise have come up on its surviving wires. `verify` grades the same condition
+/// degraded. Whether a whole zone being down should instead refuse is James's call.
+pub fn settled_down_ifs(sys: &mut dyn Sys, view: &View, doc: &Value) -> Result<Vec<String>> {
+    let mut down = down_ifs(view, doc);
+    let mut waited = 0;
+    while !down.is_empty() && waited < SETTLE_MS {
+        sys.sleep(std::time::Duration::from_millis(POLL_MS));
+        waited += POLL_MS;
+        down = down_ifs(view, &state(sys, view.fabric)?);
+    }
+    Ok(down)
 }
 
 /// A router-LSA link type as the state document carries it (holo's identity name, with or
@@ -438,6 +501,114 @@ pub(crate) mod tests {
             e.contains("ospf 'cluster' does not list interface cfab-id199"),
             "{e}"
         );
+    }
+
+    /// A listed interface with no `state` is a malformed document, not a wiring fault: it
+    /// must not slip past as healthy (the operational check reads an absent state as "not
+    /// down").
+    #[test]
+    fn readback_rejects_an_interface_with_no_state() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        for broken in [json!(null), json!(3)] {
+            let mut doc = healthy_doc(&view);
+            doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = broken.clone();
+            let e = readback(&view, &doc).unwrap_err().to_string();
+            assert!(
+                e.contains("ospf 'storage' interface cfab-st reports no state"),
+                "{broken}: {e}"
+            );
+        }
+        let mut doc = healthy_doc(&view);
+        doc["ospf"]["storage"]["interfaces"]["cfab-st"]
+            .as_object_mut()
+            .unwrap()
+            .remove("state");
+        let e = readback(&view, &doc).unwrap_err().to_string();
+        assert!(
+            e.contains("ospf 'storage' interface cfab-st reports no state"),
+            "{e}"
+        );
+    }
+
+    /// Gate-0 evidence §8.4: an interface the engine reports `down` — a wire with no carrier
+    /// at `up` time, or one `fabric.conf` names that the kernel does not have — is named, not
+    /// silently accepted. Only after the settle, and only as a list for the caller to warn
+    /// about: `settled_down_ifs` never errors.
+    #[test]
+    fn settled_down_ifs_names_an_interface_still_down_after_the_settle() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        for state in ["down", "ietf-ospf:down"] {
+            let mut doc = healthy_doc(&view);
+            doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = json!(state);
+            let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc.to_string());
+            let got = settled_down_ifs(&mut sys, &view, &doc).unwrap();
+            assert_eq!(got, ["storage/cfab-st"], "{state}");
+            // Bounded: it re-read for SETTLE_MS and stopped, it did not spin.
+            assert_eq!(sys.slept.len() as u64, SETTLE_MS / POLL_MS, "{state}");
+        }
+        // The identity interface is configured too, and is named the same way.
+        let mut doc = healthy_doc(&view);
+        doc["ospf"]["cluster"]["interfaces"]["cfab-id199"]["state"] = json!("down");
+        let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc.to_string());
+        assert_eq!(
+            settled_down_ifs(&mut sys, &view, &doc).unwrap(),
+            ["cluster/cfab-id199"]
+        );
+    }
+
+    /// The startup race: holo-ospf creates an interface in `down` and leaves it only when its
+    /// ibus round trip to holo-interface lands, which can be after the state socket binds. A
+    /// healthy host must not be named for a state it has already left, so the settle re-reads
+    /// the document over the socket — the read `up` itself would make.
+    #[test]
+    fn settled_down_ifs_clears_when_the_interface_leaves_down_during_the_settle() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut down = healthy_doc(&view);
+        down["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = json!("down");
+        let mut sys = MockSys::default().socket_seq(
+            "/run/cfab/engine.sock",
+            &[down.to_string(), healthy_doc(&view).to_string()],
+        );
+        assert!(
+            settled_down_ifs(&mut sys, &view, &down).unwrap().is_empty(),
+            "an interface that came up during the settle must not be named"
+        );
+        // Still down on the first re-read, up on the second: two waits, not the full settle.
+        assert_eq!(sys.slept.len(), 2);
+    }
+
+    /// Gate-0 evidence §8.2: a passive identity interface never leaves `waiting` (holo does
+    /// not run the interface FSM on it). That is healthy, as is every other state a working
+    /// link can be in — none of them is reported, and none of them costs a settle.
+    #[test]
+    fn settled_down_ifs_accepts_waiting_and_every_other_state() {
+        let f = fabric();
+        for m in ["pve1-tb", "pve3-tb"] {
+            let view = View::new(&f, m).unwrap();
+            let mut doc = healthy_doc(&view);
+            for z in &f.zones {
+                let ifs = doc["ospf"][&z.name]["interfaces"].as_object_mut().unwrap();
+                ifs.get_mut(&View::identity_if(z)).unwrap()["state"] = json!("waiting");
+            }
+            let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc.to_string());
+            assert!(settled_down_ifs(&mut sys, &view, &doc).unwrap().is_empty());
+            assert!(sys.slept.is_empty());
+            for state in ["bdr", "dr-other", "point-to-point", "loopback", "dr"] {
+                let mut doc = healthy_doc(&view);
+                for z in &f.zones {
+                    let ifs = doc["ospf"][&z.name]["interfaces"].as_object_mut().unwrap();
+                    for (_, v) in ifs.iter_mut() {
+                        v["state"] = json!(state);
+                    }
+                }
+                let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc.to_string());
+                let got = settled_down_ifs(&mut sys, &view, &doc).unwrap();
+                assert!(got.is_empty(), "{state}: {got:?}");
+            }
+        }
     }
 
     #[test]
