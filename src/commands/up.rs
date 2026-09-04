@@ -4,7 +4,8 @@
 //! engine (restart + readback) → fail-closed watchdog.
 
 use crate::commands::common::{
-    conf_interfaces, ensure_rule, link_exists, link_kind_is, proc_sysctl,
+    conf_interfaces, ensure_foreign_transit_accept, ensure_rule, link_exists, link_kind_is,
+    proc_sysctl,
 };
 use crate::commands::engine_ctl;
 use crate::derive::View;
@@ -577,6 +578,10 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     if let Some(admin) = view.admin_if() {
         proc_sysctl(sys, admin, "forwarding", "0")?; // belt (the policy's admin rules = braces)
     }
+    // A foreign stack's forward-hook policy drop kills transit that cfab accepts, and cfab
+    // cannot out-accept it. Where the stack offers a user hook (Docker's DOCKER-USER), ask it
+    // to pass cfab transit; `down` removes exactly this rule again.
+    ensure_foreign_transit_accept(sys)?;
     Ok(())
 }
 

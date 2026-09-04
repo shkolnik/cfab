@@ -7,8 +7,17 @@
 //! including ours — that is drift to correct, not a breach. Interfaces cfab does not own are
 //! never read or written (scoped posture; `View::owned_forwarding`). Per-interface forwarding
 //! is what the kernel checks — so conf/<if>/forwarding is written, never ip_forward.
+//!
+//! It also reports foreign forward-hook chains whose policy is drop. Those are reported and
+//! never corrected: every base chain at a hook runs and any one drop verdict ends the packet,
+//! so cfab cannot out-accept them, and switching our own forwarding off would not restore a
+//! single packet. Silence here was a real bug — with Docker running, transit was 100 % dead
+//! while cfab's own counters recorded accepts and `verify` printed `posture ok`.
 
-use crate::commands::common::conf_interfaces;
+use crate::commands::common::{
+    conf_interfaces, ensure_foreign_transit_accept, foreign_forward_remedy,
+    unresolved_forward_drops,
+};
 use crate::derive::View;
 use crate::error::Result;
 use crate::sys::{Sys, run_ignore};
@@ -18,6 +27,12 @@ pub struct WatchdogReport {
     pub failed: Option<String>,
     /// cfab interfaces whose forwarding flag was written back to the declared value.
     pub corrected: Vec<String>,
+    /// Foreign forward-hook chains dropping what cfab accepts. Reported, never "corrected":
+    /// cfab cannot override another table's verdict, and switching our own forwarding off
+    /// would not restore a single packet.
+    pub blocked: Vec<String>,
+    /// A foreign-stack accept cfab installed on this tick (`None` = nothing needed doing).
+    pub resolved: Option<String>,
 }
 
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
@@ -60,9 +75,48 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
             ],
         )?;
     }
+    // Ask the foreign stack to pass cfab transit before judging it: Docker's policy stays DROP
+    // by its own design, so the question is never "is there a drop" but "is our accept in".
+    let mut resolved = None;
+    if let Some(rule) = ensure_foreign_transit_accept(sys)? {
+        run_ignore(
+            sys,
+            &[
+                "logger",
+                "-t",
+                "cfab-fwd-watchdog",
+                &format!("installed a foreign-stack accept for cfab transit: {rule}"),
+            ],
+        )?;
+        resolved = Some(rule);
+    }
+    let blocked = unresolved_forward_drops(sys)?;
+    if !blocked.is_empty() {
+        let ifs: Vec<String> = view
+            .owned_forwarding()
+            .into_iter()
+            .filter(|(_, fwd)| *fwd)
+            .map(|(ifn, _)| ifn)
+            .collect();
+        run_ignore(
+            sys,
+            &[
+                "logger",
+                "-t",
+                "cfab-fwd-watchdog",
+                &format!(
+                    "BLOCKED by a foreign ruleset: {} — {}",
+                    blocked.join(", "),
+                    foreign_forward_remedy(&ifs)
+                ),
+            ],
+        )?;
+    }
     Ok(WatchdogReport {
         failed: None,
         corrected,
+        blocked,
+        resolved,
     })
 }
 
@@ -87,6 +141,8 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
     Ok(WatchdogReport {
         failed: Some(reason.to_string()),
         corrected: Vec::new(),
+        blocked: Vec::new(),
+        resolved: None,
     })
 }
 
@@ -104,11 +160,27 @@ mod tests {
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
+    /// `nft -j list chains` with only cfab's own tables. `extra` appends a foreign chain.
+    fn chains_json(extra: &str) -> String {
+        format!(
+            r#"{{"nftables":[
+              {{"chain":{{"family":"inet","table":"cfab-fwd","name":"forward",
+                          "hook":"forward","prio":0,"policy":"drop"}}}}
+              {extra}]}}"#
+        )
+    }
+
+    const DOCKER_FORWARD: &str = r#",
+      {"chain":{"family":"ip","table":"filter","name":"FORWARD",
+                "hook":"forward","prio":0,"policy":"drop"}}"#;
+
     fn healthy_sys(view: &View) -> MockSys {
-        let mut sys = MockSys::default().on_stdout(
-            &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
-            "chain forward {\n  type filter hook forward priority filter; policy drop;\n}",
-        );
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+                "chain forward {\n  type filter hook forward priority filter; policy drop;\n}",
+            )
+            .on_stdout(&["nft", "-j", "list", "chains"], &chains_json(""));
         for r in view.class_rows() {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
@@ -208,5 +280,39 @@ mod tests {
             Some("1\n")
         );
         assert!(sys.ran("logger"));
+    }
+
+    #[test]
+    fn a_foreign_forward_drop_is_reported_loudly_and_does_not_fail_closed() {
+        // Docker's `ip filter FORWARD` policy DROP kills transit that cfab accepts. Say so --
+        // but do not switch our forwarding off: it would not restore a single packet, and
+        // availability-first means we never make a foreign breakage worse.
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view).on_stdout(
+            &["nft", "-j", "list", "chains"],
+            &chains_json(DOCKER_FORWARD),
+        );
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_none(), "{:?}", report.failed);
+        assert_eq!(
+            report.blocked,
+            vec!["ip filter FORWARD (policy drop)".to_string()]
+        );
+        assert!(sys.ran("logger"));
+        // forwarding on a class interface is left exactly as declared
+        assert_eq!(
+            sys.writes_to("/proc/sys/net/ipv4/conf/cfab-st/forwarding"),
+            Some("1\n")
+        );
+    }
+
+    #[test]
+    fn a_healthy_host_reports_nothing_blocked() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view);
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.blocked.is_empty(), "{:?}", report.blocked);
     }
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::commands::common::conf_interfaces;
+use crate::commands::common::{conf_interfaces, foreign_forward_remedy, unresolved_forward_drops};
 use crate::commands::engine_ctl;
 use crate::derive::{View, segments_of};
 use crate::emit;
@@ -290,6 +290,24 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 .stdout;
             if !chain.contains("policy drop;") {
                 c.bad("chain forward is not policy drop");
+            }
+            // Our accept is not the last word: every base chain at the forward hook runs and
+            // one drop verdict ends the packet. Without this check `verify` reported
+            // `posture ok` with transit 100 % dead (Docker, measured on pve1 2026-09-04).
+            let blocked = unresolved_forward_drops(sys)?;
+            if !blocked.is_empty() {
+                let ifs: Vec<String> = view
+                    .owned_forwarding()
+                    .into_iter()
+                    .filter(|(_, fwd)| *fwd)
+                    .map(|(ifn, _)| ifn)
+                    .collect();
+                for b in &blocked {
+                    c.bad(&format!(
+                        "transit blocked by a foreign forward-hook chain: {b}"
+                    ));
+                }
+                c.say(&format!("  {}", foreign_forward_remedy(&ifs)));
             }
             if let Some(admin) = view.admin_if() {
                 for counter in ["admin-in", "admin-out"] {

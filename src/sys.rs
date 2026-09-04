@@ -57,6 +57,12 @@ pub fn run_ok(sys: &mut dyn Sys, argv: &[&str]) -> Result<Output> {
 }
 
 /// Run, ignore failure (bash `|| true`).
+/// Run a command that may not be installed at all. An exec failure (`iptables` absent on a host
+/// that never had Docker) is `None`, not a fatal error; a nonzero exit is still `Some`.
+pub fn run_optional(sys: &mut dyn Sys, argv: &[&str]) -> Option<Output> {
+    sys.run(argv).ok()
+}
+
 pub fn run_ignore(sys: &mut dyn Sys, argv: &[&str]) -> Result<()> {
     let _ = sys.run(argv)?;
     Ok(())
