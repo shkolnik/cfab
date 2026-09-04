@@ -82,6 +82,12 @@ enum Command {
         #[command(subcommand)]
         action: ConfAction,
     },
+    /// The resident routing engine (started by `up` as cfab-engine.service; root)
+    Engine {
+        /// Gate-0 teeth: install routes without preferred sources (the oracle must go RED)
+        #[arg(long, hide = true)]
+        unsafe_no_prefsrc: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -321,6 +327,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 &commands::measure_cap::native_flood,
             )?;
             println!("{summary}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Engine { unsafe_no_prefsrc } => {
+            cfab::engine::run(&fabric, &view, unsafe_no_prefsrc)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::PolicyTeeth => {

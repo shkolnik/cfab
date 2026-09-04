@@ -13,6 +13,7 @@ pub mod commands;
 pub mod config;
 pub mod derive;
 pub mod emit;
+pub mod engine;
 pub mod error;
 pub mod model;
 pub mod sys;
