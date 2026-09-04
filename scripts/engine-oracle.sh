@@ -22,7 +22,7 @@
 # A1 OSPF full on every wire, both instances; A2 BFD up (engine state doc and
 # FRR agree); A3 ECMP 10.99.0.2 proto 201 src 10.99.0.1; A4 10.199.0.2 proto 201 src
 # 10.199.0.1; A5 SIGTERM withdraws routes + socket within 5 s; A6 crash (SIGKILL) leaves
-# routes, restart purges them (log line, count >= 1) and reinstalls within 30 s; A7 teeth:
+# routes, restart purges them (log line, count >= 1) and reinstalls within CONVERGE_S; A7 teeth:
 # --unsafe-no-prefsrc makes A3 go RED; A8 a configured interface absent from the kernel is
 # not silent. Every assert prints OK/RED with its evidence; any RED => exit 1.
 set -euo pipefail
@@ -47,6 +47,13 @@ FRR_RUN=/var/run/frr/$FRR_PS
 FRR_LOG=/var/log/frr
 PROTO_OSPF=201                     # engine's private route protocol; = emit::engine::PROTO_BASE
                                    # (src/emit/engine.rs) + 0 = ospf. Change both together.
+# How long any assert waits for the FIB to catch up with a converged adjacency. MEASURED on
+# pve3 (gate 0, 2026-09-04, 29 immediate restarts of the engine against a live FRR peer):
+# both identity routes are back in 10.6-18.1 s in 23 runs and in 40.2-40.3 s in 6 — a
+# bimodal distribution with nothing in between and no run that failed to converge. A window
+# under ~40 s therefore makes these asserts flaky rather than strict (it produced three
+# false REDs before this was measured); the OK lines print the time, which is the evidence.
+CONVERGE_S=60
 
 RED_COUNT=0
 ENGINE_PID=""
@@ -553,7 +560,7 @@ a6_crash_window() {
     local before purge count t0 i
     start_engine "$RUN/engine-a6a.log"
     wait_ready "$RUN/engine-a6a.log" || { red "A6 engine not ready before the crash"; stop_engine; return 0; }
-    wait_routes 30 || { red "A6 routes not installed before the crash: $(proto_routes | tr '\n' ';')"; stop_engine; return 0; }
+    wait_routes "$CONVERGE_S" || { red "A6 routes not installed before the crash: $(proto_routes | tr '\n' ';')"; stop_engine; return 0; }
     kill -KILL "$ENGINE_PID" 2>/dev/null || true
     wait "$ENGINE_PID" 2>/dev/null || true
     ENGINE_PID=""
@@ -574,9 +581,10 @@ a6_crash_window() {
     else
         red "A6b restart did not log a purge with count >= 1 (log: $(elog "$RUN/engine-a6b.log" | grep -iE 'purg|stale' | tr '\n' ';'))"
     fi
-    # 30 s window (plan said 10 s): the spike measured ~5 s ECMP restore from MinLSInterval
-    # alone, on top of adjacency re-formation; the measured time is the evidence (spec §8).
-    for i in $(seq 1 60); do
+    # The plan said 10 s; the spike measured ~5 s of ECMP restore from MinLSInterval alone,
+    # on top of adjacency re-formation, and gate 0 then measured a 40 s second mode (see
+    # CONVERGE_S). The measured time on the OK line is the evidence (spec §8).
+    for i in $(seq 1 $((CONVERGE_S * 2))); do
         if check_ecmp && check_src && ip -n H route show 10.199.0.2 | grep -q "proto $PROTO_OSPF"; then
             ok "A6c routes reinstalled (ECMP + src) $(echo "$(date +%s.%N) $t0" | awk '{printf "%.2f", $1 - $2}') s after the restart: $(ip -n H route show 10.99.0.2 | tr '\n' ';' | tr -s ' \t' ' ')"
             stop_engine
@@ -584,17 +592,22 @@ a6_crash_window() {
         fi
         sleep 0.5
     done
-    red "A6c routes not reinstalled within 30 s of the restart (ecmp=$(check_ecmp && echo yes || echo no) src=$(check_src && echo yes || echo no)): [$(proto_routes | tr '\n' ';')]"
+    red "A6c routes not reinstalled within $CONVERGE_S s of the restart (ecmp=$(check_ecmp && echo yes || echo no) src=$(check_src && echo yes || echo no)): [$(proto_routes | tr '\n' ';')]"
+    say "A6c engine state doc: $(state_doc | jq -c '.ospf | to_entries | map({zone: .key, ifs: (.value.interfaces | to_entries | map({(.key): [.value.neighbors[]?.state]}))})' 2>/dev/null || echo UNREADABLE)"
+    say "A6c engine log: $(elog "$RUN/engine-a6b.log" | tail -12 | tr '\n' ';')"
+    say "A6c FRR neighbors: $(vtysh_f 'show ip ospf neighbor' | tr -s ' ' | tr '\n' ';')"
+    say "A6c FRR bfd: $(vtysh_f 'show bfd peers brief' | tr -s ' ' | tr '\n' ';')"
+    say "A6c FRR db 99: $(vtysh_f 'show ip ospf 99 database router' | tr -s ' ' | tr '\n' ';')"
     stop_engine
 }
 
 a7_teeth_no_prefsrc() {
     start_engine "$RUN/engine-a7.log" --unsafe-no-prefsrc
     wait_ready "$RUN/engine-a7.log" || { red "A7 engine not ready with --unsafe-no-prefsrc"; stop_engine; return 0; }
-    wait_routes 30 || { red "A7 routes not installed with --unsafe-no-prefsrc: $(proto_routes | tr '\n' ';')"; stop_engine; return 0; }
+    wait_routes "$CONVERGE_S" || { red "A7 routes not installed with --unsafe-no-prefsrc: $(proto_routes | tr '\n' ';')"; stop_engine; return 0; }
     # The route must be fully converged (both nexthops) before the src check means anything:
     # a single-nexthop route fails A3 too, for a reason that has nothing to do with prefsrc.
-    wait_ecmp 30 || { red "A7 10.99.0.2 not ECMP within 30 s with --unsafe-no-prefsrc (cannot judge the src check): [$(ip -n H route show 10.99.0.2 | tr '\n' ';' | tr -s ' \t' ' ')]"; stop_engine; return 0; }
+    wait_ecmp "$CONVERGE_S" || { red "A7 10.99.0.2 not ECMP within $CONVERGE_S s with --unsafe-no-prefsrc (cannot judge the src check): [$(ip -n H route show 10.99.0.2 | tr '\n' ';' | tr -s ' \t' ' ')]"; stop_engine; return 0; }
     local r
     r=$(ip -n H route show 10.99.0.2 2>/dev/null | tr '\n' ';' | tr -s ' \t' ' ' || true)
     if check_src; then
@@ -687,8 +700,8 @@ main() {
     wait_ready "$LOG" || die "engine never became ready (see $LOG)"
     a0_forwarding_untouched
     wait_full 60 || say "note: not every wire reached full within 60 s"
-    wait_routes 30 || say "note: identity routes not installed within 30 s"
-    wait_ecmp 30 || say "note: 10.99.0.2 not ECMP over both storage wires within 30 s"
+    wait_routes "$CONVERGE_S" || say "note: identity routes not installed within $CONVERGE_S s"
+    wait_ecmp "$CONVERGE_S" || say "note: 10.99.0.2 not ECMP over both storage wires within $CONVERGE_S s"
     say "state doc: $(state_doc | jq -c . 2>/dev/null || echo UNREADABLE)"
     say "F (FRR) route to H's identities: $(ip -n F route show 10.99.0.1 | tr '\n' ';' | tr -s ' \t' ' ')|$(ip -n F route show 10.199.0.1 | tr '\n' ';' | tr -s ' \t' ' ')"
     a1_ospf_full
