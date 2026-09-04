@@ -29,7 +29,7 @@ depend on.
 ```
 cfab check                      # parse + validate fabric.conf, print this member's resolved view
 cfab schema                     # the fabric.conf data model as JSON Schema
-cfab gen policy|mark|frr        # pure generators: print the derived artifacts
+cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
 cfab up                         # apply the fabric on this member (idempotent, root)
 cfab down                       # remove everything `up` created, restore pre-fabric FRR

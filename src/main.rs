@@ -11,7 +11,7 @@ use cfab::{Error, commands, emit, load_fabric};
 /// cfab — the per-host runtime of the resilient converged fabric.
 ///
 /// fabric.conf declares the fabric; this tool validates it, generates every artifact from it
-/// (nft policy/marking, HTB trees, frr config), applies and verifies the fabric on this
+/// (nft policy/marking, HTB trees, the routing engine's config tree), applies and verifies the fabric on this
 /// member, and tears it down.
 #[derive(Parser)]
 #[command(version, about, max_term_width = 100)]
@@ -102,8 +102,8 @@ enum GenArtifact {
     Policy,
     /// The traffic-class marking (table inet cfab)
     Mark,
-    /// This member's /etc/frr/frr.conf
-    Frr,
+    /// This member's routing-engine configuration tree (JSON)
+    Engine,
     /// The floor+borrow HTB derivation for one physical NIC
     Shape {
         /// The physical NIC (a CLASS_TABLE wire)
@@ -230,7 +230,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             match artifact {
                 GenArtifact::Policy => print!("{}", emit::policy::generate(&view)?),
                 GenArtifact::Mark => print!("{}", emit::mark::generate(&view)?),
-                GenArtifact::Frr => print!("{}", emit::frr::generate(&view)?),
+                GenArtifact::Engine => {
+                    let tree = emit::engine::generate(&view)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&tree).map_err(Error::fatal)?
+                    )
+                }
                 GenArtifact::Shape { dev, tc, expect } => {
                     let d = shape_for(&view, &fabric, &dev)?;
                     for w in &d.warnings {
