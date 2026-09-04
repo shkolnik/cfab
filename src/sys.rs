@@ -32,6 +32,9 @@ pub trait Sys {
     fn remove(&mut self, path: &str) -> Result<()>;
     fn rename(&mut self, from: &str, to: &str) -> Result<()>;
     fn sleep(&mut self, d: Duration);
+    /// One request, one reply over a Unix stream socket: connect to `path`, write `line`, read
+    /// until the peer closes. The engine's state socket speaks exactly this shape.
+    fn unix_request(&mut self, path: &str, line: &str) -> Result<String>;
 }
 
 /// Run and require exit 0.
@@ -121,6 +124,21 @@ impl Sys for RealSys {
     fn sleep(&mut self, d: Duration) {
         std::thread::sleep(d);
     }
+
+    fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
+        use std::io::{Read, Write};
+        let timeout = Some(Duration::from_secs(5));
+        let mut s = std::os::unix::net::UnixStream::connect(path)
+            .map_err(|e| Error::fatal(format!("cannot connect to {path}: {e}")))?;
+        s.set_read_timeout(timeout)?;
+        s.set_write_timeout(timeout)?;
+        s.write_all(line.as_bytes())
+            .map_err(|e| Error::fatal(format!("cannot write to {path}: {e}")))?;
+        let mut reply = String::new();
+        s.read_to_string(&mut reply)
+            .map_err(|e| Error::fatal(format!("cannot read from {path}: {e}")))?;
+        Ok(reply)
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +146,7 @@ pub mod mock {
     //! A scripted `Sys` for unit tests: file contents in a map, command outputs matched by
     //! prefix rules (later rules win), every call recorded for sequence assertions.
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     use super::{Output, Sys};
@@ -143,6 +161,8 @@ pub mod mock {
         pub cmd_rules: Vec<(Vec<String>, Output)>,
         pub calls: Vec<String>,
         pub slept: Vec<Duration>,
+        /// socket path → canned reply for `unix_request`; unknown path → Err.
+        pub sockets: HashMap<String, String>,
         /// Test hook run on each sleep with the 1-based sleep count — lets a test mutate
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
@@ -152,6 +172,11 @@ pub mod mock {
     impl MockSys {
         pub fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        pub fn socket(mut self, path: &str, reply: &str) -> Self {
+            self.sockets.insert(path.to_string(), reply.to_string());
             self
         }
 
@@ -268,5 +293,75 @@ pub mod mock {
                 hook(n);
             }
         }
+
+        fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
+            self.calls
+                .push(format!("unix_request {path} {}", line.trim_end()));
+            self.sockets
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    use super::mock::MockSys;
+    use super::{RealSys, Sys};
+
+    #[test]
+    fn mock_socket_replies_or_fails_loud() {
+        let mut sys = MockSys::default().socket("/run/cfab/engine.sock", "{\"ready\":true}\n");
+        assert_eq!(
+            sys.unix_request("/run/cfab/engine.sock", "state\n")
+                .unwrap(),
+            "{\"ready\":true}\n"
+        );
+        assert!(sys.ran("unix_request /run/cfab/engine.sock state"));
+        let err = sys
+            .unix_request("/run/cfab/other.sock", "state\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mock: no socket /run/cfab/other.sock")
+        );
+    }
+
+    #[test]
+    fn real_unix_request_round_trips_one_line() {
+        let dir = std::env::temp_dir().join(format!("cfab-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(format!("got {line}").as_bytes()).unwrap();
+            // Return drops the stream: EOF is the reply terminator.
+        });
+        let reply = RealSys
+            .unix_request(path.to_str().unwrap(), "state\n")
+            .unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reply, "got state\n");
+    }
+
+    #[test]
+    fn real_unix_request_missing_socket_names_path() {
+        let err = RealSys
+            .unix_request("/nonexistent/cfab/engine.sock", "state\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot connect to /nonexistent/cfab/engine.sock")
+        );
     }
 }
