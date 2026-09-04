@@ -624,9 +624,11 @@ a7_teeth_no_prefsrc() {
 # what must NOT happen is silence. Accepted outcomes, each recorded: the engine exits
 # nonzero naming the interface; or it comes up and the state document / log shows the
 # interface as `down` by name (ietf-ospf interface states: down loopback waiting
-# point-to-point dr-other backup dr). NOTE on `up`-style readback: engine_ctl::readback
-# only checks that each configured interface is LISTED under its instance (null check),
-# so a ghost listed with state "down" passes readback silently — the OK line says so.
+# point-to-point dr-other backup dr). NOTE on `up`: engine_ctl::readback checks structure,
+# not operational state; `cfab up` re-reads the document for a settle window and then WARNS
+# by name about every configured interface still "down" (engine_ctl::settled_down_ifs). It
+# never refuses — a wire without carrier must not cost the host the fabric it still has on
+# the others. This assert judges the engine, which is why "down" is an accepted outcome.
 # A refusal to start counts only when the log NAMES cfab-ghost: any other startup error
 # (busy run dir, bind failure) is a failure for an unrelated reason, so it goes RED.
 a8_missing_interface() {
@@ -644,7 +646,7 @@ a8_missing_interface() {
         fi
         ghost_state=$(printf '%s' "$doc" | jq -r '.ospf.cluster.interfaces["cfab-ghost"].state // "ABSENT"' 2>/dev/null || echo ERR)
         if [ "$ghost_state" = "down" ]; then
-            ok "A8 engine ready; state doc lists cfab-ghost state=\"down\" (not silent in the state doc; engine_ctl::readback is a listed-only null check and would NOT catch it) log:[${logline:-none}]"
+            ok "A8 engine ready; state doc lists cfab-ghost state=\"down\" (not silent in the state doc; \`cfab up\` warns by name after its settle window, and does not refuse) log:[${logline:-none}]"
         elif [ -n "$logline" ]; then
             ok "A8 engine ready; state doc cfab-ghost=$ghost_state; log names it: $logline"
         else

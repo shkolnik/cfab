@@ -181,7 +181,7 @@ pub mod mock {
     //! A scripted `Sys` for unit tests: file contents in a map, command outputs matched by
     //! prefix rules (later rules win), every call recorded for sequence assertions.
 
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::Duration;
 
     use super::{Output, Sys};
@@ -196,8 +196,9 @@ pub mod mock {
         pub cmd_rules: Vec<(Vec<String>, Output)>,
         pub calls: Vec<String>,
         pub slept: Vec<Duration>,
-        /// socket path → canned reply for `unix_request`; unknown path → Err.
-        pub sockets: HashMap<String, String>,
+        /// socket path → the replies `unix_request` hands back in order; the last one
+        /// repeats forever. Unknown path → Err.
+        pub sockets: HashMap<String, VecDeque<String>>,
         /// Test hook run on each sleep with the 1-based sleep count — lets a test mutate
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
@@ -210,8 +211,16 @@ pub mod mock {
             self
         }
 
-        pub fn socket(mut self, path: &str, reply: &str) -> Self {
-            self.sockets.insert(path.to_string(), reply.to_string());
+        /// One reply, answered to every request on `path`.
+        pub fn socket(self, path: &str, reply: &str) -> Self {
+            self.socket_seq(path, &[reply.to_string()])
+        }
+
+        /// Successive replies on `path`, one per request; the last repeats. Lets a test show
+        /// a value the engine changes between two reads (an interface leaving `down`).
+        pub fn socket_seq(mut self, path: &str, replies: &[String]) -> Self {
+            self.sockets
+                .insert(path.to_string(), replies.iter().cloned().collect());
             self
         }
 
@@ -338,10 +347,15 @@ pub mod mock {
         fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
             self.calls
                 .push(format!("unix_request {path} {}", line.trim_end()));
-            self.sockets
-                .get(path)
-                .cloned()
-                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))
+            let q = self
+                .sockets
+                .get_mut(path)
+                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))?;
+            if q.len() > 1 {
+                Ok(q.pop_front().expect("len > 1"))
+            } else {
+                Ok(q.front().cloned().unwrap_or_default())
+            }
         }
     }
 }

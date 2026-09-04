@@ -364,6 +364,19 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     engine_ctl::stop_and_sweep(sys, f)?;
     let doc = engine_ctl::start_and_wait(sys, f, &opts.exe, &opts.config, host)?;
     engine_ctl::readback(view, &doc)?;
+    // Operationally down is a warning, never a refusal: one wire without carrier must not
+    // cost the host the fabric it can still have on the others.
+    let down = engine_ctl::settled_down_ifs(sys, view, &doc)?;
+    if !down.is_empty() {
+        eprintln!(
+            "cfab: warn: ospf interfaces still down after {}s: {} — no adjacency forms on them \
+             and nothing routes over those wires. Usual cause is no carrier on the wire \
+             underneath (ip -br link show). The fabric is up on the rest; cfab verify grades \
+             this degraded",
+            engine_ctl::SETTLE_MS / 1000,
+            down.join(" ")
+        );
+    }
 
     // ---- fail-closed watchdog ---------------------------------------------------
     if kind == MemberKind::Host && f.host_forward {
@@ -638,5 +651,26 @@ mod tests {
             .position(|c| c.starts_with("spawn_detached"))
             .unwrap();
         assert!(first_sweep < start);
+    }
+
+    /// Availability-first: a segment wire with no carrier at `up` time is a real OSPF `down`,
+    /// and must not cost the host its whole fabric. `up` completes (warning on stderr); the
+    /// loss is `verify`'s to grade degraded.
+    #[test]
+    fn up_completes_when_a_segment_interface_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_ctl::tests::healthy_doc(&view);
+        doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = serde_json::json!("down");
+        let mut sys = MockSys::default()
+            .socket("/run/cfab/engine.sock", &doc.to_string())
+            .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n");
+        let pmxcfs = tempfile::tempdir().unwrap();
+        let opts = UpOpts {
+            exe: "/usr/bin/cfab".into(),
+            config: "/etc/cfab/fabric.conf".into(),
+            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
+        };
+        run(&mut sys, &view, &opts).unwrap();
     }
 }
