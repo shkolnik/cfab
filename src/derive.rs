@@ -299,15 +299,31 @@ mod tests {
         assert_eq!(
             fwd,
             vec![
-                "cfab-cl", "cfab-cl-b2", "cfab-cl-bk", "cfab-gw249", "cfab-mg", "cfab-mg-b2",
-                "cfab-mg-bk", "cfab-st", "cfab-st-b2", "cfab-st-bk", "cfab-st-vr"
+                "cfab-cl",
+                "cfab-cl-b2",
+                "cfab-cl-bk",
+                "cfab-gw249",
+                "cfab-mg",
+                "cfab-mg-b2",
+                "cfab-mg-bk",
+                "cfab-st",
+                "cfab-st-b2",
+                "cfab-st-bk",
+                "cfab-st-vr"
             ]
         );
         assert_eq!(
             off,
             vec![
-                "cfab-id199", "cfab-id199-peer", "cfab-id249", "cfab-id249-peer", "cfab-id99",
-                "cfab-id99-peer", "eth0", "eth1", "eth9"
+                "cfab-id199",
+                "cfab-id199-peer",
+                "cfab-id249",
+                "cfab-id249-peer",
+                "cfab-id99",
+                "cfab-id99-peer",
+                "eth0",
+                "eth1",
+                "eth9"
             ]
         );
         assert!(host.owns_if("eth9") && host.owns_if("cfab-anything"));
