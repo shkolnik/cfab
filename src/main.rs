@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use cfab::derive::View;
-use cfab::model::MemberKind;
+use cfab::model::{MemberKind, Role};
 use cfab::sys::RealSys;
 use cfab::{Error, commands, emit, load_fabric};
 
@@ -216,10 +216,16 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 MemberKind::Host => "host",
                 MemberKind::Leaf => "leaf",
             };
+            let rescue_legs = fabric
+                .class_table
+                .iter()
+                .filter(|r| r.role == Role::Rescue)
+                .count();
             println!(
-                "fabric.conf OK: {} zones, {} segments, {} members",
+                "fabric.conf OK: {} zones, {} segments, {} rescue legs, {} members",
                 fabric.zones.len(),
-                fabric.class_table.len(),
+                fabric.class_table.len() - rescue_legs,
+                rescue_legs,
                 fabric.members.len()
             );
             println!(
