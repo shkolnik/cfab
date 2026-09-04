@@ -8,10 +8,15 @@
 //! REPLIES — the replies of an allowed pair are accepted by the policy's conntrack rule, so each
 //! allowed pair is tested together with its return leg.
 //!
+//! Two foreign interfaces (not cfab's, forwarding on) stand in for another stack's bridges:
+//! foreign<->foreign must pass, foreign<->zone and admin->foreign must drop (scoped posture).
+//!
 //! Teeth: (1) regress — re-generate from a MODEL with an extra allowed pair (storage>cluster)
 //! through the real parser+generator: the negative test for that pair must go RED. (2) mutate —
 //! strip the admin drop rules and splice the admin NIC into the storage set: the admin negative
 //! test must go RED (proves it is those rules, not the default policy, protecting the admin NIC).
+//! (3) mutate — strip the foreign-transit accept: foreign<->foreign must go RED (proves that
+//! rule, not a hole in the default policy, is what lets another stack forward).
 
 use std::fmt::Write as _;
 
@@ -23,6 +28,8 @@ use crate::model::Fabric;
 use crate::sys::{Sys, run_ignore, run_ok};
 
 const ROUTER: &str = "cfab-teeth-r";
+/// Stand-ins for another stack's interfaces on the same router (no `cfab-` name, not declared).
+const FOREIGN: [&str; 2] = ["foreign0", "foreign1"];
 
 pub struct TeethReport {
     pub ok: bool,
@@ -60,6 +67,7 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     if f.vrrp_gw {
         ifs.push(f.vrrp_if.clone());
     }
+    ifs.extend(FOREIGN.iter().map(|s| s.to_string()));
 
     cleanup(sys)?;
     run_ok(sys, &["ip", "netns", "add", ROUTER])?;
@@ -237,12 +245,39 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
 
     let _ = writeln!(
         out,
-        "== 4. production policy again (fixture sanity after mutations)"
+        "== 4. teeth: strip the foreign-transit accept -> foreign <-> foreign must go RED"
+    );
+    let noforeign: String = prod
+        .lines()
+        .filter(|l| !l.contains("comment \"foreign-transit\""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    load(sys, &noforeign)?;
+    let got = reach(sys, &fx, FOREIGN[0], FOREIGN[1])?;
+    let r4 = if got == 3 {
+        let _ = writeln!(
+            out,
+            "  NO TEETH: foreign pair still forwards without the foreign-transit rule"
+        );
+        false
+    } else {
+        let _ = writeln!(
+            out,
+            "  RED  mutated: {} -> {} = {got}/3 (want 3) — the wanted outcome",
+            FOREIGN[0], FOREIGN[1]
+        );
+        true
+    };
+
+    let _ = writeln!(
+        out,
+        "== 5. production policy again (fixture sanity after mutations)"
     );
     load(sys, &prod)?;
-    let r4 = matrix(sys, view, &fx, &mut out)?;
+    let r5 = matrix(sys, view, &fx, &mut out)?;
 
-    let ok = r1 && r2 && r3 && r4;
+    let ok = r1 && r2 && r3 && r4 && r5;
     if ok {
         let _ = writeln!(
             out,
@@ -251,11 +286,12 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     } else {
         let _ = writeln!(
             out,
-            "policy-teeth FAILED (policy={} regress-teeth={} mutate-teeth={} sanity={})",
+            "policy-teeth FAILED (policy={} regress-teeth={} mutate-teeth={} foreign-teeth={} sanity={})",
             u8::from(!r1),
             u8::from(!r2),
             u8::from(!r3),
-            u8::from(!r4)
+            u8::from(!r4),
+            u8::from(!r5)
         );
     }
     Ok(TeethReport { ok, output: out })
@@ -381,6 +417,15 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
             3,
             out,
         )?;
+    }
+    // scoped posture: another stack's interfaces forward among themselves, never into or out
+    // of a zone, and the admin NIC stays fenced from them too
+    let storage = first_if(view, "storage")?;
+    expect(sys, "foreign-transit", FOREIGN[0], FOREIGN[1], 3, out)?;
+    expect(sys, "foreign-in", FOREIGN[0], storage, 0, out)?;
+    expect(sys, "foreign-out", storage, FOREIGN[0], 0, out)?;
+    if let Some(admin) = view.admin_if() {
+        expect(sys, "admin-to-foreign", admin, FOREIGN[0], 0, out)?;
     }
     Ok(ok)
 }

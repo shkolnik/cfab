@@ -303,26 +303,21 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                     c.bad(&format!("{admin} forwarding=1"));
                 }
             }
-            let mut allowed: BTreeSet<String> =
-                view.class_rows().into_iter().map(|r| r.ifname).collect();
-            allowed.extend(view.gw_rows().into_iter().map(|r| r.ifname));
-            if f.vrrp_gw {
-                allowed.insert(f.vrrp_if.clone());
-            }
-            for ifn in conf_interfaces(sys)? {
-                if matches!(ifn.as_str(), "all" | "default" | "lo") {
+            let present = conf_interfaces(sys)?;
+            for (ifn, fwd) in view.owned_forwarding() {
+                if !present.contains(&ifn) {
                     continue;
                 }
                 let v = sys.read(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"))?;
                 let v = v.trim();
-                if allowed.contains(&ifn) {
-                    if v != "1" {
-                        c.bad(&format!(
-                            "{ifn} forwarding=0 (class-table interface should forward)"
-                        ));
-                    }
-                } else if v != "0" {
-                    c.bad(&format!("{ifn} forwarding=1 (not a class-table interface)"));
+                if fwd && v != "1" {
+                    c.bad(&format!(
+                        "{ifn} forwarding=0 (class-table interface should forward)"
+                    ));
+                } else if !fwd && v != "0" {
+                    c.bad(&format!(
+                        "{ifn} forwarding=1 (cfab interface that must not transit)"
+                    ));
                 }
             }
             if !sys
@@ -343,6 +338,9 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 c.bad("HOST_FORWARD=0 but table inet cfab-fwd is loaded");
             }
             for ifn in conf_interfaces(sys)? {
+                if !view.owns_if(&ifn) {
+                    continue;
+                }
                 let path = format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding");
                 if sys.read(&path)?.trim() != "0" {
                     c.bad(&format!("{path} = 1 with HOST_FORWARD=0"));

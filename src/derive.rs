@@ -93,6 +93,47 @@ impl<'a> View<'a> {
         }
     }
 
+    /// Every interface cfab owns on this member with the forwarding flag cfab sets on it:
+    /// declared wires and the admin NIC (never), class-table segments, ingress legs and the
+    /// VRRP macvlan (only a forwarding host), identity veths (never). Scoped posture: cfab's
+    /// forwarding authority is exactly this set — it neither reads nor writes the flag on any
+    /// other interface, so a foreign forwarder (Docker, a routed bridge, a host-level CNI) is
+    /// not cfab's to police. Declared names only; `owns_if` adds the `cfab-` name family.
+    pub fn owned_forwarding(&self) -> Vec<(String, bool)> {
+        let f = self.fabric;
+        let transit = self.member.kind == MemberKind::Host && f.host_forward;
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for w in self.wires() {
+            out.push((w, false));
+        }
+        if let Some(a) = self.admin_if() {
+            out.push((a.to_string(), false));
+        }
+        for r in self.class_rows() {
+            out.push((r.ifname, transit));
+        }
+        for r in self.gw_rows() {
+            out.push((r.ifname, transit));
+        }
+        if f.vrrp_gw {
+            out.push((f.vrrp_if.clone(), transit));
+        }
+        for z in &f.zones {
+            let id = Self::identity_if(z);
+            out.push((format!("{id}-peer"), false));
+            out.push((id, false));
+        }
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
+    /// Is `ifname` cfab's? The declared set plus anything in the `cfab-` name family (identity
+    /// veths and their peers are created by name, never declared).
+    pub fn owns_if(&self, ifname: &str) -> bool {
+        ifname.starts_with("cfab-") || self.owned_forwarding().iter().any(|(n, _)| n == ifname)
+    }
+
     /// Declared link speed for one of this member's wires (Mb/s).
     pub fn link_speed(&self, wire: &str) -> Result<u32> {
         for w in self.member.wires.iter().flatten() {
@@ -238,6 +279,43 @@ mod tests {
             v.zone_ifs("storage"),
             vec!["cfab-st", "cfab-st-bk", "cfab-st-b2"]
         );
+    }
+
+    #[test]
+    fn owned_forwarding_is_the_declared_set_with_transit_only_on_a_forwarding_host() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let owned = host.owned_forwarding();
+        let fwd: Vec<&str> = owned
+            .iter()
+            .filter(|(_, x)| *x)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let off: Vec<&str> = owned
+            .iter()
+            .filter(|(_, x)| !*x)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            fwd,
+            vec![
+                "cfab-cl", "cfab-cl-b2", "cfab-cl-bk", "cfab-gw249", "cfab-mg", "cfab-mg-b2",
+                "cfab-mg-bk", "cfab-st", "cfab-st-b2", "cfab-st-bk", "cfab-st-vr"
+            ]
+        );
+        assert_eq!(
+            off,
+            vec![
+                "cfab-id199", "cfab-id199-peer", "cfab-id249", "cfab-id249-peer", "cfab-id99",
+                "cfab-id99-peer", "eth0", "eth1", "eth9"
+            ]
+        );
+        assert!(host.owns_if("eth9") && host.owns_if("cfab-anything"));
+        assert!(!host.owns_if("docker0") && !host.owns_if("vmbr0"));
+        // a leaf never forwards on anything it owns
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        assert!(leaf.owned_forwarding().iter().all(|(_, x)| !*x));
+        assert!(!leaf.owned_forwarding().is_empty());
     }
 
     #[test]

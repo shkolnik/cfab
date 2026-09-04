@@ -39,8 +39,11 @@ Print the
 data model as JSON Schema. Needs no config file.
 .TP
 .BR "gen policy" | mark | frr
-Print a generated artifact: the nft forward policy (table inet cfab-fwd), the
-traffic-class marking (table inet cfab), or this member's
+Print a generated artifact: the nft forward policy (table inet cfab-fwd:
+default-deny for anything touching a cfab interface, declared pairs pass, the
+admin NIC never transits, packets touching no cfab interface are accepted as
+another stack's business), the traffic-class marking (table inet cfab), or
+this member's
 .IR /etc/frr/frr.conf .
 .TP
 .BI "gen shape " DEV " " [\fB\-\-tc\fR|\fB\-\-expect\fR]
@@ -121,8 +124,13 @@ Not intended for interactive use.
 .B fwd\-watchdog
 One fail-closed forwarding-posture check; run by the
 .B cfab\-fwd\-watchdog
-timer. If any interface outside the declared set has forwarding enabled, it
-disables forwarding everywhere and exits nonzero.
+timer. If the forward policy is not loaded with a drop default, it disables
+forwarding on every cfab interface and exits nonzero. A cfab interface whose
+forwarding flag drifted from the declared value (a foreign stack writing
+.I ip_forward=1
+propagates onto every interface) is written back and logged. Interfaces cfab
+does not own are never read or written: another forwarder on the host (Docker,
+a routed bridge, a host-level CNI) is not cfab's to police.
 .TP
 .B cluster status
 Report the pmxcfs coordination state: presence, quorum (the

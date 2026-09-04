@@ -34,7 +34,9 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             ],
         )?;
         for ifn in conf_interfaces(sys)? {
-            sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
+            if view.owns_if(&ifn) {
+                sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
+            }
         }
         if have_tool(sys, "nft")? {
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
