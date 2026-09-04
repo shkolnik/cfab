@@ -155,11 +155,14 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         // neighbor's segment address; the cached entry outlives that neighbor's wire (measured).
         sys.write("/proc/sys/net/ipv4/conf/all/send_redirects", "0")?;
         sys.write("/proc/sys/net/ipv4/conf/default/send_redirects", "0")?;
-        // Forwarding starts OFF everywhere (the kernel checks the PER-INTERFACE flag); it is
-        // turned on — per class-table interface only — after the policy is loaded.
+        // Forwarding starts OFF on every cfab interface (the kernel checks the PER-INTERFACE
+        // flag); it is turned on — per class-table interface only — after the policy is loaded.
+        // Interfaces cfab does not own are left alone (scoped posture).
         sys.write("/proc/sys/net/ipv4/conf/default/forwarding", "0")?;
         for ifn in conf_interfaces(sys)? {
-            sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
+            if view.owns_if(&ifn) {
+                sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
+            }
         }
     }
 
