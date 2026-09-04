@@ -739,18 +739,23 @@ mod tests {
 
     #[test]
     fn ack_unwritable_all_window_reverts() {
-        use std::os::unix::fs::PermissionsExt;
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
-        // The severed-node stand-in: the ack dir refuses writes for the WHOLE window (a real
-        // severed pmxcfs fails the write with EACCES the same way). A transient failure is
-        // retried each poll — only window-long failure reverts.
+        // The severed-node stand-in: the ack write fails for the WHOLE window (a real severed
+        // pmxcfs refuses it with EACCES). A plain file squats where the acks directory must
+        // be, so the mkdir fails with ENOTDIR — a path-resolution error no uid can bypass,
+        // while mode bits alone would not stop root (CAP_DAC_OVERRIDE waives permission
+        // checks, not the file-type check). A transient failure is retried each poll — only
+        // window-long failure reverts.
         let pmx = Pmxcfs::at(&f.pmx_root);
-        std::fs::create_dir_all(pmx.acks_dir(1)).unwrap();
-        std::fs::set_permissions(pmx.acks_dir(1), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(pmx.cfab_dir().join("acks"), "squatter").unwrap();
+        assert_eq!(
+            std::fs::create_dir_all(pmx.acks_dir(1)).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory,
+            "the obstruction must be the uid-independent one"
+        );
         let mut sys = MockSys::default();
         let t = f.cs.tick(&mut sys).unwrap();
-        std::fs::set_permissions(pmx.acks_dir(1), std::fs::Permissions::from_mode(0o755)).unwrap();
         if let Tick::Reverted {
             generation: 1,
             reason,
