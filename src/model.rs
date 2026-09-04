@@ -26,18 +26,22 @@ pub enum Island {
     Cl,
     /// The management island; a host's wire here also carries its untagged admin path.
     Mg,
+    /// Not a physical switch domain: "every island this member has a wire on". Only a
+    /// rescue segment (`Role::Rescue`) is declared on it; `Member::wire` always returns
+    /// `None` for it (a rescue leg is a bond over every wire, resolved in the derive layer,
+    /// never a single indexed wire).
+    Any,
 }
 
 impl Island {
-    pub const ALL: [Island; 3] = [Island::St, Island::Cl, Island::Mg];
-
     pub fn parse(s: &str) -> Result<Island> {
         match s {
             "st" => Ok(Island::St),
             "cl" => Ok(Island::Cl),
             "mg" => Ok(Island::Mg),
+            "any" => Ok(Island::Any),
             other => Err(Error::config(format!(
-                "unknown island '{other}' (st|cl|mg)"
+                "unknown island '{other}' (st|cl|mg|any)"
             ))),
         }
     }
@@ -47,6 +51,7 @@ impl Island {
             Island::St => "st",
             Island::Cl => "cl",
             Island::Mg => "mg",
+            Island::Any => "any",
         }
     }
 }
@@ -100,7 +105,12 @@ pub struct Member {
 
 impl Member {
     pub fn wire(&self, island: Island) -> Option<&Wire> {
-        self.wires[island as usize].as_ref()
+        match island {
+            Island::St | Island::Cl | Island::Mg => self.wires[island as usize].as_ref(),
+            // A rescue leg is a bond over every wire this member has, not one indexed
+            // wire — resolved by the derive layer, never here.
+            Island::Any => None,
+        }
     }
 }
 
@@ -223,6 +233,9 @@ impl Zone {
 pub enum Role {
     Primary,
     Backup,
+    /// A rescue segment: island `any`, one per zone, no BFD, reached only when every
+    /// island segment of its zone is gone.
+    Rescue,
 }
 
 impl Role {
@@ -230,8 +243,9 @@ impl Role {
         match s {
             "primary" => Ok(Role::Primary),
             "backup" => Ok(Role::Backup),
+            "rescue" => Ok(Role::Rescue),
             other => Err(Error::config(format!(
-                "CLASS_TABLE role '{other}' (expected primary|backup)"
+                "CLASS_TABLE role '{other}' (expected primary|backup|rescue)"
             ))),
         }
     }
@@ -425,6 +439,49 @@ impl Fabric {
         for r in ct {
             self.zone(&r.zone)?;
         }
+        for r in ct {
+            if r.island == Island::Any && r.role != Role::Rescue {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: island 'any' requires role 'rescue' (a rescue segment is \
+                     the only segment without an island)",
+                    r.ifname
+                )));
+            }
+            if r.role == Role::Rescue && r.island != Island::Any {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: role 'rescue' requires island 'any' (an island segment \
+                     cannot be rescue)",
+                    r.ifname
+                )));
+            }
+        }
+        for r in ct.iter().filter(|r| r.role == Role::Rescue) {
+            if r.ifname.len() > 12 {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: rescue ifname must be 12 characters or fewer (slaves are \
+                     named <ifname>-<island>, IFNAMSIZ 15)",
+                    r.ifname
+                )));
+            }
+            let longest_path: u32 = ct
+                .iter()
+                .filter(|other| other.zone == r.zone && other.role != Role::Rescue)
+                .map(|other| other.ospf_cost)
+                .sum();
+            if r.ospf_cost <= longest_path {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: rescue cost {} must exceed zone {}'s longest host path \
+                     ({longest_path}, the sum of its class-row costs)",
+                    r.ifname, r.ospf_cost, r.zone
+                )));
+            }
+            if r.ospf_cost >= self.leaf_cost_offset {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: rescue cost {} must be below LEAF_COST_OFFSET ({})",
+                    r.ifname, r.ospf_cost, self.leaf_cost_offset
+                )));
+            }
+        }
         if let Some(d) = dup(self.zones.iter().map(|z| z.id.to_string())) {
             return Err(Error::config(format!("ZONE_TABLE id {d} used twice")));
         }
@@ -469,6 +526,13 @@ impl Fabric {
         }
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
+            if gw.island == Island::Any {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {} gw island 'any' is not supported yet (the ingress leg does \
+                     not migrate); use st|cl|mg",
+                    z.name
+                )));
+            }
             if ct.iter().any(|r| r.vid == gw.vid) {
                 return Err(Error::config(format!(
                     "ZONE_TABLE {} ingress vid {} is also a segment vid",
@@ -659,7 +723,8 @@ mod tests {
         let f = Fabric::from_raw(&raw).unwrap();
         assert_eq!(f.members.len(), 3);
         assert_eq!(f.zones.len(), 3);
-        assert_eq!(f.class_table.len(), 9);
+        // 9 class segments + 3 rescue rows (one per zone, island `any`).
+        assert_eq!(f.class_table.len(), 12);
         assert_eq!(f.zone("mgmt").unwrap().id, 249);
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
         assert_eq!(gw.router, "192.168.249.254");
@@ -667,6 +732,15 @@ mod tests {
         assert_eq!(gw.island, Island::Mg);
         assert_eq!(gw.leg_cidr(2), "192.168.249.2/24");
         assert!(f.zone("storage").unwrap().gw.is_none());
+        let rescue = f
+            .class_table
+            .iter()
+            .find(|r| r.ifname == "cfab-st-rs")
+            .unwrap();
+        assert_eq!(rescue.island, Island::Any);
+        assert_eq!(rescue.role, Role::Rescue);
+        assert_eq!(rescue.zone, "storage");
+        assert_eq!(rescue.ospf_cost, 5000);
         assert_eq!(f.member("pve3-tb").unwrap().kind, MemberKind::Leaf);
         assert_eq!(
             f.member("pve1-tb")
@@ -783,5 +857,127 @@ mod tests {
             err.to_string().contains("members: pve1-tb pve2-tb pve3-tb"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn island_parses_any() {
+        assert_eq!(Island::parse("any").unwrap(), Island::Any);
+        assert_eq!(Island::Any.as_str(), "any");
+        assert_eq!(Island::Any.to_string(), "any");
+    }
+
+    #[test]
+    fn role_parses_rescue() {
+        assert_eq!(Role::parse("rescue").unwrap(), Role::Rescue);
+    }
+
+    #[test]
+    fn wire_of_island_any_is_always_none() {
+        let raw = RawConfig::parse(&real_conf()).unwrap();
+        let f = Fabric::from_raw(&raw).unwrap();
+        for m in &f.members {
+            assert!(m.wire(Island::Any).is_none(), "{}", m.name);
+        }
+    }
+
+    #[test]
+    fn island_any_without_role_rescue_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-rs  any storage 9 300 rescue 5000",
+                "cfab-st-rs  any storage 9 300 primary 5000",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("island 'any' requires role 'rescue'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn role_rescue_without_island_any_fails() {
+        // Flip an ordinary segment's role to `rescue` without changing its island — the
+        // opposite-direction check, exercised without colliding with the zone:island
+        // uniqueness check (every zone already has a row on every physical island).
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-bk  cl storage 2 101 backup  100",
+                "cfab-st-bk  cl storage 2 101 rescue  100",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role 'rescue' requires island 'any'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rescue_ifname_over_12_chars_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace("cfab-st-rs  any storage", "cfab-storage-rs any storage")
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rescue ifname must be 12 characters or fewer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rescue_cost_at_or_below_zones_longest_path_fails() {
+        // storage's other class rows sum to 10 + 100 + 300 = 410; 400 does not clear it.
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-rs  any storage 9 300 rescue 5000",
+                "cfab-st-rs  any storage 9 300 rescue 400",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rescue cost 400 must exceed zone storage's longest host path (410"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rescue_cost_at_or_above_leaf_cost_offset_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-cl-rs  any cluster 9 301 rescue 5000",
+                "cfab-cl-rs  any cluster 9 301 rescue 30000",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rescue cost 30000 must be below LEAF_COST_OFFSET (30000)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gw_island_any_fails() {
+        let err = parse_fabric(|t| *t = t.replace("mg:249:", "any:249:")).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "gw island 'any' is not supported yet (the ingress leg does not migrate); \
+                 use st|cl|mg"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn schema_still_emits_with_rescue() {
+        let schema = schemars::schema_for!(Fabric);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        assert!(json.contains("\"rescue\""), "{json}");
+        assert!(json.contains("\"any\""), "{json}");
     }
 }
