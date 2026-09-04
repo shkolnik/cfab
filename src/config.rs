@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn functions_and_control_flow_are_skipped() {
         let text = "member_rows() { printf '%s\\n' \"$MEMBER_TABLE\" | awk 'NF==6'; }\n\
-                    if [ -d /run ]; then frr_ctl() { systemctl \"$1\" frr; }\nfi\nA=1\n";
+                    if [ -d /run ]; then svc_ctl() { systemctl \"$1\" svc; }\nfi\nA=1\n";
         let c = RawConfig::parse(text).unwrap();
         assert_eq!(c.get("A"), Some("1"));
         assert_eq!(c.unconsumed(&["A"]), Vec::<&str>::new());

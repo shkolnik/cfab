@@ -196,7 +196,7 @@ impl ConfSync {
         }
 
         // Witness. The ack write is retried across the whole window, not treated as terminal
-        // on first failure: applying a conf restarts FRR, which blips the very routes the
+        // on first failure: applying a conf restarts the routing engine, which blips the very routes the
         // coordination channel rides, so pmxcfs is routinely unwritable (EPERM/EACCES) for a
         // few seconds after `up`. A member that stays unable to write its ack for the full
         // window is genuinely severed — that, and only that, is the revert signal.

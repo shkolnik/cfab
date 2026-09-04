@@ -1,12 +1,12 @@
 //! `cfab up` — apply the fabric on THIS member. Idempotent, root. The order is load-bearing:
 //! preconditions → own the NICs → sysctls → per-class netdevs → return path → VRRP netdev →
-//! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → FRR →
-//! read-backs → fail-closed watchdog.
+//! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → routing
+//! engine (restart + readback) → fail-closed watchdog.
 
 use crate::commands::common::{
-    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, FRR_OWNERSHIP_MARKER,
-    conf_interfaces, ensure_rule, frr_interface_block, link_exists, link_kind_is, proc_sysctl,
+    conf_interfaces, ensure_rule, link_exists, link_kind_is, proc_sysctl,
 };
+use crate::commands::engine_ctl;
 use crate::derive::View;
 use crate::emit;
 use crate::error::{Error, Result};
@@ -39,20 +39,24 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             return Err(Error::fatal(format!("{dev} missing")));
         }
     }
-    let mut tools: Vec<&str> = vec!["vtysh", "ip"];
+    // The engine runs as a transient unit where systemd is (probed, like the other daemons);
+    // a container leaf detaches it with setsid (`Sys::spawn_detached`) and stops it by pid.
+    let mut tools: Vec<&str> = vec!["ip"];
+    if sys.exists("/run/systemd/system") {
+        tools.push("systemd-run");
+    } else {
+        tools.extend(["setsid", "kill"]);
+    }
     if kind == MemberKind::Host {
         tools.extend(["tc", "ethtool", "nft"]);
         if f.host_forward {
-            tools.extend(["systemd-run", "logger"]);
+            tools.push("logger");
         }
     }
     for tool in tools {
         if !have_tool(sys, tool)? {
             return Err(Error::fatal(format!("{tool} not installed")));
         }
-    }
-    if !sys.exists("/etc/frr") {
-        return Err(Error::fatal("/etc/frr missing (frr not installed?)"));
     }
     if f.fabric_mode != "tagged" {
         return Err(Error::fatal(format!(
@@ -174,7 +178,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             &format!("{}/32", view.identity_addr(z)),
         )?;
         // Fabric blocks must never fall through to the default route (identity traffic leaking
-        // onto the management LAN during a peer's FRR restart).
+        // onto the management LAN during a peer's routing-engine restart).
         run_ok(
             sys,
             &[
@@ -353,78 +357,13 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         )?;
     }
 
-    // ---- FRR -------------------------------------------------------------------
-    adopt_frr_conf(sys)?;
-    edit_daemons(sys, view)?;
-    apply_routing(sys)?;
-
-    // ---- read-backs: the load-bearing config must be in the daemons ------------
-    sys.sleep(std::time::Duration::from_secs(2));
-    let running = run_ok(sys, &["vtysh", "-c", "show running-config"])?.stdout;
-    if !running
-        .lines()
-        .any(|l| l == "ip protocol ospf route-map CFAB_SRC")
-    {
-        return Err(Error::fatal(
-            "zebra dropped 'ip protocol ospf route-map CFAB_SRC'",
-        ));
-    }
-    if kind == MemberKind::Host && f.vrrp_gw {
-        let vrrp = run_ok(sys, &["vtysh", "-c", "show vrrp"])?.stdout;
-        let want = format!("Virtual Router ID {}", f.vrrp_vrid);
-        let seen = vrrp.lines().any(|l| {
-            l.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .contains(&want)
-        });
-        if !seen {
-            return Err(Error::fatal(format!(
-                "vrrpd did not take the VRRP {} config",
-                f.vrrp_vrid
-            )));
-        }
-    }
-    for r in &gw_rows {
-        // ingress is load-bearing: bgpd must hold the session config
-        let z = f.zone(&r.zone)?;
-        let gw = z.gw.as_ref().expect("gw zone");
-        let want = format!(" neighbor {} remote-as {}", gw.router, f.bgp_as);
-        if !running.lines().any(|l| l == want) {
-            return Err(Error::fatal(format!(
-                "bgpd dropped 'neighbor {} remote-as {}' ({} ingress)",
-                gw.router, f.bgp_as, r.zone
-            )));
-        }
-    }
-    for z in &f.zones {
-        // the return path is load-bearing: a gw zone's static must be in staticd
-        let Some(gw) = &z.gw else { continue };
-        let want = format!("ip route 0.0.0.0/0 {} table {}", gw.router, z.id);
-        if !running.lines().any(|l| l == want) {
-            return Err(Error::fatal(format!(
-                "staticd dropped 'ip route 0.0.0.0/0 {} table {}' ({} return path)",
-                gw.router, z.id, z.name
-            )));
-        }
-    }
-    if kind == MemberKind::Leaf {
-        // never-a-transit is load-bearing: every transit link this leaf advertises must carry
-        // the offset (read back from the running config; the LSA follows it)
-        for r in &class_rows {
-            let want_cost = r.ospf_cost + f.leaf_cost_offset;
-            let block = frr_interface_block(&running, &r.ifname);
-            if !block
-                .iter()
-                .any(|l| *l == format!(" ip ospf cost {want_cost}"))
-            {
-                return Err(Error::fatal(format!(
-                    "{}: ospfd did not take cost {want_cost} (leaf offset)",
-                    r.ifname
-                )));
-            }
-        }
-    }
+    // ---- routing engine ----------------------------------------------------------
+    // A fresh start on every `up`: the engine has no config file and no state to replay, so
+    // stop → sweep its routes → start → wait for ready is the whole apply. `ready` alone is
+    // not proof the providers took the tree: the readback checks every instance.
+    engine_ctl::stop_and_sweep(sys, f)?;
+    let doc = engine_ctl::start_and_wait(sys, f, &opts.exe, &opts.config, host)?;
+    engine_ctl::readback(view, &doc)?;
 
     // ---- fail-closed watchdog ---------------------------------------------------
     if kind == MemberKind::Host && f.host_forward {
@@ -651,157 +590,53 @@ fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
-/// The routing apply. frr.conf generation is gone from this branch; the embedded engine
-/// (`cfab engine`, fed by emit::engine) replaces it together with the vtysh read-backs below.
-fn apply_routing(_sys: &mut dyn Sys) -> Result<()> {
-    Err(Error::fatal(
-        "routing apply is not wired on this branch yet: the embedded engine replaces FRR",
-    ))
-}
-
-/// Overwrite /etc/frr/frr.conf only when it is provably ours to replace: absent, carrying the
-/// generated-by-cfab marker, or byte-identical to the recorded backup. Anything else is another
-/// owner's routing config — an admin's, or a manager like Proxmox SDN that regenerates the file
-/// on every apply — and destroying it can cut the host's own connectivity. The remedy `mv` is
-/// both the operator's consent and the backup `cfab down` restores.
-fn adopt_frr_conf(sys: &mut dyn Sys) -> Result<()> {
-    if !sys.exists(FRR_CONF) {
-        return Ok(());
-    }
-    let cur = sys.read(FRR_CONF)?;
-    if cur.contains(FRR_OWNERSHIP_MARKER) {
-        return Ok(());
-    }
-    if sys.exists(FRR_CONF_BACKUP) {
-        if sys.read(FRR_CONF_BACKUP)? == cur {
-            return Ok(()); // the backed-up original, unchanged — still restorable
-        }
-        return Err(Error::fatal(format!(
-            "{FRR_CONF} is not cfab-generated and differs from the {FRR_CONF_BACKUP} backup — \
-             refusing to overwrite; something else edited or regenerated it since the backup \
-             was taken; reconcile the two by hand, then rerun `cfab up`"
-        )));
-    }
-    Err(Error::fatal(format!(
-        "{FRR_CONF} exists and is not cfab-generated — refusing to overwrite; cfab takes \
-         exclusive ownership of this file (a routed Proxmox SDN setup cannot coexist with \
-         cfab yet); if the existing config is yours to retire, review it, then \
-         `mv {FRR_CONF} {FRR_CONF_BACKUP}` and rerun `cfab up` (`cfab down` restores it)"
-    )))
-}
-
-/// /etc/frr/daemons: enable ospfd+bfdd, vrrpd/bgpd per role, one ospfd instance per zone.
-/// The first edit on a host records the original file, so `down` can put the managed keys
-/// back instead of guessing.
-fn edit_daemons(sys: &mut dyn Sys, view: &View) -> Result<()> {
-    let f = view.fabric;
-    let path = FRR_DAEMONS;
-    let text = sys.read(path)?;
-    if !sys.exists(FRR_DAEMONS_SNAPSHOT) {
-        sys.write(FRR_DAEMONS_SNAPSHOT, &text)?;
-    }
-    let want_vrrp = view.kind() == MemberKind::Host && f.vrrp_gw;
-    let want_bgp = !view.gw_rows().is_empty();
-    let instances = f
-        .zones
-        .iter()
-        .map(|z| z.id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut saw_instances = false;
-    let mut out: Vec<String> = text
-        .lines()
-        .map(|line| {
-            if line == "ospfd=no" {
-                "ospfd=yes".to_string()
-            } else if line == "bfdd=no" {
-                "bfdd=yes".to_string()
-            } else if line.starts_with("vrrpd=") {
-                format!("vrrpd={}", if want_vrrp { "yes" } else { "no" })
-            } else if line.starts_with("bgpd=") {
-                format!("bgpd={}", if want_bgp { "yes" } else { "no" })
-            } else if line.starts_with("ospfd_instances=") {
-                saw_instances = true;
-                format!("ospfd_instances=\"{instances}\"")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    if !saw_instances {
-        out.push(format!("ospfd_instances=\"{instances}\""));
-    }
-    sys.write(path, &(out.join("\n") + "\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RawConfig;
+    use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
-    #[test]
-    fn adopt_frr_conf_accepts_absent_or_cfab_generated() {
-        let mut sys = MockSys::default();
-        adopt_frr_conf(&mut sys).unwrap();
-        let mut sys = MockSys::default().file(
-            FRR_CONF,
-            &format!("frr defaults traditional\n{}\n", FRR_OWNERSHIP_MARKER),
-        );
-        adopt_frr_conf(&mut sys).unwrap();
-    }
-
-    #[test]
-    fn adopt_frr_conf_refuses_a_foreign_file_and_names_the_remedy() {
-        let mut sys = MockSys::default().file(FRR_CONF, "router bgp 65100\n");
-        let e = adopt_frr_conf(&mut sys).unwrap_err().to_string();
-        assert!(e.contains("not cfab-generated"), "{e}");
-        assert!(
-            e.contains(&format!("mv {FRR_CONF} {FRR_CONF_BACKUP}")),
-            "{e}"
-        );
-        assert!(
-            sys.files.get(FRR_CONF).unwrap() == "router bgp 65100\n",
-            "the foreign file is untouched"
-        );
-    }
-
-    #[test]
-    fn adopt_frr_conf_accepts_a_file_identical_to_its_backup() {
-        let mut sys = MockSys::default()
-            .file(FRR_CONF, "log syslog informational\n")
-            .file(FRR_CONF_BACKUP, "log syslog informational\n");
-        adopt_frr_conf(&mut sys).unwrap();
-    }
-
-    #[test]
-    fn adopt_frr_conf_refuses_when_the_file_drifted_from_its_backup() {
-        let mut sys = MockSys::default()
-            .file(FRR_CONF, "router bgp 65100\n")
-            .file(FRR_CONF_BACKUP, "log syslog informational\n");
-        let e = adopt_frr_conf(&mut sys).unwrap_err().to_string();
-        assert!(e.contains("differs from"), "{e}");
-    }
-
-    #[test]
-    fn edit_daemons_records_the_original_once() {
+    fn fabric() -> Fabric {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap();
-        let fabric =
-            crate::model::Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap())
-                .unwrap();
-        let view = View::new(&fabric, "pve1-tb").unwrap();
-        let orig = "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=no\n";
-        let mut sys = MockSys::default().file(FRR_DAEMONS, orig);
-        edit_daemons(&mut sys, &view).unwrap();
-        assert_eq!(
-            sys.files.get(FRR_DAEMONS_SNAPSHOT).unwrap(),
-            orig,
-            "first edit snapshots the pre-cfab file"
-        );
-        assert!(sys.files.get(FRR_DAEMONS).unwrap().contains("ospfd=yes"));
-        // A second run must not overwrite the record with the already-edited file.
-        edit_daemons(&mut sys, &view).unwrap();
-        assert_eq!(sys.files.get(FRR_DAEMONS_SNAPSHOT).unwrap(), orig);
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// A leaf whose engine came up ready but took only two of the three zones: `up` must
+    /// refuse, naming the third, instead of trusting `ready`.
+    #[test]
+    fn up_refuses_when_readback_misses_an_instance() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_ctl::tests::healthy_doc(&view);
+        doc["ospf"].as_object_mut().unwrap().remove("mgmt");
+        let mut sys = MockSys::default()
+            .socket("/run/cfab/engine.sock", &doc.to_string())
+            .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n");
+        let pmxcfs = tempfile::tempdir().unwrap();
+        let opts = UpOpts {
+            exe: "/usr/bin/cfab".into(),
+            config: "/etc/cfab/fabric.conf".into(),
+            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
+        };
+        let e = run(&mut sys, &view, &opts).unwrap_err().to_string();
+        assert!(e.contains("ospf instance 'mgmt' missing"), "{e}");
+        assert!(sys.ran(
+            "spawn_detached /usr/bin/cfab --config /etc/cfab/fabric.conf --host pve3-tb engine"
+        ));
+        // Sweep before start, every id of the private range.
+        let first_sweep = sys
+            .calls
+            .iter()
+            .position(|c| c.contains("route show table all proto 201"))
+            .unwrap();
+        let start = sys
+            .calls
+            .iter()
+            .position(|c| c.starts_with("spawn_detached"))
+            .unwrap();
+        assert!(first_sweep < start);
     }
 }

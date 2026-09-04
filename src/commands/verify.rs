@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::commands::common::conf_interfaces;
+use crate::commands::engine_ctl;
 use crate::derive::{View, segments_of};
 use crate::emit;
 use crate::error::Result;
@@ -122,19 +123,23 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         sys.sleep(Duration::from_secs(2));
     }
     if kind == MemberKind::Host && f.vrrp_gw {
-        let vrrp = sys.run(&["vtysh", "-c", "show vrrp"])?.stdout;
-        let st = vrrp
-            .lines()
-            .find(|l| l.contains("Status (v4)"))
-            // " Status (v4)   Master" → whitespace fields [Status, (v4), Master]
-            .and_then(|l| l.split_whitespace().nth(2))
-            .unwrap_or("?")
-            .to_string();
-        c.say(&format!(
-            "  vrrp {}: {st} (prio {})",
-            f.vrrp_vrid,
-            view.vrrp_prio()?
-        ));
+        let doc = engine_ctl::state(sys, f)?;
+        let inst = doc["vrrp"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|v| v["vrid"] == f.vrrp_vrid);
+        match inst {
+            Some(v) => {
+                let st = v["state"].as_str().unwrap_or("?").to_string();
+                c.say(&format!(
+                    "  vrrp {}: {st} (prio {})",
+                    f.vrrp_vrid,
+                    view.vrrp_prio()?
+                ));
+            }
+            None => c.bad("vrrp: no instance in engine state"),
+        }
     }
     if c.fails > 0 {
         let fails = c.fails;
@@ -226,30 +231,30 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 }
             }
             // never-a-transit: every transit link in our self-originated router LSA carries
-            // the offset
+            // the offset — exactly cost + offset for a link from one of our segment
+            // addresses, at least the offset for any other
+            let doc = engine_ctl::state(sys, f)?;
             for z in &f.zones {
-                let lsa = sys
-                    .run(&[
-                        "vtysh",
-                        "-c",
-                        &format!("show ip ospf {} database router self-originate", z.id),
-                    ])?
-                    .stdout;
-                let mut in_transit = false;
+                let rows: Vec<_> = view
+                    .class_rows()
+                    .into_iter()
+                    .filter(|r| r.zone == z.name)
+                    .collect();
                 let mut below = false;
-                for line in lsa.lines() {
-                    if line.contains("Link connected to: a Transit") {
-                        in_transit = true;
-                    } else if in_transit && line.contains("TOS 0 Metric") {
-                        let metric: u64 = line
-                            .split_whitespace()
-                            .next_back()
-                            .and_then(|w| w.parse().ok())
-                            .unwrap_or(0);
-                        if metric < f.leaf_cost_offset as u64 {
-                            below = true;
-                        }
-                        in_transit = false;
+                for link in doc["ospf"][&z.name]["self_lsa_links"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|l| engine_ctl::is_transit(&l["type"]))
+                {
+                    let metric = link["metric"].as_u64().unwrap_or(0);
+                    let addr = link["if"].as_str().unwrap_or("");
+                    let want = rows
+                        .iter()
+                        .find(|r| view.segment_addr(z, r.seg) == addr)
+                        .map(|r| u64::from(r.ospf_cost + f.leaf_cost_offset));
+                    if metric < u64::from(f.leaf_cost_offset) || want.is_some_and(|w| metric != w) {
+                        below = true;
                     }
                 }
                 if below {
@@ -351,7 +356,7 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Return-path rules per zone; a gw zone's table must hold FRR's default, its leg must carry
+/// Return-path rules per zone; a gw zone's table must hold the engine's default, its leg must carry
 /// the address, and the router must be peering.
 fn return_path_and_ingress(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     let f = view.fabric;
@@ -406,17 +411,19 @@ fn return_path_and_ingress(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Resul
                 z.name, leg.ifname
             ));
         }
-        let nbr = sys
-            .run(&["vtysh", "-c", &format!("show bgp neighbors {}", gw.router)])?
-            .stdout;
+        let doc = engine_ctl::state(sys, f)?;
+        let nbr = doc["bgp"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|n| n["peer"] == gw.router.as_str());
         let state = nbr
-            .lines()
-            .find_map(|l| l.split("BGP state = ").nth(1))
-            .and_then(|rest| rest.split([',', ' ']).next())
+            .and_then(|n| n["state"].as_str())
             .unwrap_or("absent")
             .to_string();
         if state == "Established" {
-            let prefixes = find_prefix_counts(&nbr).unwrap_or_default();
+            let n = nbr.expect("Established comes from an entry");
+            let prefixes = format!("{} accepted, {} sent prefixes", n["pfx_rcd"], n["pfx_snt"]);
             c.say(&format!(
                 "  {} ingress: bgp {} Established ({prefixes})",
                 z.name, gw.router
@@ -557,14 +564,13 @@ fn check(
 ) -> Result<(u8, String, Vec<String>)> {
     let f = view.fabric;
     let host = &view.member.name;
-    let up_addrs: BTreeSet<String> = sys
-        .run(&["vtysh", "-c", "show bfd peers brief"])?
-        .stdout
-        .lines()
-        .filter_map(|l| {
-            let w: Vec<&str> = l.split_whitespace().collect();
-            (w.len() >= 4 && w[3] == "up").then(|| w[2].to_string())
-        })
+    let doc = engine_ctl::state(sys, f)?;
+    let up_addrs: BTreeSet<String> = doc["bfd"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["state"] == "up")
+        .filter_map(|s| s["peer"].as_str().map(str::to_string))
         .collect();
     let mut down: Vec<String> = Vec::new();
     let mut alive: BTreeSet<(u8, String)> = BTreeSet::new();
@@ -667,30 +673,6 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
     words.get(i + 1)?.parse().ok()
 }
 
-/// First "N accepted, M sent prefixes" in a `show bgp neighbors` output.
-fn find_prefix_counts(text: &str) -> Option<String> {
-    for line in text.lines() {
-        if let Some(pos) = line.find(" accepted, ") {
-            let before = &line[..pos];
-            let accepted: String = before
-                .chars()
-                .rev()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>();
-            let accepted: String = accepted.chars().rev().collect();
-            let after = &line[pos + " accepted, ".len()..];
-            let sent: String = after.chars().take_while(char::is_ascii_digit).collect();
-            if !accepted.is_empty()
-                && !sent.is_empty()
-                && after[sent.len()..].starts_with(" sent prefixes")
-            {
-                return Some(format!("{accepted} accepted, {sent} sent prefixes"));
-            }
-        }
-    }
-    None
-}
-
 /// The cap the shape derivation prefers over the declared link speed: the shared chain (local
 /// cap file → cluster-published cap, cached back locally → declared).
 fn read_cap(sys: &mut dyn Sys, view: &View, dev: &str) -> Option<u64> {
@@ -717,6 +699,22 @@ mod tests {
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
+    /// The engine's state document as `engine::state::document` shapes it: every instance
+    /// healthy with transit links at the leaf offset, plus one BFD session per (peer, state).
+    fn engine_doc(view: &View, bfd: &[(String, &str)]) -> String {
+        let mut doc = engine_ctl::tests::healthy_doc(view);
+        doc["bfd"] = bfd
+            .iter()
+            .map(|(peer, state)| {
+                serde_json::json!({
+                    "local": null, "peer": peer, "if": "cfab-x", "state": state,
+                    "rx_us": 300000, "tx_us": 300000, "mult": 3
+                })
+            })
+            .collect();
+        doc.to_string()
+    }
+
     #[test]
     fn counter_parse() {
         let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
@@ -724,18 +722,6 @@ mod tests {
         assert_eq!(counter_packets(chain, "admin-in"), Some(0));
         assert_eq!(counter_packets(chain, "default-deny"), Some(42));
         assert_eq!(counter_packets(chain, "nope"), None);
-    }
-
-    #[test]
-    fn prefix_counts_parse() {
-        let out = "  3 accepted, 0 filtered, 5 sent prefixes on this session\n";
-        // "0 filtered," breaks contiguity — the parser needs "accepted, N sent" adjacent.
-        assert_eq!(find_prefix_counts(out), None);
-        let out2 = "  0 accepted, 3 sent prefixes\n";
-        assert_eq!(
-            find_prefix_counts(out2).as_deref(),
-            Some("0 accepted, 3 sent prefixes")
-        );
     }
 
     /// A leaf whose whole environment is healthy reports OK with the right session count.
@@ -780,27 +766,17 @@ mod tests {
             // gw zone (mgmt): the leaf learns the ingress default via OSPF from the hosts
             .on_stdout(&["ip", "route", "show", "table", "249"],
                 "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
-        // LSA: transit links at offset cost
-        for z in &f.zones {
-            sys = sys.on_stdout(
-                &[
-                    "vtysh",
-                    "-c",
-                    &format!("show ip ospf {} database router self-originate", z.id),
-                ],
-                "  Link connected to: a Transit Network\n    TOS 0 Metric: 30010\n",
-            );
-        }
-        // BFD: every expected session up (peer segment addresses for nodes 1 and 2)
-        let mut bfd = String::new();
+        // Engine state: transit links at offset cost, every expected BFD session up (peer
+        // segment addresses for nodes 1 and 2)
+        let mut bfd = Vec::new();
         for p in [1u8, 2u8] {
             for z in &f.zones {
                 for seg in [1u8, 2, 3] {
-                    bfd.push_str(&format!("1 local {}.{seg}.{p} up\n", z.block()));
+                    bfd.push((format!("{}.{seg}.{p}", z.block()), "up"));
                 }
             }
         }
-        sys = sys.on_stdout(&["vtysh", "-c", "show bfd peers brief"], &bfd);
+        sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
         // routes: each identity via the zone's primary with pinned src
         for p in [1u8, 2u8] {
             for z in &f.zones {
@@ -870,29 +846,21 @@ mod tests {
                 "from 10.99.0.0/16 lookup 99\nfrom 10.199.0.0/16 lookup 199\nfrom 10.249.0.0/16 lookup 249\n")
             .on_stdout(&["ip", "rule", "show", "pref", "2002"],
                 "from 10.99.0.0/16 unreachable\nfrom 10.199.0.0/16 unreachable\nfrom 10.249.0.0/16 unreachable\n");
-        for z in &f.zones {
-            sys = sys.on_stdout(
-                &[
-                    "vtysh",
-                    "-c",
-                    &format!("show ip ospf {} database router self-originate", z.id),
-                ],
-                "  Link connected to: a Transit Network\n    TOS 0 Metric: 30010\n",
-            );
-        }
-        // BFD: all up EXCEPT storage seg 1 to node 1 (10.99.1.1)
-        let mut bfd = String::new();
+        // BFD: all up EXCEPT storage seg 1 to node 1 (10.99.1.1), which the engine still
+        // lists, down
+        let mut bfd = Vec::new();
         for p in [1u8, 2u8] {
             for z in &f.zones {
                 for seg in [1u8, 2, 3] {
-                    if p == 1 && z.name == "storage" && seg == 1 {
-                        continue;
-                    }
-                    bfd.push_str(&format!("1 local {}.{seg}.{p} up\n", z.block()));
+                    let dark = p == 1 && z.name == "storage" && seg == 1;
+                    bfd.push((
+                        format!("{}.{seg}.{p}", z.block()),
+                        if dark { "down" } else { "up" },
+                    ));
                 }
             }
         }
-        sys = sys.on_stdout(&["vtysh", "-c", "show bfd peers brief"], &bfd);
+        sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
         for p in [1u8, 2u8] {
             for z in &f.zones {
                 // identity to node 1 in storage now rides the backup; that's allowed while a

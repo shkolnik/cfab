@@ -42,7 +42,7 @@ enum Command {
     },
     /// Apply the fabric on this member (idempotent; root)
     Up,
-    /// Remove everything `up` created, restore FRR to the pre-fabric state (root)
+    /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
     /// Full health check: posture, drift, convergence. Exit 0 OK / 2 degraded / 1 failed
     Verify {
