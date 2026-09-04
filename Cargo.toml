@@ -14,6 +14,17 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+holo-yang = { path = "../holo/holo-yang" }
+holo-northbound = { path = "../holo/holo-northbound" }
+holo-protocol = { path = "../holo/holo-protocol" }
+holo-utils = { path = "../holo/holo-utils" }
+holo-interface = { path = "../holo/holo-interface" }
+holo-routing = { path = "../holo/holo-routing", features = ["ospf", "bfd"] }
+yang5 = { version = "0.3", features = ["bundled"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+ipnetwork = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
@@ -21,10 +32,10 @@ tempfile = "3"
 [package.metadata.deb]
 maintainer = "James Shkolnik <jshkolnik@gmail.com>"
 copyright = "2026 James Shkolnik"
-extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / FRR config from it, applies and verifies the fabric on this member, and tears it down. Installing this package pulls in the full runtime chain (FRR, nftables)."
+extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables)."
 section = "net"
 priority = "optional"
-depends = "frr (>= 8.0), nftables, iproute2, ethtool"
+depends = "nftables, iproute2, ethtool, libpcre2-8-0"
 assets = [
     ["target/release/cfab", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/cfab/", "644"],
