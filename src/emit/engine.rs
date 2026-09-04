@@ -20,7 +20,12 @@ pub const PROTO_BASE: u8 = 201;
 /// the defaults on the testbed: a second topology event inside the hold-down window took 5.106 s
 /// against 0.156 s for the first, and every event — a link returning, a peer restarting, a USB NIC
 /// bouncing — re-arms the window. Availability-first says be fast when the fabric is being tested.
-const SPF_LONG_DELAY_MS: u32 = 1000;
+/// `long-delay` is what a second event pays once `time-to-learn` (500 ms) has passed. FRR's
+/// equivalent (`spf-timers` holdtime, `lib/libospf.h`) starts at 50 ms and only ramps under
+/// sustained churn; 1000 ms here was measured as 0.9 s of a 1.85 s second-event outage, 100 ms
+/// leaves 0.93 s, all of it BFD detection plus MinLSInterval. The fixed value cannot ramp the way
+/// FRR's does; at this scale an SPF every 100 ms under a flap storm is still noise.
+const SPF_LONG_DELAY_MS: u32 = 100;
 const SPF_HOLD_DOWN_MS: u32 = 3000;
 
 pub fn generate(view: &View) -> Result<Value> {
@@ -242,7 +247,7 @@ mod tests {
             for inst in instances(&t) {
                 let d = &inst["ietf-ospf:ospf"]["spf-control"]["ietf-spf-delay"];
                 let name = &inst["name"];
-                assert_eq!(d["long-delay"], 1000, "{member} {name}");
+                assert_eq!(d["long-delay"], 100, "{member} {name}");
                 assert_eq!(d["hold-down"], 3000, "{member} {name}");
                 // The rest of the algorithm stays on the model's defaults.
                 for dflt in ["initial-delay", "short-delay", "time-to-learn"] {
