@@ -29,6 +29,28 @@ pub struct GwRow {
     pub vid: u16,
 }
 
+/// One slave of a rescue bond: a physical wire, tagged with the rescue segment's vid.
+#[derive(Debug, Clone)]
+pub struct Slave {
+    pub ifname: String,
+    pub wire: String,
+    pub island: Island,
+}
+
+/// A rescue segment resolved for one member: an active-backup bond over every wire the
+/// member has, one VLAN sub-interface per wire as a slave. `home` is the wire carrying this
+/// zone's cheapest class segment this member actually has — derived, never declared.
+#[derive(Debug, Clone)]
+pub struct RescueRow {
+    pub ifname: String,
+    pub zone: String,
+    pub seg: u8,
+    pub vid: u16,
+    pub ospf_cost: u32,
+    pub home: String,
+    pub slaves: Vec<Slave>,
+}
+
 /// The fabric resolved for the member running the binary.
 pub struct View<'a> {
     pub fabric: &'a Fabric,
@@ -61,7 +83,14 @@ impl<'a> View<'a> {
         gw_rows_of(self.fabric, self.member)
     }
 
-    /// This member's interfaces in a zone: segments (table order), then the ingress leg.
+    /// This member's rescue segments, one per zone this member has a rescue row for (table
+    /// order), each a bond over every wire the member has.
+    pub fn rescue_rows(&self) -> Vec<RescueRow> {
+        rescue_rows_of(self.fabric, self.member)
+    }
+
+    /// This member's interfaces in a zone: segments (table order), then the rescue bond, then
+    /// the ingress leg — adjacency interfaces before the router-facing one.
     pub fn zone_ifs(&self, zone: &str) -> Vec<String> {
         let mut ifs: Vec<String> = self
             .class_rows()
@@ -69,6 +98,12 @@ impl<'a> View<'a> {
             .filter(|r| r.zone == zone)
             .map(|r| r.ifname)
             .collect();
+        ifs.extend(
+            self.rescue_rows()
+                .into_iter()
+                .filter(|r| r.zone == zone)
+                .map(|r| r.ifname),
+        );
         ifs.extend(
             self.gw_rows()
                 .into_iter()
@@ -94,11 +129,14 @@ impl<'a> View<'a> {
     }
 
     /// Every interface cfab owns on this member with the forwarding flag cfab sets on it:
-    /// declared wires and the admin NIC (never), class-table segments, ingress legs and the
-    /// VRRP macvlan (only a forwarding host), identity veths (never). Scoped posture: cfab's
-    /// forwarding authority is exactly this set — it neither reads nor writes the flag on any
-    /// other interface, so a foreign forwarder (Docker, a routed bridge, a host-level CNI) is
-    /// not cfab's to police. Declared names only; `owns_if` adds the `cfab-` name family.
+    /// declared wires and the admin NIC (never), class-table segments, ingress legs, rescue
+    /// bonds (transit like a segment — a rescue leg for one zone can carry another zone's
+    /// island-disjoint traffic) and the VRRP macvlan (only a forwarding host), rescue slaves
+    /// and identity veths (never: a slave is L2 only, the bond is the L3 interface). Scoped
+    /// posture: cfab's forwarding authority is exactly this set — it neither reads nor writes
+    /// the flag on any other interface, so a foreign forwarder (Docker, a routed bridge, a
+    /// host-level CNI) is not cfab's to police. Declared names only; `owns_if` adds the
+    /// `cfab-` name family.
     pub fn owned_forwarding(&self) -> Vec<(String, bool)> {
         let f = self.fabric;
         let transit = self.member.kind == MemberKind::Host && f.host_forward;
@@ -114,6 +152,12 @@ impl<'a> View<'a> {
         }
         for r in self.gw_rows() {
             out.push((r.ifname, transit));
+        }
+        for r in self.rescue_rows() {
+            out.push((r.ifname, transit));
+            for s in r.slaves {
+                out.push((s.ifname, false));
+            }
         }
         if f.vrrp_gw {
             out.push((f.vrrp_if.clone(), transit));
@@ -200,6 +244,57 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
         .collect()
 }
 
+/// The wire carrying this member's cheapest class segment of `zone` — the rescue leg's home,
+/// derived (never declared). Ties keep the first row in CLASS_TABLE order.
+fn home_wire(fabric: &Fabric, member: &Member, zone: &str) -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for r in class_rows_of(fabric, member) {
+        if r.zone != zone {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(cost, _)| r.ospf_cost < *cost) {
+            best = Some((r.ospf_cost, r.wire));
+        }
+    }
+    best.map(|(_, wire)| wire)
+}
+
+/// This member's rescue segments (table order): each `any` row fanned out over the member's
+/// wires in st/cl/mg order, one slave per wire, homed on the zone's cheapest wire this member
+/// has. A member with no wires at all has no rescue row (it has no fabric).
+pub fn rescue_rows_of(fabric: &Fabric, member: &Member) -> Vec<RescueRow> {
+    if member.wires.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    fabric
+        .class_table
+        .iter()
+        .filter(|r| r.role == Role::Rescue)
+        .filter_map(|r| {
+            let home = home_wire(fabric, member, &r.zone)?;
+            let slaves = [Island::St, Island::Cl, Island::Mg]
+                .into_iter()
+                .filter_map(|island| {
+                    member.wire(island).map(|w| Slave {
+                        ifname: format!("{}-{}", r.ifname, island.as_str()),
+                        wire: w.name.clone(),
+                        island,
+                    })
+                })
+                .collect();
+            Some(RescueRow {
+                ifname: r.ifname.clone(),
+                zone: r.zone.clone(),
+                seg: r.seg,
+                vid: r.vid,
+                ospf_cost: r.ospf_cost,
+                home,
+                slaves,
+            })
+        })
+        .collect()
+}
+
 pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
     if member.kind != MemberKind::Host {
         return Vec::new();
@@ -273,11 +368,17 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             v.zone_ifs("mgmt"),
-            vec!["cfab-mg", "cfab-mg-bk", "cfab-mg-b2", "cfab-gw249"]
+            vec![
+                "cfab-mg",
+                "cfab-mg-bk",
+                "cfab-mg-b2",
+                "cfab-mg-rs",
+                "cfab-gw249"
+            ]
         );
         assert_eq!(
             v.zone_ifs("storage"),
-            vec!["cfab-st", "cfab-st-bk", "cfab-st-b2"]
+            vec!["cfab-st", "cfab-st-bk", "cfab-st-b2", "cfab-st-rs"]
         );
     }
 
@@ -302,25 +403,37 @@ mod tests {
                 "cfab-cl",
                 "cfab-cl-b2",
                 "cfab-cl-bk",
+                "cfab-cl-rs",
                 "cfab-gw249",
                 "cfab-mg",
                 "cfab-mg-b2",
                 "cfab-mg-bk",
+                "cfab-mg-rs",
                 "cfab-st",
                 "cfab-st-b2",
                 "cfab-st-bk",
+                "cfab-st-rs",
                 "cfab-st-vr"
             ]
         );
         assert_eq!(
             off,
             vec![
+                "cfab-cl-rs-cl",
+                "cfab-cl-rs-mg",
+                "cfab-cl-rs-st",
                 "cfab-id199",
                 "cfab-id199-peer",
                 "cfab-id249",
                 "cfab-id249-peer",
                 "cfab-id99",
                 "cfab-id99-peer",
+                "cfab-mg-rs-cl",
+                "cfab-mg-rs-mg",
+                "cfab-mg-rs-st",
+                "cfab-st-rs-cl",
+                "cfab-st-rs-mg",
+                "cfab-st-rs-st",
                 "eth0",
                 "eth1",
                 "eth9"
@@ -356,6 +469,57 @@ mod tests {
         let v = View::new(&f, "pve3-tb").unwrap();
         assert_eq!(v.vrrp_vip().unwrap(), "10.99.1.254");
         assert_eq!(v.vrrp_prio().unwrap(), 200);
+    }
+
+    #[test]
+    fn rescue_rows_fan_out_over_every_wire_homed_on_the_cheapest_segment() {
+        for name in ["pve1-tb", "pve3-tb"] {
+            let f = fabric();
+            let v = View::new(&f, name).unwrap();
+            let rows = v.rescue_rows();
+            assert_eq!(rows.len(), 3, "{name}: one rescue row per zone");
+            let expect_home = [
+                ("cfab-st-rs", "eth9"),
+                ("cfab-cl-rs", "eth1"),
+                ("cfab-mg-rs", "eth0"),
+            ];
+            for (i, (ifname, home)) in expect_home.into_iter().enumerate() {
+                let row = &rows[i];
+                assert_eq!(row.ifname, ifname, "{name}");
+                assert_eq!(row.home, home, "{name}: {ifname} home wire");
+                assert_eq!(row.slaves.len(), 3, "{name}: {ifname} slaves");
+                assert_eq!(
+                    row.slaves
+                        .iter()
+                        .map(|s| s.ifname.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        format!("{ifname}-st"),
+                        format!("{ifname}-cl"),
+                        format!("{ifname}-mg")
+                    ]
+                );
+                assert_eq!(
+                    row.slaves
+                        .iter()
+                        .map(|s| s.wire.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["eth9", "eth1", "eth0"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wires_and_segments_of_never_see_the_rescue_bond_or_its_slaves() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        // wires() feeds the shaper, down's qdisc sweep and verify's link-speed checks: a
+        // rescue row must never enter it (only class_rows() does).
+        assert_eq!(v.wires(), vec!["eth0", "eth1", "eth9"]);
+        assert!(!v.wires().iter().any(|w| w.contains("-rs")));
+        // segments_of feeds BFD pairing: no rescue segment, no BFD.
+        assert!(!segments_of(&f, v.member).iter().any(|s| s.contains(":9")));
     }
 
     #[test]
