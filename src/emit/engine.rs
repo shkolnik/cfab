@@ -14,6 +14,15 @@ use crate::model::MemberKind;
 /// 203 = bgp`, so `down`'s sweep and the startup purge touch nothing another stack installed.
 pub const PROTO_BASE: u8 = 201;
 
+/// RFC 8405 SPF back-off, in milliseconds (`ietf-ospf` units), overriding the model defaults of
+/// 5000/10000. Those defaults protect a large IGP's CPU from repeated SPF over hundreds of nodes;
+/// a fabric of three routers and nine segments computes an SPF in microseconds. Measured cost of
+/// the defaults on the testbed: a second topology event inside the hold-down window took 5.106 s
+/// against 0.156 s for the first, and every event — a link returning, a peer restarting, a USB NIC
+/// bouncing — re-arms the window. Availability-first says be fast when the fabric is being tested.
+const SPF_LONG_DELAY_MS: u32 = 1000;
+const SPF_HOLD_DOWN_MS: u32 = 3000;
+
 pub fn generate(view: &View) -> Result<Value> {
     let f = view.fabric;
     let class_rows = view.class_rows();
@@ -76,6 +85,10 @@ pub fn generate(view: &View) -> Result<Value> {
             "name": z.name,
             "ietf-ospf:ospf": {
                 "explicit-router-id": view.identity_addr(z),
+                "spf-control": { "ietf-spf-delay": {
+                    "long-delay": SPF_LONG_DELAY_MS,
+                    "hold-down": SPF_HOLD_DOWN_MS,
+                } },
                 "areas": { "area": [ {
                     "area-id": "0.0.0.0",
                     "interfaces": { "interface": ospf_ifs },
@@ -219,6 +232,23 @@ mod tests {
             assert_eq!(keys, ["name", "type"], "{e}");
             assert_eq!(e["type"], "iana-if-type:ethernetCsmacd");
             assert!(e["name"].as_str().unwrap().starts_with("cfab-"));
+        }
+    }
+
+    #[test]
+    fn every_instance_sets_the_spf_backoff() {
+        for member in ["pve1-tb", "pve3-tb"] {
+            let t = tree(member);
+            for inst in instances(&t) {
+                let d = &inst["ietf-ospf:ospf"]["spf-control"]["ietf-spf-delay"];
+                let name = &inst["name"];
+                assert_eq!(d["long-delay"], 1000, "{member} {name}");
+                assert_eq!(d["hold-down"], 3000, "{member} {name}");
+                // The rest of the algorithm stays on the model's defaults.
+                for dflt in ["initial-delay", "short-delay", "time-to-learn"] {
+                    assert!(d.get(dflt).is_none(), "{member} {name} pins {dflt}");
+                }
+            }
         }
     }
 
