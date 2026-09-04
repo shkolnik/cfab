@@ -378,8 +378,11 @@ proto_routes() { ip -n H -4 route show table all proto "$PROTO_OSPF"; }
 # A0: the engine must never write a forwarding sysctl (holo patch P1 deletes holo-routing's
 # startup `ipv4_forwarding("1")` / `ipv6_forwarding("1")`; forwarding is cfab's scoped policy).
 # This is the only place that watches it happen instead of reading that the code is gone: the
-# container is privileged, so an unpatched build's write WOULD succeed, and a fresh netns
-# starts at 0 — so 0 -> 1 is exactly the old behavior and 0 -> 0 the new one.
+# container is privileged, so an unpatched build's write WOULD succeed.
+# The baseline is SET to 0, not assumed: a new netns copies init_net's all-devconf, and on any
+# host running dockerd that is `ip_forward=1` (measured on pve3: a fresh `ip netns add` starts
+# at 1). Without the write the assert could never see 0 -> 1, which is precisely the pre-P1
+# behavior it exists to catch.
 FWD4_BEFORE=""
 FWD6_BEFORE=""
 
@@ -392,10 +395,22 @@ read_fwd() {                       # 4|6 -> the sysctl's value in H, or ERR when
     printf '%s' "${v:-ERR}"
 }
 
+write_fwd() {                      # 4|6 value -> write the sysctl in H (netns H is ours)
+    case $1 in
+        4) ip netns exec H sh -c "echo $2 > /proc/sys/net/ipv4/ip_forward" 2>/dev/null || true ;;
+        *) ip netns exec H sh -c "echo $2 > /proc/sys/net/ipv6/conf/all/forwarding" 2>/dev/null || true ;;
+    esac
+}
+
 sample_forwarding() {              # call immediately before the first start_engine
+    local i4 i6
+    i4=$(read_fwd 4)
+    i6=$(read_fwd 6)
+    write_fwd 4 0
+    write_fwd 6 0
     FWD4_BEFORE=$(read_fwd 4)
     FWD6_BEFORE=$(read_fwd 6)
-    say "A0 baseline in H: ipv4.ip_forward=$FWD4_BEFORE ipv6.conf.all.forwarding=$FWD6_BEFORE"
+    say "A0 baseline in H: inherited ipv4.ip_forward=$i4 ipv6.conf.all.forwarding=$i6; set to ipv4.ip_forward=$FWD4_BEFORE ipv6.conf.all.forwarding=$FWD6_BEFORE"
 }
 
 a0_forwarding_untouched() {
@@ -403,10 +418,12 @@ a0_forwarding_untouched() {
     a4=$(read_fwd 4)
     a6=$(read_fwd 6)
     ev="ipv4.ip_forward $FWD4_BEFORE->$a4, ipv6.conf.all.forwarding $FWD6_BEFORE->$a6"
-    if [ "$a4" = "$FWD4_BEFORE" ] && [ "$a6" = "$FWD6_BEFORE" ] && [ "$a4" = 0 ] && [ "$a6" = 0 ]; then
+    if [ "$FWD4_BEFORE" != 0 ] || [ "$FWD6_BEFORE" != 0 ]; then
+        red "A0 cannot judge: the baseline in H would not go to 0 before the engine started ($ev)"
+    elif [ "$a4" = 0 ] && [ "$a6" = 0 ]; then
         ok "A0 engine wrote no forwarding sysctl: $ev"
     else
-        red "A0 forwarding sysctl changed or non-zero after engine start (want 0->0 for both; holo patch P1): $ev"
+        red "A0 forwarding sysctl written by the engine (want 0->0 for both; holo patch P1): $ev"
     fi
 }
 
@@ -672,6 +689,8 @@ main() {
     wait_full 60 || say "note: not every wire reached full within 60 s"
     wait_routes 30 || say "note: identity routes not installed within 30 s"
     wait_ecmp 30 || say "note: 10.99.0.2 not ECMP over both storage wires within 30 s"
+    say "state doc: $(state_doc | jq -c . 2>/dev/null || echo UNREADABLE)"
+    say "F (FRR) route to H's identities: $(ip -n F route show 10.99.0.1 | tr '\n' ';' | tr -s ' \t' ' ')|$(ip -n F route show 10.199.0.1 | tr '\n' ';' | tr -s ' \t' ' ')"
     a1_ospf_full
     a2_bfd_up
     a3_ecmp_prefsrc
