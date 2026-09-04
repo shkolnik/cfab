@@ -38,13 +38,12 @@ Print the
 .B fabric.conf
 data model as JSON Schema. Needs no config file.
 .TP
-.BR "gen policy" | mark | frr
+.BR "gen policy" | mark | engine
 Print a generated artifact: the nft forward policy (table inet cfab-fwd:
 default-deny for anything touching a cfab interface, declared pairs pass, the
 admin NIC never transits, packets touching no cfab interface are accepted as
 another stack's business), the traffic-class marking (table inet cfab), or
-this member's
-.IR /etc/frr/frr.conf .
+this member's routing-engine configuration tree (JSON).
 .TP
 .BI "gen shape " DEV " " [\fB\-\-tc\fR|\fB\-\-expect\fR]
 Print the floor+borrow HTB derivation for one physical NIC.

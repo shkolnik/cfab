@@ -4,8 +4,8 @@
 //! read-backs → fail-closed watchdog.
 
 use crate::commands::common::{
-    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, conf_interfaces, ensure_rule,
-    frr_ctl, frr_interface_block, link_exists, link_kind_is, proc_sysctl,
+    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, FRR_OWNERSHIP_MARKER,
+    conf_interfaces, ensure_rule, frr_interface_block, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::derive::View;
 use crate::emit;
@@ -356,9 +356,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     // ---- FRR -------------------------------------------------------------------
     adopt_frr_conf(sys)?;
     edit_daemons(sys, view)?;
-    let frr_conf = emit::frr::generate(view)?;
-    sys.write(FRR_CONF, &frr_conf)?;
-    frr_ctl(sys, "restart")?;
+    apply_routing(sys)?;
 
     // ---- read-backs: the load-bearing config must be in the daemons ------------
     sys.sleep(std::time::Duration::from_secs(2));
@@ -653,6 +651,14 @@ fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
+/// The routing apply. frr.conf generation is gone from this branch; the embedded engine
+/// (`cfab engine`, fed by emit::engine) replaces it together with the vtysh read-backs below.
+fn apply_routing(_sys: &mut dyn Sys) -> Result<()> {
+    Err(Error::fatal(
+        "routing apply is not wired on this branch yet: the embedded engine replaces FRR",
+    ))
+}
+
 /// Overwrite /etc/frr/frr.conf only when it is provably ours to replace: absent, carrying the
 /// generated-by-cfab marker, or byte-identical to the recorded backup. Anything else is another
 /// owner's routing config — an admin's, or a manager like Proxmox SDN that regenerates the file
@@ -663,7 +669,7 @@ fn adopt_frr_conf(sys: &mut dyn Sys) -> Result<()> {
         return Ok(());
     }
     let cur = sys.read(FRR_CONF)?;
-    if cur.contains(emit::frr::OWNERSHIP_MARKER) {
+    if cur.contains(FRR_OWNERSHIP_MARKER) {
         return Ok(());
     }
     if sys.exists(FRR_CONF_BACKUP) {
@@ -739,10 +745,7 @@ mod tests {
         adopt_frr_conf(&mut sys).unwrap();
         let mut sys = MockSys::default().file(
             FRR_CONF,
-            &format!(
-                "frr defaults traditional\n{}\n",
-                emit::frr::OWNERSHIP_MARKER
-            ),
+            &format!("frr defaults traditional\n{}\n", FRR_OWNERSHIP_MARKER),
         );
         adopt_frr_conf(&mut sys).unwrap();
     }
