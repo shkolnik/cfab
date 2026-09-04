@@ -298,12 +298,19 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::FwdWatchdog => {
             let mut sys = RealSys;
             let report = commands::fwd_watchdog::run(&mut sys, &view)?;
+            if let Some(rule) = &report.resolved {
+                eprintln!("cfab fwd-watchdog: installed foreign-stack accept: {rule}");
+            }
+            for b in &report.blocked {
+                eprintln!("cfab fwd-watchdog: BLOCKED by a foreign ruleset: {b}");
+            }
             match report.failed {
-                None => Ok(ExitCode::SUCCESS),
                 Some(reason) => {
                     eprintln!("cfab fwd-watchdog: FAIL-CLOSED: {reason}");
                     Ok(ExitCode::FAILURE)
                 }
+                None if !report.blocked.is_empty() => Ok(ExitCode::FAILURE),
+                None => Ok(ExitCode::SUCCESS),
             }
         }
         Command::ConfSync => {

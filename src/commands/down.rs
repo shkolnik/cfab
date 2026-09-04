@@ -2,7 +2,9 @@
 //! Order matters: forwarding OFF first (fail closed even mid-teardown), then policy, then
 //! netdevs. Prove-ownership: only deletes cfab-* netdevs of the expected kind.
 
-use crate::commands::common::{conf_interfaces, drop_rules, link_exists, link_kind_is};
+use crate::commands::common::{
+    conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
+};
 use crate::commands::engine_ctl;
 use crate::derive::View;
 use crate::error::{Error, Result};
@@ -40,6 +42,9 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
         }
+        // custody: the accept `up` put in a foreign user hook is ours to remove, and only the
+        // rule carrying our tag is touched
+        remove_foreign_transit_accept(sys)?;
     } else {
         // a leaf owns nothing global: its own rules (prove ownership by pref + our block)
         for z in &f.zones {
