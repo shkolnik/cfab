@@ -65,3 +65,72 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("    counter comment \"default-deny\"\n  }\n}\n");
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RawConfig;
+    use crate::model::Fabric;
+
+    fn fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
+    /// rescue bond after a zone's segments, and this generator just emits whatever `zone_ifs`
+    /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
+    /// (so `FORWARD_ALLOW storage>storage` covers island-disjoint transit through it) and in
+    /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
+    /// A slave is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
+    /// own — the bond does), but it IS in `owned_forwarding()` (Task 2, `false`/never-transit)
+    /// and so correctly appears in the `cfab` owned set too — that set means "an interface cfab
+    /// owns," not "an interface that transits," and a slave's own traffic (the bond's frames on
+    /// the wire) must not fall into the blanket `iifname != @cfab` foreign-transit accept.
+    #[test]
+    fn zone_set_carries_the_rescue_bond_never_a_slave_owned_set_carries_both() {
+        for member in ["pve1-tb", "pve3-tb"] {
+            let f = fabric();
+            let v = View::new(&f, member).unwrap();
+            let out = generate(&v).unwrap();
+            for row in v.rescue_rows() {
+                let want = format!("\"{}\"", row.ifname);
+                let set_line = out
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(&format!("set {} {{", row.zone)))
+                    .unwrap_or_else(|| panic!("{member}: missing set line for {}", row.zone));
+                assert!(
+                    set_line.contains(&want),
+                    "{member}: zone set for {} missing the rescue bond: {set_line}",
+                    row.zone
+                );
+                let cfab_line = out
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("set cfab {"))
+                    .unwrap();
+                assert!(
+                    cfab_line.contains(&want),
+                    "{member}: cfab owned set missing the rescue bond: {cfab_line}"
+                );
+                for slave in &row.slaves {
+                    let slave_tag = format!("\"{}\"", slave.ifname);
+                    assert!(
+                        !set_line.contains(&slave_tag),
+                        "{member}: zone set for {} names a rescue slave {}: it carries no zone \
+                         traffic of its own, the bond does",
+                        row.zone,
+                        slave.ifname
+                    );
+                    assert!(
+                        cfab_line.contains(&slave_tag),
+                        "{member}: cfab owned set missing the rescue slave {} \
+                         (owned_forwarding lists it with transit=false)",
+                        slave.ifname
+                    );
+                }
+            }
+        }
+    }
+}
