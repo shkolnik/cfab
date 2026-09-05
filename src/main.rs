@@ -44,8 +44,11 @@ enum Command {
     Up,
     /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
-    /// This member's fabric state: UP / UP-DEGRADED / FAILED / DOWN, with the counts
-    /// (peers | links | fallbacks) and one line per condition. Exit 0 / 1 / 2 / 3.
+    /// This member's fabric state, from its adjacency counts: UP (exit 0), UP-DEGRADED (1),
+    /// FAILED (2), DOWN (3). The headline carries three fixed counts, (peers | links |
+    /// fallbacks), each n/N: peers with at least one available adjacency (self never counted),
+    /// BFD sessions on declared segments, and OSPF neighbors on the fallback segment. One
+    /// indented line per condition follows. Never writes: the watchdog actuates, status reports.
     Status {
         /// Seconds to re-read (every 2 s) while the state is not UP; 0 = one instant read
         #[arg(long, default_value_t = 0)]

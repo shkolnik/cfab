@@ -33,7 +33,8 @@ cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
 cfab up                         # apply the fabric on this member (idempotent, root)
 cfab down                       # remove everything `up` created, restore pre-fabric FRR
-cfab verify [--timeout N]       # exit 0 OK / 2 degraded / 1 failed
+cfab status [--wait N] [--permissive]
+                                # UP 0 / UP-DEGRADED 1 / FAILED 2 / DOWN 3
 cfab measure-cap <dev> <peer>   # measure a wire's real capacity; feeds the shape derivation
 cfab policy-teeth               # prove the forward policy in throwaway netnses — and prove the proof bites
 cfab cluster status             # Proxmox (pmxcfs) coordination state; clean "not clustered" when absent
@@ -73,7 +74,7 @@ the point of use, with identical single-host behavior when absent:
 - `conf publish` distributes one validated `fabric.conf` cluster-wide (atomic rename publish,
   generation counter, stale-lock reclaim).
 - `conf-sync` applies published configurations under a **peer-witness protocol**: validate →
-  apply → verify → ack, then commit only once at least one fresh peer ack proves the new
+  apply → status → ack, then commit only once at least one fresh peer ack proves the new
   fabric actually carries traffic — otherwise revert to the previous configuration. A
   cluster-wide bad config (one the switches cannot forward) self-heals: every member reverts.
 - `measure-cap` serializes floods behind a cluster lease and publishes measured capacities so
@@ -86,9 +87,14 @@ the point of use, with identical single-host behavior when absent:
   argv vectors, no shell, fully mockable — every imperative branch is unit-tested.
 - **Fail loud, never degrade silently.** A missing capability, absent interface, or unmet
   precondition is a clear, actionable error, never a partial apply.
-- **Verify is a first-class citizen.** `verify` checks the fabric end to end (BFD sessions,
-  identities, source pinning, forward posture) and its exit code is the contract every other
-  mechanism builds on.
+- **Detectors actuate, `status` reports.** A condition that makes a link unsafe is brought down
+  by the watchdog, and the state follows from the adjacency counts; everything else is a reason
+  line that never moves the state. `status` itself is read-only, with a test that proves it —
+  a false FAILED costs an exit code, a false actuation costs packets.
+- **`status` is a first-class citizen.** It reads the fabric end to end (BFD sessions, fallback
+  neighbors, identities, source pinning, forward posture) and reports one of four states with
+  three counts, `(<peers> | <links> | <fallbacks>)`. Its exit code — 0 UP, 1 UP-DEGRADED,
+  2 FAILED, 3 DOWN — is the contract every other mechanism builds on.
 
 ## Building
 
