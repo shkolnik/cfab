@@ -41,7 +41,27 @@ assets = [
     ["README.md", "usr/share/doc/cfab/", "644"],
     ["doc/cfab.8", "usr/share/man/man8/", "644"],
     ["examples/fabric.conf", "usr/share/doc/cfab/examples/fabric.conf.example", "644"],
+    ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
 ]
+# No hand-written maintainer scripts: the directory is named only because cargo-deb
+# generates no systemd maintainer-script fragments at all unless this key is set
+# (cargo-deb 3.8.0, deb/control.rs generate_scripts). The unit would ship installed
+# but never enabled, stopped, or masked.
+maintainer-scripts = "packaging/deb"
+
+# cfab-fabric.service, installed disabled and never started by the package: installing
+# cfab must not change the network. The operator writes /etc/cfab/fabric.conf and runs
+# `systemctl enable --now cfab-fabric`.
+[package.metadata.deb.systemd-units]
+unit-scripts = "packaging/deb"
+unit-name = "cfab-fabric"
+enable = false
+start = false
+# An upgrade must not tear the fabric down: stopping the unit runs `cfab down`, an outage
+# for every identity on the host. Both false leaves the running unit alone; the new binary
+# takes effect on the next `systemctl reload cfab-fabric`.
+stop-on-upgrade = false
+restart-after-upgrade = false
 
 [lints.rust]
 unsafe_code = "forbid"

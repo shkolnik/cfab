@@ -1,0 +1,3 @@
+# /etc/default/cfab — environment for cfab-fabric.service.
+# Only needed when this host's MEMBER_TABLE row is not named by the kernel hostname.
+#CFAB_HOST=pve1
