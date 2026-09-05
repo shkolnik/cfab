@@ -2,6 +2,8 @@
 //! Order matters: forwarding OFF first (fail closed even mid-teardown), then policy, then
 //! netdevs. Prove-ownership: only deletes cfab-* netdevs of the expected kind.
 
+use std::path::{Path, PathBuf};
+
 use crate::commands::common::{
     conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
 };
@@ -16,38 +18,27 @@ use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 /// lets the supervisor's stop sequence fail closed *first* (spec §13): everything after this
 /// point can be `SIGKILL`ed by `TimeoutStopSec` without a packet transiting a half-torn-down
 /// host.
+///
+/// Host-only (RULED, James 2026-09-05, on Gate A review finding 6/B4): a leaf has no global
+/// forwarding to turn off, and its leak-guard `ip rule`s are its ONLY containment — dropping
+/// them here would fail *open* for the rest of the teardown (netdevs, addresses and routes
+/// all still present), the opposite of what "stage one, fail closed first" means. The leaf's
+/// rules come off in the main body below, after its netdevs are gone.
 pub fn forwarding_off(sys: &mut dyn Sys, view: &View) -> Result<()> {
-    let f = view.fabric;
-    if view.kind() == MemberKind::Host {
-        for ifn in conf_interfaces(sys)? {
-            if view.owns_if(&ifn) {
-                sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
-            }
-        }
-        if have_tool(sys, "nft")? {
-            run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
-        }
-        // custody: the accept `up` put in a foreign user hook is ours to remove, and only the
-        // rule carrying our tag is touched
-        remove_foreign_transit_accept(sys)?;
-    } else {
-        // a leaf owns nothing global: its own rules (prove ownership by pref + our block)
-        for z in &f.zones {
-            let blk = format!("{}.0.0/16", z.block());
-            drop_rules(
-                sys,
-                "1000",
-                &format!("to {blk} iif lo lookup main"),
-                &["to", &blk, "iif", "lo", "lookup", "main"],
-            )?;
-            drop_rules(
-                sys,
-                "1001",
-                &format!("to {blk} unreachable"),
-                &["to", &blk, "unreachable"],
-            )?;
+    if view.kind() != MemberKind::Host {
+        return Ok(());
+    }
+    for ifn in conf_interfaces(sys)? {
+        if view.owns_if(&ifn) {
+            sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
         }
     }
+    if have_tool(sys, "nft")? {
+        run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
+    }
+    // custody: the accept `up` put in a foreign user hook is ours to remove, and only the
+    // rule carrying our tag is touched
+    remove_foreign_transit_accept(sys)?;
     Ok(())
 }
 
@@ -98,6 +89,27 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             &format!("from {blk} unreachable"),
             &["from", &blk, "unreachable"],
         )?;
+    }
+
+    // Review finding 11 (2026-09-05, escalated to blocking — B3): refuse before destroying
+    // the run_dir if `engine.lock` is still held. `stop_and_sweep` above only signals a
+    // systemd-managed engine; a detached (non-systemd) one has no stop mechanism in this
+    // gate at all and may still be alive. Removing its socket/lock files here would let the
+    // very next `cfab engine` take a FRESH, uncontended lock on a new inode — two live
+    // engines, exactly the state the flock (spec §14) exists to make unrepresentable.
+    // Checked directly against the real filesystem, matching `supervisor::lock` itself (not
+    // through `Sys` — the flock is a kernel object, not something to mock), and only when
+    // the run_dir exists at all: a member that was never applied has nothing to hold.
+    let lock_path = PathBuf::from(&f.run_dir).join(crate::engine::LOCK_NAME);
+    if Path::new(&f.run_dir).exists()
+        && let Err(held) = crate::supervisor::lock::hold(&lock_path)
+    {
+        return Err(Error::fatal(format!(
+            "an engine is still running (pid {} holds {}); stop it first — teardown refuses \
+             to remove a run_dir a live engine still owns",
+            held.pid.map_or("unknown".to_string(), |p| p.to_string()),
+            lock_path.display()
+        )));
     }
     sys.remove(&f.run_dir)?;
 
@@ -194,6 +206,25 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     if view.kind() == MemberKind::Host {
         for dev in view.wires() {
             run_ignore(sys, &["tc", "qdisc", "del", "dev", &dev, "root"])?;
+        }
+    } else {
+        // B4 (ruling): the leaf's leak-guard rules are its only containment, so they come
+        // off here — after its netdevs are already gone — rather than in `forwarding_off`
+        // (stage one), where removing them first would fail open for the rest of teardown.
+        for z in &f.zones {
+            let blk = format!("{}.0.0/16", z.block());
+            drop_rules(
+                sys,
+                "1000",
+                &format!("to {blk} iif lo lookup main"),
+                &["to", &blk, "iif", "lo", "lookup", "main"],
+            )?;
+            drop_rules(
+                sys,
+                "1001",
+                &format!("to {blk} unreachable"),
+                &["to", &blk, "unreachable"],
+            )?;
         }
     }
     let mut msg = notes.join("\n");
@@ -413,5 +444,59 @@ mod tests {
                 .count();
             assert_eq!(fwd, usize::from(kind == "host"), "{kind}: {:?}", sys.calls);
         }
+    }
+
+    /// Review finding 11 / B3 (escalated to blocking, 2026-09-05): a still-running engine
+    /// (holding `engine.lock`) makes teardown refuse rather than remove the run_dir out from
+    /// under it — the two-live-engines state spec §14's flock exists to make unrepresentable.
+    #[test]
+    fn down_refuses_while_the_engine_lock_is_held() {
+        let mut f = fabric();
+        let dir = tempfile::tempdir().unwrap();
+        f.run_dir = dir.path().to_str().unwrap().to_string();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let lock_path = dir.path().join(crate::engine::LOCK_NAME);
+        let _held = crate::supervisor::lock::hold(&lock_path).unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        let err = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(err.contains("an engine is still running"), "{err}");
+        assert!(
+            !sys.ran(&format!("rm {}", f.run_dir)),
+            "the run_dir must not be removed while its lock is held: {:?}",
+            sys.calls
+        );
+    }
+
+    /// With nobody holding the lock (or no run_dir at all yet — a member never applied),
+    /// teardown proceeds and does remove the run_dir.
+    #[test]
+    fn down_proceeds_when_the_engine_lock_is_free() {
+        let mut f = fabric();
+        let dir = tempfile::tempdir().unwrap();
+        f.run_dir = dir.path().to_str().unwrap().to_string();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran(&format!("rm {}", f.run_dir)));
+    }
+
+    /// B4 (RULING, James 2026-09-05, on Gate A review finding 6): `forwarding_off` alone must
+    /// not remove a leaf's leak-guard rules — they are its only containment, and stage one's
+    /// whole point is to fail closed before anything that can be `SIGKILL`ed later.
+    #[test]
+    fn a_leafs_leak_guard_survives_forwarding_off_alone() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // Deliberately no `ip rule show pref …` mock at all: `forwarding_off` on a leaf must
+        // not even QUERY the leak-guard rules, let alone delete one — that whole action moved
+        // to the main teardown body (B4). (A rule mocked as persistently present would loop
+        // forever under a regression that still calls `drop_rules` here, since the mock
+        // never reflects a `del`; asserting "never even asked" avoids that hazard and is the
+        // stronger claim anyway.)
+        let mut sys = MockSys::default();
+        forwarding_off(&mut sys, &view).unwrap();
+        assert!(!sys.ran("ip rule show pref 1000"), "{:?}", sys.calls);
+        assert!(!sys.ran("ip rule show pref 1001"), "{:?}", sys.calls);
+        assert!(!sys.ran("ip rule del"), "{:?}", sys.calls);
     }
 }
