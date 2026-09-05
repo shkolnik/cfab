@@ -340,31 +340,31 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
 
 /// The two lines `cfab check` prints: the fabric as declared, then what THIS member gets.
 /// The second line is the last thing an operator sees before `up` creates the netdevs, so it
-/// names every leg `up` will build — the rescue legs included: their slaves fan out per wire,
+/// names every leg `up` will build — the fallback legs included: their slaves fan out per wire,
 /// so their count is member-dependent and not derivable from the fabric-wide line.
 fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
     let kind = match view.kind() {
         MemberKind::Host => "host",
         MemberKind::Leaf => "leaf",
     };
-    let rescue_legs = fabric
+    let fallback_legs = fabric
         .class_table
         .iter()
-        .filter(|r| r.role == Role::Rescue)
+        .filter(|r| r.role == Role::Fallback)
         .count();
     format!(
-        "fabric.conf OK: {} zones, {} segments, {} rescue legs, {} members\n\
-         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} rescue leg(s), \
+        "fabric.conf OK: {} zones, {} segments, {} fallback legs, {} members\n\
+         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
          {} ingress leg(s)\n",
         fabric.zones.len(),
-        fabric.class_table.len() - rescue_legs,
-        rescue_legs,
+        fabric.class_table.len() - fallback_legs,
+        fallback_legs,
         fabric.members.len(),
         view.member.name,
         view.node(),
         view.class_rows().len(),
         view.wires().join(" "),
-        view.rescue_rows().len(),
+        view.fallback_rows().len(),
         view.gw_rows().len(),
     )
 }
@@ -415,34 +415,34 @@ mod tests {
     }
 
     /// The per-member line is the only output that says what THIS host will get, and `up`
-    /// builds one bond per rescue leg with one slave per wire under it. It must say so.
+    /// builds one bond per fallback leg with one slave per wire under it. It must say so.
     #[test]
-    fn check_names_this_members_rescue_legs() {
+    fn check_names_this_members_fallback_legs() {
         let f = fabric_from(&example());
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             check_report(&f, &view),
-            "fabric.conf OK: 3 zones, 9 segments, 3 rescue legs, 3 members\n\
+            "fabric.conf OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             3 rescue leg(s), 1 ingress leg(s)\n"
+             3 fallback leg(s), 1 ingress leg(s)\n"
         );
     }
 
-    /// A fabric declaring no rescue row: one spelling, counted zero, never absent.
+    /// A fabric declaring no fallback row: one spelling, counted zero, never absent.
     #[test]
-    fn check_on_a_rescue_free_fabric_counts_zero() {
+    fn check_on_a_fallback_free_fabric_counts_zero() {
         let text = example()
             .lines()
-            .filter(|l| !l.contains(" rescue "))
+            .filter(|l| !l.contains(" fallback "))
             .collect::<Vec<_>>()
             .join("\n");
         let f = fabric_from(&text);
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             check_report(&f, &view),
-            "fabric.conf OK: 3 zones, 9 segments, 0 rescue legs, 3 members\n\
+            "fabric.conf OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             0 rescue leg(s), 1 ingress leg(s)\n"
+             0 fallback leg(s), 1 ingress leg(s)\n"
         );
     }
 }

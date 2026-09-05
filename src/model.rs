@@ -27,8 +27,8 @@ pub enum Island {
     /// The management island; a host's wire here also carries its untagged admin path.
     Mg,
     /// Not a physical switch domain: "every island this member has a wire on". Only a
-    /// rescue segment (`Role::Rescue`) is declared on it; `Member::wire` always returns
-    /// `None` for it (a rescue leg is a bond over every wire, resolved in the derive layer,
+    /// fallback segment (`Role::Fallback`) is declared on it; `Member::wire` always returns
+    /// `None` for it (a fallback leg is a bond over every wire, resolved in the derive layer,
     /// never a single indexed wire).
     Any,
 }
@@ -92,7 +92,7 @@ pub struct Wire {
     pub speed_mbit: u32,
 }
 
-/// The widest ifname a bond leg (a rescue segment, or a migrating ingress leg) may carry.
+/// The widest ifname a bond leg (a fallback segment, or a migrating ingress leg) may carry.
 /// Its slaves are named `<ifname>-<island>`: three characters of suffix inside IFNAMSIZ 15.
 pub const MAX_BOND_IFNAME: usize = 12;
 
@@ -117,7 +117,7 @@ impl Member {
     pub fn wire(&self, island: Island) -> Option<&Wire> {
         match island {
             Island::St | Island::Cl | Island::Mg => self.wires[island as usize].as_ref(),
-            // A rescue leg is a bond over every wire this member has, not one indexed
+            // A fallback leg is a bond over every wire this member has, not one indexed
             // wire — resolved by the derive layer, never here.
             Island::Any => None,
         }
@@ -243,9 +243,9 @@ impl Zone {
 pub enum Role {
     Primary,
     Backup,
-    /// A rescue segment: island `any`, one per zone, no BFD, reached only when every
+    /// A fallback segment: island `any`, one per zone, no BFD, reached only when every
     /// island segment of its zone is gone.
-    Rescue,
+    Fallback,
 }
 
 impl Role {
@@ -253,9 +253,9 @@ impl Role {
         match s {
             "primary" => Ok(Role::Primary),
             "backup" => Ok(Role::Backup),
-            "rescue" => Ok(Role::Rescue),
+            "fallback" => Ok(Role::Fallback),
             other => Err(Error::config(format!(
-                "CLASS_TABLE role '{other}' (expected primary|backup|rescue)"
+                "CLASS_TABLE role '{other}' (expected primary|backup|fallback)"
             ))),
         }
     }
@@ -450,44 +450,44 @@ impl Fabric {
             self.zone(&r.zone)?;
         }
         for r in ct {
-            if r.island == Island::Any && r.role != Role::Rescue {
+            if r.island == Island::Any && r.role != Role::Fallback {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: island 'any' requires role 'rescue' (a rescue segment is \
+                    "CLASS_TABLE {}: island 'any' requires role 'fallback' (a fallback segment is \
                      the only segment without an island)",
                     r.ifname
                 )));
             }
-            if r.role == Role::Rescue && r.island != Island::Any {
+            if r.role == Role::Fallback && r.island != Island::Any {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: role 'rescue' requires island 'any' (an island segment \
-                     cannot be rescue)",
+                    "CLASS_TABLE {}: role 'fallback' requires island 'any' (an island segment \
+                     cannot be fallback)",
                     r.ifname
                 )));
             }
         }
-        for r in ct.iter().filter(|r| r.role == Role::Rescue) {
+        for r in ct.iter().filter(|r| r.role == Role::Fallback) {
             if bond_ifname_too_long(&r.ifname) {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: rescue ifname must be {MAX_BOND_IFNAME} characters or \
+                    "CLASS_TABLE {}: fallback ifname must be {MAX_BOND_IFNAME} characters or \
                      fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
                     r.ifname
                 )));
             }
             let longest_path: u32 = ct
                 .iter()
-                .filter(|other| other.zone == r.zone && other.role != Role::Rescue)
+                .filter(|other| other.zone == r.zone && other.role != Role::Fallback)
                 .map(|other| other.ospf_cost)
                 .sum();
             if r.ospf_cost <= longest_path {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: rescue cost {} must exceed zone {}'s longest host path \
+                    "CLASS_TABLE {}: fallback cost {} must exceed zone {}'s longest host path \
                      ({longest_path}, the sum of its class-row costs)",
                     r.ifname, r.ospf_cost, r.zone
                 )));
             }
             if r.ospf_cost >= self.leaf_cost_offset {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: rescue cost {} must be below LEAF_COST_OFFSET ({})",
+                    "CLASS_TABLE {}: fallback cost {} must be below LEAF_COST_OFFSET ({})",
                     r.ifname, r.ospf_cost, self.leaf_cost_offset
                 )));
             }
@@ -537,7 +537,7 @@ impl Fabric {
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
             // island `any` = a migrating ingress leg: a bond over one tagged sub-interface
-            // per wire, named like a rescue leg's slaves, so the derived bond name must
+            // per wire, named like a fallback leg's slaves, so the derived bond name must
             // leave room for the `-<island>` suffix.
             if gw.island == Island::Any && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
                 return Err(Error::config(format!(
@@ -736,7 +736,7 @@ mod tests {
         let f = Fabric::from_raw(&raw).unwrap();
         assert_eq!(f.members.len(), 3);
         assert_eq!(f.zones.len(), 3);
-        // 9 class segments + 3 rescue rows (one per zone, island `any`).
+        // 9 class segments + 3 fallback rows (one per zone, island `any`).
         assert_eq!(f.class_table.len(), 12);
         assert_eq!(f.zone("mgmt").unwrap().id, 249);
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
@@ -745,15 +745,15 @@ mod tests {
         assert_eq!(gw.island, Island::Mg);
         assert_eq!(gw.leg_cidr(2), "192.168.249.2/24");
         assert!(f.zone("storage").unwrap().gw.is_none());
-        let rescue = f
+        let fallback = f
             .class_table
             .iter()
-            .find(|r| r.ifname == "cfab-st-rs")
+            .find(|r| r.ifname == "cfab-st-fb")
             .unwrap();
-        assert_eq!(rescue.island, Island::Any);
-        assert_eq!(rescue.role, Role::Rescue);
-        assert_eq!(rescue.zone, "storage");
-        assert_eq!(rescue.ospf_cost, 5000);
+        assert_eq!(fallback.island, Island::Any);
+        assert_eq!(fallback.role, Role::Fallback);
+        assert_eq!(fallback.zone, "storage");
+        assert_eq!(fallback.ospf_cost, 5000);
         assert_eq!(f.member("pve3-tb").unwrap().kind, MemberKind::Leaf);
         assert_eq!(
             f.member("pve1-tb")
@@ -880,8 +880,8 @@ mod tests {
     }
 
     #[test]
-    fn role_parses_rescue() {
-        assert_eq!(Role::parse("rescue").unwrap(), Role::Rescue);
+    fn role_parses_fallback() {
+        assert_eq!(Role::parse("fallback").unwrap(), Role::Fallback);
     }
 
     #[test]
@@ -894,82 +894,82 @@ mod tests {
     }
 
     #[test]
-    fn island_any_without_role_rescue_fails() {
+    fn island_any_without_role_fallback_fails() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "cfab-st-rs  any storage 9 300 rescue 5000",
-                "cfab-st-rs  any storage 9 300 primary 5000",
+                "cfab-st-fb  any storage 9 300 fallback 5000",
+                "cfab-st-fb  any storage 9 300 primary 5000",
             )
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("island 'any' requires role 'rescue'"),
+                .contains("island 'any' requires role 'fallback'"),
             "{err}"
         );
     }
 
     #[test]
-    fn role_rescue_without_island_any_fails() {
-        // Flip an ordinary segment's role to `rescue` without changing its island — the
+    fn role_fallback_without_island_any_fails() {
+        // Flip an ordinary segment's role to `fallback` without changing its island — the
         // opposite-direction check, exercised without colliding with the zone:island
         // uniqueness check (every zone already has a row on every physical island).
         let err = parse_fabric(|t| {
             *t = t.replace(
                 "cfab-st-bk  cl storage 2 101 backup  100",
-                "cfab-st-bk  cl storage 2 101 rescue  100",
+                "cfab-st-bk  cl storage 2 101 fallback  100",
             )
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("role 'rescue' requires island 'any'"),
+                .contains("role 'fallback' requires island 'any'"),
             "{err}"
         );
     }
 
     #[test]
-    fn rescue_ifname_over_12_chars_fails() {
+    fn fallback_ifname_over_12_chars_fails() {
         let err = parse_fabric(|t| {
-            *t = t.replace("cfab-st-rs  any storage", "cfab-storage-rs any storage")
+            *t = t.replace("cfab-st-fb  any storage", "cfab-storage-fb any storage")
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("rescue ifname must be 12 characters or fewer"),
+                .contains("fallback ifname must be 12 characters or fewer"),
             "{err}"
         );
     }
 
     #[test]
-    fn rescue_cost_at_or_below_zones_longest_path_fails() {
+    fn fallback_cost_at_or_below_zones_longest_path_fails() {
         // storage's other class rows sum to 10 + 100 + 300 = 410; 400 does not clear it.
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "cfab-st-rs  any storage 9 300 rescue 5000",
-                "cfab-st-rs  any storage 9 300 rescue 400",
+                "cfab-st-fb  any storage 9 300 fallback 5000",
+                "cfab-st-fb  any storage 9 300 fallback 400",
             )
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("rescue cost 400 must exceed zone storage's longest host path (410"),
+                .contains("fallback cost 400 must exceed zone storage's longest host path (410"),
             "{err}"
         );
     }
 
     #[test]
-    fn rescue_cost_at_or_above_leaf_cost_offset_fails() {
+    fn fallback_cost_at_or_above_leaf_cost_offset_fails() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "cfab-cl-rs  any cluster 9 301 rescue 5000",
-                "cfab-cl-rs  any cluster 9 301 rescue 30000",
+                "cfab-cl-fb  any cluster 9 301 fallback 5000",
+                "cfab-cl-fb  any cluster 9 301 fallback 30000",
             )
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("rescue cost 30000 must be below LEAF_COST_OFFSET (30000)"),
+                .contains("fallback cost 30000 must be below LEAF_COST_OFFSET (30000)"),
             "{err}"
         );
     }
@@ -989,7 +989,7 @@ mod tests {
     /// so 12 characters fit IFNAMSIZ and 13 do not.
     #[test]
     fn bond_ifname_longer_than_twelve_is_refused() {
-        assert!(!bond_ifname_too_long("cfab-st-rs"));
+        assert!(!bond_ifname_too_long("cfab-st-fb"));
         assert!(!bond_ifname_too_long("123456789012"));
         assert!(bond_ifname_too_long("1234567890123"));
     }
@@ -1008,10 +1008,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_still_emits_with_rescue() {
+    fn schema_still_emits_with_fallback() {
         let schema = schemars::schema_for!(Fabric);
         let json = serde_json::to_string(&schema).expect("schema serializes");
-        assert!(json.contains("\"rescue\""), "{json}");
+        assert!(json.contains("\"fallback\""), "{json}");
         assert!(json.contains("\"any\""), "{json}");
     }
 }

@@ -61,13 +61,13 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     let f = view.fabric;
     let mut out = String::new();
     let mut ifs: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
-    // Rescue bonds are in the zone's forward-policy set (`zone_ifs`) like a segment, so the
+    // Fallback bonds are in the zone's forward-policy set (`zone_ifs`) like a segment, so the
     // fixture's router carries a veth stand-in for each — proves the generated ruleset does not
-    // special-case them out. No endpoint netns test exercises a rescue ifname directly (no
+    // special-case them out. No endpoint netns test exercises a fallback ifname directly (no
     // production traffic addresses it in this fixture); the container proof on real hardware is
-    // the only proof of actual rescue transit (Task 7.2(c)). Slaves are NOT added: they carry no
+    // the only proof of actual fallback transit (Task 7.2(c)). Slaves are NOT added: they carry no
     // L3 and are not in any forward-policy set.
-    ifs.extend(view.rescue_rows().into_iter().map(|r| r.ifname));
+    ifs.extend(view.fallback_rows().into_iter().map(|r| r.ifname));
     if let Some(a) = view.admin_if() {
         ifs.push(a.to_string());
     }
@@ -348,27 +348,27 @@ fn reach(sys: &mut dyn Sys, fx: &Fixture, from: &str, to: &str) -> Result<u32> {
 
 fn first_if<'v>(view: &'v View, zone: &str) -> Result<&'v str> {
     // Only segment sub-ifs get endpoints (the gw leg exists in the set but has no netns).
-    // Excludes Role::Rescue explicitly: a rescue row shares the zone name but has no endpoint
+    // Excludes Role::Fallback explicitly: a fallback row shares the zone name but has no endpoint
     // in this fixture (its ifname is never added to `ifs` — class_rows() drops it by
     // construction), so picking one up here would fail loudly via `Fixture::endpoint`, not
     // silently — but the guard makes the intended row (a real segment) explicit rather than
-    // relying on rescue rows happening to sort last in the table.
+    // relying on fallback rows happening to sort last in the table.
     view.fabric
         .class_table
         .iter()
-        .filter(|r| r.role != Role::Rescue)
+        .filter(|r| r.role != Role::Fallback)
         .find(|r| r.zone == zone)
         .map(|r| r.ifname.as_str())
         .ok_or_else(|| Error::fatal(format!("policy-teeth: zone {zone} has no interface")))
 }
 
 fn second_if<'v>(view: &'v View, zone: &str) -> Option<&'v str> {
-    // Same exclusion as `first_if`: never let a rescue row (no fixture endpoint) satisfy the
+    // Same exclusion as `first_if`: never let a fallback row (no fixture endpoint) satisfy the
     // "zone's second interface" lookup.
     view.fabric
         .class_table
         .iter()
-        .filter(|r| r.zone == zone && r.role != Role::Rescue)
+        .filter(|r| r.zone == zone && r.role != Role::Fallback)
         .nth(1)
         .map(|r| r.ifname.as_str())
 }

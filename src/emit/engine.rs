@@ -31,10 +31,10 @@ const SPF_HOLD_DOWN_MS: u32 = 3000;
 pub fn generate(view: &View) -> Result<Value> {
     let f = view.fabric;
     let class_rows = view.class_rows();
-    let rescue_rows = view.rescue_rows();
+    let fallback_rows = view.fallback_rows();
     let gw_rows = view.gw_rows();
 
-    // Every interface any instance names, in class-row → rescue-bond → identity →
+    // Every interface any instance names, in class-row → fallback-bond → identity →
     // ingress-leg order.
     let mut if_names: Vec<String> = Vec::new();
     let mut add_if = |name: String| {
@@ -45,9 +45,9 @@ pub fn generate(view: &View) -> Result<Value> {
     for r in &class_rows {
         add_if(r.ifname.clone());
     }
-    // The rescue bond is an interface like any other here: holo needs only its name, and the
+    // The fallback bond is an interface like any other here: holo needs only its name, and the
     // slaves under it are L2, never in the tree.
-    for r in &rescue_rows {
+    for r in &fallback_rows {
         add_if(r.ifname.clone());
     }
     for z in &f.zones {
@@ -86,11 +86,11 @@ pub fn generate(view: &View) -> Result<Value> {
                 },
             }));
         }
-        // The rescue bond: an adjacency interface like a segment, but with NO bfd key at all.
-        // The rescue path exists only when the fabric is already degraded and its active slave
+        // The fallback bond: an adjacency interface like a segment, but with NO bfd key at all.
+        // The fallback path exists only when the fabric is already degraded and its active slave
         // migrates between wires in ~50 ms; a session would only re-establish per migration.
         // OSPF's dead interval is its detector, as it is for the ingress leg.
-        for r in rescue_rows.iter().filter(|r| r.zone == z.name) {
+        for r in fallback_rows.iter().filter(|r| r.zone == z.name) {
             let cost = if view.kind() == MemberKind::Leaf {
                 r.ospf_cost + f.leaf_cost_offset
             } else {
@@ -292,17 +292,17 @@ mod tests {
         assert!(!s.contains("cfab-gw"), "leaf carries an ingress leg: {s}");
     }
 
-    /// The rescue bond is an adjacency interface with a cost and no BFD, sitting between the
+    /// The fallback bond is an adjacency interface with a cost and no BFD, sitting between the
     /// segments and the passive identity. `"bfd": {"enabled": false}` would not do: the key
     /// must be absent, so holo never builds a session for it.
     #[test]
-    fn rescue_interface_carries_a_cost_and_no_bfd_after_the_segments() {
+    fn fallback_interface_carries_a_cost_and_no_bfd_after_the_segments() {
         for (member, cost) in [("pve1-tb", 5000), ("pve3-tb", 35000)] {
             let t = tree(member);
             for (zone, bond) in [
-                ("storage", "cfab-st-rs"),
-                ("cluster", "cfab-cl-rs"),
-                ("mgmt", "cfab-mg-rs"),
+                ("storage", "cfab-st-fb"),
+                ("cluster", "cfab-cl-fb"),
+                ("mgmt", "cfab-mg-fb"),
             ] {
                 let inst = instance(&t, zone);
                 let r = ospf_if(inst, bond);
@@ -325,7 +325,7 @@ mod tests {
                 let id = names.iter().position(|n| n.starts_with("cfab-id")).unwrap();
                 assert!(at < id, "{member} {zone}: {names:?}");
                 for (i, n) in names.iter().enumerate() {
-                    if n.ends_with("-rs") || n.starts_with("cfab-id") || n.starts_with("cfab-gw") {
+                    if n.ends_with("-fb") || n.starts_with("cfab-id") || n.starts_with("cfab-gw") {
                         continue;
                     }
                     assert!(
@@ -336,29 +336,29 @@ mod tests {
             }
             // The bond is in the interface list; its slaves are L2 and never in the tree.
             let ifs = if_names(&t);
-            for bond in ["cfab-st-rs", "cfab-cl-rs", "cfab-mg-rs"] {
+            for bond in ["cfab-st-fb", "cfab-cl-fb", "cfab-mg-fb"] {
                 assert!(ifs.contains(&bond.to_string()), "{member}: {ifs:?}");
             }
             let s = serde_json::to_string(&t).unwrap();
-            for slave in ["cfab-st-rs-st", "cfab-st-rs-cl", "cfab-st-rs-mg"] {
+            for slave in ["cfab-st-fb-st", "cfab-st-fb-cl", "cfab-st-fb-mg"] {
                 assert!(!s.contains(slave), "{member} carries slave {slave}");
             }
         }
     }
 
-    /// The whole engine-tree delta of the rescue segment, stated as a count: three interface
+    /// The whole engine-tree delta of the fallback segment, stated as a count: three interface
     /// entries, and one OSPF interface in each of the three zones.
     #[test]
-    fn rescue_adds_exactly_three_interfaces_and_one_ospf_if_per_zone() {
+    fn fallback_adds_exactly_three_interfaces_and_one_ospf_if_per_zone() {
         for member in ["pve1-tb", "pve2-tb", "pve3-tb"] {
             let t = tree(member);
             let names = if_names(&t);
-            let rescue: Vec<&String> = names.iter().filter(|n| n.ends_with("-rs")).collect();
-            assert_eq!(rescue.len(), 3, "{member}: {rescue:?}");
+            let fallback: Vec<&String> = names.iter().filter(|n| n.ends_with("-fb")).collect();
+            assert_eq!(fallback.len(), 3, "{member}: {fallback:?}");
             for inst in instances(&t) {
                 let n = ospf_ifs(inst)
                     .iter()
-                    .filter(|i| i["name"].as_str().unwrap().ends_with("-rs"))
+                    .filter(|i| i["name"].as_str().unwrap().ends_with("-fb"))
                     .count();
                 assert_eq!(n, 1, "{member} {}", inst["name"]);
             }
