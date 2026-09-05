@@ -113,7 +113,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
-        run: gh workflow run check-releases.yml -R shkolnik/pkg
+        # --ref: without it gh first resolves the default branch over GraphQL,
+        # one more call the token must be allowed to make.
+        run: gh workflow run check-releases.yml -R shkolnik/pkg --ref main
       - name: Publish rolling dev release
         if: steps.meta.outputs.channel == 'dev'
         env:
