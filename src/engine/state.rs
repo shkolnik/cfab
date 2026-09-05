@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn an_established_neighbor_distils_the_four_fields() {
+    fn an_established_neighbor_distills_the_four_fields() {
         let d = document(true, &cfg(), &[bgp_state_tree("established", 12, 34)]);
         assert_eq!(
             d["bgp"],
