@@ -20,11 +20,20 @@ use crate::commands::engine_ctl;
 use crate::derive::{View, segments_of};
 use crate::emit;
 use crate::error::Result;
-use crate::model::MemberKind;
+use crate::model::{Fabric, MemberKind};
+use crate::supervisor::child::State as CompState;
+use crate::supervisor::report::{Components, render_line};
 use crate::sys::{Sys, run_optional};
 
 /// The re-read cadence of `--wait`.
 const POLL_SECS: u64 = 2;
+
+/// The forwarding watchdog ticks every 3 s (spec §5). `status` treats it as not ticking once
+/// the last tick is older than this — comfortably past three missed ticks, so a scheduling
+/// hiccup on a busy single-vCPU host does not raise a false alarm. This is a reason line, never
+/// actuation, so a generous bar is right: a false positive costs an operator a look, a packet
+/// never. Chosen, not derived — the tick cadence is a supervisor constant, not a declaration.
+const WATCHDOG_STALE_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -114,21 +123,26 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
     // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not desired,
     // and there is nothing to wait for.
     if !sys.exists(&f.run_dir) {
+        // No fabric applied: there is nothing to describe and no supervisor to ask, so the
+        // always-printed components line is suppressed here alone.
         return Ok(finish(
             view,
             State::Down,
             "fabric not applied".to_string(),
             &Ctx::default(),
             permissive,
+            None,
+            false,
         ));
     }
 
     let expected = expected_links(view)?;
     let mut t = 0u64;
-    let (mut counts, mut c);
+    let (mut counts, mut c, mut comps);
     loop {
         c = Ctx::default();
-        counts = read(sys, view, &expected, &mut c)?;
+        comps = read_components(sys, f);
+        counts = read(sys, view, &expected, &mut c, comps.as_ref())?;
         // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
         // A degraded or failed member waits the full deadline and then reports what it reached.
         if counts.state() == State::Up || t >= wait_s {
@@ -143,10 +157,55 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
         counts.fields(),
         &c,
         permissive,
+        comps.as_ref(),
+        true,
     ))
 }
 
-fn finish(view: &View, state: State, fields: String, c: &Ctx, permissive: bool) -> StatusReport {
+/// The `components` document over `<run_dir>/cfab.sock` (spec §9). A read, never a write; the
+/// supervisor being absent, slow or unparseable is not a crash — it degrades to `None`, which
+/// the engine row and the components line render as "no supervisor answering".
+fn read_components(sys: &mut dyn Sys, f: &Fabric) -> Option<Components> {
+    let reply = sys
+        .unix_request(&format!("{}/cfab.sock", f.run_dir), "components\n")
+        .ok()?;
+    serde_json::from_str(&reply).ok()
+}
+
+/// The engine's socket is silent: say why, in the one spelling the condition earns. With a
+/// supervisor answering, quote the child it reports; without one, name the socket and the
+/// remedy. The old `cfab-engine.service` spelling is gone — there is no such unit any more.
+fn engine_down_reason(f: &Fabric, comps: Option<&Components>) -> String {
+    match comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) {
+        Some(e) => {
+            let mut s = format!(
+                "engine not running: the supervisor reports it {}, {} restart(s)",
+                e.state.as_str(),
+                e.restarts
+            );
+            if let Some(x) = &e.last_exit {
+                s.push_str(&format!(", last exit {}", x.cause));
+            }
+            s
+        }
+        None => format!(
+            "engine not running: no supervisor answering on {}/cfab.sock — start it \
+             (systemctl start cfab)",
+            f.run_dir
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    view: &View,
+    state: State,
+    fields: String,
+    c: &Ctx,
+    permissive: bool,
+    comps: Option<&Components>,
+    with_components: bool,
+) -> StatusReport {
     let kind_s = match view.kind() {
         MemberKind::Host => "host",
         MemberKind::Leaf => "leaf",
@@ -158,6 +217,21 @@ fn finish(view: &View, state: State, fields: String, c: &Ctx, permissive: bool) 
     );
     for r in once_each(&c.reasons) {
         let _ = writeln!(out, "  {r}");
+    }
+    // The one always-printed line (spec §9): last, so the reasons read as a block above it.
+    if with_components {
+        match comps {
+            Some(cc) => {
+                let _ = writeln!(out, "  {}", render_line(cc));
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  components: no supervisor answering on {}/cfab.sock",
+                    view.fabric.run_dir
+                );
+            }
+        }
     }
     let code = if permissive && matches!(state, State::Up | State::UpDegraded) {
         0
@@ -205,6 +279,7 @@ fn read(
     view: &View,
     expected: &[(u8, String, u8, String)],
     c: &mut Ctx,
+    comps: Option<&Components>,
 ) -> Result<Counts> {
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
@@ -212,17 +287,16 @@ fn read(
     let port_taken = bfd_port(sys, view, c)?;
     let doc = engine_ctl::state(sys, f).ok();
     if doc.is_none() && !port_taken {
-        // Review finding 12 (2026-09-05): "re-run cfab up" is no longer true — `apply`
-        // (Task 5) starts no daemon at all. The honest remedy is the not-yet-built
-        // supervisor's job (spec §9 rewords this row properly in a later task); until then,
-        // say only what is true.
-        c.note("engine not running: cfab-engine.service is not answering");
+        // The engine's socket is silent. The supervisor (spec §9) is the authority on why:
+        // if it answers, quote the child's state; if it does not, the fault is upstream of
+        // the engine and the remedy is to start the service — one spelling each.
+        c.note(engine_down_reason(f, comps));
     }
-    posture(sys, view, doc.as_ref(), c)?;
+    posture(sys, view, doc.as_ref(), comps, c)?;
     return_path_and_ingress(sys, view, doc.as_ref(), c)?;
     mark_drift(sys, view, c)?;
     ceiling_counters(sys, view, c)?;
-    shape_posture(sys, view, c)?;
+    shape_posture(sys, view, comps, c)?;
     link_speeds(sys, view, c)?;
 
     let mut counts = Counts::default();
@@ -337,7 +411,13 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
     Ok(true)
 }
 
-fn posture(sys: &mut dyn Sys, view: &View, doc: Option<&Value>, c: &mut Ctx) -> Result<()> {
+fn posture(
+    sys: &mut dyn Sys,
+    view: &View,
+    doc: Option<&Value>,
+    comps: Option<&Components>,
+    c: &mut Ctx,
+) -> Result<()> {
     let f = view.fabric;
     // The fallback bond is a segment here: it carries L3 and takes the same loose rp_filter.
     // Its slaves never appear — they are L2 only.
@@ -512,11 +592,16 @@ fn posture(sys: &mut dyn Sys, view: &View, doc: Option<&Value>, c: &mut Ctx) -> 
                     ));
                 }
             }
-            if !sys
-                .run(&["systemctl", "is-active", "-q", "cfab-fwd-watchdog.timer"])?
-                .ok()
+            // The watchdog is a task in the supervisor now (spec §5): read its last tick from
+            // the components document instead of probing a systemd timer. No supervisor answering
+            // is already said once on the components line, so this row stays silent then.
+            if let Some(cc) = comps
+                && let Some(ago) = cc.watchdog.last_tick_s_ago
+                && ago > WATCHDOG_STALE_SECS
             {
-                c.note("cfab-fwd-watchdog.timer not active (the actuator is down)");
+                c.note(format!(
+                    "forwarding watchdog not ticking (last tick {ago}s ago) — the actuator is down"
+                ));
             }
         }
         MemberKind::Host => {
@@ -893,15 +978,27 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
 /// The daemon must be alive, and every wire with carrier must carry exactly the tree the shape
 /// derivation gives for the current up-set. A wire without carrier may hold a stale tree
 /// (left alone).
-fn shape_posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+fn shape_posture(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<&Components>,
+    c: &mut Ctx,
+) -> Result<()> {
     if view.kind() != MemberKind::Host {
         return Ok(());
     }
-    if !sys
-        .run(&["systemctl", "is-active", "-q", "cfab-shape.service"])?
-        .ok()
+    // shape-daemon is a supervised child now (spec §9): its liveness is the state the supervisor
+    // reports, not a systemd unit. Anything other than `running` is shaping down; no supervisor
+    // answering is already said once on the components line, so this row stays silent then.
+    if let Some(cc) = comps
+        && let Some(sd) = cc.components.iter().find(|k| k.name == "shape-daemon")
+        && sd.state != CompState::Running
     {
-        c.note("shaping down: cfab-shape.service not active");
+        c.note(format!(
+            "shaping down: shape-daemon is {}, {} restart(s)",
+            sd.state.as_str(),
+            sd.restarts
+        ));
     }
     let wires = view.wires();
     let carrier_up: Vec<bool> = wires
@@ -1209,11 +1306,40 @@ mod tests {
         sys
     }
 
-    /// The healthy leaf, ready to run: every posture file, every route, every session up.
+    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
+    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
+    /// (this testbed is not clustered), and the forwarding watchdog ticking. Uptimes are 3600 s
+    /// so the line renders `1h00m`.
+    fn healthy_components(view: &View) -> String {
+        let shape = if view.kind() == MemberKind::Host {
+            serde_json::json!({"name": "shape-daemon", "state": "running", "pid": 1250,
+                "uptime_s": 3600, "restarts": 0, "last_exit": null})
+        } else {
+            serde_json::json!({"name": "shape-daemon", "state": "stopped", "pid": null,
+                "uptime_s": null, "restarts": 0, "last_exit": null, "why": "host only"})
+        };
+        serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                shape,
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string()
+    }
+
+    /// The healthy leaf, ready to run: every posture file, every route, every session up, and a
+    /// supervisor answering the `components` query.
     fn healthy_leaf(view: &View) -> MockSys {
         let f = view.fabric;
         primary_routes(leaf_env(view), view)
             .socket("/run/cfab/engine.sock", &engine_doc(view, &all_bfd_up(f)))
+            .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
     /// `table inet cfab` as `up` leaves it: the generated file, the `-s` readback it stores and
@@ -1380,8 +1506,15 @@ mod tests {
             "tc class show dev ",
             "ethtool -i ",
         ];
-        (call.starts_with("unix_request ") && call.trim_end().ends_with(" state"))
-            || ALLOWED.iter().any(|p| call.starts_with(p))
+        if let Some(rest) = call.strip_prefix("unix_request ") {
+            // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
+            // `components` / `log` (spec §9). Every other request would be a write.
+            return matches!(
+                rest.split_whitespace().nth(1),
+                Some("state" | "components" | "log")
+            );
+        }
+        ALLOWED.iter().any(|p| call.starts_with(p))
     }
 
     /// One `status` run over one fixture: nothing in `MockSys.files` may change, and every
@@ -1639,6 +1772,7 @@ mod tests {
             }
         }
         sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
+            .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
     #[test]
@@ -1804,7 +1938,10 @@ mod tests {
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert_eq!(
-            report.output, "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n",
+            report.output,
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  components: engine running 1h00m \
+             (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
+             | watchdog ok 2s ago\n",
             "{}",
             report.output
         );
@@ -1896,11 +2033,19 @@ mod tests {
             headline(&report),
             "FAILED (0/2 | 0/18 | 0/6) on pve3-tb (leaf)"
         );
+        // No supervisor answering on cfab.sock (leaf_env registers none): the fault is upstream
+        // of the engine, and the row names the socket and the remedy — never the old unit.
         assert!(
-            report
-                .output
-                .contains("  engine not running: cfab-engine.service is not answering\n"),
+            report.output.contains(
+                "  engine not running: no supervisor answering on /run/cfab/cfab.sock — start it \
+                 (systemctl start cfab)\n"
+            ),
             "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("cfab-engine.service"),
+            "the old spelling must be gone: {}",
             report.output
         );
     }
@@ -2756,5 +2901,105 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    // ---- Task 11: the components block and the reworded rows (spec §9) ------------------
+
+    /// A `components:` line is always printed, and last — after every reason line.
+    #[test]
+    fn the_components_line_is_always_printed_last() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        let last = report.output.lines().last().unwrap();
+        assert_eq!(
+            last,
+            "  components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago"
+        );
+    }
+
+    /// No supervisor answering: stated once on the components line and once in the engine row,
+    /// both naming the run-dir socket, and the old `cfab-engine.service` spelling gone.
+    #[test]
+    fn no_supervisor_is_stated_once_on_the_components_line_and_in_the_engine_row() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The fabric is applied (leaf_env creates the run dir) but no cfab.sock answers, and the
+        // engine's own socket is silent too.
+        let mut sys = leaf_env(&view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  engine not running: no supervisor answering on /run/cfab/cfab.sock — start it \
+                 (systemctl start cfab)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("  components: no supervisor answering on /run/cfab/cfab.sock\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("cfab-engine.service"),
+            "the old spelling must be gone: {}",
+            report.output
+        );
+    }
+
+    /// The watchdog and shaping rows are read from the components document, not a local probe:
+    /// a stale tick is "not ticking", a shape-daemon that is not `running` is "shaping down".
+    #[test]
+    fn the_watchdog_and_shaping_rows_read_the_components_document() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "shape-daemon", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 3, "last_exit": {"cause": "signal SIGKILL", "s_ago": 1}},
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 47, "result": "error", "detail": "no tick"}
+        })
+        .to_string();
+        let mut sys = healthy_host(&f, &view).socket("/run/cfab/cfab.sock", &comps);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        let out = &report.output;
+        assert!(
+            out.contains(
+                "  forwarding watchdog not ticking (last tick 47s ago) — the actuator is down\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  shaping down: shape-daemon is restarting, 3 restart(s)\n"),
+            "{out}"
+        );
+    }
+
+    /// `status` still never writes with the new socket reads: the same snapshot-and-allowlist
+    /// test, whose read-only allowlist now covers `unix_request <run_dir>/cfab.sock components`.
+    /// A healthy supervisor answering cfab.sock is exercised through every fixture in
+    /// `status_never_writes`; this asserts the allowlist accepts the new verb and rejects a
+    /// hypothetical write on the same socket.
+    #[test]
+    fn status_still_never_writes_with_the_new_socket_reads() {
+        assert!(is_read_only("unix_request /run/cfab/cfab.sock components"));
+        assert!(is_read_only(
+            "unix_request /run/cfab/cfab.sock log engine 2"
+        ));
+        assert!(is_read_only("unix_request /run/cfab/engine.sock state"));
+        assert!(!is_read_only("unix_request /run/cfab/cfab.sock reapply"));
+        assert!(!is_read_only("write /run/cfab/cfab.sock"));
     }
 }
