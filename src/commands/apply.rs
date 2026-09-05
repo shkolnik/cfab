@@ -159,13 +159,31 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         // NetworkManager RUNNING" (`systemctl is-active`), which Task 5 had to drop (no
         // systemd probe in apply); "is nmcli INSTALLED" is a different, weaker condition —
         // a host with NM installed but masked would now run a command that fails every
-        // apply. Ask NM itself instead of systemd or the binary's mere presence, and refuse
-        // (not ignore) when a genuinely running NM keeps fighting cfab for the wire's
-        // addresses — that refusal is the whole reason this block exists.
+        // apply. Ask NM itself instead of systemd or the binary's mere presence.
+        //
+        // Round 2 (RULED, 2026-09-05): a refusal here strands an unattended host with NO
+        // supervisor at all — strictly worse than a wire NM keeps fighting us for. ALWAYS
+        // attempt the release when nmcli is installed; the RUNNING probe words the warning
+        // only (not-running vs. running-but-refused), it never gates the attempt, and a
+        // failure is a WARNING, never a refusal.
         if have_tool(sys, "nmcli")? {
             let nm = sys.run(&["nmcli", "-t", "-f", "RUNNING", "general"])?;
-            if nm.stdout.trim() == "running" {
-                run_ok(sys, &["nmcli", "device", "set", dev, "managed", "no"])?;
+            let out = sys.run(&["nmcli", "device", "set", dev, "managed", "no"])?;
+            if !out.ok() {
+                warnings.push(if nm.stdout.trim() == "running" {
+                    format!(
+                        "WARNING: NetworkManager is running and refused to release {dev} \
+                         ({}) — it may keep fighting cfab for this wire's addresses; check \
+                         `nmcli device show {dev}`",
+                        out.stderr.trim()
+                    )
+                } else {
+                    format!(
+                        "WARNING: nmcli is installed but NetworkManager is not running, and \
+                         releasing {dev} still failed ({}) — check `nmcli device show {dev}`",
+                        out.stderr.trim()
+                    )
+                });
             }
         }
         let dhcp = sys.run(&["pgrep", "-af", "dhclient|udhcpc"])?;
@@ -852,11 +870,13 @@ mod tests {
         assert!(!err.contains("absent (no such netdev)"), "{err}");
     }
 
-    /// Review finding 3 (2026-09-05): whether nmcli is INSTALLED and whether NetworkManager is
-    /// RUNNING are different conditions; only the latter is cfab's business, and only a
-    /// genuinely running NM that refuses to release the wire is a refusal.
+    /// Round 2 (RULED, 2026-09-05): a refusal here would strand an unattended host with no
+    /// supervisor at all — strictly worse than a wire NM keeps fighting us for. A running NM
+    /// that refuses to release the wire is a WARNING, never a refusal, and the apply succeeds;
+    /// the release is still ATTEMPTED (the reviewer's real point: the condition is no longer
+    /// silent).
     #[test]
-    fn a_running_networkmanager_that_refuses_to_release_a_wire_refuses_the_apply() {
+    fn a_running_nm_that_refuses_to_release_a_wire_warns_and_the_apply_still_succeeds() {
         let (mut sys, view) = up_sys_and_view();
         sys = sys
             .on_stdout(
@@ -869,22 +889,32 @@ mod tests {
                 1,
                 "Error: Device 'eth0' not managed.",
             );
-        let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
-        assert!(err.contains("nmcli device set eth1 managed no"), "{err}");
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran("nmcli device set eth1 managed no"));
+        assert!(
+            warnings.iter().any(|w| w
+                .contains("NetworkManager is running and refused to release eth1")
+                && w.contains("Error: Device 'eth0' not managed.")),
+            "{warnings:?}"
+        );
     }
 
-    /// nmcli installed but NetworkManager not running (masked, stopped): nothing to release,
-    /// no command even attempted — the old `systemctl is-active` skip, re-expressed without
-    /// systemd.
+    /// nmcli installed but NetworkManager not running (masked, stopped): the release is still
+    /// attempted (round 2 drops the RUNNING probe as a gate on whether to try), it succeeds
+    /// (nmcli manages the release fine with NM down), and no warning is raised.
     #[test]
-    fn an_installed_but_not_running_networkmanager_is_never_asked_to_release_anything() {
+    fn an_installed_but_not_running_networkmanager_release_is_attempted_and_clean() {
         let (mut sys, view) = up_sys_and_view();
         sys = sys.on_stdout(
             &["/usr/bin/env", "sh", "-c", "command -v nmcli"],
             "/usr/bin/nmcli\n",
         );
-        run(&mut sys, &view, &opts()).unwrap();
-        assert!(!sys.ran("nmcli device set"));
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran("nmcli device set eth1 managed no"));
+        assert!(
+            !warnings.iter().any(|w| w.contains("NetworkManager")),
+            "{warnings:?}"
+        );
     }
 
     /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC

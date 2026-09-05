@@ -5,7 +5,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nix::fcntl::{Flock, FlockArg};
 
@@ -24,13 +24,14 @@ pub struct Held {
 /// released, never usefully held); it does not catch the more deliberate `let _ = hold(path)`,
 /// so the field also gets a real `Drop` impl (rather than `#[allow(dead_code)]` on an unused
 /// tuple field) that logs release at debug — a caller who reads the log even once notices a
-/// lock it meant to hold vanishing immediately.
+/// lock it meant to hold vanishing immediately. Review round 2 (2026-09-05): the log names
+/// the path, so `cfab.lock` vs. `engine.lock` releases are distinguishable in the log.
 #[must_use = "the lock is released when the guard is dropped"]
-pub struct LockGuard(#[allow(dead_code)] Flock<File>);
+pub struct LockGuard(#[allow(dead_code)] Flock<File>, PathBuf);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        tracing::debug!("lock released");
+        tracing::debug!(path = %self.1.display(), "lock released");
     }
 }
 
@@ -63,7 +64,7 @@ pub fn hold(path: &Path) -> std::result::Result<LockGuard, Held> {
         .and_then(|()| file.rewind())
         .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()))
         .unwrap_or_else(|e| panic!("cannot write lock file {}: {e}", path.display()));
-    Ok(LockGuard(file))
+    Ok(LockGuard(file, path.to_path_buf()))
 }
 
 /// Best-effort: the previous holder's pid, for the message a refused caller prints. Read
