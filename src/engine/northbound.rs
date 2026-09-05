@@ -12,6 +12,7 @@ use holo_northbound::configuration::{
 use holo_northbound::error::Error as NbError;
 use holo_northbound::{NbDaemonSender, NbProviderReceiver};
 use holo_protocol::InstanceShared;
+use holo_utils::bfd::BfdSocketPolicy;
 use holo_utils::ibus;
 use holo_utils::southbound::FibPolicy;
 use holo_utils::yang::{ContextExt, SchemaNodeExt};
@@ -132,7 +133,11 @@ pub struct Northbound {
 impl Northbound {
     /// Start holo-interface + holo-routing (which spawns the OSPF instances and the BFD
     /// instance itself). Must run inside the tokio runtime: the providers spawn tasks.
-    pub fn start(hostname: &str, fib_policy: FibPolicy) -> Northbound {
+    pub fn start(
+        hostname: &str,
+        fib_policy: FibPolicy,
+        bfd_socket_policy: BfdSocketPolicy,
+    ) -> Northbound {
         let ctx = yang_ctx();
         let running = Arc::new(DataTree::new(ctx));
 
@@ -142,6 +147,7 @@ impl Northbound {
             db: None,
             hostname: Some(hostname.to_string()),
             fib_policy: Arc::new(fib_policy),
+            bfd_socket_policy,
             ..Default::default()
         };
 
