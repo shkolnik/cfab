@@ -115,7 +115,12 @@ jobs:
           GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
         # --ref: without it gh first resolves the default branch over GraphQL,
         # one more call the token must be allowed to make.
-        run: gh workflow run check-releases.yml -R shkolnik/pkg --ref main
+        run: |
+          # Say which account the secret's token is and whether it can see the
+          # repo before dispatching, so a failure names the token, not the job.
+          echo "token account: $(gh api user --jq .login)"
+          echo "token sees: $(gh api repos/shkolnik/pkg --jq .full_name)"
+          gh workflow run check-releases.yml -R shkolnik/pkg --ref main
       - name: Publish rolling dev release
         if: steps.meta.outputs.channel == 'dev'
         env:
