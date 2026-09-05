@@ -6,7 +6,7 @@ use crate::commands::common::{
     conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
 };
 use crate::commands::engine_ctl;
-use crate::derive::View;
+use crate::derive::{Slave, View};
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
@@ -115,18 +115,29 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     // delete them, which is why the second loop exists. The engine is already stopped and its
     // routes swept above, so this order is ownership-proof clarity, nothing more.
     let rescue_rows = view.rescue_rows();
-    for r in &rescue_rows {
-        if link_exists(sys, &r.ifname)? {
-            if !link_kind_is(sys, &r.ifname, " bond ")? {
+    let gw_rows = view.gw_rows();
+    // An ingress leg on gw island `any` is the same bond and is torn down the same way.
+    let bond_legs: Vec<(&str, &[Slave])> = rescue_rows
+        .iter()
+        .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
+        .chain(
+            gw_rows
+                .iter()
+                .filter(|r| r.migrates())
+                .map(|r| (r.ifname.as_str(), r.slaves.as_slice())),
+        )
+        .collect();
+    for (ifname, _) in &bond_legs {
+        if link_exists(sys, ifname)? {
+            if !link_kind_is(sys, ifname, " bond ")? {
                 return Err(Error::fatal(format!(
-                    "REFUSING: {} exists but is not a bond",
-                    r.ifname
+                    "REFUSING: {ifname} exists but is not a bond"
                 )));
             }
-            run_ok(sys, &["ip", "link", "del", &r.ifname])?;
+            run_ok(sys, &["ip", "link", "del", ifname])?;
         }
     }
-    for s in rescue_rows.iter().flat_map(|r| &r.slaves) {
+    for s in bond_legs.iter().flat_map(|(_, slaves)| *slaves) {
         if link_exists(sys, &s.ifname)? {
             if !link_kind_is(sys, &s.ifname, " vlan ")? {
                 return Err(Error::fatal(format!(
@@ -138,7 +149,13 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
     }
     let mut ifnames: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
-    ifnames.extend(view.gw_rows().into_iter().map(|r| r.ifname));
+    // A migrating leg was deleted above as a bond; the rest are plain sub-interfaces.
+    ifnames.extend(
+        gw_rows
+            .iter()
+            .filter(|r| !r.migrates())
+            .map(|r| r.ifname.clone()),
+    );
     for dev in &ifnames {
         if link_exists(sys, dev)? {
             if !link_kind_is(sys, dev, " macvlan ")? && !link_kind_is(sys, dev, " vlan ")? {
@@ -246,6 +263,53 @@ mod tests {
         assert_eq!(
             dels,
             ["ip link del cfab-st-rs", "ip link del cfab-st-rs-st"]
+        );
+    }
+
+    /// The same declaration with the ingress leg on island `any`.
+    fn fabric_with_a_migrating_gw() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("mg:249:", "any:249:");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
+    /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
+    /// ("neither macvlan nor vlan") and strand the leg on a `cfab down`.
+    #[test]
+    fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_rescue_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg@eth0: vlan protocol 802.1Q id 249 \n",
+            );
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            [
+                "ip link del cfab-st-rs",
+                "ip link del cfab-gw249",
+                "ip link del cfab-st-rs-st",
+                "ip link del cfab-gw249-mg",
+            ]
         );
     }
 

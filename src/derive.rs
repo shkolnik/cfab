@@ -20,16 +20,30 @@ pub struct ClassRow {
     pub ospf_cost: u32,
 }
 
-/// An ingress leg this member carries (hosts only: leaves never peer).
+/// An ingress leg this member carries (hosts only: leaves never peer). Shaped exactly like
+/// `RescueRow`: on a physical gw island the leg is a plain sub-interface on `home` and
+/// `slaves` is empty; on island `any` it is a bond over `slaves`, one per wire, and `home`
+/// names the wire the bond takes as `primary` — so the leg survives an island's isolation
+/// with one leg and one BGP session, not two.
 #[derive(Debug, Clone)]
 pub struct GwRow {
     pub ifname: String,
-    pub wire: String,
+    pub home: String,
     pub zone: String,
     pub vid: u16,
+    pub slaves: Vec<Slave>,
 }
 
-/// One slave of a rescue bond: a physical wire, tagged with the rescue segment's vid.
+impl GwRow {
+    /// Does this leg migrate between wires (island `any`)? The one branch every consumer
+    /// keys on, so no consumer re-derives it from the declaration.
+    pub fn migrates(&self) -> bool {
+        !self.slaves.is_empty()
+    }
+}
+
+/// One slave of a bond leg (a rescue segment, or a migrating ingress leg): a physical wire,
+/// tagged with that leg's vid.
 #[derive(Debug, Clone)]
 pub struct Slave {
     pub ifname: String,
@@ -152,6 +166,10 @@ impl<'a> View<'a> {
         }
         for r in self.gw_rows() {
             out.push((r.ifname, transit));
+            // A migrating leg's slaves, like a rescue leg's: L2 only, never transit.
+            for s in r.slaves {
+                out.push((s.ifname, false));
+            }
         }
         for r in self.rescue_rows() {
             out.push((r.ifname, transit));
@@ -244,6 +262,22 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
         .collect()
 }
 
+/// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member
+/// has, in st/cl/mg order, named `<ifname>-<island>`. Shared by the rescue segment and a
+/// migrating ingress leg — one fan-out, so the two legs cannot drift apart.
+fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
+    [Island::St, Island::Cl, Island::Mg]
+        .into_iter()
+        .filter_map(|island| {
+            member.wire(island).map(|w| Slave {
+                ifname: format!("{ifname}-{}", island.as_str()),
+                wire: w.name.clone(),
+                island,
+            })
+        })
+        .collect()
+}
+
 /// The wire carrying this member's cheapest class segment of `zone` — the rescue leg's home,
 /// derived (never declared). Ties keep the first row in CLASS_TABLE order.
 fn home_wire(fabric: &Fabric, member: &Member, zone: &str) -> Option<String> {
@@ -272,16 +306,7 @@ pub fn rescue_rows_of(fabric: &Fabric, member: &Member) -> Vec<RescueRow> {
         .filter(|r| r.role == Role::Rescue)
         .filter_map(|r| {
             let home = home_wire(fabric, member, &r.zone)?;
-            let slaves = [Island::St, Island::Cl, Island::Mg]
-                .into_iter()
-                .filter_map(|island| {
-                    member.wire(island).map(|w| Slave {
-                        ifname: format!("{}-{}", r.ifname, island.as_str()),
-                        wire: w.name.clone(),
-                        island,
-                    })
-                })
-                .collect();
+            let slaves = slaves_of(member, &r.ifname);
             Some(RescueRow {
                 ifname: r.ifname.clone(),
                 zone: r.zone.clone(),
@@ -304,12 +329,30 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
         .iter()
         .filter_map(|z| {
             let gw = z.gw.as_ref()?;
-            let wire = member.wire(gw.island)?;
+            let ifname = format!("cfab-gw{}", z.id);
+            let (home, slaves) = match gw.island {
+                // One island: the leg is that wire's sub-interface, as it has always been.
+                Island::St | Island::Cl | Island::Mg => {
+                    (member.wire(gw.island)?.name.clone(), Vec::new())
+                }
+                // Every island: a bond, homed like a rescue leg on the wire carrying this
+                // zone's cheapest segment. A zone can have an ingress and no segment on this
+                // member, and then there is no cheapest wire — fall back to the first wire in
+                // st/cl/mg order rather than dropping the leg, which would take the outside
+                // away silently. A member with no wires at all has no leg (and no fabric).
+                Island::Any => {
+                    let slaves = slaves_of(member, &ifname);
+                    let home = home_wire(fabric, member, &z.name)
+                        .or_else(|| slaves.first().map(|s| s.wire.clone()))?;
+                    (home, slaves)
+                }
+            };
             Some(GwRow {
-                ifname: format!("cfab-gw{}", z.id),
-                wire: wire.name.clone(),
+                ifname,
+                home,
                 zone: z.name.clone(),
                 vid: gw.vid,
+                slaves,
             })
         })
         .collect()
@@ -356,10 +399,78 @@ mod tests {
         let rows = host.gw_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ifname, "cfab-gw249");
-        assert_eq!(rows[0].wire, "eth0");
+        assert_eq!(rows[0].home, "eth0");
         assert_eq!(rows[0].vid, 249);
+        // An island leg is a plain sub-interface: no bond, no slaves, unchanged by task 9.
+        assert!(rows[0].slaves.is_empty());
+        assert!(!rows[0].migrates());
         let leaf = View::new(&f, "pve3-tb").unwrap();
         assert!(leaf.gw_rows().is_empty());
+    }
+
+    /// The same declaration with the ingress on island `any`.
+    fn fabric_with_a_migrating_gw() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("mg:249:", "any:249:");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Task 9: a gw island of `any` fans the leg out into a bond over every wire, exactly
+    /// like a rescue leg — same slave naming, same home rule (mgmt's cheapest segment is on
+    /// the mg island, so the bond homes on eth0), and still hosts only.
+    #[test]
+    fn a_gw_island_of_any_fans_out_into_a_bond() {
+        let f = fabric_with_a_migrating_gw();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let rows = host.gw_rows();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert!(r.migrates());
+        assert_eq!(r.ifname, "cfab-gw249");
+        assert_eq!(r.home, "eth0");
+        assert_eq!(
+            r.slaves
+                .iter()
+                .map(|s| (s.ifname.as_str(), s.wire.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("cfab-gw249-st", "eth9"),
+                ("cfab-gw249-cl", "eth1"),
+                ("cfab-gw249-mg", "eth0"),
+            ]
+        );
+        assert!(View::new(&f, "pve3-tb").unwrap().gw_rows().is_empty());
+    }
+
+    /// Every derived slave name fits IFNAMSIZ — the guard `Fabric::validate` enforces.
+    #[test]
+    fn a_migrating_gw_slave_name_fits_ifnamsiz() {
+        let f = fabric_with_a_migrating_gw();
+        for m in &f.members {
+            for s in gw_rows_of(&f, m).iter().flat_map(|r| &r.slaves) {
+                assert!(s.ifname.len() <= 15, "{}", s.ifname);
+            }
+        }
+    }
+
+    /// A migrating leg's slaves are cfab's and never forward — the bond holds the L3, as for
+    /// a rescue leg. The bond itself stays `transit` on a forwarding host.
+    #[test]
+    fn owned_forwarding_carries_a_migrating_gw_bond_and_its_slaves() {
+        let f = fabric_with_a_migrating_gw();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let owned = v.owned_forwarding();
+        let get = |n: &str| owned.iter().find(|(i, _)| i == n).map(|(_, t)| *t);
+        assert_eq!(get("cfab-gw249"), Some(true));
+        for s in ["cfab-gw249-st", "cfab-gw249-cl", "cfab-gw249-mg"] {
+            assert_eq!(get(s), Some(false), "{s}");
+            assert!(v.owns_if(s), "{s}");
+        }
+        // ...and a slave is not a wire and not a segment.
+        assert!(!v.wires().iter().any(|w| w.starts_with("cfab-")));
+        assert!(!v.zone_ifs("mgmt").iter().any(|i| i.contains("gw249-")));
     }
 
     #[test]
