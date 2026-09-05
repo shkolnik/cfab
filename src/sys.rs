@@ -457,9 +457,15 @@ mod tests {
         }
         let pid = pid.trim().to_string();
         assert!(!pid.is_empty(), "child never wrote its pid");
-        // Still alive after the launcher returned, and its stderr landed in the log.
+        // Still alive after the launcher returned, and its stderr landed in the log. The child
+        // writes the pid before the stderr line, so the log is polled under the same deadline
+        // rather than read once (a single read raced the child and failed ~1 run in 4).
         assert!(std::path::Path::new(&format!("/proc/{pid}/status")).exists());
-        let logged = std::fs::read_to_string(&log).unwrap();
+        let mut logged = String::new();
+        while !logged.contains("hello-from-stderr") && std::time::Instant::now() < deadline {
+            logged = std::fs::read_to_string(&log).unwrap_or_default();
+            std::thread::yield_now();
+        }
         assert!(logged.contains("hello-from-stderr"), "{logged:?}");
         let killed = std::process::Command::new("sh")
             .args(["-c", "kill \"$1\"", "sh", &pid])
