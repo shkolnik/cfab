@@ -1,5 +1,7 @@
-//! The state socket: `run_dir/engine.sock`, mode 0600. Protocol: the client sends the line
-//! `state\n`; the server answers one JSON object, then closes.
+//! The engine socket: `run_dir/engine.sock`, mode 0600. Protocol: the client sends one
+//! request line; the server answers one JSON object, then closes. Two verbs: `state` (read
+//! the operational document) and `transit-cost leaf|normal` (re-advertise this member's
+//! transit links at the leaf offset, or at the declared cost — spec §12 (b)).
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -10,9 +12,30 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::emit::engine::TransitCost;
 use crate::error::{Error, Result};
 
 const CLIENT_IO: Duration = Duration::from_secs(2);
+
+/// One request line, already parsed. An unknown verb never reaches the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// `state`: the operational document.
+    State,
+    /// `transit-cost leaf|normal`: re-commit with this member's transit links at that cost.
+    TransitCost(TransitCost),
+}
+
+/// `state\n` and `transit-cost leaf\n` are the whole protocol; anything else is `None` and
+/// is answered with an error rather than guessed at.
+pub fn parse_request(line: &str) -> Option<Request> {
+    match line.trim() {
+        "state" => Some(Request::State),
+        "transit-cost leaf" => Some(Request::TransitCost(TransitCost::LeafOffset)),
+        "transit-cost normal" => Some(Request::TransitCost(TransitCost::Declared)),
+        _ => None,
+    }
+}
 
 /// Refuse to start when another engine owns this run_dir. Two independent liveness
 /// signals, either one refuses: something answers `state\n` on the socket, or the pid in
@@ -96,23 +119,27 @@ fn answers(path: &Path) -> bool {
 }
 
 /// Serve one accepted connection: read the request line, reply with `respond`'s JSON.
-/// A client that sends nothing within the timeout is dropped without a reply.
+/// A client that sends nothing within the timeout is dropped without a reply. Reading the
+/// request and answering it are separate so the engine loop can hand `respond` a `&mut`
+/// borrow of the northbound (`transit-cost` re-commits; `state` only reads).
 pub async fn serve_one<F>(stream: UnixStream, respond: F)
 where
-    F: AsyncFnOnce() -> Result<serde_json::Value>,
+    F: AsyncFnOnce(Request) -> Result<serde_json::Value>,
 {
     let (rd, mut wr) = stream.into_split();
     let mut line = String::new();
     let read = tokio::time::timeout(CLIENT_IO, BufReader::new(rd).read_line(&mut line)).await;
     let reply = match read {
-        Ok(Ok(_)) if line.trim() == "state" => match respond().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "state request failed");
-                serde_json::json!({ "error": e.to_string() })
-            }
+        Ok(Ok(_)) => match parse_request(&line) {
+            Some(req) => match respond(req).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%e, ?req, "request failed");
+                    serde_json::json!({ "error": e.to_string() })
+                }
+            },
+            None => serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) }),
         },
-        Ok(Ok(_)) => serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) }),
         Ok(Err(_)) | Err(_) => return,
     };
     let mut text = reply.to_string();
@@ -147,7 +174,7 @@ mod tests {
             // Live: the listener answers, so a second bind must refuse.
             let server = tokio::spawn(async move {
                 let (s, _) = listener.accept().await.unwrap();
-                serve_one(s, async || Ok(serde_json::json!({ "ready": true }))).await;
+                serve_one(s, async |_| Ok(serde_json::json!({ "ready": true }))).await;
             });
             let err = tokio::task::spawn_blocking({
                 let sock = sock.clone();
@@ -202,6 +229,30 @@ mod tests {
         assert!(err.contains("not a cfab engine"), "{err}");
     }
 
+    /// The whole protocol, in one place: two verbs, and everything else refused rather
+    /// than guessed at (a mis-typed verb must not silently read state or re-commit).
+    #[test]
+    fn the_protocol_is_two_verbs_and_nothing_else() {
+        assert_eq!(parse_request("state\n"), Some(Request::State));
+        assert_eq!(
+            parse_request("transit-cost leaf\n"),
+            Some(Request::TransitCost(TransitCost::LeafOffset))
+        );
+        assert_eq!(
+            parse_request("transit-cost normal\n"),
+            Some(Request::TransitCost(TransitCost::Declared))
+        );
+        for bogus in [
+            "",
+            "State",
+            "transit-cost",
+            "transit-cost lea",
+            "transit-cost leaf x",
+        ] {
+            assert_eq!(parse_request(bogus), None, "{bogus:?}");
+        }
+    }
+
     #[test]
     fn serve_one_answers_state_and_rejects_other_requests() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -214,10 +265,13 @@ mod tests {
         rt.block_on(async {
             let listener = bind(&sock, &pid).unwrap();
             let server = tokio::spawn(async move {
-                for _ in 0..2 {
+                for _ in 0..3 {
                     let (s, _) = listener.accept().await.unwrap();
-                    serve_one(s, async || {
-                        Ok(serde_json::json!({ "ready": true, "bfd": [] }))
+                    serve_one(s, async |req| match req {
+                        Request::State => Ok(serde_json::json!({ "ready": true, "bfd": [] })),
+                        Request::TransitCost(t) => {
+                            Ok(serde_json::json!({ "transit_cost": t.word() }))
+                        }
                     })
                     .await;
                 }
@@ -236,6 +290,8 @@ mod tests {
             assert_eq!(ok, "{\"ready\":true,\"bfd\":[]}\n");
             let bad = ask("bogus\n").await.unwrap();
             assert!(bad.contains("unknown request \\\"bogus\\\""), "{bad}");
+            let tc = ask("transit-cost leaf\n").await.unwrap();
+            assert_eq!(tc, "{\"transit_cost\":\"leaf\"}\n");
             server.await.unwrap();
         });
     }

@@ -322,6 +322,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             for u in &report.unrestored {
                 eprintln!("cfab fwd-watchdog: COULD NOT RESTORE: {u}");
             }
+            if let Some(e) = &report.transit_cost_error {
+                eprintln!("cfab fwd-watchdog: COULD NOT RE-ADVERTISE: {e}");
+            }
             if let Some(rule) = &report.resolved {
                 eprintln!("cfab fwd-watchdog: installed foreign-stack accept: {rule}");
             }
