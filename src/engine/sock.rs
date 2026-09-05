@@ -4,12 +4,10 @@
 //! transit links at the leaf offset, or at the declared cost — spec §12 (b)).
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::emit::engine::TransitCost;
@@ -97,11 +95,7 @@ pub fn bind(path: &Path, pid_path: &Path) -> Result<UnixListener> {
         std::fs::remove_file(path)
             .map_err(|e| Error::fatal(format!("cannot remove stale {}: {e}", path.display())))?;
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|e| Error::fatal(format!("cannot bind {}: {e}", path.display())))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::fatal(format!("cannot chmod {}: {e}", path.display())))?;
-    Ok(listener)
+    crate::sock_frame::bind(path)
 }
 
 /// Does a process answer `state\n` on this socket?
@@ -121,35 +115,24 @@ fn answers(path: &Path) -> bool {
 /// Serve one accepted connection: read the request line, reply with `respond`'s JSON.
 /// A client that sends nothing within the timeout is dropped without a reply. Reading the
 /// request and answering it are separate so the engine loop can hand `respond` a `&mut`
-/// borrow of the northbound (`transit-cost` re-commits; `state` only reads).
+/// borrow of the northbound (`transit-cost` re-commits; `state` only reads). Framing itself
+/// (read one line, write one JSON object, close) lives in `sock_frame`, shared with
+/// `cfab.sock`; only the engine's own two-verb vocabulary lives here.
 pub async fn serve_one<F>(stream: UnixStream, respond: F)
 where
     F: AsyncFnOnce(Request) -> Result<serde_json::Value>,
 {
-    let (rd, mut wr) = stream.into_split();
-    let mut line = String::new();
-    let read = tokio::time::timeout(CLIENT_IO, BufReader::new(rd).read_line(&mut line)).await;
-    let reply = match read {
-        Ok(Ok(_)) => match parse_request(&line) {
-            Some(req) => match respond(req).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(%e, ?req, "request failed");
-                    serde_json::json!({ "error": e.to_string() })
-                }
-            },
-            None => serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) }),
-        },
-        Ok(Err(_)) | Err(_) => return,
-    };
-    let mut text = reply.to_string();
-    text.push('\n');
-    let _ = tokio::time::timeout(CLIENT_IO, wr.write_all(text.as_bytes())).await;
-    let _ = wr.shutdown().await;
+    crate::sock_frame::serve_one(stream, async |line: &str| match parse_request(line) {
+        Some(req) => respond(req).await,
+        None => Ok(serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) })),
+    })
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
