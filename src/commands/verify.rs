@@ -168,12 +168,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         let gw_note = if c.degraded.is_empty() {
             String::new()
         } else {
-            format!("; gw unreachable: {}", c.degraded.join(" "))
+            format!("; gw unreachable: {}", once_each(&c.degraded).join(" "))
         };
         let rescue_note = if c.rescue.is_empty() {
             String::new()
         } else {
-            format!("; rescue degraded: {}", c.rescue.join(" "))
+            format!("; rescue degraded: {}", once_each(&c.rescue).join(" "))
         };
         c.say(&format!(
             "verify DEGRADED on {host} ({kind_s}): {}/{} BFD up; every identity reachable, src pinned; posture ok{}{}",
@@ -456,19 +456,26 @@ fn rescue(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 c.say(&format!("  rescue {zone} via {wire}"));
             } else {
                 // Off the home wire is only a fault while the home wire still has carrier:
-                // that is a stuck reselect. A dark home is the bond doing its job.
-                let home_up = sys
-                    .read(&format!("/sys/class/net/{}/carrier", r.home))
-                    .map(|s| s.trim() == "1")
-                    .unwrap_or(false);
-                if home_up {
-                    c.warn(&format!(
-                        "rescue {zone} via {wire} (home {} has carrier but is not active)",
-                        r.home
-                    ));
-                    c.rescue.push(format!("{zone}:rescue-leg"));
-                } else {
-                    c.say(&format!("  rescue {zone} via {wire}"));
+                // that is a stuck reselect. A dark home is the bond doing its job. An
+                // unreadable carrier is neither and is never assumed healthy — the file
+                // returns EINVAL on a down interface, so this is a field state, not a
+                // theoretical one.
+                match sys.read(&format!("/sys/class/net/{}/carrier", r.home)) {
+                    Ok(s) if s.trim() == "1" => {
+                        c.warn(&format!(
+                            "rescue {zone} via {wire} (home {} has carrier but is not active)",
+                            r.home
+                        ));
+                        c.rescue.push(format!("{zone}:rescue-leg"));
+                    }
+                    Ok(_) => c.say(&format!("  rescue {zone} via {wire}")),
+                    Err(_) => {
+                        c.warn(&format!(
+                            "rescue {zone} via {wire} (home {} carrier unreadable)",
+                            r.home
+                        ));
+                        c.rescue.push(format!("{zone}:rescue-leg"));
+                    }
                 }
             }
         }
@@ -524,21 +531,17 @@ fn rescue(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 continue;
             }
             let target = format!("{}.0.{}", z.block(), m.node);
-            let route = sys.run(&["ip", "route", "get", &target])?.stdout;
-            let route_line = route.lines().next().unwrap_or("").trim().to_string();
-            let words: Vec<&str> = route_line.split_whitespace().collect();
-            let dev = words
-                .iter()
-                .position(|w| *w == "dev")
-                .and_then(|i| words.get(i + 1))
-                .copied()
-                .unwrap_or_default();
+            let (dev, route_line) = route_dev(sys, &target)?;
             if dev == r.ifname {
                 c.say(&format!(
                     "  {zone} id .0.{} ({}) via rescue {}",
                     m.node, m.name, r.ifname
                 ));
             } else {
+                // Reachable only when a segment is down: `check()` makes the same comparison
+                // and refuses to converge on it, but skips it entirely while `down` is
+                // non-empty. That is exactly when the rescue path matters most, so the
+                // degraded verdict has to come from here.
                 c.warn(&format!(
                     "{zone} id .0.{} via {dev}, not rescue {}: [{route_line}]",
                     m.node, r.ifname
@@ -820,15 +823,7 @@ fn check(
                         .map(|r| r.ifname)
                 })
                 .unwrap_or_default();
-            let route = sys.run(&["ip", "route", "get", &target])?.stdout;
-            let route_line = route.lines().next().unwrap_or("").trim().to_string();
-            let words: Vec<&str> = route_line.split_whitespace().collect();
-            let dev = words
-                .iter()
-                .position(|w| *w == "dev")
-                .and_then(|i| words.get(i + 1))
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let (dev, route_line) = route_dev(sys, &target)?;
             if !ifs.contains(&dev) {
                 return Ok((
                     1,
@@ -863,6 +858,32 @@ fn check(
     } else {
         Ok((2, String::new(), down))
     }
+}
+
+/// `ip route get <target>` → (the `dev` it leaves by, the whole first line). The line is
+/// carried back with the device because every caller quotes it in the failure it reports.
+fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(String, String)> {
+    let route = sys.run(&["ip", "route", "get", target])?.stdout;
+    let route_line = route.lines().next().unwrap_or("").trim().to_string();
+    let words: Vec<&str> = route_line.split_whitespace().collect();
+    let dev = words
+        .iter()
+        .position(|w| *w == "dev")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    Ok((dev, route_line))
+}
+
+/// The headline notes name each condition once: a zone with two down peers pushes its token
+/// per peer, and this output is machine-read.
+fn once_each(tokens: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    tokens
+        .iter()
+        .filter(|t| seen.insert(t.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// `counter packets N bytes M … comment "<name>"` → N.
@@ -1224,6 +1245,70 @@ mod tests {
         );
     }
 
+    /// The same reselect, but the home wire's carrier cannot be read at all (the file
+    /// returns EINVAL on a down interface). Unreadable is never healthy: its own spelling,
+    /// and DEGRADED.
+    #[test]
+    fn rescue_leg_home_carrier_unreadable_is_degraded() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        // no /sys/class/net/eth9/carrier at all — the read fails
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file(
+                "/sys/class/net/cfab-st-rs/bonding/active_slave",
+                "cfab-st-rs-mg\n",
+            );
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  warn: rescue storage via eth0 (home eth9 carrier unreadable)\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: storage:rescue-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Two peers down in the SAME zone push the same token twice; the headline note names
+    /// each condition once, because it is machine-read.
+    #[test]
+    fn a_zone_with_two_down_peers_names_its_token_once() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        // both peers gone from the storage rescue LAN
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-rs"]["neighbors"] = serde_json::json!([]);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        for m in ["pve1-tb", "pve2-tb"] {
+            assert!(
+                report.output.contains(&format!(
+                    "  warn: rescue storage neighbor {m} is absent (want 2-Way or better)\n"
+                )),
+                "{}",
+                report.output
+            );
+        }
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: storage:rescue-nbr\n"),
+            "{}",
+            report.output
+        );
+    }
+
     /// Every slave dark: one spelling, `no carrier`, and DEGRADED.
     #[test]
     fn rescue_leg_no_carrier_is_degraded() {
@@ -1397,6 +1482,103 @@ mod tests {
         assert!(
             why.contains("storage id .0.2 via cfab-st, not primary cfab-st-rs"),
             "{why}"
+        );
+    }
+
+    /// pve1-tb and pve3-tb sit on the st and mg islands, pve2-tb only on cl: pve2-tb shares
+    /// no segment with pve3-tb in any zone, while pve1-tb shares two per zone (so one of
+    /// them can go dark without the zone losing its only session).
+    fn half_disjoint_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace(
+                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve1-tb 1 host eth9:5000 - eth0:1000",
+                )
+                .replace(
+                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve2-tb 2 host - eth1:1000 -",
+                )
+                .replace(
+                    "pve3-tb 3 leaf eth9:10000 eth1:1000 eth0:1000",
+                    "pve3-tb 3 leaf eth9:10000 - eth0:1000",
+                )
+                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// The `<zone>:rescue-path` branch through the only path that reaches it: a down segment
+    /// makes `check()` skip its primary comparison, so the rescue clause is the only thing
+    /// left watching the island-disjoint peer — and it is exactly then that the rescue
+    /// segment is load-bearing.
+    #[test]
+    fn an_island_disjoint_peer_off_the_bond_is_degraded_while_a_segment_is_down() {
+        let f = half_disjoint_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        assert!(
+            segments_of(&f, view.member)
+                .intersection(&segments_of(&f, f.member("pve2-tb").unwrap()))
+                .next()
+                .is_none(),
+            "pve2-tb must be island-disjoint from pve3-tb in every zone"
+        );
+        let sys = leaf_env(&view);
+        // pve1-tb shares two segments per zone; storage seg 1 is dark, the rest up.
+        let bfd: Vec<(String, &str)> = [
+            ("10.99.1.1", "down"),
+            ("10.99.3.1", "up"),
+            ("10.199.2.1", "up"),
+            ("10.199.3.1", "up"),
+            ("10.249.1.1", "up"),
+            ("10.249.3.1", "up"),
+        ]
+        .iter()
+        .map(|(a, s)| (a.to_string(), *s))
+        .collect();
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        for (target, dev) in [
+            // the peer we share segments with
+            ("10.99.0.1", "cfab-st"),
+            ("10.199.0.1", "cfab-cl-bk"),
+            ("10.249.0.1", "cfab-mg"),
+            // the island-disjoint peer: cluster and mgmt over the bond, storage NOT
+            ("10.99.0.2", "cfab-st-b2"),
+            ("10.199.0.2", "cfab-cl-rs"),
+            ("10.249.0.2", "cfab-mg-rs"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.3 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let report = run(&mut sys, &view, 60).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: storage id .0.2 via cfab-st-b2, not rescue cfab-st-rs: \
+                 [10.99.0.2 dev cfab-st-b2 src 10.99.0.3 uid 0]\n"
+            ),
+            "{}",
+            report.output
+        );
+        // the other direction, over the same live run
+        assert!(
+            report
+                .output
+                .contains("  cluster id .0.2 (pve2-tb) via rescue cfab-cl-rs\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: storage:rescue-path\n"),
+            "{}",
+            report.output
         );
     }
 
