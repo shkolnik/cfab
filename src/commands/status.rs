@@ -948,6 +948,14 @@ fn shape_posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
 
 fn link_speeds(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     for wire in view.wires() {
+        // Task 5b (RULED, James 2026-09-05): an absent wire gets its own spelling, distinct
+        // from a present-but-carrierless one — an operator must tell "unplugged" from "gone".
+        if !sys.exists(&format!("/sys/class/net/{wire}")) {
+            c.note(format!(
+                "wire {wire} absent (no such netdev) — its segments are not configured"
+            ));
+            continue;
+        }
         let decl = view.link_speed(&wire)?.to_string();
         let obs = sys
             .read(&format!("/sys/class/net/{wire}/speed"))
@@ -1139,6 +1147,9 @@ mod tests {
                     "0\n",
                 );
         }
+        for w in view.wires() {
+            sys = sys.file(&format!("/sys/class/net/{w}"), "");
+        }
         sys = mark_env(fallback_sysfs(sys, view, "0\n"), view);
         sys
             .on_stdout(&["ip", "rule", "show", "pref", "1000"],
@@ -1304,6 +1315,7 @@ mod tests {
         }
         for w in view.wires() {
             sys = sys
+                .file(&format!("/sys/class/net/{w}"), "")
                 .file(&format!("/sys/class/net/{w}/carrier"), "1\n")
                 .file(
                     &format!("/sys/class/net/{w}/speed"),
@@ -2311,6 +2323,72 @@ mod tests {
                 .output
                 .contains("  rp_filter cfab-mg-fb=1 (want 2 = loose)\n"),
             "{}",
+            report.output
+        );
+    }
+
+    /// Task 5b (RULED, James 2026-09-05): a declared wire with no netdev gets its own reason
+    /// line — distinct from the existing "no carrier" wording — and grades UP-DEGRADED by
+    /// adjacency exactly as a carrier-less wire does, never a refusal.
+    #[test]
+    fn status_names_an_absent_wire_in_its_own_words() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // eth9 carries storage seg1 (primary), cluster seg2 (backup) and mgmt seg3 (backup):
+        // an absent eth9 kills adjacency on exactly those three (zone, seg) pairs, for both
+        // peers.
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    let dark = (z.name == "storage" && seg == 1)
+                        || (z.name == "cluster" && seg == 2)
+                        || (z.name == "mgmt" && seg == 3);
+                    bfd.push((
+                        format!("{}.{seg}.{p}", z.block()),
+                        if dark { "down" } else { "up" },
+                    ));
+                }
+            }
+        }
+        let mut sys = host_env(&view);
+        sys.files.remove("/sys/class/net/eth9");
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                let prim = view
+                    .class_rows()
+                    .into_iter()
+                    .filter(|r| r.zone == z.name)
+                    .min_by_key(|r| r.ospf_cost)
+                    .unwrap()
+                    .ifname;
+                sys = sys.on_stdout(
+                    &["ip", "route", "get", &format!("{}.0.{p}", z.block())],
+                    &format!(
+                        "{}.0.{p} dev {prim} src {}.0.1 uid 0\n",
+                        z.block(),
+                        z.block()
+                    ),
+                );
+            }
+        }
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  wire eth9 absent (no such netdev) — its segments are not configured\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("no carrier"),
+            "not the carrier row: {}",
+            report.output
+        );
+        assert_eq!(
+            report.code, 1,
+            "UP-DEGRADED: graded by adjacency, as today: {}",
             report.output
         );
     }

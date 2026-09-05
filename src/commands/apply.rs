@@ -23,18 +23,57 @@ pub struct ApplyOpts {
     pub pmxcfs_root: String,
 }
 
-/// The set of declared wires with no netdev: reserved for Task 5b (James's ruling,
-/// 2026-09-05), which turns that condition from a refusal into a warning. Always empty
-/// today — `own_wires` still refuses on an absent wire, unchanged from before this refactor.
+/// The set of declared wires with no netdev (James's ruling, 2026-09-05): the rest of the
+/// apply consults this set and touches none of them — no sub-if, no bond slave, no
+/// per-interface sysctl. `own_wires` is the one place that decides membership.
 pub type AbsentWires = BTreeSet<String>;
 
+/// The exact wording for an absent wire (spec §6/§9 string table): the operator must be able
+/// to tell it apart from a present-but-carrierless wire, one spelling per condition.
+fn absent_wire_warning(dev: &str) -> String {
+    format!(
+        "wire {dev} absent (no such netdev) — its segments are not configured; the fabric is \
+         up on the rest"
+    )
+}
+
 /// Bring up every declared wire, releasing it from a manager it does not belong to. One
-/// presence check per wire: `ip link set <dev> up` fails when the netdev does not exist.
+/// presence check per wire: `ip link set <dev> up` fails when the netdev does not exist —
+/// RULED (James, 2026-09-05) to be a warning, never a refusal, because under a supervisor
+/// the old refusal would leave an unattended host with no supervisor at all.
 fn own_wires(sys: &mut dyn Sys, view: &View) -> Result<AbsentWires> {
+    let mut absent = AbsentWires::new();
     for dev in &view.wires() {
-        run_ok(sys, &["ip", "link", "set", dev, "up"])?;
+        if run_ok(sys, &["ip", "link", "set", dev, "up"]).is_err() {
+            absent.insert(dev.clone());
+        }
     }
-    Ok(AbsentWires::new())
+    Ok(absent)
+}
+
+/// A bond leg's slaves, minus any on an absent wire; if the leg's declared `home` wire is one
+/// of them, the first surviving slave takes over as home (any survivor is a legal `primary`;
+/// `mk_bond_leg` only needs ONE that matches). `None` when every wire under the leg is absent
+/// — nothing to build, and the caller skips it with a warning of its own.
+fn present_slaves<'a>(
+    slaves: &'a [Slave],
+    home: &'a str,
+    absent: &AbsentWires,
+) -> Option<(Vec<Slave>, String)> {
+    let kept: Vec<Slave> = slaves
+        .iter()
+        .filter(|s| !absent.contains(&s.wire))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let new_home = if absent.contains(home) {
+        kept[0].wire.clone()
+    } else {
+        home.to_string()
+    };
+    Some((kept, new_home))
 }
 
 pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<String>> {
@@ -97,9 +136,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // ---- own the fabric NICs ---------------------------------------------------
     // Release the wires from their manager — leftover DHCP state on a fabric NIC is a fight
     // for its addresses. The admin NIC's UNTAGGED L3 is the admin path: only tagged sub-ifs
-    // are added on it, never a flush.
-    let _absent = own_wires(sys, view)?;
-    for dev in &wires {
+    // are added on it, never a flush. An absent wire (§6, RULED) is warned about, not
+    // refused: `own_wires` decides membership once, here, and nothing below re-derives it.
+    let absent = own_wires(sys, view)?;
+    let mut warnings: Vec<String> = absent.iter().map(|dev| absent_wire_warning(dev)).collect();
+    for dev in wires.iter().filter(|d| !absent.contains(d.as_str())) {
         if kind != MemberKind::Host {
             continue; // a leaf never owns a wire's L3 (DSM does)
         }
@@ -126,8 +167,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     }
 
     // ---- NIC safe mode ---------------------------------------------------------
-    let mut warnings = Vec::new();
-    for (_, dev) in f.usb_nics.iter().filter(|(m, _)| m == host) {
+    for (_, dev) in f
+        .usb_nics
+        .iter()
+        .filter(|(m, dev)| m == host && !absent.contains(dev.as_str()))
+    {
         let out = run_ok(sys, &["ethtool", "-i", dev])?;
         let drv = out
             .stdout
@@ -192,7 +236,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             ],
         )?;
     }
-    for r in &class_rows {
+    for r in class_rows.iter().filter(|r| !absent.contains(&r.wire)) {
         let z = f.zone(&r.zone)?;
         mk_vlan(
             sys,
@@ -222,19 +266,22 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         ];
         let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
         if r.migrates() {
+            let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
+                continue; // every wire under this leg is absent; already warned above
+            };
             mk_bond_leg(
                 sys,
                 &BondLeg {
                     ifname: &r.ifname,
                     vid: r.vid,
-                    home: &r.home,
-                    slaves: &r.slaves,
+                    home: &home,
+                    slaves: &slaves,
                     cidr: &cidr,
                     role: Role::Backup,
                 },
                 &qos_map,
             )?;
-        } else {
+        } else if !absent.contains(&r.home) {
             mk_vlan(sys, &r.ifname, &r.home, r.vid, Some(&cidr), true, &qos_map)?;
             class_sysctls(sys, &r.ifname, Role::Backup)?;
         }
@@ -245,13 +292,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // shaper, the qdisc sweep, status's link-speed checks) ever sees it.
     for r in &view.fallback_rows() {
         let z = f.zone(&r.zone)?;
+        let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
+            continue; // every wire under this fallback leg is absent; already warned above
+        };
         mk_bond_leg(
             sys,
             &BondLeg {
                 ifname: &r.ifname,
                 vid: r.vid,
-                home: &r.home,
-                slaves: &r.slaves,
+                home: &home,
+                slaves: &slaves,
                 cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
                 role: Role::Fallback,
             },
@@ -296,7 +346,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
 
     // ---- qos (host only: a leaf shapes nothing; its wires' qdiscs belong to its OS) ----------
     if kind == MemberKind::Host {
-        for dev in &wires {
+        for dev in wires.iter().filter(|d| !absent.contains(d.as_str())) {
             run_ok(
                 sys,
                 &["tc", "qdisc", "replace", "dev", dev, "root", "fq_codel"],
@@ -311,7 +361,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         warnings.push(format!(
             "apply OK on {host} (node {n}, host); forward={} {} wires",
             u8::from(f.host_forward),
-            wires.len()
+            wires.len() - absent.len()
         ));
     } else {
         warnings.push(format!(
@@ -696,6 +746,40 @@ mod tests {
             assert!(!c.contains("systemctl"), "{c}");
             assert!(!c.starts_with("spawn_detached"), "{c}");
         }
+    }
+
+    /// Task 5b (RULED, James 2026-09-05): the netdev does not exist. Today this refuses the
+    /// whole apply; it must warn instead, skip that wire entirely, and say WHICH condition it
+    /// hit.
+    #[test]
+    fn an_absent_wire_warns_and_the_apply_continues() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys.on_fail(
+            &["ip", "link", "set", "eth9"],
+            1,
+            "Cannot find device \"eth9\"",
+        );
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "wire eth9 absent (no such netdev) — its segments are not configured; the \
+                    fabric is up on the rest"),
+            "{warnings:?}"
+        );
+        // Nothing else may touch it: no sub-if, no bond slave, no sysctl.
+        for c in sys
+            .calls
+            .iter()
+            .skip_while(|c| !c.contains("ip link set eth9"))
+            .skip(1)
+        {
+            assert!(
+                !c.contains("eth9"),
+                "the apply kept using an absent wire: {c}"
+            );
+        }
+        // And the other wires were still configured.
+        assert!(sys.ran("ip link add link eth0"));
     }
 
     /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC
