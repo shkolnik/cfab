@@ -173,11 +173,9 @@ where the shape derivation finds it again should the local (tmpfs) cap file be
 lost; a publication failure is a warning, never a measurement failure. Refuses
 to run while the fabric's shaper holds
 .IR DEV 's
-egress (stop
-.B cfab\-shape.service
-first, re-apply with
-.B cfab up
-after).
+egress qdisc \(em the shape-daemon child of
+.B cfab run
+holds it while the fabric is up, and the measurement needs the qdisc free.
 .TP
 .B policy\-teeth
 Prove the forward policy in throwaway network namespaces \(em every zone pair
@@ -186,16 +184,16 @@ bites, by regressing the policy in memory and requiring the matrix to go red.
 Cleans up its namespaces even on failure.
 .TP
 .B shape\-daemon
-Membership-reactive shaping loop; started by
-.B up
-as
-.BR cfab\-shape.service .
-Not intended for interactive use.
+Membership-reactive shaping loop; a supervised child of
+.B cfab run
+on host members. Not intended for interactive use.
 .TP
 .B fwd\-watchdog
-One fail-closed forwarding-posture check; run by the
-.B cfab\-fwd\-watchdog
-timer. If the forward policy is not loaded with a drop default, it disables
+One fail-closed forwarding-posture check. Inside
+.B cfab run
+this runs as an in-process task on a few-second tick (it replaces a systemd
+timer); the subcommand runs a single check by hand.
+If the forward policy is not loaded with a drop default, it disables
 forwarding on every cfab interface and exits nonzero. A cfab interface whose
 forwarding flag drifted from the declared value (a foreign stack writing
 .I ip_forward=1
@@ -228,10 +226,8 @@ and release the lock. Ack directories older than the previous generation are
 then removed (best effort).
 .TP
 .B conf\-sync
-Cluster config-sync daemon; started by
-.B up
-as
-.B cfab\-conf\-sync.service
+Cluster config-sync daemon; a supervised child of
+.B cfab run
 on every clustered member (publisher included \(em it is not special). Not
 intended for interactive use. Every second it checks quorum (non-quorate:
 do nothing, reads may be stale) and the published generation. On a new
@@ -241,9 +237,9 @@ retried), caches the current
 .I /etc/cfab/fabric.conf
 to
 .IR fabric.conf.prev ,
-installs the published text, and re-execs its own binary's
-.B up
-and
+installs the published text, asks the supervisor to re-apply it over
+.BR cfab.sock ,
+and runs
 .B status
 (exit 0 or 1 \(em UP or UP\-DEGRADED \(em counts as carrying traffic). It then
 writes its ack file and
@@ -253,8 +249,7 @@ member. No peer ack, a
 .B status
 of FAILED or DOWN, or a failed ack write (the severed\-node
 signal: a member that cannot write acks cannot see them either) \(em all
-REVERT to the previous conf and re-run
-.BR up .
+REVERT to the previous conf and re-apply it.
 A byte-identical publish acks and commits without applying. A single-member
 cluster skips the witness wait.
 .IP
