@@ -149,9 +149,9 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     );
     for dev in &ifnames {
         if link_exists(sys, dev)? {
-            if !link_kind_is(sys, dev, " macvlan ")? && !link_kind_is(sys, dev, " vlan ")? {
+            if !link_kind_is(sys, dev, " vlan ")? {
                 return Err(Error::fatal(format!(
-                    "REFUSING: {dev} exists but is neither macvlan nor vlan"
+                    "REFUSING: {dev} exists but is not a vlan"
                 )));
             }
             run_ok(sys, &["ip", "link", "del", dev])?;
@@ -268,7 +268,7 @@ mod tests {
 
     /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
     /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
-    /// ("neither macvlan nor vlan") and strand the leg on a `cfab down`.
+    /// ("not a vlan") and strand the leg on a `cfab down`.
     #[test]
     fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
         let f = fabric_with_a_migrating_gw();

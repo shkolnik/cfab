@@ -381,7 +381,7 @@ impl Derivation {
         cmds
     }
 
-    /// The "classid effective-rate" lines verify diffs (--expect).
+    /// The "classid effective-rate" lines status diffs (--expect).
     pub fn render_expect(&self) -> String {
         self.bands
             .iter()

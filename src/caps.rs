@@ -1,4 +1,4 @@
-//! The measured-cap chain, shared by every shape-derivation reader (gen shape, verify,
+//! The measured-cap chain, shared by every shape-derivation reader (gen shape, status,
 //! shape-daemon): local cap file → cluster-published cap (pmxcfs, written back locally) →
 //! `None` (the declared rate). The local file stays the single source at derivation time: a
 //! cluster cap is cached back to it on first use, so the host is self-sufficient afterward

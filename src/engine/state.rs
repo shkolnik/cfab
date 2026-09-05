@@ -1,4 +1,4 @@
-//! The engine's state document (spec §6): the one JSON object `verify` and `up` read over
+//! The engine's state document (spec §6): the one JSON object `status` and `up` read over
 //! `engine.sock`, distilled from the providers' merged operational tree plus this member's
 //! own configuration tree (cost/passive are config facts holo does not echo into state).
 

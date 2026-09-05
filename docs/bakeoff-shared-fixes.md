@@ -5,6 +5,12 @@ Fixes made on `embedded` that `main` (FRR) also needs; James applies them after 
 The fallback segment was built under the name `rescue` and renamed at merge; its commits on the
 branch are still titled `rescue segment (task N)`, everything below uses the shipped name.
 
+`cfab verify` is now `cfab status` (`src/commands/verify.rs` → `status.rs`), grading UP /
+UP-DEGRADED / FAILED / DOWN with exit codes 0 / 1 / 2 / 3 instead of OK / degraded / failed with
+0 / 2 / 1. The rows below are the evidence of what each commit did at the time, so they keep the
+vocabulary they were written in; read `verify` as `status` throughout, and note that a fix
+described as "degraded" is "UP-DEGRADED" today and one described as exit 2 is exit 1.
+
 | commit | what | main needs |
 |---|---|---|
 | (none yet) | `.github/workflows/release.yml` still builds `--target x86_64-unknown-linux-musl` with no holo clone/apt/`holo-check` step; breaks if `embedded` is merged or tagged | rework release.yml for whichever engine wins (musl static size is a post-decision measurement, spec §11) |
