@@ -580,13 +580,15 @@ fn fallback(
                 ));
             }
             (Ok(mii), Ok(active)) if mii.trim() != "up" => {
-                // A bond the watchdog had to take down because it could not evict an intruder
-                // reads exactly like a dark bond, and "no carrier" would send an operator to
-                // the wrong end of the cable. The active slave still names the intruder.
+                // A dark bond whose active slave is a stranger is not the same fault as a dark
+                // bond, and "no carrier" would send an operator to the wrong end of the cable.
+                // The line says what was READ, not what the watchdog did with it: `status`
+                // cannot know whether an eviction was attempted (on a leaf the watchdog is not
+                // even scheduled), and a confident wrong diagnosis is worse than a plain one.
                 let active = active.trim().to_string();
                 if !active.is_empty() && !r.slaves.iter().any(|s| s.ifname == active) {
                     c.note(format!(
-                        "fallback {zone} down: foreign slave {active} could not be released"
+                        "fallback {zone} down with foreign slave {active} active"
                     ));
                 } else {
                     c.note(format!("fallback {zone} no carrier"));
@@ -1393,6 +1395,17 @@ mod tests {
             0,
         );
         assert_never_writes(
+            "rows 5/6 actuated: the fabric legs are down and the rules are still missing",
+            &mut leaf_env(&leaf)
+                .on_stdout(&["ip", "rule", "show", "pref", "1001"], "")
+                .on_stdout(&["ip", "rule", "show", "pref", "2002"], "")
+                .file("/sys/class/net/eth9/carrier", "0\n")
+                .file("/sys/class/net/eth1/carrier", "0\n")
+                .file("/sys/class/net/eth0/carrier", "0\n"),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
             "stuck reselect",
             &mut healthy_leaf(&leaf)
                 .file(
@@ -1932,9 +1945,10 @@ mod tests {
         );
     }
 
-    /// Row 19's actuated end: the watchdog could not evict an intruder from a bond cfab owns,
-    /// so it downed the bond. That reads exactly like a dark bond, and "no carrier" would send
-    /// an operator to the wrong end of the cable — the active slave still names the intruder.
+    /// Row 19's actuated end: a bond cfab owns is down with a stranger still enslaved in it.
+    /// That reads exactly like a dark bond, and "no carrier" would send an operator to the
+    /// wrong end of the cable. The line reports what was READ — `status` cannot know whether
+    /// the watchdog ever tried to evict the intruder, and on a leaf it is not even scheduled.
     #[test]
     fn a_bond_downed_over_a_foreign_slave_says_so_not_no_carrier() {
         let f = fabric();
@@ -1947,9 +1961,9 @@ mod tests {
             );
         let report = run(&mut sys, &view, 0, false).unwrap();
         assert!(
-            report.output.contains(
-                "  fallback storage down: foreign slave someone-elses0 could not be released\n"
-            ),
+            report
+                .output
+                .contains("  fallback storage down with foreign slave someone-elses0 active\n"),
             "{}",
             report.output
         );
