@@ -310,6 +310,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::FwdWatchdog => {
             let mut sys = RealSys;
             let report = commands::fwd_watchdog::run(&mut sys, &view)?;
+            for r in &report.restored {
+                eprintln!("cfab fwd-watchdog: restored: {r}");
+            }
+            for d in &report.downed {
+                eprintln!("cfab fwd-watchdog: ACTUATED: {d}");
+            }
             if let Some(rule) = &report.resolved {
                 eprintln!("cfab fwd-watchdog: installed foreign-stack accept: {rule}");
             }
@@ -321,6 +327,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                     eprintln!("cfab fwd-watchdog: FAIL-CLOSED: {reason}");
                     Ok(ExitCode::FAILURE)
                 }
+                None if !report.downed.is_empty() => Ok(ExitCode::FAILURE),
                 None if !report.blocked.is_empty() => Ok(ExitCode::FAILURE),
                 None => Ok(ExitCode::SUCCESS),
             }

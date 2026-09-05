@@ -3,9 +3,9 @@
 //! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → routing
 //! engine (restart + readback) → fail-closed watchdog.
 
+use crate::commands::common;
 use crate::commands::common::{
-    conf_interfaces, ensure_foreign_transit_accept, ensure_rule, link_exists, link_kind_is,
-    proc_sysctl,
+    conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::commands::engine_ctl;
 use crate::derive::{GwRow, Slave, View};
@@ -262,37 +262,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
 
     // ---- return path (ZONE_TABLE gw): identity-sourced traffic never leaves untagged ---------
-    for z in &f.zones {
-        let blk = format!("{}.0.0/16", z.block());
-        let id = z.id.to_string();
-        ensure_rule(
-            sys,
-            "2000",
-            &format!("from {blk} to {blk} lookup main suppress_prefixlength 0"),
-            &[
-                "from",
-                &blk,
-                "to",
-                &blk,
-                "lookup",
-                "main",
-                "suppress_prefixlength",
-                "0",
-            ],
-        )?;
-        // The substring "lookup <id>" is unique within this pref's rules.
-        ensure_rule(
-            sys,
-            "2001",
-            &format!("from {blk} lookup {id}"),
-            &["from", &blk, "lookup", &id],
-        )?;
-        ensure_rule(
-            sys,
-            "2002",
-            &format!("from {blk} unreachable"),
-            &["from", &blk, "unreachable"],
-        )?;
+    for r in common::return_path_rules(view) {
+        common::ensure_fabric_rule(sys, &r)?;
     }
 
     // ---- forward policy + per-interface forwarding ------------------------------
@@ -796,20 +767,8 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
 /// interface bound for a fabric block is refused — no netfilter needed (DSM kernels may lack
 /// nf_tables).
 fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
-    for z in &view.fabric.zones {
-        let blk = format!("{}.0.0/16", z.block());
-        ensure_rule(
-            sys,
-            "1000",
-            &format!("to {blk} iif lo lookup main"),
-            &["to", &blk, "iif", "lo", "lookup", "main"],
-        )?;
-        ensure_rule(
-            sys,
-            "1001",
-            &format!("to {blk} unreachable"),
-            &["to", &blk, "unreachable"],
-        )?;
+    for r in common::leak_guard_rules(view) {
+        common::ensure_fabric_rule(sys, &r)?;
     }
     Ok(())
 }
