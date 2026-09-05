@@ -18,7 +18,7 @@ const CEILING_RXMT_SECS: u64 = 5;
 
 /// Measured worst legitimate egress on a fallback bond: 1 pkt/s steady, up to ~20 pkt/s for one
 /// second during a convergence burst (three-member container fixture, 2026-09-05,
-/// `docs/research/2026-09-05-fallback-storm-ceiling.md` §3). A derived rate below this would
+/// research repo, fallback-storm-ceiling study §3). A derived rate below this would
 /// police a healthy fabric, so it is the floor — with the same headroom applied to it.
 const CEILING_FLOOR_PPS: u64 = 20;
 
@@ -228,7 +228,7 @@ mod tests {
     /// the LSDB is `members + 4` and the peer count on the fallback LAN is `members - 1`.
     ///
     /// The two margins this has to keep, as numbers (fixture measurements,
-    /// `docs/research/2026-09-05-fallback-storm-ceiling.md` §3 and §5):
+    /// research repo, fallback-storm-ceiling study §3 and §5):
     ///   * above the legitimate worst case — 1 pkt/s steady, ~20 pkt/s for one convergence
     ///     second: 80x steady and 4x the burst at 3 members, and only wider above that;
     ///   * below the pathology — the measured worst-case storm egressed 149 000 pkt/s per
