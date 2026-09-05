@@ -45,13 +45,12 @@ pub fn log_path(f: &Fabric) -> String {
     format!("{}/{LOG_NAME}", f.run_dir)
 }
 
-/// Stop a systemd-managed engine (`stop` sends the signal itself; no pid file is ever
-/// consulted — that mechanism is gone, replaced by the `engine.lock` flock, spec §14) and
-/// sweep every kernel route carrying the engine's private protocol ids in every table (a
-/// crash leaves them behind; the engine's own shutdown withdraws them). Idempotent. Stopping
-/// a detached (non-systemd) engine is not this function's job in this gate — that lands with
-/// the supervisor, which holds the child's real pid from having spawned it, needing no
-/// `/proc` cmdline forensics on a recycled pid at all.
+/// Stop a systemd-managed engine (`systemctl stop` sends the signal itself) and sweep every
+/// kernel route carrying the engine's private protocol ids in every table (a crash leaves
+/// them behind; the engine's own shutdown withdraws them). Idempotent. Stopping a detached
+/// (non-systemd) engine has no path here: that lands with the supervisor, which holds the
+/// child's real pid from having spawned it. `_f` is unused today (the pid path it drove is
+/// gone) and kept for the supervisor to pass through unchanged.
 pub fn stop_and_sweep(sys: &mut dyn Sys, _f: &Fabric) -> Result<()> {
     if sys.exists("/run/systemd/system") {
         run_ignore(sys, &["systemctl", "stop", &format!("{UNIT}.service")])?;

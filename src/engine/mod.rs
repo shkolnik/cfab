@@ -195,8 +195,7 @@ async fn set_transit_cost(
 
 /// Remove the socket file. Safe unconditionally: the caller still holds the `engine.lock`
 /// flock at this point (it is dropped only after `run` returns), so no other engine can have
-/// taken over this run_dir out from under us — unlike the pid file this replaces, there is no
-/// "does this name us" check to get wrong.
+/// taken over this run_dir out from under us.
 fn cleanup(sock_path: &std::path::Path) {
     let _ = std::fs::remove_file(sock_path);
 }

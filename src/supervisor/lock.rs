@@ -1,7 +1,5 @@
 //! `flock`-based single instance (spec §14): a held lock is released by the kernel on ANY
-//! death — including `SIGKILL` and OOM — which makes the stale-state class that
-//! `engine_ctl::stop_and_sweep`'s `/proc` cmdline forensics existed to work around
-//! unrepresentable. Pid files are gone; `<run_dir>/cfab.lock` (the supervisor) and
+//! death — including `SIGKILL` and OOM. `<run_dir>/cfab.lock` (the supervisor) and
 //! `<run_dir>/engine.lock` (the engine) are both held through this one function, for the
 //! process's whole lifetime.
 
@@ -21,8 +19,20 @@ pub struct Held {
 
 /// The lock, held for as long as this guard lives: dropping it releases the flock (also done
 /// by the kernel on `SIGKILL`/OOM, which is the whole point). Carries the open, locked file so
-/// the fd — and therefore the lock — survives for the guard's lifetime.
+/// the fd — and therefore the lock — survives for the guard's lifetime. Review finding 9/10
+/// (2026-09-05): `#[must_use]` catches `hold(path);` as a bare statement (the lock instantly
+/// released, never usefully held); it does not catch the more deliberate `let _ = hold(path)`,
+/// so the field also gets a real `Drop` impl (rather than `#[allow(dead_code)]` on an unused
+/// tuple field) that logs release at debug — a caller who reads the log even once notices a
+/// lock it meant to hold vanishing immediately.
+#[must_use = "the lock is released when the guard is dropped"]
 pub struct LockGuard(#[allow(dead_code)] Flock<File>);
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        tracing::debug!("lock released");
+    }
+}
 
 /// Take an exclusive, non-blocking `flock` on `path` (creating it if it does not exist yet)
 /// and, once held, write our own pid into it — AFTER locking, so a pid a `SIGKILL`ed previous
