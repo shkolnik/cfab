@@ -24,7 +24,12 @@ pub struct VerifyReport {
 struct Ctx {
     out: String,
     fails: u32,
+    /// Zones whose ingress is unreachable — `<zone>:gw` / `<zone>:bgp`.
     degraded: Vec<String>,
+    /// Rescue-segment conditions — `<zone>:rescue-leg` / `<zone>:rescue-nbr` /
+    /// `<zone>:rescue-path`. Kept apart from `degraded` so neither headline note has to
+    /// describe the other's condition.
+    rescue: Vec<String>,
 }
 
 impl Ctx {
@@ -52,6 +57,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         out: String::new(),
         fails: 0,
         degraded: Vec::new(),
+        rescue: Vec::new(),
     };
 
     posture(sys, view, &mut c)?;
@@ -122,6 +128,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         }
         sys.sleep(Duration::from_secs(2));
     }
+    rescue(sys, view, &mut c)?;
     if kind == MemberKind::Host && f.vrrp_gw {
         let doc = engine_ctl::state(sys, f)?;
         let inst = doc["vrrp"]
@@ -151,7 +158,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
             output: c.out,
         });
     }
-    if !down.is_empty() || !c.degraded.is_empty() {
+    if !down.is_empty() || !c.degraded.is_empty() || !c.rescue.is_empty() {
         if !down.is_empty() {
             c.say(&format!(
                 "  DOWN segments (zone:seg:peer): {}",
@@ -163,11 +170,17 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         } else {
             format!("; gw unreachable: {}", c.degraded.join(" "))
         };
+        let rescue_note = if c.rescue.is_empty() {
+            String::new()
+        } else {
+            format!("; rescue degraded: {}", c.rescue.join(" "))
+        };
         c.say(&format!(
-            "verify DEGRADED on {host} ({kind_s}): {}/{} BFD up; every identity reachable, src pinned; posture ok{}",
+            "verify DEGRADED on {host} ({kind_s}): {}/{} BFD up; every identity reachable, src pinned; posture ok{}{}",
             expect_bfd - down.len(),
             expect_bfd,
-            gw_note
+            gw_note,
+            rescue_note
         ));
         return Ok(VerifyReport {
             code: 2,
@@ -185,22 +198,29 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
 
 fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     let f = view.fabric;
-    for r in view.class_rows() {
+    // The rescue bond is a segment here: it carries L3 and takes the same loose rp_filter.
+    // Its slaves never appear — they are L2 only.
+    let l3: Vec<String> = view
+        .class_rows()
+        .into_iter()
+        .map(|r| r.ifname)
+        .chain(view.rescue_rows().into_iter().map(|r| r.ifname))
+        .collect();
+    for ifname in &l3 {
         let got = sys
-            .read(&format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname))
+            .read(&format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "missing".to_string());
         if got != "2" {
             c.bad(&format!(
-                "{} rp_filter={got} (want 2 = loose, every role)",
-                r.ifname
+                "{ifname} rp_filter={got} (want 2 = loose, every role)"
             ));
         }
     }
 
     match view.kind() {
         MemberKind::Leaf => {
-            let mut ifs: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
+            let mut ifs: Vec<String> = l3.clone();
             for z in &f.zones {
                 let id = View::identity_if(z);
                 ifs.push(id.clone());
@@ -368,6 +388,162 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 if sys.read(&path)?.trim() != "0" {
                     c.bad(&format!("{path} = 1 with HOST_FORWARD=0"));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ietf-ospf `nbr-state-type`, in its enum order. The rescue bar is 2-Way: on a broadcast LAN
+/// two DROthers never go past it, so Full would be a bar a healthy rescue LAN cannot clear.
+const NBR_STATES: [&str; 8] = [
+    "down", "attempt", "init", "2-way", "exstart", "exchange", "loading", "full",
+];
+
+fn at_least_two_way(state: &str) -> bool {
+    NBR_STATES
+        .iter()
+        .position(|s| *s == state)
+        .is_some_and(|i| i >= 3)
+}
+
+/// The rescue segment: which wire each zone's bond is actually on, whether every peer that
+/// carries the row is adjacent on it, and — the point of the whole segment — that a peer we
+/// share no island with is reached over the bond, which is HEALTH, not degradation.
+///
+/// Runs after convergence, so the routes it reads have settled. Nothing here touches the
+/// headline: rescue carries no BFD, so `<n> BFD up` counts segments only.
+fn rescue(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+    let f = view.fabric;
+    let rows = view.rescue_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let doc = engine_ctl::state(sys, f)?;
+    let ours = segments_of(f, view.member);
+    for r in &rows {
+        let z = f.zone(&r.zone)?;
+        let zone = &r.zone;
+
+        // ---- the leg: bonding/{mii_status,active_slave} ------------------------------
+        let mii = sys.read(&format!("/sys/class/net/{}/bonding/mii_status", r.ifname));
+        let active = sys.read(&format!("/sys/class/net/{}/bonding/active_slave", r.ifname));
+        let (Ok(mii), Ok(active)) = (mii, active) else {
+            c.bad(&format!(
+                "rescue {zone}: {} is not a bond (/sys/class/net/{}/bonding unreadable) — re-run cfab up",
+                r.ifname, r.ifname
+            ));
+            continue;
+        };
+        if mii.trim() != "up" {
+            c.warn(&format!("rescue {zone} no carrier"));
+            c.rescue.push(format!("{zone}:rescue-leg"));
+        } else {
+            let active = active.trim();
+            let Some(wire) = r
+                .slaves
+                .iter()
+                .find(|s| s.ifname == active)
+                .map(|s| s.wire.clone())
+            else {
+                c.bad(&format!(
+                    "rescue {zone}: {} is up with no slave of ours active (active_slave={active:?})",
+                    r.ifname
+                ));
+                continue;
+            };
+            if wire == r.home {
+                c.say(&format!("  rescue {zone} via {wire}"));
+            } else {
+                // Off the home wire is only a fault while the home wire still has carrier:
+                // that is a stuck reselect. A dark home is the bond doing its job.
+                let home_up = sys
+                    .read(&format!("/sys/class/net/{}/carrier", r.home))
+                    .map(|s| s.trim() == "1")
+                    .unwrap_or(false);
+                if home_up {
+                    c.warn(&format!(
+                        "rescue {zone} via {wire} (home {} has carrier but is not active)",
+                        r.home
+                    ));
+                    c.rescue.push(format!("{zone}:rescue-leg"));
+                } else {
+                    c.say(&format!("  rescue {zone} via {wire}"));
+                }
+            }
+        }
+
+        // ---- adjacency: every peer carrying this zone's rescue row, at least 2-Way ----
+        let nbrs = &doc["ospf"][zone]["interfaces"][&r.ifname]["neighbors"];
+        let peers: Vec<&crate::model::Member> = f
+            .members
+            .iter()
+            .filter(|m| m.name != view.member.name)
+            .filter(|m| {
+                crate::derive::rescue_rows_of(f, m)
+                    .iter()
+                    .any(|p| p.zone == *zone)
+            })
+            .collect();
+        let mut adjacent = 0usize;
+        for m in &peers {
+            let rid = format!("{}.0.{}", z.block(), m.node);
+            let state = nbrs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|n| n["router_id"] == rid.as_str())
+                .and_then(|n| n["state"].as_str())
+                .map(|s| s.rsplit(':').next().unwrap_or(s))
+                .unwrap_or("absent");
+            if at_least_two_way(state) {
+                adjacent += 1;
+            } else {
+                c.warn(&format!(
+                    "rescue {zone} neighbor {} is {state} (want 2-Way or better)",
+                    m.name
+                ));
+                c.rescue.push(format!("{zone}:rescue-nbr"));
+            }
+        }
+        c.say(&format!(
+            "  rescue {zone} neighbors: {adjacent}/{} 2-Way or better",
+            peers.len()
+        ));
+
+        // ---- island-disjoint peers: reached over the bond, and that is health ---------
+        for m in &f.members {
+            if m.name == view.member.name {
+                continue;
+            }
+            let theirs = segments_of(f, m);
+            if ours
+                .intersection(&theirs)
+                .any(|s| s.starts_with(&format!("{zone}:")))
+            {
+                continue;
+            }
+            let target = format!("{}.0.{}", z.block(), m.node);
+            let route = sys.run(&["ip", "route", "get", &target])?.stdout;
+            let route_line = route.lines().next().unwrap_or("").trim().to_string();
+            let words: Vec<&str> = route_line.split_whitespace().collect();
+            let dev = words
+                .iter()
+                .position(|w| *w == "dev")
+                .and_then(|i| words.get(i + 1))
+                .copied()
+                .unwrap_or_default();
+            if dev == r.ifname {
+                c.say(&format!(
+                    "  {zone} id .0.{} ({}) via rescue {}",
+                    m.node, m.name, r.ifname
+                ));
+            } else {
+                c.warn(&format!(
+                    "{zone} id .0.{} via {dev}, not rescue {}: [{route_line}]",
+                    m.node, r.ifname
+                ));
+                c.rescue.push(format!("{zone}:rescue-path"));
             }
         }
     }
@@ -632,9 +808,17 @@ fn check(
                 .map(|r| (r.ospf_cost, r.ifname))
                 .collect();
             candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            // No shared segment = island-disjoint from this peer in this zone: the rescue
+            // bond is the expected path, and reaching the peer over it is health.
             let prim = candidates
                 .first()
                 .map(|(_, i)| i.clone())
+                .or_else(|| {
+                    view.rescue_rows()
+                        .into_iter()
+                        .find(|r| r.zone == z.name)
+                        .map(|r| r.ifname)
+                })
                 .unwrap_or_default();
             let route = sys.run(&["ip", "route", "get", &target])?.stdout;
             let route_line = route.lines().next().unwrap_or("").trim().to_string();
@@ -718,8 +902,10 @@ mod tests {
     }
 
     /// The engine's state document as `engine::state::document` shapes it: every instance
-    /// healthy with transit links at the leaf offset, plus one BFD session per (peer, state).
-    fn engine_doc(view: &View, bfd: &[(String, &str)]) -> String {
+    /// healthy with transit links at the leaf offset, one BFD session per (peer, state), and
+    /// every peer that carries the zone's rescue row adjacent on the rescue bond.
+    fn engine_value(view: &View, bfd: &[(String, &str)]) -> serde_json::Value {
+        let f = view.fabric;
         let mut doc = engine_ctl::tests::healthy_doc(view);
         doc["bfd"] = bfd
             .iter()
@@ -730,25 +916,72 @@ mod tests {
                 })
             })
             .collect();
-        doc.to_string()
+        for r in view.rescue_rows() {
+            let z = f.zone(&r.zone).unwrap();
+            let nbrs: Vec<serde_json::Value> = f
+                .members
+                .iter()
+                .filter(|m| m.name != view.member.name)
+                .filter(|m| {
+                    crate::derive::rescue_rows_of(f, m)
+                        .iter()
+                        .any(|p| p.zone == r.zone)
+                })
+                .map(|m| {
+                    serde_json::json!({
+                        "router_id": format!("{}.0.{}", z.block(), m.node),
+                        "addr": format!("{}.{}.{}", z.block(), r.seg, m.node),
+                        "state": "full",
+                    })
+                })
+                .collect();
+            doc["ospf"][&r.zone]["interfaces"][&r.ifname]["neighbors"] =
+                serde_json::Value::Array(nbrs);
+        }
+        doc
     }
 
-    #[test]
-    fn counter_parse() {
-        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
-                     counter packets 42 bytes 999 comment \"default-deny\"";
-        assert_eq!(counter_packets(chain, "admin-in"), Some(0));
-        assert_eq!(counter_packets(chain, "default-deny"), Some(42));
-        assert_eq!(counter_packets(chain, "nope"), None);
+    fn engine_doc(view: &View, bfd: &[(String, &str)]) -> String {
+        engine_value(view, bfd).to_string()
     }
 
-    /// A leaf whose whole environment is healthy reports OK with the right session count.
-    #[test]
-    fn leaf_verify_ok_end_to_end_mocked() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
+    /// The `bonding/` sysfs a live active-backup bond exposes, captured from the spike
+    /// container (`cat /sys/class/net/cfab-st-rs/bonding/{mii_status,active_slave}` →
+    /// `up` / `cfab-st-rs-st`), plus the L3 posture `up` sets on the bond itself.
+    fn rescue_sysfs(mut sys: MockSys, view: &View, forwarding: &str) -> MockSys {
+        for r in view.rescue_rows() {
+            let home = r
+                .slaves
+                .iter()
+                .find(|s| s.wire == r.home)
+                .expect("the home wire is one of the slaves");
+            sys = sys
+                .file(
+                    &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
+                    "up\n",
+                )
+                .file(
+                    &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                    &format!("{}\n", home.ifname),
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
+                    "2\n",
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                    forwarding,
+                );
+        }
+        sys
+    }
+
+    /// A leaf's healthy environment: posture sysctls on every segment, the rescue bonds and
+    /// the identity veths, the leak-guard and return-path rules, and the gw zone's learned
+    /// default. Each test adds the engine state and the routes it wants to prove.
+    fn leaf_env(view: &View) -> MockSys {
+        let f = view.fabric;
         let mut sys = MockSys::default();
-        // sysctls all correct
         for r in view.class_rows() {
             sys = sys
                 .file(
@@ -769,8 +1002,8 @@ mod tests {
                     "0\n",
                 );
         }
-        // leak guard + return path rules
-        sys = sys
+        sys = rescue_sysfs(sys, view, "0\n");
+        sys
             .on_stdout(&["ip", "rule", "show", "pref", "1000"],
                 "1000: from all to 10.99.0.0/16 iif lo lookup main\n1000: from all to 10.199.0.0/16 iif lo lookup main\n1000: from all to 10.249.0.0/16 iif lo lookup main\n")
             .on_stdout(&["ip", "rule", "show", "pref", "1001"],
@@ -783,9 +1016,11 @@ mod tests {
                 "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
             // gw zone (mgmt): the leaf learns the ingress default via OSPF from the hosts
             .on_stdout(&["ip", "route", "show", "table", "249"],
-                "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
-        // Engine state: transit links at offset cost, every expected BFD session up (peer
-        // segment addresses for nodes 1 and 2)
+                "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+    }
+
+    /// Every expected BFD session, up.
+    fn all_bfd_up(f: &Fabric) -> Vec<(String, &'static str)> {
         let mut bfd = Vec::new();
         for p in [1u8, 2u8] {
             for z in &f.zones {
@@ -794,10 +1029,13 @@ mod tests {
                 }
             }
         }
-        sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        // routes: each identity via the zone's primary with pinned src
+        bfd
+    }
+
+    /// Each peer identity reached over the zone's primary segment with a pinned src.
+    fn primary_routes(mut sys: MockSys, view: &View) -> MockSys {
         for p in [1u8, 2u8] {
-            for z in &f.zones {
+            for z in &view.fabric.zones {
                 let prim = view
                     .class_rows()
                     .into_iter()
@@ -816,6 +1054,26 @@ mod tests {
                 );
             }
         }
+        sys
+    }
+
+    #[test]
+    fn counter_parse() {
+        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
+                     counter packets 42 bytes 999 comment \"default-deny\"";
+        assert_eq!(counter_packets(chain, "admin-in"), Some(0));
+        assert_eq!(counter_packets(chain, "default-deny"), Some(42));
+        assert_eq!(counter_packets(chain, "nope"), None);
+    }
+
+    /// A leaf whose whole environment is healthy reports OK with the right session count.
+    #[test]
+    fn leaf_verify_ok_end_to_end_mocked() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)));
         let report = run(&mut sys, &view, 10).unwrap();
         assert_eq!(report.code, 0, "output:\n{}", report.output);
         assert!(
@@ -825,6 +1083,24 @@ mod tests {
             "{}",
             report.output
         );
+        // The rescue clause: each bond active on the wire carrying that zone's cheapest
+        // segment, and every peer that carries the row adjacent on it.
+        for (zone, wire) in [("storage", "eth9"), ("cluster", "eth1"), ("mgmt", "eth0")] {
+            assert!(
+                report
+                    .output
+                    .contains(&format!("  rescue {zone} via {wire}\n")),
+                "{}",
+                report.output
+            );
+            assert!(
+                report
+                    .output
+                    .contains(&format!("  rescue {zone} neighbors: 2/2 2-Way or better\n")),
+                "{}",
+                report.output
+            );
+        }
     }
 
     /// Pull one segment (dark) → DEGRADED with the session named.
@@ -832,38 +1108,7 @@ mod tests {
     fn leaf_verify_degraded_names_the_down_segment() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = MockSys::default();
-        for r in view.class_rows() {
-            sys = sys
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
-                    "2\n",
-                )
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
-                    "0\n",
-                );
-        }
-        for z in &f.zones {
-            let id = View::identity_if(z);
-            sys = sys
-                .file(&format!("/proc/sys/net/ipv4/conf/{id}/forwarding"), "0\n")
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{id}-peer/forwarding"),
-                    "0\n",
-                );
-        }
-        sys = sys
-            .on_stdout(&["ip", "rule", "show", "pref", "1000"],
-                "to 10.99.0.0/16 iif lo lookup main\nto 10.199.0.0/16 iif lo lookup main\nto 10.249.0.0/16 iif lo lookup main\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "1001"],
-                "to 10.99.0.0/16 unreachable\nto 10.199.0.0/16 unreachable\nto 10.249.0.0/16 unreachable\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2000"],
-                "from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\nfrom 10.199.0.0/16 to 10.199.0.0/16 lookup main suppress_prefixlength 0\nfrom 10.249.0.0/16 to 10.249.0.0/16 lookup main suppress_prefixlength 0\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2001"],
-                "from 10.99.0.0/16 lookup 99\nfrom 10.199.0.0/16 lookup 199\nfrom 10.249.0.0/16 lookup 249\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2002"],
-                "from 10.99.0.0/16 unreachable\nfrom 10.199.0.0/16 unreachable\nfrom 10.249.0.0/16 unreachable\n");
+        let mut sys = leaf_env(&view);
         // BFD: all up EXCEPT storage seg 1 to node 1 (10.99.1.1), which the engine still
         // lists, down
         let mut bfd = Vec::new();
@@ -921,5 +1166,287 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    /// The bond is active on a wire that is not the home while the home still has carrier —
+    /// a stuck reselect. DEGRADED, and the line names both wires.
+    #[test]
+    fn rescue_leg_degraded_when_the_home_has_carrier_but_is_not_active() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            // storage homes on eth9 (cfab-st, cost 10); the bond sits on the mg slave
+            .file(
+                "/sys/class/net/cfab-st-rs/bonding/active_slave",
+                "cfab-st-rs-mg\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: rescue storage via eth0 (home eth9 has carrier but is not active)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: storage:rescue-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The same reselect, but the home wire is dark: the bond did exactly its job, so the
+    /// line is the plain OK spelling and the report stays OK.
+    #[test]
+    fn rescue_leg_on_a_backup_wire_is_ok_when_the_home_is_dark() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file(
+                "/sys/class/net/cfab-st-rs/bonding/active_slave",
+                "cfab-st-rs-mg\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "0\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 0, "output:\n{}", report.output);
+        assert!(
+            report.output.contains("  rescue storage via eth0\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Every slave dark: one spelling, `no carrier`, and DEGRADED.
+    #[test]
+    fn rescue_leg_no_carrier_is_degraded() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/sys/class/net/cfab-cl-rs/bonding/mii_status", "down\n")
+            .file("/sys/class/net/cfab-cl-rs/bonding/active_slave", "\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  warn: rescue cluster no carrier\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: cluster:rescue-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// "Which member is down": a peer that carries the zone's rescue row but is not adjacent
+    /// on the bond is named, and the report is DEGRADED.
+    #[test]
+    fn rescue_neighbor_below_two_way_is_named() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        // pve1-tb (10.99.0.1) drops out of the storage rescue LAN entirely; pve2-tb is stuck
+        // in init on the mgmt one.
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-rs"]["neighbors"] = serde_json::json!([
+            { "router_id": "10.99.0.2", "addr": "10.99.9.2", "state": "2-way" }
+        ]);
+        doc["ospf"]["mgmt"]["interfaces"]["cfab-mg-rs"]["neighbors"] = serde_json::json!([
+            { "router_id": "10.249.0.1", "addr": "10.249.9.1", "state": "full" },
+            { "router_id": "10.249.0.2", "addr": "10.249.9.2", "state": "ietf-ospf:init" }
+        ]);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: rescue storage neighbor pve1-tb is absent (want 2-Way or better)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("  warn: rescue mgmt neighbor pve2-tb is init (want 2-Way or better)\n"),
+            "{}",
+            report.output
+        );
+        // 2-way itself clears the bar, and cluster is untouched.
+        assert!(
+            report
+                .output
+                .contains("  rescue cluster neighbors: 2/2 2-Way or better\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; rescue degraded: storage:rescue-nbr mgmt:rescue-nbr"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Two members with no island in common: pve1-tb has only its st wire, pve2-tb only its
+    /// cl wire, so they share no segment in any zone. The rescue bond is the only path
+    /// between them — and that is HEALTH, not degradation.
+    fn disjoint_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace(
+                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve1-tb 1 host eth9:5000 - -",
+                )
+                .replace(
+                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve2-tb 2 host - eth1:1000 -",
+                )
+                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_island_disjoint_peer_is_expected_over_the_rescue_bond() {
+        let f = disjoint_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // pve1-tb and pve2-tb share nothing; pve3-tb has every wire, so it still shares the
+        // st segments with pve1-tb.
+        assert!(
+            segments_of(&f, f.member("pve1-tb").unwrap())
+                .intersection(&segments_of(&f, f.member("pve2-tb").unwrap()))
+                .next()
+                .is_none()
+        );
+        let mut sys = MockSys::default();
+        for (target, dev) in [
+            // the island-disjoint peer: over the storage rescue bond
+            ("10.99.0.2", "cfab-st-rs"),
+            ("10.199.0.2", "cfab-cl-rs"),
+            ("10.249.0.2", "cfab-mg-rs"),
+            // the peer we do share segments with: over the cheapest shared segment
+            ("10.99.0.3", "cfab-st"),
+            ("10.199.0.3", "cfab-cl-bk"),
+            ("10.249.0.3", "cfab-mg-b2"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.1 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let mut bfd: Vec<(String, &str)> = Vec::new();
+        for (z, seg) in [("storage", 1u8), ("cluster", 2), ("mgmt", 3)] {
+            let block = f.zone(z).unwrap().block();
+            bfd.push((format!("{block}.{seg}.3"), "up"));
+        }
+        let expected: Vec<(u8, String, u8, String)> = bfd
+            .iter()
+            .zip([("storage", 1u8), ("cluster", 2), ("mgmt", 3)])
+            .map(|((addr, _), (z, seg))| (3u8, z.to_string(), seg, addr.clone()))
+            .collect();
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        let (rc, why, down) = check(&mut sys, &view, &expected).unwrap();
+        assert_eq!(rc, 0, "why: {why}");
+        assert!(down.is_empty(), "{down:?}");
+    }
+
+    #[test]
+    fn an_island_disjoint_peer_off_the_rescue_bond_does_not_converge() {
+        let f = disjoint_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        for (target, dev) in [
+            // storage to the disjoint peer leaves over a class segment, not the bond
+            ("10.99.0.2", "cfab-st"),
+            ("10.199.0.2", "cfab-cl-rs"),
+            ("10.249.0.2", "cfab-mg-rs"),
+            ("10.99.0.3", "cfab-st"),
+            ("10.199.0.3", "cfab-cl-bk"),
+            ("10.249.0.3", "cfab-mg-b2"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.1 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &[]));
+        let (rc, why, _) = check(&mut sys, &view, &[]).unwrap();
+        assert_eq!(rc, 1, "why: {why}");
+        assert!(
+            why.contains("storage id .0.2 via cfab-st, not primary cfab-st-rs"),
+            "{why}"
+        );
+    }
+
+    /// 5.4: the bond carries L3 and must have the loose rp_filter every cfab interface has.
+    #[test]
+    fn rescue_bond_rp_filter_is_a_posture_check() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/proc/sys/net/ipv4/conf/cfab-mg-rs/rp_filter", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  FAIL: cfab-mg-rs rp_filter=1 (want 2 = loose, every role)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// 5.4: a leaf never transits — on the bond either.
+    #[test]
+    fn rescue_bond_forwarding_is_a_leaf_posture_check() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/proc/sys/net/ipv4/conf/cfab-st-rs/forwarding", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  FAIL: cfab-st-rs forwarding!=0 (a leaf never transits)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    #[test]
+    fn two_way_is_the_adjacency_bar() {
+        for s in ["2-way", "exstart", "exchange", "loading", "full"] {
+            assert!(at_least_two_way(s), "{s}");
+        }
+        for s in ["down", "attempt", "init", "absent", ""] {
+            assert!(!at_least_two_way(s), "{s}");
+        }
     }
 }
