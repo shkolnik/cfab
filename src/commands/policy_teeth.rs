@@ -71,9 +71,6 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     if let Some(a) = view.admin_if() {
         ifs.push(a.to_string());
     }
-    if f.vrrp_gw {
-        ifs.push(f.vrrp_if.clone());
-    }
     ifs.extend(FOREIGN.iter().map(|s| s.to_string()));
 
     cleanup(sys)?;
@@ -422,16 +419,6 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
     if let Some(admin) = view.admin_if() {
         expect(sys, "admin-in", admin, first_if(view, "storage")?, 0, out)?;
         expect(sys, "admin-out", first_if(view, "storage")?, admin, 0, out)?;
-    }
-    if f.vrrp_gw {
-        expect(
-            sys,
-            "vrrp-ingress",
-            &f.vrrp_if.clone(),
-            first_if(view, "storage")?,
-            3,
-            out,
-        )?;
     }
     // scoped posture: another stack's interfaces forward among themselves, never into or out
     // of a zone, and the admin NIC stays fenced from them too
