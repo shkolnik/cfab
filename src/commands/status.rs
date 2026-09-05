@@ -1164,8 +1164,301 @@ mod tests {
             .socket("/run/cfab/engine.sock", &engine_doc(view, &all_bfd_up(f)))
     }
 
+    /// A forwarding host's healthy environment. The host arm of `posture` is the widest
+    /// surface `status` touches — policy and mark drift, nft counters, shaping, link speeds —
+    /// so the never-writes invariant is only worth something if it runs over this too.
+    fn host_env(view: &View) -> MockSys {
+        let f = view.fabric;
+        let mut sys = MockSys::default().file(&f.run_dir, "");
+        for r in view.class_rows() {
+            sys = sys
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
+                    "2\n",
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                    "1\n",
+                );
+        }
+        for r in view.fallback_rows() {
+            let home = r
+                .slaves
+                .iter()
+                .find(|s| s.wire == r.home)
+                .expect("the home wire is one of the slaves");
+            sys = sys
+                .file(
+                    &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
+                    "up\n",
+                )
+                .file(
+                    &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                    &format!("{}\n", home.ifname),
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
+                    "2\n",
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                    "1\n",
+                );
+        }
+        for r in view.gw_rows() {
+            sys = sys.file(
+                &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                "1\n",
+            );
+        }
+        for s in view.fallback_rows().into_iter().flat_map(|r| r.slaves) {
+            sys = sys.file(
+                &format!("/proc/sys/net/ipv4/conf/{}/forwarding", s.ifname),
+                "0\n",
+            );
+        }
+        for w in view.wires() {
+            sys = sys
+                .file(&format!("/sys/class/net/{w}/carrier"), "1\n")
+                .file(
+                    &format!("/sys/class/net/{w}/speed"),
+                    &format!("{}\n", view.link_speed(&w).unwrap()),
+                );
+        }
+        sys = sys
+            .file("/proc/sys/net/ipv4/conf/eth0/forwarding", "0\n")
+            .file(
+                &format!("{}/policy.nft", f.run_dir),
+                &crate::emit::policy::generate(view).unwrap(),
+            )
+            .file(
+                &format!("{}/policy.applied", f.run_dir),
+                "table inet cfab-fwd\n",
+            )
+            .file(
+                &format!("{}/mark.nft", f.run_dir),
+                &crate::emit::mark::generate(view).unwrap(),
+            )
+            .file(&format!("{}/mark.applied", f.run_dir), "table inet cfab\n");
+        sys.on_stdout(
+            &["nft", "-s", "list", "table", "inet", "cfab-fwd"],
+            "table inet cfab-fwd\n",
+        )
+        .on_stdout(&["nft", "-s", "list", "table", "inet", "cfab"], "table inet cfab\n")
+        .on_stdout(
+            &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+            "chain forward {\n  type filter hook forward priority filter; policy drop;\n               iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n               oifname @admin counter packets 0 bytes 0 drop comment \"admin-out\"\n               counter packets 0 bytes 0 comment \"default-deny\"\n}",
+        )
+        .on_stdout(
+            &["nft", "-j", "list", "chains"],
+            r#"{"nftables":[{"chain":{"family":"inet","table":"cfab-fwd","name":"forward","hook":"forward","prio":0,"policy":"drop"}}]}"#,
+        )
+        .on_stdout(&["ip", "rule", "show", "pref", "2000"],
+            "2000: from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n2000: from 10.199.0.0/16 to 10.199.0.0/16 lookup main suppress_prefixlength 0\n2000: from 10.249.0.0/16 to 10.249.0.0/16 lookup main suppress_prefixlength 0\n")
+        .on_stdout(&["ip", "rule", "show", "pref", "2001"],
+            "2001: from 10.99.0.0/16 lookup 99\n2001: from 10.199.0.0/16 lookup 199\n2001: from 10.249.0.0/16 lookup 249\n")
+        .on_stdout(&["ip", "rule", "show", "pref", "2002"],
+            "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
+        .on_stdout(&["ip", "route", "show", "table", "249"],
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+    }
+
     fn headline(report: &StatusReport) -> &str {
         report.output.lines().next().unwrap_or("")
+    }
+
+    /// Every argv `status` is allowed to run, and the one socket request. This list is the
+    /// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
+    /// `calls` too, so anything that is not on it fails the test by name.
+    fn is_read_only(call: &str) -> bool {
+        const ALLOWED: &[&str] = &[
+            "ip route get ",
+            "ip route show table ",
+            "ip rule show pref ",
+            "ip -4 -br addr show dev ",
+            "nft list ",
+            "nft -s list ",
+            "nft -j list ",
+            "systemctl is-active ",
+            "systemctl is-enabled ",
+            "tc class show dev ",
+            "ethtool -i ",
+        ];
+        (call.starts_with("unix_request ") && call.trim_end().ends_with(" state"))
+            || ALLOWED.iter().any(|p| call.starts_with(p))
+    }
+
+    /// One `status` run over one fixture: nothing in `MockSys.files` may change, and every
+    /// call must be on the read-only allowlist.
+    fn assert_never_writes(label: &str, sys: &mut MockSys, view: &View, wait: u64) {
+        let before = sys.files.clone();
+        let report = run(sys, view, wait, false).unwrap();
+        let changed: BTreeSet<&String> = before
+            .keys()
+            .chain(sys.files.keys())
+            .filter(|k| before.get(*k) != sys.files.get(*k))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "{label}: status changed {changed:?}\n{}",
+            report.output
+        );
+        for call in &sys.calls {
+            assert!(
+                is_read_only(call),
+                "{label}: status is not read-only: `{call}`"
+            );
+        }
+    }
+
+    /// **Detectors actuate, status reports.** This is the test that gives the split its teeth:
+    /// if `status` ever repairs something itself, the two halves start disagreeing about what
+    /// the fabric is, and a member can report a posture it only has because reading it created
+    /// it. Run over every fixture in this module, healthy and broken, host and leaf.
+    #[test]
+    fn status_never_writes() {
+        let f = fabric();
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let host = View::new(&f, "pve1-tb").unwrap();
+
+        assert_never_writes("healthy leaf", &mut healthy_leaf(&leaf), &leaf, 0);
+        assert_never_writes("engine absent (FAILED)", &mut leaf_env(&leaf), &leaf, 0);
+        assert_never_writes("no run dir (DOWN)", &mut MockSys::default(), &leaf, 0);
+        assert_never_writes(
+            "bfd port taken (FAILED)",
+            &mut leaf_env(&leaf).file(
+                "/run/cfab/engine.log",
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use\n",
+            ),
+            &leaf,
+            0,
+        );
+
+        let mut bfd = all_bfd_up(&f);
+        bfd[0].1 = "down";
+        assert_never_writes(
+            "a down BFD session (UP-DEGRADED)",
+            &mut primary_routes(leaf_env(&leaf), &leaf)
+                .socket("/run/cfab/engine.sock", &engine_doc(&leaf, &bfd)),
+            &leaf,
+            0,
+        );
+        // With a deadline: the wait loop must not write on any pass either.
+        assert_never_writes(
+            "a down BFD session, --wait 6",
+            &mut primary_routes(leaf_env(&leaf), &leaf)
+                .socket("/run/cfab/engine.sock", &engine_doc(&leaf, &bfd)),
+            &leaf,
+            6,
+        );
+
+        // Every posture condition rows 4/5/6/19 detect: status must REPORT each one and repair
+        // none of them — the watchdog owns the repair.
+        assert_never_writes(
+            "rp_filter drift (row 4)",
+            &mut healthy_leaf(&leaf).file("/proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter", "1\n"),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "leak guard missing (row 5)",
+            &mut healthy_leaf(&leaf).on_stdout(&["ip", "rule", "show", "pref", "1001"], ""),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "return path missing (row 6)",
+            &mut healthy_leaf(&leaf).on_stdout(&["ip", "rule", "show", "pref", "2002"], ""),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "foreign active slave (row 19)",
+            &mut healthy_leaf(&leaf).file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "someone-elses0\n",
+            ),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "bond downed over a foreign slave (row 19, actuated)",
+            &mut healthy_leaf(&leaf)
+                .file("/sys/class/net/cfab-st-fb/bonding/mii_status", "down\n")
+                .file(
+                    "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                    "someone-elses0\n",
+                ),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "stuck reselect",
+            &mut healthy_leaf(&leaf)
+                .file(
+                    "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                    "cfab-st-fb-mg\n",
+                )
+                .file("/sys/class/net/eth9/carrier", "1\n"),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "dark bond",
+            &mut healthy_leaf(&leaf)
+                .file("/sys/class/net/cfab-cl-fb/bonding/mii_status", "down\n")
+                .file("/sys/class/net/cfab-cl-fb/bonding/active_slave", "\n"),
+            &leaf,
+            0,
+        );
+        assert_never_writes(
+            "a leaf transit link below the offset",
+            &mut {
+                let mut doc = engine_value(&leaf, &all_bfd_up(&f));
+                doc["ospf"]["storage"]["self_lsa_links"][0]["metric"] = serde_json::json!(1);
+                primary_routes(leaf_env(&leaf), &leaf)
+                    .socket("/run/cfab/engine.sock", &doc.to_string())
+            },
+            &leaf,
+            0,
+        );
+
+        // The host arm: policy and mark drift, nft counters, shaping, link speeds, ingress.
+        let mut host_sys = host_env(&host);
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                host_sys = host_sys.on_stdout(
+                    &["ip", "route", "get", &format!("{}.0.{p}", z.block())],
+                    &format!(
+                        "{}.0.{p} dev cfab-st src {}.0.1 uid 0\n",
+                        z.block(),
+                        z.block()
+                    ),
+                );
+            }
+        }
+        assert_never_writes(
+            "a forwarding host with drift everywhere",
+            &mut host_sys.socket("/run/cfab/engine.sock", &engine_doc(&host, &[])),
+            &host,
+            0,
+        );
+
+        // The runtime-disjoint shape, over the fabric that has no fallback rows at all.
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
+                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
+                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
+        let nofb = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let nofb_view = View::new(&nofb, "pve3-tb").unwrap();
+        assert_never_writes(
+            "a member declaring no fallback rows",
+            &mut healthy_leaf(&nofb_view),
+            &nofb_view,
+            0,
+        );
     }
 
     #[test]
@@ -1196,6 +1489,47 @@ mod tests {
             "a".to_string(),
         ];
         assert_eq!(once_each(&r), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_healthy_forwarding_host_is_up() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_env(&view);
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                let prim = view
+                    .class_rows()
+                    .into_iter()
+                    .filter(|r| r.zone == z.name)
+                    .min_by_key(|r| r.ospf_cost)
+                    .unwrap()
+                    .ifname;
+                sys = sys.on_stdout(
+                    &["ip", "route", "get", &format!("{}.0.{p}", z.block())],
+                    &format!(
+                        "{}.0.{p} dev {prim} src {}.0.1 uid 0\n",
+                        z.block(),
+                        z.block()
+                    ),
+                );
+            }
+        }
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    bfd.push((format!("{}.{seg}.{p}", z.block()), "up"));
+                }
+            }
+        }
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)"
+        );
     }
 
     /// UP: every link and every fallback available, three fields, exit 0, and — the whole
