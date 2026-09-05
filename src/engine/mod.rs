@@ -9,6 +9,7 @@ pub mod state;
 use std::path::PathBuf;
 
 use holo_utils::bfd::BfdSocketPolicy;
+use holo_utils::bgp::BgpListenPolicy;
 use holo_utils::southbound::FibPolicy;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
@@ -42,6 +43,7 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         prefsrc,
     };
     let bfd_policy = bfd_socket_policy(fabric);
+    let bgp_policy = bgp_listen_policy(fabric);
     let sock_path = PathBuf::from(&fabric.run_dir).join(SOCK_NAME);
     let pid_path = PathBuf::from(&fabric.run_dir).join(PID_NAME);
     // Before anything destructive: starting the providers purges the private-proto routes
@@ -58,7 +60,8 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         .map_err(|e| Error::fatal(format!("engine: cannot create async runtime: {e}")))?;
     rt.block_on(async {
         info!(member = %view.member.name, "engine starting");
-        let mut nb = northbound::Northbound::start(&view.member.name, policy, bfd_policy);
+        let mut nb =
+            northbound::Northbound::start(&view.member.name, policy, bfd_policy, bgp_policy);
         let result = serve(&mut nb, view, &cfg, fabric, &sock_path, &pid_path).await;
         // Every exit, healthy or not, is holod's teardown: stop answering, drop the
         // providers, wait for every task (holo-routing uninstalls its routes on that path).
@@ -78,6 +81,17 @@ fn bfd_socket_policy(fabric: &Fabric) -> BfdSocketPolicy {
         ipv6: false,
         ..Default::default()
     }
+}
+
+/// The BGP listening socket holo-bgp may bind: none. cfab's neighbors are ACTIVE only — the
+/// upstream router is the passive side (it runs `bgp listen range`), so an inbound listener is
+/// never used. holo-bgp's default is a wildcard `0.0.0.0:179` with `SO_REUSEADDR`, which
+/// silently shares the port with any other BGP daemon on the host (PVE SDN's bgpd is the
+/// realistic one). Same design rule as the BFD socket policy: never a wildcard bind, fail loud
+/// on a collision. `fabric` is taken for symmetry with `bfd_socket_policy` — no declaration
+/// can turn the listener on.
+fn bgp_listen_policy(_fabric: &Fabric) -> BgpListenPolicy {
+    BgpListenPolicy::NoListener
 }
 
 /// Commit, publish readiness (pid + socket), answer state requests until a signal.
@@ -267,6 +281,23 @@ mod tests {
             policy.port(holo_utils::bfd::PathType::IpMultihop),
             BfdSocketPolicy::default().multihop_port
         );
+    }
+
+    /// No member, and no declaration, can turn the listener on: cfab is the active side of
+    /// every session it opens, so port 179 stays free for whatever else runs on the host.
+    #[test]
+    fn no_member_of_the_shipped_fabric_binds_a_bgp_listener() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        let fabric = Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+        assert!(!fabric.members.is_empty());
+        for m in &fabric.members {
+            let view = View::new(&fabric, &m.name).unwrap();
+            let policy = bgp_listen_policy(view.fabric);
+            assert_eq!(policy, BgpListenPolicy::NoListener, "{}", m.name);
+            assert!(!policy.binds_listener(), "{}", m.name);
+        }
     }
 
     #[test]

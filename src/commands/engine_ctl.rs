@@ -406,6 +406,45 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             }
         }
     }
+    bgp_readback(view, doc)?;
+    Ok(())
+}
+
+/// Readback of the ingress iBGP: every gw zone this member carries must have a neighbor entry
+/// for its router in the state document. A member with no ingress leg peers with nobody and is
+/// checked for nothing. The entry only has to EXIST — the session state is an operational fact
+/// `up` settles on, not a configuration readback.
+fn bgp_readback(view: &View, doc: &Value) -> Result<()> {
+    let rows = view.gw_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let peers: Vec<&str> = doc["bgp"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n["neighbor"].as_str())
+        .collect();
+    for r in &rows {
+        let z = view.fabric.zone(&r.zone)?;
+        let router = match z.gw.as_ref() {
+            Some(gw) => &gw.router,
+            // `emit::engine` refuses to generate this member's tree at all in that case, so
+            // the engine cannot be running one; say so rather than reading as a wiring fault.
+            None => {
+                return Err(Error::fatal(format!(
+                    "engine readback: zone '{}' carries an ingress leg but no gw",
+                    z.name
+                )));
+            }
+        };
+        if !peers.contains(&router.as_str()) {
+            return Err(Error::fatal(format!(
+                "engine readback: bgp neighbor {router} (zone '{}') missing",
+                z.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -537,7 +576,13 @@ pub(crate) mod tests {
                 }),
             );
         }
-        json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": [] })
+        let bgp: Vec<Value> = view
+            .gw_rows()
+            .into_iter()
+            .filter_map(|r| f.zone(&r.zone).ok().and_then(|z| z.gw.as_ref()))
+            .map(|gw| json!({ "neighbor": gw.router, "state": "established" }))
+            .collect();
+        json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": bgp })
     }
 
     #[test]
@@ -557,6 +602,41 @@ pub(crate) mod tests {
         doc["ospf"].as_object_mut().unwrap().remove("mgmt");
         let e = readback(&view, &doc).unwrap_err().to_string();
         assert!(e.contains("ospf instance 'mgmt' missing"), "{e}");
+    }
+
+    /// The gw zones of the shipped fabric's host are covered, so the clause cannot pass
+    /// vacuously on the healthy document.
+    #[test]
+    fn readback_names_the_missing_bgp_neighbor() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(
+            !view.gw_rows().is_empty(),
+            "pve1-tb must carry an ingress leg"
+        );
+        let healthy = healthy_doc(&view);
+        assert!(!healthy["bgp"].as_array().unwrap().is_empty());
+        let router = healthy["bgp"][0]["neighbor"].as_str().unwrap().to_string();
+        let mut doc = healthy;
+        doc["bgp"] = json!([]);
+        let e = readback(&view, &doc).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!("bgp neighbor {router}")) && e.contains("missing"),
+            "{e}"
+        );
+        // The zone is named too: a member with two gw zones needs to know which one.
+        assert!(e.contains("zone '"), "{e}");
+    }
+
+    /// A leaf never peers, so an empty `bgp` array is healthy for it.
+    #[test]
+    fn readback_asks_a_leaf_for_no_bgp() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        assert!(view.gw_rows().is_empty());
+        let mut doc = healthy_doc(&view);
+        doc["bgp"] = json!([]);
+        readback(&view, &doc).unwrap();
     }
 
     #[test]
