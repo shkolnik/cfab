@@ -17,6 +17,7 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod sock_frame;
+pub mod supervisor;
 pub mod sys;
 
 use std::path::Path;

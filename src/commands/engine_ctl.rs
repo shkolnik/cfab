@@ -7,8 +7,7 @@ use serde_json::Value;
 
 use crate::derive::View;
 use crate::emit::engine::PROTO_BASE;
-use crate::engine::sock::is_engine_cmdline;
-use crate::engine::{PID_NAME, SOCK_NAME};
+use crate::engine::SOCK_NAME;
 use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
 use crate::sys::{Sys, run_ignore, run_ok};
@@ -18,7 +17,6 @@ pub const LOG_NAME: &str = "engine.log";
 /// Every kernel route-protocol id the engine may install under (spec §7 P2: base+0 ospf,
 /// +1 static, +2 bgp, +3 spare); `down` sweeps exactly this range.
 const PROTO_RANGE: std::ops::RangeInclusive<u8> = PROTO_BASE..=PROTO_BASE + 3;
-const STOP_WAIT_MS: u64 = 10_000;
 const START_WAIT_MS: u64 = 30_000;
 const POLL_MS: u64 = 500;
 /// How long `up` re-reads the state document before believing a configured interface really
@@ -42,62 +40,25 @@ pub fn sock_path(f: &Fabric) -> String {
     format!("{}/{SOCK_NAME}", f.run_dir)
 }
 
-fn pid_path(f: &Fabric) -> String {
-    format!("{}/{PID_NAME}", f.run_dir)
-}
-
 /// Where a detached (non-systemd) engine's stdout+stderr go.
 pub fn log_path(f: &Fabric) -> String {
     format!("{}/{LOG_NAME}", f.run_dir)
 }
 
-/// Stop any running engine (systemd unit or pidfile), wait ≤10 s, SIGKILL after; then sweep
-/// every kernel route carrying the engine's private protocol ids in every table (a crash
-/// leaves them behind; the engine's own shutdown withdraws them). Idempotent. A pid is
-/// signalled only after `/proc/<pid>/cmdline` proves it is a `cfab … engine` (the engine's
-/// own test): a pidfile outlives a SIGKILLed/OOMed engine, and its pid gets recycled.
-pub fn stop_and_sweep(sys: &mut dyn Sys, f: &Fabric) -> Result<()> {
+/// Stop a systemd-managed engine (`stop` sends the signal itself; no pid file is ever
+/// consulted — that mechanism is gone, replaced by the `engine.lock` flock, spec §14) and
+/// sweep every kernel route carrying the engine's private protocol ids in every table (a
+/// crash leaves them behind; the engine's own shutdown withdraws them). Idempotent. Stopping
+/// a detached (non-systemd) engine is not this function's job in this gate — that lands with
+/// the supervisor, which holds the child's real pid from having spawned it, needing no
+/// `/proc` cmdline forensics on a recycled pid at all.
+pub fn stop_and_sweep(sys: &mut dyn Sys, _f: &Fabric) -> Result<()> {
     if sys.exists("/run/systemd/system") {
         run_ignore(sys, &["systemctl", "stop", &format!("{UNIT}.service")])?;
         run_ignore(
             sys,
             &["systemctl", "reset-failed", &format!("{UNIT}.service")],
         )?;
-    }
-    let pid_file = pid_path(f);
-    if sys.exists(&pid_file) {
-        let pid = sys.read(&pid_file)?.trim().to_string();
-        if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) {
-            // The status file, not the directory: readable and present for exactly the process lifetime.
-            let proc_dir = format!("/proc/{pid}/status");
-            let ours = sys.exists(&proc_dir)
-                && sys
-                    .read(&format!("/proc/{pid}/cmdline"))
-                    .map(|c| is_engine_cmdline(c.as_bytes()))
-                    .unwrap_or(false);
-            if !ours && sys.exists(&proc_dir) {
-                eprintln!(
-                    "cfab: {pid_file} names pid {pid}, which is not a cfab engine — stale \
-                     pidfile removed, process left alone"
-                );
-            }
-            if ours {
-                run_ignore(sys, &["kill", "-TERM", &pid])?;
-                let mut waited = 0;
-                while sys.exists(&proc_dir) && waited < STOP_WAIT_MS {
-                    sys.sleep(std::time::Duration::from_millis(POLL_MS));
-                    waited += POLL_MS;
-                }
-                if sys.exists(&proc_dir) {
-                    eprintln!(
-                        "cfab: engine pid {pid} did not exit within {}s — SIGKILL",
-                        STOP_WAIT_MS / 1000
-                    );
-                    run_ignore(sys, &["kill", "-KILL", &pid])?;
-                }
-            }
-        }
-        sys.remove(&pid_file)?;
     }
     let n = sweep_routes(sys)?;
     if n > 0 {
@@ -115,7 +76,7 @@ pub fn stop_and_sweep(sys: &mut dyn Sys, f: &Fabric) -> Result<()> {
 /// multipath routes continue on indented `nexthop` lines and flags like `linkdown` are
 /// output-only. A typed route (`unreachable`/`blackhole`/… prefix) keeps its type word in
 /// front of the prefix, which is where `ip route del` wants it.
-fn sweep_routes(sys: &mut dyn Sys) -> Result<usize> {
+pub fn sweep_routes(sys: &mut dyn Sys) -> Result<usize> {
     let mut n = 0;
     for proto in PROTO_RANGE {
         let proto = proto.to_string();
@@ -887,50 +848,17 @@ pub(crate) mod tests {
         assert!(!sys.ran("systemctl"));
     }
 
-    const ENGINE_CMDLINE: &str =
-        "/usr/bin/cfab\0--config\0/etc/cfab/fabric.conf\0--host\0pve3-tb\0engine\0";
-
+    /// Task 9: `stop_and_sweep` no longer touches any pid file at all — a systemd host's
+    /// `systemctl stop` sends its own signal, and there is no other engine-stopping path in
+    /// this gate (the supervisor holds its own child's pid; a later task wires that in).
     #[test]
-    fn stop_terminates_a_pidfile_engine_and_kills_it_after_the_wait() {
+    fn stop_and_sweep_never_reads_or_removes_a_pid_file() {
         let f = fabric();
-        let mut sys = MockSys::default()
-            .file("/run/cfab/engine.pid", "4242\n")
-            .file("/proc/4242/status", "")
-            .file("/proc/4242/cmdline", ENGINE_CMDLINE);
-        stop_and_sweep(&mut sys, &f).unwrap();
-        assert!(sys.ran("kill -TERM 4242"));
-        assert!(sys.ran("kill -KILL 4242"), "never exited → SIGKILL");
-        assert_eq!(sys.slept.len(), 20, "10 s in 500 ms steps");
-        assert!(sys.ran("rm /run/cfab/engine.pid"));
-    }
-
-    /// A recycled pid: the pidfile survived a SIGKILLed engine and now names some other
-    /// program. Prove ownership before destroy — no signal, stale pidfile dropped.
-    #[test]
-    fn stop_leaves_a_recycled_pid_alone_and_drops_the_stale_pidfile() {
-        let f = fabric();
-        for cmdline in [
-            "/usr/sbin/sshd\0-D\0",
-            "/usr/bin/cfab\0status\0",
-            "/usr/bin/some-engine\0engine\0",
-            "",
-        ] {
-            let mut sys = MockSys::default()
-                .file("/run/cfab/engine.pid", "4242\n")
-                .file("/proc/4242/status", "")
-                .file("/proc/4242/cmdline", cmdline);
-            stop_and_sweep(&mut sys, &f).unwrap();
-            assert!(!sys.ran("kill"), "{cmdline:?}: {:?}", sys.calls);
-            assert!(sys.slept.is_empty());
-            assert!(sys.ran("rm /run/cfab/engine.pid"));
-        }
-        // Unreadable cmdline (process gone between the two reads): same answer.
-        let mut sys = MockSys::default()
-            .file("/run/cfab/engine.pid", "4242\n")
-            .file("/proc/4242/status", "");
+        let mut sys = MockSys::default().file("/run/cfab/engine.pid", "4242\n");
         stop_and_sweep(&mut sys, &f).unwrap();
         assert!(!sys.ran("kill"));
-        assert!(sys.ran("rm /run/cfab/engine.pid"));
+        assert!(!sys.ran("rm /run/cfab/engine.pid"));
+        assert!(sys.files.contains_key("/run/cfab/engine.pid"));
     }
 
     #[test]
