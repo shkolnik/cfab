@@ -198,6 +198,7 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
     let mut policies: Vec<Value> = Vec::new();
     let mut import_policies: Vec<Value> = Vec::new();
     let mut neighbors: Vec<Value> = Vec::new();
+    let mut networks: Vec<Value> = Vec::new();
 
     for r in gw_rows {
         let z = f.zone(&r.zone)?;
@@ -248,6 +249,12 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
             } ] },
         }));
         import_policies.push(Value::String(import_policy(&z.name)));
+        // The owner's own identity /32 has no connected DIRECT route (holo marks a
+        // non-loopback /32 UNNUMBERED), so `redistribute direct` never originates it and the
+        // router only ever learns it via transit at MED = OSPF cost. `network` originates it
+        // directly with MED 0, so the router prefers the owner over any transit re-advertising
+        // the same /32.
+        networks.push(Value::String(format!("{}/32", view.identity_addr(z))));
 
         let leg = gw.leg_cidr(view.node());
         let local = leg.split('/').next().unwrap_or(&leg).to_string();
@@ -298,10 +305,13 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
                     // redistributed route is dropped with the session Established, PfxSnt 0,
                     // and no error anywhere.
                     "apply-policy": { "import-policy": import_policies },
-                    "ipv4-unicast": { "holo-bgp:redistribution": [
-                        { "type": "ietf-routing:direct" },
-                        { "type": "ietf-ospf:ospfv2" },
-                    ] },
+                    "ipv4-unicast": {
+                        "holo-bgp:redistribution": [
+                            { "type": "ietf-routing:direct" },
+                            { "type": "ietf-ospf:ospfv2" },
+                        ],
+                        "holo-bgp:network": networks,
+                    },
                 } ] },
             },
             "neighbors": { "neighbor": neighbors },
@@ -815,6 +825,32 @@ mod tests {
                         .map(|z| Value::String(format!("cfab-{z}-import")))
                         .collect();
                     assert_eq!(imports, &want, "{member}");
+                }
+            }
+        }
+    }
+
+    /// The owner's own identity /32 is originated via `holo-bgp:network`, one per gw zone, in
+    /// gw-row order — the fix for the defect where redistribution never carries it (holo flags
+    /// a non-loopback /32 UNNUMBERED, so there is no connected DIRECT route for it).
+    #[test]
+    fn network_carries_this_members_own_identity_per_gw_zone() {
+        for f in [fabric(), fabric_with_two_gw_zones()] {
+            for member in ["pve1-tb", "pve2-tb"] {
+                let v = View::new(&f, member).unwrap();
+                let t = generate(&v).unwrap();
+                let want: Vec<Value> = v
+                    .gw_rows()
+                    .iter()
+                    .map(|r| {
+                        let z = f.zone(&r.zone).unwrap();
+                        Value::String(format!("{}/32", v.identity_addr(z)))
+                    })
+                    .collect();
+                let global = &bgp_instance(&t).unwrap()["ietf-bgp:bgp"]["global"];
+                for afi in global["afi-safis"]["afi-safi"].as_array().unwrap() {
+                    let network = afi["ipv4-unicast"]["holo-bgp:network"].as_array().unwrap();
+                    assert_eq!(network, &want, "{member}");
                 }
             }
         }

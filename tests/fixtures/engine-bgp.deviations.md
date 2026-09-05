@@ -144,6 +144,7 @@ that leaf is correctly omitted from the fixture.
 | `…/ipv4-unicast/holo-bgp:redistribution` (key `type`) | `augmentations/holo-bgp.yang:185` (augment), `:188` (list), `:193` (leaf `type`) | `holo-bgp/src/northbound/configuration.rs:480` → `:493` |
 | `…/redistribution/type` = `ietf-routing:direct` | identityref to `rt:control-plane-protocol` | `holo-utils/src/protocol.rs:99` / `:118` |
 | `…/redistribution/type` = `ietf-ospf:ospfv2` | same | `holo-utils/src/protocol.rs:103` / `:122` |
+| `…/ipv4-unicast/holo-bgp:network` (leaf-list, `inet:ip-prefix`) = `10.249.0.1/32` | same augment, `augmentations/holo-bgp.yang:208` — locally-originated prefixes advertised with origin IGP and MED 0, independent of redistribution; fixes the owner's own identity /32 never being redistributed (holo flags a non-loopback /32 UNNUMBERED, so there is no connected DIRECT route for it) | `InstanceAfiSafiCfg.network: BTreeSet<IpNetwork>` (`holo-bgp/src/northbound/configuration.rs:92`), callback `apply_afi_safi_network` (`:493`, `:535`) queues `Event::NetworkOriginate`, dispatched at `:903-922` to `events::network_originate`/`network_withdraw` in `holo-bgp/src/events.rs` |
 | `…/bgp/neighbors` | `ietf-bgp@2023-07-05.yang:381` | — |
 | `…/neighbors/neighbor` (key `remote-address`) | `:385` | `holo-bgp/src/northbound/configuration.rs:327`, `:540`ff |
 | `…/neighbor/remote-address` = `192.168.249.254` | `:391` | key |

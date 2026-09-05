@@ -90,6 +90,9 @@
                   {
                     "type": "ietf-ospf:ospfv2"
                   }
+                ],
+                "holo-bgp:network": [
+                  "10.249.0.1/32"
                 ]
               }
             }
