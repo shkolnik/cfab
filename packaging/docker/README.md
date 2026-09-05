@@ -50,16 +50,17 @@ services:
     network_mode: host
     privileged: true
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 60s
     volumes:
       - /etc/cfab/fabric.conf:/etc/cfab/fabric.conf:ro
     environment:
       CFAB_HOST: ${CFAB_HOST:-}
 ```
 
-`docker compose up -d` runs `cfab up` then `cfab status` once (informational: a member that
-cannot converge stays up for inspection instead of restart-looping); `docker compose down`
-(SIGTERM) runs `cfab down`, tearing down everything cfab created.
+PID 1 is `cfab run`; the restart policy is the runtime's (`restart: unless-stopped`);
+`stop_grace_period: 60s` is required or the teardown is SIGKILLed halfway. `docker compose
+up -d` starts the supervisor, which applies the fabric and keeps its children alive;
+`docker compose down` (SIGTERM) runs the stop sequence, tearing down everything cfab created.
 
 The declaration's fallback segment (active-backup bond leg over every wire's fallback VLAN,
 role `fallback`, no BFD, cost 5000) reaches this container the same way any other segment
@@ -83,10 +84,11 @@ bakes its own `fabric.conf` and a leaf-specific entrypoint, and is the thing act
 - **No diagnostic tools** (`tcpdump`, `python3`, `jq`, ...) baked in — they are fixture/test
   conveniences, not part of the runtime contract; add them in a derived `FROM cfab` image if a
   deployment wants them.
-- **The entrypoint here is a generalization of `leaf-entrypoint.sh`** (up / status-once /
-  wait / SIGTERM→down), with the baked `fabric.conf` and hostname assumption removed. Behavior
-  is otherwise identical, so `cfab-leaf`'s compose project (`/root/leaf-cfab` on pve3) stays the
-  reference for the one member actually running this way.
+- **No shell entrypoint** — the entrypoint is the binary itself (`ENTRYPOINT ["/usr/bin/cfab"]`,
+  `CMD ["run"]`), so `cfab run` is PID 1: it applies the fabric, supervises its children, reaps
+  orphans, and on SIGTERM runs the stop sequence. An argv override (`docker run <img> status`)
+  still works. `cfab-leaf`'s compose project (`/root/leaf-cfab` on pve3) stays the reference for
+  the one member actually running this way.
 
 ## Caveats
 
@@ -94,6 +96,6 @@ bakes its own `fabric.conf` and a leaf-specific entrypoint, and is the thing act
   it `kind=leaf`) — this image does not change that; it is a packaging convenience, not a new
   engine capability.
 - A host with Docker installed drops all forwarded traffic through the FORWARD chain's Docker
-  base policy unless cfab's `DOCKER-USER` accept is in place (`cfab up`/the watchdog install it
+  base policy unless cfab's `DOCKER-USER` accept is in place (`cfab run`/the watchdog install it
   automatically) — irrelevant to a container that only ever runs *as* a leaf, but relevant if
   this image is later run on a Docker host that also transits for other fabric members.

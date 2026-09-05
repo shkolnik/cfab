@@ -52,17 +52,17 @@ assets = [
 # but never enabled, stopped, or masked.
 maintainer-scripts = "packaging/deb"
 
-# cfab-fabric.service, installed disabled and never started by the package: installing
+# cfab.service, installed disabled and never started by the package: installing
 # cfab must not change the network. The operator writes /etc/cfab/fabric.conf and runs
-# `systemctl enable --now cfab-fabric`.
+# `systemctl enable --now cfab`.
 [package.metadata.deb.systemd-units]
 unit-scripts = "packaging/deb"
-unit-name = "cfab-fabric"
+unit-name = "cfab"
 enable = false
 start = false
 # An upgrade must not tear the fabric down: stopping the unit runs `cfab down`, an outage
 # for every identity on the host. Both false leaves the running unit alone; the new binary
-# takes effect on the next `systemctl reload cfab-fabric`.
+# takes effect on the next `systemctl reload cfab`.
 stop-on-upgrade = false
 restart-after-upgrade = false
 
