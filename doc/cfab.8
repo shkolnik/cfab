@@ -261,17 +261,12 @@ directory.
 is written before any apply, so a refused or reverted generation is never
 retried, even across a daemon restart.
 .TP
-.I /etc/frr/frr.conf
-Written by
-.BR up ,
-restored by
-.B down
-from
-.IR /etc/frr/frr.conf.pre\-cfab .
-.B up
-refuses to overwrite a file that is not cfab\-generated (a hand\-written
-config, or another manager's, such as Proxmox SDN); reviewing it and moving
-it to the backup path is the operator's consent to hand it over.
+.I /etc/iproute2/rt_protos.d/cfab.conf
+Names the engine's private kernel route\-protocol ids for
+.B ip route
+output only (
+.BR cfab\-ospf ", " cfab\-static ", " cfab\-bgp ", " cfab\-other ,
+201\-204); cosmetic, cfab's own sweep matches the numeric ids.
 .TP
 .I /etc/pve/cfab/fabric.conf
 The cluster-published declaration (pmxcfs; written by
