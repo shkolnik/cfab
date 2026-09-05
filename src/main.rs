@@ -44,11 +44,15 @@ enum Command {
     Up,
     /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
-    /// Full health check: posture, drift, convergence. Exit 0 OK / 2 degraded / 1 failed
-    Verify {
-        /// Seconds to wait for BFD/route convergence before failing
-        #[arg(long, default_value_t = 60)]
-        timeout: u64,
+    /// This member's fabric state: UP / UP-DEGRADED / FAILED / DOWN, with the counts
+    /// (peers | links | fallbacks) and one line per condition. Exit 0 / 1 / 2 / 3.
+    Status {
+        /// Seconds to re-read (every 2 s) while the state is not UP; 0 = one instant read
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// Exit 0 for UP-DEGRADED as well as UP (FAILED and DOWN are unchanged)
+        #[arg(long)]
+        permissive: bool,
     },
     /// Membership-reactive shaping daemon (started by `up` as cfab-shape.service)
     ShapeDaemon {
@@ -117,7 +121,7 @@ enum GenArtifact {
         /// Print the tc program instead of the derivation
         #[arg(long, conflicts_with = "expect")]
         tc: bool,
-        /// Print the "classid effective-rate" lines that `verify` diffs
+        /// Print the "classid effective-rate" lines that `status` diffs
         #[arg(long)]
         expect: bool,
     },
@@ -191,6 +195,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    // A member with no declaration cannot desire the fabric to be up: that is DOWN, not a
+    // failure. (A fabric.conf that is PRESENT but unparseable keeps its loud parse error and
+    // exit 1 below — we cannot know what was desired.)
+    if let Command::Status { .. } = cli.command
+        && !path.exists()
+    {
+        println!("DOWN (no {})", path.display());
+        return Ok(ExitCode::from(3));
+    }
     let fabric = load_fabric(&path)?;
     let member = member_name(&cli.host)?;
     let view = View::new(&fabric, &member)?;
@@ -263,9 +276,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             print!("{}", commands::down::run(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Verify { timeout } => {
+        Command::Status { wait, permissive } => {
             let mut sys = RealSys;
-            let report = commands::verify::run(&mut sys, &view, timeout)?;
+            let report = commands::status::run(&mut sys, &view, wait, permissive)?;
             print!("{}", report.output);
             Ok(ExitCode::from(report.code))
         }

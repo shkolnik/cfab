@@ -1,4 +1,4 @@
-//! Helpers shared by the imperative commands (up/down/verify/daemons).
+//! Helpers shared by the imperative commands (up/down/status/daemons).
 
 use crate::error::Result;
 use crate::sys::{Sys, run_ok, run_optional};
