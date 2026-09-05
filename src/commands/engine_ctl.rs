@@ -423,7 +423,7 @@ fn bgp_readback(view: &View, doc: &Value) -> Result<()> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|n| n["neighbor"].as_str())
+        .filter_map(|n| n["peer"].as_str())
         .collect();
     for r in &rows {
         let z = view.fabric.zone(&r.zone)?;
@@ -580,7 +580,7 @@ pub(crate) mod tests {
             .gw_rows()
             .into_iter()
             .filter_map(|r| f.zone(&r.zone).ok().and_then(|z| z.gw.as_ref()))
-            .map(|gw| json!({ "neighbor": gw.router, "state": "established" }))
+            .map(|gw| json!({ "peer": gw.router, "state": "established" }))
             .collect();
         json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": bgp })
     }
@@ -616,7 +616,7 @@ pub(crate) mod tests {
         );
         let healthy = healthy_doc(&view);
         assert!(!healthy["bgp"].as_array().unwrap().is_empty());
-        let router = healthy["bgp"][0]["neighbor"].as_str().unwrap().to_string();
+        let router = healthy["bgp"][0]["peer"].as_str().unwrap().to_string();
         let mut doc = healthy;
         doc["bgp"] = json!([]);
         let e = readback(&view, &doc).unwrap_err().to_string();

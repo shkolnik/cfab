@@ -523,19 +523,25 @@ mod tests {
     /// no policy name is resolved before it is defined. The live proof on real interfaces is
     /// still the testbed's.
     ///
-    /// `proto_base` is deliberately cfab's private range, NOT `FibPolicy::default()`: with no
-    /// base holo-routing's startup purge deletes every route the kernel attributes to
-    /// `static`/`ospf`/`bgp` — running `cargo test` as root would take out the host's default
-    /// route. The private range confines the purge to protocol ids only cfab installs.
+    /// `proto_base` is set, NOT `FibPolicy::default()`: with no base holo-routing's startup
+    /// purge deletes every route the kernel attributes to `static`/`ospf`/`bgp` — running
+    /// `cargo test` as root would take out the host's default route. It is deliberately
+    /// `TEST_PROTO_BASE`, DISJOINT from the production `PROTO_BASE` (201..=204): the purge
+    /// deletes any route in `base..=base+3` regardless of owner and this test has none of the
+    /// real engine's `sock::refuse_if_live` guard, so a shared base would let a root test run
+    /// delete a live `cfab engine`'s routes.
     #[tokio::test]
     async fn the_emitted_tree_commits_through_the_real_providers() {
+        // Free range 250..=253 (FibPolicy asserts base <= 252): well clear of production and of
+        // every well-known rt_proto id, so the startup purge can touch no real engine's routes.
+        const TEST_PROTO_BASE: u8 = 250;
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let candidate = parse_candidate(&crate::emit::engine::generate(&v).unwrap()).unwrap();
         let mut nb = Northbound::start(
             "pve1-tb",
             FibPolicy {
-                proto_base: Some(crate::emit::engine::PROTO_BASE),
+                proto_base: Some(TEST_PROTO_BASE),
                 prefsrc: Vec::new(),
             },
             BfdSocketPolicy::default(),
