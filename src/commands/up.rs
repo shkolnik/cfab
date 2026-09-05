@@ -1,6 +1,7 @@
 //! `cfab up` — apply the fabric on THIS member. Idempotent, root. The order is load-bearing:
 //! preconditions → own the NICs → sysctls → per-class netdevs → return path →
-//! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → routing
+//! policy + per-interface forwarding (or the leaf leak guard) → marking + the fallback
+//! ceiling → qos + shape daemon → routing
 //! engine (restart + readback) → fail-closed watchdog.
 
 use crate::commands::common;
@@ -42,14 +43,17 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
     // The engine runs as a transient unit where systemd is (probed, like the other daemons);
     // a container leaf detaches it with setsid (`Sys::spawn_detached`) and stops it by pid.
-    let mut tools: Vec<&str> = vec!["ip"];
+    // `nft` is uniform: every kind installs `table inet cfab` (marking + the fallback
+    // control-egress ceiling). `tc`/`ethtool` stay host-only — a leaf shapes nothing and its
+    // wires' qdiscs and offloads belong to its OS.
+    let mut tools: Vec<&str> = vec!["ip", "nft"];
     if sys.exists("/run/systemd/system") {
         tools.push("systemd-run");
     } else {
         tools.extend(["setsid", "kill"]);
     }
     if kind == MemberKind::Host {
-        tools.extend(["tc", "ethtool", "nft"]);
+        tools.extend(["tc", "ethtool"]);
         if f.host_forward {
             tools.push("logger");
         }
@@ -278,6 +282,22 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         sys.remove(&format!("{}/policy.applied", f.run_dir))?;
     }
 
+    // ---- marking + the fallback ceiling (EVERY kind) ----------------------------------------
+    // `table inet cfab` is derived from the class table alone — `oifname` groups over this
+    // member's own `cfab-*` segments, bonds and ingress legs, which a leaf creates exactly as a
+    // host does. Nothing in it reads a wire, a qdisc or the forwarding posture, so there is one
+    // code path and no `kind` branch: a leaf marks its own egress and, more to the point, gets
+    // the fallback control-egress ceiling. A containment one member class escapes is half a
+    // containment: a leaf sources a fallback-segment control storm at the same measured rate a
+    // host does (149 k pkt/s and 3.5 cores, all three members alike), and the leaf is the
+    // member most likely to be a 4-core NAS.
+    let mark = emit::mark::generate(view)?;
+    let mark_path = format!("{}/mark.nft", f.run_dir);
+    sys.write(&mark_path, &mark)?;
+    run_ok(sys, &["nft", "-f", &mark_path])?; // one transaction: atomic replace
+    let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab"])?;
+    sys.write(&format!("{}/mark.applied", f.run_dir), &applied.stdout)?;
+
     // ---- qos (host only: a leaf shapes nothing; its wires' qdiscs belong to its OS) ----------
     if kind == MemberKind::Host {
         for dev in &wires {
@@ -286,12 +306,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
                 &["tc", "qdisc", "replace", "dev", dev, "root", "fq_codel"],
             )?;
         }
-        let mark = emit::mark::generate(view)?;
-        let mark_path = format!("{}/mark.nft", f.run_dir);
-        sys.write(&mark_path, &mark)?;
-        run_ok(sys, &["nft", "-f", &mark_path])?; // one transaction: atomic replace
-        let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab"])?;
-        sys.write(&format!("{}/mark.applied", f.run_dir), &applied.stdout)?;
         // Floor+borrow shaping: the daemon re-derives each up wire's HTB tree on link events.
         run_ignore(sys, &["systemctl", "stop", "cfab-shape.service"])?;
         run_ignore(sys, &["systemctl", "reset-failed", "cfab-shape.service"])?;
@@ -764,8 +778,10 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
 
 /// Leaf leak guard (the braces; per-interface forwarding=0 is the belt): traffic to a fabric
 /// block is looked up in main ONLY when locally originated; anything arriving on another
-/// interface bound for a fabric block is refused — no netfilter needed (DSM kernels may lack
-/// nf_tables).
+/// interface bound for a fabric block is refused. Routing rules, not netfilter: the guard is a
+/// property of the routing table it protects. (`nft` is required on every kind for `table inet
+/// cfab`; a member without it fails loud at the tool probe. The guard stays rule-based because
+/// a second mechanism for the same invariant is a second thing to keep in step.)
 fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
     for r in common::leak_guard_rules(view) {
         common::ensure_fabric_rule(sys, &r)?;
@@ -1358,5 +1374,60 @@ mod tests {
             pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
         };
         run(&mut sys, &view, &opts).unwrap();
+    }
+
+    /// A leaf installs `table inet cfab` exactly as a host does: the generated file, the one
+    /// `nft -f` transaction, and the `-s` readback stored for `status`'s drift check. The
+    /// containment the table carries (the fallback control-egress ceiling) is worthless if the
+    /// one member class that is not a Proxmox host escapes it.
+    #[test]
+    fn a_leaf_installs_the_mark_table_with_its_ceilings() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view).on_stdout(
+            &["nft", "-s", "list", "table", "inet", "cfab"],
+            "table inet cfab\n",
+        );
+        let (_pmxcfs, opts) = opts();
+        run(&mut sys, &view, &opts).unwrap();
+
+        let want = emit::mark::generate(&view).unwrap();
+        assert!(
+            want.contains("comment \"ceiling-storage\""),
+            "the leaf's table carries no ceiling: {want}"
+        );
+        assert_eq!(sys.files.get("/run/cfab/mark.nft"), Some(&want));
+        assert_eq!(
+            sys.files.get("/run/cfab/mark.applied"),
+            Some(&"table inet cfab\n".to_string())
+        );
+        assert_eq!(
+            calls_for(&sys, "nft -f"),
+            vec!["nft -f /run/cfab/mark.nft".to_string()]
+        );
+        // ...and only the mark table: a leaf still shapes nothing and filters nothing.
+        assert!(calls_for(&sys, "tc ").is_empty(), "{:?}", sys.calls);
+        assert!(calls_for(&sys, "policy.nft").is_empty(), "{:?}", sys.calls);
+    }
+
+    /// `nft` is a uniform dependency, so a leaf without it is refused by name before anything
+    /// is applied — never a member silently running without the ceiling.
+    #[test]
+    fn a_leaf_without_nft_is_refused_by_name() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view).on_fail(
+            &["/usr/bin/env", "sh", "-c", "command -v nft"],
+            1,
+            "",
+        );
+        let (_pmxcfs, opts) = opts();
+        let err = run(&mut sys, &view, &opts).unwrap_err().to_string();
+        assert!(err.contains("nft not installed"), "{err}");
+        assert!(
+            !sys.files.contains_key("/run/cfab/mark.nft"),
+            "refused after applying: {:?}",
+            sys.calls
+        );
     }
 }

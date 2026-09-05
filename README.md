@@ -45,6 +45,16 @@ cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands starte
 `--config` defaults to `fabric.conf` beside the binary; `--host` to `$CFAB_HOST`, else the
 kernel hostname.
 
+## Runtime requirements
+
+Both member kinds need `ip` (iproute2) and `nft` (nftables): every member installs
+`table inet cfab`, the traffic-class marking plus one derived control-egress ceiling per
+fallback bond — a leaf sources a fallback-segment control storm exactly as a host does, so a
+containment it escaped would be half a containment. A **host** additionally needs `tc` and
+`ethtool` for its shaping trees and per-NIC offload posture; a **leaf** shapes nothing, its
+wires' qdiscs being its own OS's business. Anything missing is refused by name before `up`
+applies a thing. The Debian package's `Depends` covers all of it.
+
 ## Running it as a service
 
 The Debian package ships `cfab-fabric.service`, **installed disabled and not started** —
