@@ -24,9 +24,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Clone holo fork at pin
+        run: |
+          git clone --quiet https://github.com/shkolnik/holo.git ../holo
+          git -C ../holo checkout --quiet $(cat holo.rev)
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - name: Install libyang build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake build-essential libpcre2-dev
+      - name: Holo pin and feature guard
+        run: bash scripts/holo-check.sh
       - name: Test
         # A tag can point at a commit CI never checked; never publish untested.
         run: cargo test --locked
