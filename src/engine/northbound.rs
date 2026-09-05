@@ -352,7 +352,7 @@ mod tests {
         assert!(yang_ctx().get_module_latest("ietf-bfd-ip-sh").is_some());
         assert!(
             yang_ctx().get_module_latest("ietf-vrrp").is_none(),
-            "vrrp is gate 3"
+            "vrrp was deleted (NAS is a leaf)"
         );
     }
 

@@ -129,25 +129,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         sys.sleep(Duration::from_secs(2));
     }
     fallback(sys, view, &mut c)?;
-    if kind == MemberKind::Host && f.vrrp_gw {
-        let doc = engine_ctl::state(sys, f)?;
-        let inst = doc["vrrp"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|v| v["vrid"] == f.vrrp_vrid);
-        match inst {
-            Some(v) => {
-                let st = v["state"].as_str().unwrap_or("?").to_string();
-                c.say(&format!(
-                    "  vrrp {}: {st} (prio {})",
-                    f.vrrp_vrid,
-                    view.vrrp_prio()?
-                ));
-            }
-            None => c.bad("vrrp: no instance in engine state"),
-        }
-    }
     if c.fails > 0 {
         let fails = c.fails;
         c.say(&format!(

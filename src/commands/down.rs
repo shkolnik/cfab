@@ -102,15 +102,6 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     sys.remove(&f.run_dir)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
-    if link_exists(sys, &f.vrrp_if)? {
-        if !link_kind_is(sys, &f.vrrp_if, " macvlan ")? {
-            return Err(Error::fatal(format!(
-                "REFUSING: {} exists but is not a macvlan",
-                f.vrrp_if
-            )));
-        }
-        run_ok(sys, &["ip", "link", "del", &f.vrrp_if])?;
-    }
     // Fallback legs, bonds before slaves: `ip link del <bond>` RELEASES its slaves, it does not
     // delete them, which is why the second loop exists. The engine is already stopped and its
     // routes swept above, so this order is ownership-proof clarity, nothing more.
