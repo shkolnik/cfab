@@ -36,7 +36,9 @@ impl State {
 }
 
 /// How a child last died: `exit <code>`, `signal <NAME>` or `unknown`, plus the elapsed
-/// seconds since it happened (monotonic, never a wall-clock timestamp).
+/// seconds since it happened (monotonic, never a wall-clock timestamp). This is the
+/// serialized shape only — a `Child` stores the cause and the instant, and `s_ago` is
+/// measured when the document is built, never frozen at the moment of death.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExitCause {
     pub cause: String,
@@ -56,7 +58,8 @@ pub struct Child {
     pub why_stopped: Option<String>,
     pid: Option<u32>,
     started_at: Option<Instant>,
-    last_exit: Option<ExitCause>,
+    last_exit: Option<String>,
+    exited_at: Option<Instant>,
     log: VecDeque<String>,
 }
 
@@ -71,6 +74,7 @@ impl Child {
             pid: None,
             started_at: None,
             last_exit: None,
+            exited_at: None,
             log: VecDeque::with_capacity(LOG_LINES),
         }
     }
@@ -83,14 +87,15 @@ impl Child {
         c
     }
 
-    /// The process died. Records the cause and returns the instant at which it may be
-    /// respawned — `None` when it is not wanted, which is the only case that is not a fault.
+    /// The process died of `cause` (`exit <code>` / `signal <NAME>` / `unknown`). Records it
+    /// against `now` and returns the instant at which it may be respawned — `None` when it is not wanted, which is the only case that is not a fault.
     /// ANY exit restarts a wanted child, clean or not: a daemon that exits 0 while the
     /// supervisor still wants it running is a fault, not a success (spec §4).
-    pub fn exited(&mut self, cause: ExitCause, now: Instant) -> Option<Instant> {
+    pub fn exited(&mut self, cause: String, now: Instant) -> Option<Instant> {
         self.pid = None;
         self.started_at = None;
         self.last_exit = Some(cause);
+        self.exited_at = Some(now);
         if self.want {
             self.state = State::Restarting;
             self.restarts += 1;
@@ -128,8 +133,14 @@ impl Child {
         self.pid
     }
 
-    pub fn last_exit(&self) -> Option<&ExitCause> {
-        self.last_exit.as_ref()
+    /// How this child last died, aged at `now`. The age is measured here rather than stored,
+    /// so a crash from two hours ago never keeps reporting the second it happened.
+    pub fn last_exit(&self, now: Instant) -> Option<ExitCause> {
+        let (cause, at) = (self.last_exit.as_ref()?, self.exited_at?);
+        Some(ExitCause {
+            cause: cause.clone(),
+            s_ago: now.saturating_duration_since(at).as_secs(),
+        })
     }
 
     /// Seconds since this process started, or `None` when no process is running.
@@ -289,29 +300,30 @@ mod tests {
         c.became_ready();
         assert_eq!(c.state, State::Running);
         // A CLEAN exit is still a fault while the supervisor wants it running.
-        let at = c
-            .exited(
-                ExitCause {
-                    cause: "exit 0".into(),
-                    s_ago: 0,
-                },
-                t0,
-            )
-            .unwrap();
+        let at = c.exited("exit 0".into(), t0).unwrap();
         assert_eq!(c.state, State::Restarting);
         assert_eq!(at.duration_since(t0), BACKOFF);
         assert_eq!(c.restarts, 1);
         for i in 2..=6 {
             c.spawned(10 + i as u32, t0, true);
-            c.exited(
-                ExitCause {
-                    cause: "signal SIGKILL".into(),
-                    s_ago: 0,
-                },
-                t0,
-            );
+            c.exited("signal SIGKILL".into(), t0);
             assert_eq!(c.restarts, i, "the restart counter must never reset");
         }
+    }
+
+    /// The document says "how long ago", not "how long ago it was when it happened": a crash
+    /// two hours old must never keep reporting the age it had the moment it was recorded.
+    #[test]
+    fn the_last_exit_age_is_measured_when_it_is_read() {
+        let t0 = Instant::now();
+        let mut c = Child::new("engine");
+        c.spawned(10, t0, false);
+        c.exited("signal SIGKILL".into(), t0);
+        let e = c
+            .last_exit(t0 + std::time::Duration::from_secs(90))
+            .unwrap();
+        assert_eq!(e.cause, "signal SIGKILL");
+        assert_eq!(e.s_ago, 90);
     }
 
     #[test]
@@ -325,16 +337,7 @@ mod tests {
             "no readiness protocol: running on spawn"
         );
         c.want = false;
-        assert!(
-            c.exited(
-                ExitCause {
-                    cause: "exit 0".into(),
-                    s_ago: 0
-                },
-                t0
-            )
-            .is_none()
-        );
+        assert!(c.exited("exit 0".into(), t0).is_none());
         assert_eq!(c.state, State::Stopped);
         assert_eq!(c.restarts, 0, "a deliberate stop is not a restart");
     }
