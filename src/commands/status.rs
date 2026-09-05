@@ -796,11 +796,25 @@ fn return_path_and_ingress(
         }
         let Some(gw) = &z.gw else { continue };
         let table = sys.run(&["ip", "route", "show", "table", &id])?.stdout;
-        if !table.lines().any(|l| l.starts_with("default ")) {
-            c.note(format!(
+        // Two distinct failures, each with its own wording (neither reachable for the other):
+        // no default line at all, versus a default line the kernel has marked inactive.
+        match table.lines().find(|l| l.starts_with("default ")) {
+            None => c.note(format!(
                 "{} gw {} unreachable (table {id} has no default)",
                 z.name, gw.router
-            ));
+            )),
+            // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
+            // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
+            // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
+            // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
+            // degraded the zone; cfab must not read healthier than the FRR build did. If E3
+            // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
+            Some(l) if l.contains("linkdown") || l.contains("dead") => c.note(format!(
+                "{} gw {} unreachable (table {id} default is linkdown — the ingress leg has no \
+                 carrier)",
+                z.name, gw.router
+            )),
+            Some(_) => {}
         }
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
@@ -2045,6 +2059,85 @@ mod tests {
         );
         let report = run(&mut sys, &host, 0, false).unwrap();
         assert!(!report.output.contains("ingress: bgp"), "{}", report.output);
+    }
+
+    /// A default line the kernel has flagged `linkdown` is a DISTINCT failure from no default
+    /// at all, with its own wording (ignore_routes_with_linkdown=1 keeps the line but makes it
+    /// inactive for lookups). INFERRED (task E2.2): the exact flag string is settled live in E3.
+    #[test]
+    fn a_linkdown_default_is_a_distinct_reason() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+            ]),
+        )
+        .on_stdout(
+            &["ip", "route", "show", "table", "249"],
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20 linkdown\n",
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown — the \
+                 ingress leg has no carrier)"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("has no default"),
+            "the linkdown wording must not spill into the no-default condition: {}",
+            report.output
+        );
+    }
+
+    /// No default line at all keeps today's wording — a different condition, a different string.
+    #[test]
+    fn no_default_at_all_keeps_its_own_wording() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+            ]),
+        )
+        .on_stdout(&["ip", "route", "show", "table", "249"], "");
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            report
+                .output
+                .contains("mgmt gw 192.168.249.254 unreachable (table 249 has no default)"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("is linkdown"),
+            "the no-default wording must not spill into the linkdown condition: {}",
+            report.output
+        );
+    }
+
+    /// A healthy default (present, no linkdown/dead flag) notes nothing about the return path.
+    #[test]
+    fn a_healthy_default_notes_nothing() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+            ]),
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            !report.output.contains("has no default") && !report.output.contains("is linkdown"),
+            "{}",
+            report.output
+        );
     }
 
     /// Intent: no run dir = `down` was run (or `up` never was). DOWN, exit 3, and nothing is

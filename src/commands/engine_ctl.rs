@@ -17,7 +17,7 @@ pub const UNIT: &str = "cfab-engine";
 pub const LOG_NAME: &str = "engine.log";
 /// Every kernel route-protocol id the engine may install under (spec §7 P2: base+0 ospf,
 /// +1 static, +2 bgp, +3 spare); `down` sweeps exactly this range.
-const PROTO_RANGE: std::ops::RangeInclusive<u8> = PROTO_BASE..=PROTO_BASE + 3;
+pub(crate) const PROTO_RANGE: std::ops::RangeInclusive<u8> = PROTO_BASE..=PROTO_BASE + 3;
 const STOP_WAIT_MS: u64 = 10_000;
 const START_WAIT_MS: u64 = 30_000;
 const POLL_MS: u64 = 500;
@@ -580,7 +580,7 @@ pub(crate) mod tests {
             .gw_rows()
             .into_iter()
             .filter_map(|r| f.zone(&r.zone).ok().and_then(|z| z.gw.as_ref()))
-            .map(|gw| json!({ "peer": gw.router, "state": "established" }))
+            .map(|gw| json!({ "peer": gw.router, "state": "Established" }))
             .collect();
         json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": bgp })
     }

@@ -69,8 +69,10 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
     }
     // The engine stops (and its routes are swept) before any interface goes away, so it never
-    // acts on vanished links. The zone tables hold only the engine's static, gone with it —
-    // anything left there is not ours and is left alone (said so).
+    // acts on vanished links. A zone's table now holds two things cfab owns: the engine's
+    // routes (swept here with the engine) and, on a gw zone, cfab's own proto-205 return-path
+    // default (deleted explicitly below). Anything else left in the table is not ours and is
+    // left alone (the leftover-note loop says so).
     engine_ctl::stop_and_sweep(sys, f)?;
     // return-path rules (both kinds)
     for z in &f.zones {
@@ -102,6 +104,27 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             "2002",
             &format!("from {blk} unreachable"),
             &["from", &blk, "unreachable"],
+        )?;
+    }
+    // cfab's own return-path default (up installs it, proto 205): deleted by exact key
+    // (prefix `default`, the zone's table, proto 205), never a broad pattern, so only the route
+    // cfab owns is removed. Idempotent like the neighboring teardown (`run_ignore`): the leg's
+    // netdev may already be gone, taking the route with it.
+    let proto = crate::emit::engine::CFAB_PROTO.to_string();
+    for r in view.gw_rows() {
+        let z = f.zone(&r.zone)?;
+        run_ignore(
+            sys,
+            &[
+                "ip",
+                "route",
+                "del",
+                "default",
+                "table",
+                &z.id.to_string(),
+                "proto",
+                &proto,
+            ],
         )?;
     }
     sys.remove(&f.run_dir)?;
@@ -388,6 +411,24 @@ mod tests {
         assert!(
             last_del < first_link_del,
             "sweep precedes interface deletion"
+        );
+    }
+
+    /// `down` deletes cfab's own return-path default by exact key (prefix `default`, the zone's
+    /// table, proto 205) — never a broad pattern — for the gw zone this member carries.
+    #[test]
+    fn down_deletes_the_return_path_default_by_exact_key() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut sys, &view).unwrap();
+        assert!(
+            sys.ran("ip route del default table 249 proto 205"),
+            "{:?}",
+            sys.calls
+                .iter()
+                .filter(|c| c.contains("route del default"))
+                .collect::<Vec<_>>()
         );
     }
 

@@ -14,6 +14,12 @@ use crate::model::MemberKind;
 /// 203 = bgp`, so `down`'s sweep and the startup purge touch nothing another stack installed.
 pub const PROTO_BASE: u8 = 201;
 
+/// cfab's own kernel route-protocol id, for the routes cfab installs itself (the per-zone
+/// return-path default, task E2.2). Deliberately OUTSIDE the engine's purged range
+/// `PROTO_BASE..=PROTO_BASE + 3` (201..204), so neither the engine's startup purge nor `down`'s
+/// sweep — both of which delete by that range — removes a route cfab owns from under itself.
+pub const CFAB_PROTO: u8 = 205;
+
 /// RFC 8405 SPF back-off, in milliseconds (`ietf-ospf` units), overriding the model defaults of
 /// 5000/10000. Those defaults protect a large IGP's CPU from repeated SPF over hundreds of nodes;
 /// a fabric of three routers and nine segments computes an SPF in microseconds. Measured cost of
@@ -342,6 +348,28 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap();
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
+    /// deletes cfab's own default from under it) and must not collide with a well-known id.
+    #[test]
+    fn cfab_proto_is_outside_the_swept_range_and_not_well_known() {
+        use crate::commands::engine_ctl::PROTO_RANGE;
+        assert!(
+            !PROTO_RANGE.contains(&CFAB_PROTO),
+            "CFAB_PROTO {CFAB_PROTO} is inside the engine's swept range {PROTO_RANGE:?}"
+        );
+        // The numeric ids in this host's /usr/share/iproute2/rt_protos (checked 2026-09-05):
+        // kernel 2, boot 3, static 4, gated 8, ra 9, mrt 10, zebra 11, bird 12, dnrouted 13,
+        // xorp 14, ntk 15, dhcp 16, keepalived 18, babel 42, ovn 84, openr 99, bgp 186,
+        // isis 187, ospf 188, rip 189, eigrp 192. cfab-return (205) is none of them.
+        const WELL_KNOWN: [u8; 21] = [
+            2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 42, 84, 99, 186, 187, 188, 189, 192,
+        ];
+        assert!(
+            !WELL_KNOWN.contains(&CFAB_PROTO),
+            "CFAB_PROTO {CFAB_PROTO} collides with a well-known rt_protos id"
+        );
     }
 
     fn tree(member: &str) -> Value {
