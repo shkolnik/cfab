@@ -212,30 +212,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Check => {
-            let kind = match view.kind() {
-                MemberKind::Host => "host",
-                MemberKind::Leaf => "leaf",
-            };
-            let rescue_legs = fabric
-                .class_table
-                .iter()
-                .filter(|r| r.role == Role::Rescue)
-                .count();
-            println!(
-                "fabric.conf OK: {} zones, {} segments, {} rescue legs, {} members",
-                fabric.zones.len(),
-                fabric.class_table.len() - rescue_legs,
-                rescue_legs,
-                fabric.members.len()
-            );
-            println!(
-                "this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} ingress leg(s)",
-                member,
-                view.node(),
-                view.class_rows().len(),
-                view.wires().join(" "),
-                view.gw_rows().len()
-            );
+            print!("{}", check_report(&fabric, &view));
             Ok(ExitCode::SUCCESS)
         }
         Command::Gen { artifact } => {
@@ -361,6 +338,37 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
+/// The two lines `cfab check` prints: the fabric as declared, then what THIS member gets.
+/// The second line is the last thing an operator sees before `up` creates the netdevs, so it
+/// names every leg `up` will build — the rescue legs included: their slaves fan out per wire,
+/// so their count is member-dependent and not derivable from the fabric-wide line.
+fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
+    let kind = match view.kind() {
+        MemberKind::Host => "host",
+        MemberKind::Leaf => "leaf",
+    };
+    let rescue_legs = fabric
+        .class_table
+        .iter()
+        .filter(|r| r.role == Role::Rescue)
+        .count();
+    format!(
+        "fabric.conf OK: {} zones, {} segments, {} rescue legs, {} members\n\
+         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} rescue leg(s), \
+         {} ingress leg(s)\n",
+        fabric.zones.len(),
+        fabric.class_table.len() - rescue_legs,
+        rescue_legs,
+        fabric.members.len(),
+        view.member.name,
+        view.node(),
+        view.class_rows().len(),
+        view.wires().join(" "),
+        view.rescue_rows().len(),
+        view.gw_rows().len(),
+    )
+}
+
 /// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
 /// CFAB_RUN cap files with the cluster-published cap as the absent-local fallback, and
 /// CFAB_UP_IFS as the authoritative up-set, else sysfs carrier, else assume up (never demote
@@ -389,4 +397,52 @@ fn shape_for<'a>(
         }
     };
     emit::shape::derive(view, dev, measured, &up)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfab::config::RawConfig;
+    use cfab::model::Fabric;
+
+    fn fabric_from(text: &str) -> Fabric {
+        Fabric::from_raw(&RawConfig::parse(text).unwrap()).unwrap()
+    }
+
+    fn example() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            .unwrap()
+    }
+
+    /// The per-member line is the only output that says what THIS host will get, and `up`
+    /// builds one bond per rescue leg with one slave per wire under it. It must say so.
+    #[test]
+    fn check_names_this_members_rescue_legs() {
+        let f = fabric_from(&example());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            check_report(&f, &view),
+            "fabric.conf OK: 3 zones, 9 segments, 3 rescue legs, 3 members\n\
+             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 rescue leg(s), 1 ingress leg(s)\n"
+        );
+    }
+
+    /// A fabric declaring no rescue row: one spelling, counted zero, never absent.
+    #[test]
+    fn check_on_a_rescue_free_fabric_counts_zero() {
+        let text = example()
+            .lines()
+            .filter(|l| !l.contains(" rescue "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = fabric_from(&text);
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            check_report(&f, &view),
+            "fabric.conf OK: 3 zones, 9 segments, 0 rescue legs, 3 members\n\
+             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             0 rescue leg(s), 1 ingress leg(s)\n"
+        );
+    }
 }
