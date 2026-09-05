@@ -489,7 +489,7 @@ pub(crate) mod tests {
                 }),
             );
         }
-        json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": [], "vrrp": [] })
+        json!({ "ready": true, "ospf": Value::Object(ospf), "bfd": [], "bgp": [] })
     }
 
     #[test]

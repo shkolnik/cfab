@@ -20,14 +20,11 @@ pub fn generate(view: &View) -> Result<String> {
         None => out.push_str("  set admin { type ifname; }\n"),
     }
     for z in &f.zones {
-        let mut ifs: Vec<String> = view
+        let ifs: Vec<String> = view
             .zone_ifs(&z.name)
             .into_iter()
             .map(|i| format!("\"{i}\""))
             .collect();
-        if z.name == "storage" && f.vrrp_gw {
-            ifs.push(format!("\"{}\"", f.vrrp_if));
-        }
         if ifs.is_empty() {
             out.push_str(&format!("  set {} {{ type ifname; }}\n", z.name));
         } else {

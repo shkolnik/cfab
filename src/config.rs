@@ -52,7 +52,7 @@ impl RawConfig {
                     }
                 }
                 if value.contains('$') {
-                    continue; // computed by the shell (e.g. VRRP_VIP) — the model derives it
+                    continue; // computed by the shell (e.g. CFAB_HOST) — the model derives it
                 }
                 cfg.insert(key, value);
             } else {
@@ -137,11 +137,10 @@ mod tests {
 
     #[test]
     fn computed_values_are_skipped() {
-        let text =
-            "CFAB_HOST=${CFAB_HOST:-$(hostname)}\nVRRP_VIP=\"$(zone_block storage).1.254\"\n";
+        let text = "CFAB_HOST=${CFAB_HOST:-$(hostname)}\nFABRIC_MEMBERS=\"$(member_rows)\"\n";
         let c = RawConfig::parse(text).unwrap();
         assert_eq!(c.get("CFAB_HOST"), None);
-        assert_eq!(c.get("VRRP_VIP"), None);
+        assert_eq!(c.get("FABRIC_MEMBERS"), None);
     }
 
     #[test]
