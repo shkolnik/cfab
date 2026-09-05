@@ -582,9 +582,9 @@ fn mk_vlan(
 }
 
 /// Bond `updelay` in ms — how long a returning wire must hold carrier before it is reselected.
-/// **500 is MEASURED, not a target** (sweep of 0/200/500, n=1 per value, research repo
-/// `docs/research/2026-09-04-rescue-segment-container-evidence.md` §5): it costs a 0.574 s window
-/// after a *legitimate* return in which `verify` reads DEGRADED (0.074 s at 0), with **zero**
+/// **500 is MEASURED, not a target** (sweep of 0/200/500, n=1 per value, container fixture on a
+/// three-member testbed): it costs a 0.574 s window after a *legitimate* return in which
+/// `verify` reads DEGRADED (0.074 s at 0), with **zero**
 /// packets lost at every value, and it buys a 10x reduction in migrations on a bouncing wire —
 /// 2 versus 20 active-slave switches over ten 250 ms flaps, each avoided switch an avoided GARP
 /// burst and MAC move on every switch in the path. `updelay` never delays the failover AWAY from
