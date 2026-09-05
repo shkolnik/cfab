@@ -234,7 +234,8 @@ fn parse_state(reply: &str) -> Result<Value> {
     Ok(doc)
 }
 
-/// The OSPF interfaces cfab configures per zone: segments, the identity, the ingress leg.
+/// The OSPF interfaces cfab configures per zone, in the order `emit::engine` writes them:
+/// segments, the rescue bond, the identity, the ingress leg.
 fn configured_ifs(view: &View, zone: &crate::model::Zone) -> Vec<String> {
     let mut ifs: Vec<String> = view
         .class_rows()
@@ -242,6 +243,12 @@ fn configured_ifs(view: &View, zone: &crate::model::Zone) -> Vec<String> {
         .filter(|r| r.zone == zone.name)
         .map(|r| r.ifname)
         .collect();
+    ifs.extend(
+        view.rescue_rows()
+            .into_iter()
+            .filter(|r| r.zone == zone.name)
+            .map(|r| r.ifname),
+    );
     ifs.push(View::identity_if(zone));
     ifs.extend(
         view.gw_rows()
@@ -297,19 +304,30 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
         if view.kind() != MemberKind::Leaf {
             continue;
         }
-        let rows: Vec<_> = view
+        // Every adjacency interface of the zone as `(ifname, seg, cost)`: the class segments
+        // and the rescue bond. The bond addresses and advertises exactly like a segment
+        // (`10.<id>.<seg>.<node>`), so leaving it out here made a leaf's rescue link an
+        // unrecognized transit source and `up` fatal on every leaf.
+        let rows: Vec<(String, u8, u32)> = view
             .class_rows()
             .into_iter()
             .filter(|r| r.zone == z.name)
+            .map(|r| (r.ifname, r.seg, r.ospf_cost))
+            .chain(
+                view.rescue_rows()
+                    .into_iter()
+                    .filter(|r| r.zone == z.name)
+                    .map(|r| (r.ifname, r.seg, r.ospf_cost)),
+            )
             .collect();
-        for r in &rows {
-            let want = u64::from(r.ospf_cost + f.leaf_cost_offset);
-            let got = inst["interfaces"][&r.ifname]["cost"].as_u64();
+        for (ifname, _, ospf_cost) in &rows {
+            let want = u64::from(ospf_cost + f.leaf_cost_offset);
+            let got = inst["interfaces"][ifname]["cost"].as_u64();
             if got != Some(want) {
                 return Err(Error::fatal(format!(
-                    "engine readback: ospf '{}' {} cost is {} (want {want} = cost + \
+                    "engine readback: ospf '{}' {ifname} cost is {} (want {want} = cost + \
                      LEAF_COST_OFFSET)",
-                    z.name, r.ifname, inst["interfaces"][&r.ifname]["cost"]
+                    z.name, inst["interfaces"][ifname]["cost"]
                 )));
             }
         }
@@ -320,19 +338,22 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             .filter(|l| is_transit(&l["type"]));
         for link in transit {
             let addr = link["if"].as_str().unwrap_or("?");
-            let Some(r) = rows.iter().find(|r| view.segment_addr(z, r.seg) == addr) else {
+            let Some((ifname, _, ospf_cost)) = rows
+                .iter()
+                .find(|(_, seg, _)| view.segment_addr(z, *seg) == addr)
+            else {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' advertises a transit link from {addr}, which \
                      is not one of this member's segment addresses",
                     z.name
                 )));
             };
-            let want = u64::from(r.ospf_cost + f.leaf_cost_offset);
+            let want = u64::from(ospf_cost + f.leaf_cost_offset);
             if link["metric"].as_u64() != Some(want) {
                 return Err(Error::fatal(format!(
-                    "engine readback: ospf '{}' transit link {} ({addr}) advertised at {} \
+                    "engine readback: ospf '{}' transit link {ifname} ({addr}) advertised at {} \
                      (want {want} = cost + LEAF_COST_OFFSET)",
-                    z.name, r.ifname, link["metric"]
+                    z.name, link["metric"]
                 )));
             }
         }
@@ -425,25 +446,35 @@ pub(crate) mod tests {
             let mut ifs = serde_json::Map::new();
             let mut links = Vec::new();
             for ifn in configured_ifs(view, z) {
-                let row = view
+                // Segments and the rescue bond are adjacency interfaces: both carry a cost and
+                // both advertise a transit link once the LAN has a DR. Only the identity and
+                // the ingress leg are passive.
+                let seg = view
                     .class_rows()
                     .into_iter()
-                    .find(|r| r.ifname == ifn && r.zone == z.name);
-                let cost = row.as_ref().map(|r| {
+                    .find(|r| r.ifname == ifn && r.zone == z.name)
+                    .map(|r| (r.seg, r.ospf_cost))
+                    .or_else(|| {
+                        view.rescue_rows()
+                            .into_iter()
+                            .find(|r| r.ifname == ifn && r.zone == z.name)
+                            .map(|r| (r.seg, r.ospf_cost))
+                    });
+                let cost = seg.map(|(_, c)| {
                     if view.kind() == MemberKind::Leaf {
-                        r.ospf_cost + f.leaf_cost_offset
+                        c + f.leaf_cost_offset
                     } else {
-                        r.ospf_cost
+                        c
                     }
                 });
                 ifs.insert(
                     ifn.clone(),
-                    json!({ "state": "dr", "cost": cost, "passive": row.is_none(), "neighbors": [] }),
+                    json!({ "state": "dr", "cost": cost, "passive": seg.is_none(), "neighbors": [] }),
                 );
-                if let Some(r) = row {
+                if let Some((s, _)) = seg {
                     links.push(json!({
-                        "if": view.segment_addr(z, r.seg),
-                        "link_id": view.segment_addr(z, r.seg),
+                        "if": view.segment_addr(z, s),
+                        "link_id": view.segment_addr(z, s),
                         "type": "transit-network-link",
                         "metric": cost,
                     }));
@@ -654,6 +685,127 @@ pub(crate) mod tests {
         assert!(
             e.contains("ospf 'storage' cfab-st-bk cost is 10 (want 30100"),
             "{e}"
+        );
+    }
+
+    /// The readback proves what `emit::engine` wrote, so it must configure the same set in the
+    /// same order: segments, the rescue bond, the identity, the ingress leg.
+    #[test]
+    fn configured_ifs_lists_the_rescue_bond_after_the_segments() {
+        let f = fabric();
+        for (m, zone, want) in [
+            // A host's zone with an ingress leg: segments, bond, identity, leg.
+            (
+                "pve1-tb",
+                "mgmt",
+                vec![
+                    "cfab-mg",
+                    "cfab-mg-bk",
+                    "cfab-mg-b2",
+                    "cfab-mg-rs",
+                    "cfab-id249",
+                    "cfab-gw249",
+                ],
+            ),
+            // A leaf never peers, so the list ends at the identity.
+            (
+                "pve3-tb",
+                "storage",
+                vec![
+                    "cfab-st",
+                    "cfab-st-bk",
+                    "cfab-st-b2",
+                    "cfab-st-rs",
+                    "cfab-id99",
+                ],
+            ),
+        ] {
+            let view = View::new(&f, m).unwrap();
+            assert_eq!(
+                configured_ifs(&view, f.zone(zone).unwrap()),
+                want,
+                "{m} {zone}"
+            );
+        }
+    }
+
+    /// The blocker this task closes: a leaf's rescue link is advertised from `10.<id>.9.<node>`
+    /// like any segment. Resolving transit sources against class rows alone made every leaf's
+    /// `up` fatal; the cost rule is the same for it as for a segment.
+    #[test]
+    fn readback_leaf_checks_the_rescue_interface_and_its_transit_link() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The healthy leaf document advertises it: 5000 + 30000.
+        let doc = healthy_doc(&view);
+        assert_eq!(
+            doc["ospf"]["storage"]["interfaces"]["cfab-st-rs"]["cost"],
+            json!(35000)
+        );
+        assert!(
+            doc["ospf"]["storage"]["self_lsa_links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l["if"] == "10.99.9.3"),
+            "the fixture does not advertise the rescue link: {}",
+            doc["ospf"]["storage"]["self_lsa_links"]
+        );
+        readback(&view, &doc).unwrap();
+
+        let mut doc = healthy_doc(&view);
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-rs"]["cost"] = json!(5000);
+        let e = readback(&view, &doc).unwrap_err().to_string();
+        assert!(
+            e.contains("ospf 'storage' cfab-st-rs cost is 5000 (want 35000"),
+            "{e}"
+        );
+
+        let mut doc = healthy_doc(&view);
+        let links = doc["ospf"]["storage"]["self_lsa_links"]
+            .as_array_mut()
+            .unwrap();
+        let rs = links
+            .iter_mut()
+            .find(|l| l["if"] == "10.99.9.3")
+            .expect("rescue link");
+        rs["metric"] = json!(5000);
+        let e = readback(&view, &doc).unwrap_err().to_string();
+        assert!(
+            e.contains("transit link cfab-st-rs (10.99.9.3) advertised at 5000 (want 35000"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn readback_names_a_missing_rescue_interface() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut doc = healthy_doc(&view);
+        doc["ospf"]["mgmt"]["interfaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cfab-mg-rs");
+        let e = readback(&view, &doc).unwrap_err().to_string();
+        assert!(
+            e.contains("ospf 'mgmt' does not list interface cfab-mg-rs"),
+            "{e}"
+        );
+    }
+
+    /// Task 3 left `up`'s "(no wire with carrier under it)" wording unreachable in production:
+    /// `configured_ifs` did not list the bond, so the operational check could never report it
+    /// down. It can now — this is the path `describe_down` decorates.
+    #[test]
+    fn settled_down_ifs_names_a_down_rescue_bond() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut doc = healthy_doc(&view);
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-rs"]["state"] = json!("down");
+        let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc.to_string());
+        assert_eq!(
+            settled_down_ifs(&mut sys, &view, &doc).unwrap(),
+            ["storage/cfab-st-rs"]
         );
     }
 
