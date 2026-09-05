@@ -1469,6 +1469,29 @@ mod tests {
         );
     }
 
+    /// FAILED does not end the wait either: a fabric coming up passes through it, so ending
+    /// early there would report the state of a fabric that had not finished starting.
+    #[test]
+    fn wait_does_not_short_circuit_on_failed() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = leaf_env(&view);
+        let report = run(&mut sys, &view, 6, false).unwrap();
+        assert_eq!(report.state, State::Failed, "{}", report.output);
+        assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps: FAILED waited it out");
+    }
+
+    /// DOWN does short-circuit: there is no intent, so there is nothing to wait for.
+    #[test]
+    fn wait_short_circuits_on_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = MockSys::default();
+        let report = run(&mut sys, &view, 600, false).unwrap();
+        assert_eq!(report.state, State::Down);
+        assert!(sys.slept.is_empty(), "DOWN never waits");
+    }
+
     /// The wait is for the post-`up` settle, not a verdict: a member that stays degraded waits
     /// the whole deadline and then reports the state it reached.
     #[test]
