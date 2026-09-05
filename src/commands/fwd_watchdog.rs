@@ -18,7 +18,9 @@ use crate::commands::common::{
     self, conf_interfaces, ensure_foreign_transit_accept, foreign_forward_remedy,
     unresolved_forward_drops,
 };
+use crate::commands::engine_ctl;
 use crate::derive::View;
+use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
 use crate::sys::{Sys, run_ignore};
@@ -41,6 +43,10 @@ pub struct WatchdogReport {
     /// Restores that failed, after which the narrowest thing that removes the hazard was
     /// brought down. The name says what went down and why.
     pub downed: Vec<String>,
+    /// The engine would not take the `transit-cost` re-advertisement (it is down, or it
+    /// refused the candidate). Loud, but never an exit code of its own: an engine that is not
+    /// answering is `status`'s story, and the forwarding flags are already off.
+    pub transit_cost_error: Option<String>,
     /// Restores that failed where there is nothing to actuate on — the drift stands, loudly,
     /// and `status` keeps reporting it. Never silent, never an outage.
     pub unrestored: Vec<String>,
@@ -52,6 +58,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
     // (`up` only schedules this timer on a forwarding host today; the guard makes the command
     // safe to run anywhere, which is what the rule restores below need.)
     let transits = view.kind() == MemberKind::Host && view.fabric.host_forward;
+    let mut transit_cost_error = None;
     if transits {
         let chain = sys.run(&["nft", "list", "chain", "inet", "cfab-fwd", "forward"])?;
         if !chain.ok() || !chain.stdout.contains("policy drop;") {
@@ -61,6 +68,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
                 "table inet cfab-fwd / chain forward with policy drop is not loaded",
             );
         }
+        // The policy is loaded, so this member may transit again: put the transit links back
+        // at their declared cost. Re-asserted every tick, not remembered — the engine diffs
+        // the candidate, so the cost already in force costs nothing, and no state file can
+        // disagree with what is actually advertised.
+        transit_cost_error = ask_transit_cost(sys, view, TransitCost::Declared);
     }
     let present = conf_interfaces(sys)?;
     let mut corrected = Vec::new();
@@ -120,6 +132,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
             restored,
             downed,
             unrestored,
+            transit_cost_error,
         });
     }
     // Ask the foreign stack to pass cfab transit before judging it: Docker's policy stays DROP
@@ -167,6 +180,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
         restored,
         downed,
         unrestored,
+        transit_cost_error,
     })
 }
 
@@ -282,6 +296,21 @@ fn restore_bond_membership(
     Ok(())
 }
 
+/// Tell the engine what cost to advertise this member's transit links at (spec §12 (b)).
+/// Returns the error text when the engine would not take it — loud, never fatal: the
+/// forwarding flags are the actuator, this is only what the peers are told.
+fn ask_transit_cost(sys: &mut dyn Sys, view: &View, at: TransitCost) -> Option<String> {
+    let sock = engine_ctl::sock_path(view.fabric);
+    let line = format!("transit-cost {}\n", at.word());
+    match sys.unix_request(&sock, &line) {
+        Ok(reply) if reply.contains("\"error\"") => {
+            Some(format!("engine refused {}: {}", line.trim(), reply.trim()))
+        }
+        Ok(_) => None,
+        Err(e) => Some(format!("engine would not take {}: {e}", line.trim())),
+    }
+}
+
 fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogReport> {
     let present = conf_interfaces(sys)?;
     for (ifn, _) in view.owned_forwarding() {
@@ -289,6 +318,14 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
             sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
         }
     }
+    // Forwarding is off here, so every packet a peer still sends through this member is a
+    // black hole until the peers stop choosing it as transit. Re-advertise at the leaf offset:
+    // still reachable, never a path through. A leaf is already offset and is never asked.
+    let transit_cost_error = if view.kind() == MemberKind::Host && view.fabric.host_forward {
+        ask_transit_cost(sys, view, TransitCost::LeafOffset)
+    } else {
+        None
+    };
     run_ignore(
         sys,
         &[
@@ -308,6 +345,7 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
         restored: Vec::new(),
         downed: Vec::new(),
         unrestored: Vec::new(),
+        transit_cost_error,
     })
 }
 
@@ -341,6 +379,10 @@ mod tests {
 
     fn healthy_sys(view: &View) -> MockSys {
         let mut sys = MockSys::default()
+            .socket(
+                &engine_ctl::sock_path(view.fabric),
+                "{\"transit_cost\":\"normal\"}",
+            )
             .on_stdout(
                 &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
                 "chain forward {\n  type filter hook forward priority filter; policy drop;\n}",
@@ -609,6 +651,87 @@ mod tests {
                 );
         }
         rules_present(sys, view)
+    }
+
+    /// Spec §12 (b). Failing closed turns forwarding off, which black-holes anything a peer
+    /// still sends through this member — so the same tick tells the engine to re-advertise the
+    /// transit links at the leaf offset. A healthy tick asks for the declared cost back: the
+    /// request is re-asserted every tick rather than remembered, so no state file can disagree
+    /// with what is actually advertised.
+    #[test]
+    fn failing_closed_re_advertises_at_the_leaf_offset_and_a_healthy_tick_puts_it_back() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let sock = engine_ctl::sock_path(view.fabric);
+
+        let mut sys = healthy_sys(&view);
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_none());
+        assert!(
+            sys.ran(&format!("unix_request {sock} transit-cost normal")),
+            "{:?}",
+            sys.calls
+        );
+        assert_eq!(report.transit_cost_error, None);
+
+        let mut sys = healthy_sys(&view)
+            .socket(&sock, "{\"transit_cost\":\"leaf\"}")
+            .on_stdout(
+                &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+                "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
+            );
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_some());
+        assert!(
+            sys.ran(&format!("unix_request {sock} transit-cost leaf")),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.ran(&format!("unix_request {sock} transit-cost normal")),
+            "{:?}",
+            sys.calls
+        );
+        assert_eq!(report.transit_cost_error, None);
+    }
+
+    /// An engine that is not answering must not turn a fail-closed tick into a panic or a
+    /// silent success: the forwarding flags still go off, and the undelivered re-advertisement
+    /// is named.
+    #[test]
+    fn an_engine_that_will_not_take_the_re_advertisement_is_loud_not_fatal() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view).on_stdout(
+            &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+            "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
+        );
+        sys.sockets.clear();
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_some());
+        let e = report.transit_cost_error.expect("named");
+        assert!(e.contains("transit-cost leaf"), "{e}");
+        assert!(
+            sys.ran("write /proc/sys/net/ipv4/conf/cfab-st/forwarding"),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// A leaf is offset by what it is and never transits: it asks for nothing, in either
+    /// direction, so a leaf with no engine socket is not a fail-closed leaf.
+    #[test]
+    fn a_leaf_never_asks_for_a_transit_cost() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf_sys(&view);
+        let report = run(&mut sys, &view).unwrap();
+        assert_eq!(report.transit_cost_error, None);
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("transit-cost")),
+            "{:?}",
+            sys.calls
+        );
     }
 
     /// Row 4, restore. cfab owns the loose rp_filter, so drift is written back — and nothing is

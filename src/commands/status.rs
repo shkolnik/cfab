@@ -1504,11 +1504,10 @@ mod tests {
         assert_eq!(once_each(&r), vec!["a".to_string(), "b".to_string()]);
     }
 
-    #[test]
-    fn a_healthy_forwarding_host_is_up() {
-        let f = fabric();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = host_env(&view);
+    /// A forwarding host with every leg up, every route on its primary and every BFD session
+    /// established: the fixture the transit-posture tests vary one fact of.
+    fn healthy_host(f: &Fabric, view: &View) -> MockSys {
+        let mut sys = host_env(view);
         for p in [2u8, 3u8] {
             for z in &f.zones {
                 let prim = view
@@ -1536,12 +1535,53 @@ mod tests {
                 }
             }
         }
-        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
+    }
+
+    #[test]
+    fn a_healthy_forwarding_host_is_up() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
         let report = run(&mut sys, &view, 0, false).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
             headline(&report),
             "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)"
+        );
+        assert!(
+            !report.output.contains("transit disabled"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Spec §12 (b), the reporting half. A host whose forward policy is gone has failed closed:
+    /// the watchdog turned forwarding off and had the engine re-advertise at the leaf offset.
+    /// This member is still reachable on every leg, so `status` stays UP — the transit loss is
+    /// a reason line, not a state. The offset costs are invisible here by design: `status`
+    /// counts adjacencies, and every one of them survives the re-advertisement.
+    #[test]
+    fn a_fail_closed_transit_host_is_up_with_the_transit_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).on_stdout(
+            &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+            "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
+        );
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)"
+        );
+        assert!(
+            report.output.contains(
+                "transit disabled: table inet cfab-fwd / chain forward with policy drop is not \
+                 loaded — re-run cfab up"
+            ),
+            "{}",
+            report.output
         );
     }
 

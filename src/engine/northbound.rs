@@ -188,8 +188,9 @@ impl Northbound {
 
     /// Two-phase commit of a full candidate (holod's `create_transaction`): validate, diff
     /// against running, refuse unmapped changes, Prepare everywhere, then Apply — or Abort
-    /// everywhere and fail.
-    pub async fn commit(&mut self, candidate: DataTree<'static>) -> Result<()> {
+    /// everywhere and fail. `false` = the candidate was already what is running, so nothing
+    /// was applied; a caller re-asserting on a timer uses it to stay quiet.
+    pub async fn commit(&mut self, candidate: DataTree<'static>) -> Result<bool> {
         let candidate = Arc::new(candidate);
         validate(&self.validation_fns, &candidate).map_err(|e| {
             Error::fatal(format!(
@@ -203,7 +204,7 @@ impl Northbound {
             .diff(&candidate, DataDiffFlags::DEFAULTS)
             .map_err(|e| Error::fatal(format!("engine: diff failed: {}", yang_err(&e))))?;
         if diff.iter().next().is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let changes = changes_from_diff(&diff);
         if let Some(path) = first_unmapped(&changes, &self.provider_paths) {
@@ -221,7 +222,7 @@ impl Northbound {
                 self.commit_phase_notify(CommitPhase::Apply, &candidate, &changes)
                     .await?;
                 self.running = candidate;
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 // Abort everywhere; the Prepare error is the one worth reporting.
