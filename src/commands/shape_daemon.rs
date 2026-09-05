@@ -1,4 +1,4 @@
-//! `cfab shape-daemon` — membership-reactive shaping; runs as cfab-shape.service on a host.
+//! `cfab shape-daemon` — membership-reactive shaping; runs as a supervised child of `cfab run` on a host.
 //! Watches link events for the fabric wires and regenerates+applies each UP wire's
 //! HTB tree with an authoritative up-set. On a link down, a bulk zone's full floor re-derives
 //! onto its next-preferred surviving wire; on return it re-derives back. Control keeps its full

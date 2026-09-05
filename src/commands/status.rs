@@ -174,7 +174,7 @@ fn read_components(sys: &mut dyn Sys, f: &Fabric) -> Option<Components> {
 
 /// The engine's socket is silent: say why, in the one spelling the condition earns. With a
 /// supervisor answering, quote the child it reports; without one, name the socket and the
-/// remedy. The old `cfab-engine.service` spelling is gone — there is no such unit any more.
+/// remedy. The engine is a supervised child now, never its own unit.
 fn engine_down_reason(f: &Fabric, comps: Option<&Components>) -> String {
     match comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) {
         Some(e) => {
@@ -284,9 +284,9 @@ fn read(
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
     // below needs the engine. Diagnose that before reporting its symptoms.
-    let port_taken = bfd_port(sys, view, c)?;
+    bfd_port(sys, view, c)?;
     let doc = engine_ctl::state(sys, f).ok();
-    if doc.is_none() && !port_taken {
+    if doc.is_none() {
         // The engine's socket is silent. The supervisor (spec §9) is the authority on why:
         // if it answers, quote the child's state; if it does not, the fault is upstream of
         // the engine and the remedy is to start the service — one spelling each.
@@ -351,11 +351,11 @@ fn read(
 
 /// BFD port custody, and the one diagnosis that must run before anything else: the engine binds
 /// udp/BFD_PORT exclusively (no SO_REUSEADDR), so a daemon holding the port makes the engine exit
-/// at the first session instead of stealing our packets. Returns true when that is why there is
-/// no engine to talk to. A second BFD daemon that is merely present is a reason line: it takes
-/// the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on both sides FRR's bfdd
-/// and holo both bound 0.0.0.0:3784 and the last binder silently took every packet, either order.
-fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
+/// at the first session instead of stealing our packets. A second BFD daemon that is present is a
+/// reason line: it takes the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on
+/// both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder silently took every
+/// packet, either order.
+fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     let f = view.fabric;
     let port = f.bfd_port;
     let mut found: Vec<String> = Vec::new();
@@ -391,24 +391,7 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
             found.join(", ")
         ));
     }
-    // A bind failure in the log is only news while the engine is gone: the engine that answers
-    // holds the port (nothing else can), and a line from a start it has since survived is history.
-    if engine_ctl::state(sys, f).is_ok() {
-        return Ok(false);
-    }
-    let systemd = sys.exists("/run/systemd/system");
-    let log = engine_ctl::engine_log(sys, f, systemd);
-    let Some(line) = engine_ctl::bfd_bind_error_line(&log, port) else {
-        return Ok(false);
-    };
-    c.note(format!(
-        "bfd udp/{port}: the engine is not running and could not bind it — {line}"
-    ));
-    c.note(format!(
-        "remedy: {}",
-        engine_ctl::bfd_bind_remedy(line, port)
-    ));
-    Ok(true)
+    Ok(())
 }
 
 fn posture(
@@ -1553,15 +1536,6 @@ mod tests {
         assert_never_writes("healthy leaf", &mut healthy_leaf(&leaf), &leaf, 0);
         assert_never_writes("engine absent (FAILED)", &mut leaf_env(&leaf), &leaf, 0);
         assert_never_writes("no run dir (DOWN)", &mut MockSys::default(), &leaf, 0);
-        assert_never_writes(
-            "bfd port taken (FAILED)",
-            &mut leaf_env(&leaf).file(
-                "/run/cfab/engine.log",
-                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use\n",
-            ),
-            &leaf,
-            0,
-        );
 
         let mut bfd = all_bfd_up(&f);
         bfd[0].1 = "down";
@@ -1975,50 +1949,6 @@ mod tests {
         );
     }
 
-    /// The engine is gone because the port is taken: zero adjacencies is FAILED, and the
-    /// doctor's diagnosis rides along as the reason so a dead-because-stolen-port engine is
-    /// explained rather than reported as a bare FAILED.
-    #[test]
-    fn a_lost_bfd_port_is_failed_with_the_diagnosis() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = leaf_env(&view).file(
-            "/run/cfab/engine.log",
-            "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n",
-        );
-        let report = run(&mut sys, &view, 0, false).unwrap();
-        assert_eq!(report.state, State::Failed, "output:\n{}", report.output);
-        assert_eq!(report.code, 2);
-        assert_eq!(
-            headline(&report),
-            "FAILED (0/2 | 0/18 | 0/6) on pve3-tb (leaf)"
-        );
-        assert!(
-            report.output.contains(
-                "  bfd udp/3784: the engine is not running and could not bind it — bfd: \
-                 cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n"
-            ),
-            "{}",
-            report.output
-        );
-        assert!(
-            report.output.contains(
-                "  remedy: stop FRR, which owns bfdd: systemctl disable --now frr; or declare a \
-                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
-                 session must use the same port\n"
-            ),
-            "{}",
-            report.output
-        );
-        // The generic "engine not running" line must NOT also appear: one spelling per
-        // condition, and the doctor's is the one that names the cause.
-        assert!(
-            !report.output.contains("engine not running:"),
-            "{}",
-            report.output
-        );
-    }
-
     /// The engine is simply absent (no port thief): still zero adjacencies, still FAILED, and
     /// the reason names the engine rather than eighteen symptoms of it.
     #[test]
@@ -2203,12 +2133,9 @@ mod tests {
         bfd[0].1 = "down";
         let degraded = engine_doc(&view, &bfd);
         let up = engine_doc(&view, &all_bfd_up(&f));
-        // The doctor and the count each read the socket once per pass, so a pass consumes two
-        // replies; the last reply repeats forever.
-        let mut sys = primary_routes(leaf_env(&view), &view).socket_seq(
-            "/run/cfab/engine.sock",
-            &[degraded.clone(), degraded, up.clone(), up],
-        );
+        // The count reads the engine socket once per pass; the last reply repeats forever.
+        let mut sys = primary_routes(leaf_env(&view), &view)
+            .socket_seq("/run/cfab/engine.sock", &[degraded, up]);
         let report = run(&mut sys, &view, 30, false).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(

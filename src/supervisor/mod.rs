@@ -1279,9 +1279,6 @@ mod tests {
         fn unix_request(&mut self, p: &str, l: &str) -> crate::error::Result<String> {
             self.inner.unix_request(p, l)
         }
-        fn spawn_detached(&mut self, a: &[&str], l: &str) -> crate::error::Result<()> {
-            self.inner.spawn_detached(a, l)
-        }
     }
 
     fn quiet_hooks(shared: Arc<Mutex<Shared>>, ready: tokio::sync::oneshot::Sender<()>) -> Hooks {

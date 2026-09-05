@@ -267,8 +267,8 @@ where
 /// Arm this process's parent-death signal, but **only when supervised** (spec §7).
 ///
 /// `None` (no `CFAB_SUPERVISOR_PID` in the environment) does nothing at all — no prctl, no
-/// `getppid`: a standalone `cfab engine` must survive its launcher exiting, and
-/// `scripts/engine-oracle.sh` runs it under `setsid -f`, whose intermediate parent exits
+/// `getppid`: a standalone `cfab engine` must survive its launcher exiting, as when
+/// `scripts/engine-oracle.sh` starts it in a new session whose intermediate parent exits
 /// immediately. `Some(p)` arms SIGTERM first and only then compares `getppid()` with `p`, so
 /// a supervisor that dies inside the fork window cannot slip between the check and the arm;
 /// the mismatch is this child's own exit 5, never the supervisor's 4.

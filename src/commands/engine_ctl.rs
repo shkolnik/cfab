@@ -1,7 +1,8 @@
-//! The embedded routing engine's lifecycle from the outside: start it (systemd where there
-//! is one, `setsid` in a container), wait for its state socket to report ready, stop it and
-//! sweep the kernel routes it owns, read its state, and check that the running engine took
-//! the configuration `up` meant (spec §9 readback). Shared by up/down/status.
+//! The embedded routing engine's lifecycle from the outside: stop it and sweep the kernel
+//! routes it owns, read its state, and check that the running engine took the configuration
+//! meant for it (spec §9 readback). The supervisor starts and supervises the engine itself
+//! (one bring-up path); this module is what teardown and status still need. Shared by
+//! run/down/status.
 
 use serde_json::Value;
 
@@ -10,14 +11,11 @@ use crate::emit::engine::PROTO_BASE;
 use crate::engine::SOCK_NAME;
 use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
-use crate::sys::{Sys, run_ignore, run_ok};
+use crate::sys::{Sys, run_ok};
 
-pub const UNIT: &str = "cfab-engine";
-pub const LOG_NAME: &str = "engine.log";
 /// Every kernel route-protocol id the engine may install under (spec §7 P2: base+0 ospf,
 /// +1 static, +2 bgp, +3 spare); `down` sweeps exactly this range.
 const PROTO_RANGE: std::ops::RangeInclusive<u8> = PROTO_BASE..=PROTO_BASE + 3;
-const START_WAIT_MS: u64 = 30_000;
 const POLL_MS: u64 = 500;
 /// How long `up` re-reads the state document before believing a configured interface really
 /// is operationally down (see `settled_down_ifs`).
@@ -40,25 +38,12 @@ pub fn sock_path(f: &Fabric) -> String {
     format!("{}/{SOCK_NAME}", f.run_dir)
 }
 
-/// Where a detached (non-systemd) engine's stdout+stderr go.
-pub fn log_path(f: &Fabric) -> String {
-    format!("{}/{LOG_NAME}", f.run_dir)
-}
-
-/// Stop a systemd-managed engine (`systemctl stop` sends the signal itself) and sweep every
-/// kernel route carrying the engine's private protocol ids in every table (a crash leaves
-/// them behind; the engine's own shutdown withdraws them). Idempotent. Stopping a detached
-/// (non-systemd) engine has no path here: that lands with the supervisor, which holds the
-/// child's real pid from having spawned it. `_f` is unused today (the pid path it drove is
-/// gone) and kept for the supervisor to pass through unchanged.
+/// Sweep every kernel route carrying the engine's private protocol ids in every table (a crash
+/// leaves them behind; the engine's own shutdown withdraws them). Idempotent. Stopping the
+/// engine process itself lands with the supervisor, which holds the child's real pid from
+/// having spawned it — there is no other engine-stopping path. `_f` is unused today (the pid
+/// path it drove is gone) and kept for the supervisor to pass through unchanged.
 pub fn stop_and_sweep(sys: &mut dyn Sys, _f: &Fabric) -> Result<()> {
-    if sys.exists("/run/systemd/system") {
-        run_ignore(sys, &["systemctl", "stop", &format!("{UNIT}.service")])?;
-        run_ignore(
-            sys,
-            &["systemctl", "reset-failed", &format!("{UNIT}.service")],
-        )?;
-    }
     let n = sweep_routes(sys)?;
     if n > 0 {
         eprintln!(
@@ -112,124 +97,12 @@ pub fn sweep_routes(sys: &mut dyn Sys) -> Result<usize> {
     Ok(n)
 }
 
-/// Start the engine and wait until its state socket answers `"ready": true`. systemd hosts get
-/// a transient unit (`Restart=on-failure`; stop waits ≤10 s before SIGKILL, matching
-/// `stop_and_sweep`); a container leaf gets a detached process logging to `engine.log`.
-pub fn start_and_wait(
-    sys: &mut dyn Sys,
-    f: &Fabric,
-    exe: &str,
-    config: &str,
-    host: &str,
-) -> Result<Value> {
-    let systemd = sys.exists("/run/systemd/system");
-    let tail = [exe, "--config", config, "--host", host, "engine"];
-    let unit_arg = format!("--unit={UNIT}");
-    if systemd {
-        run_ignore(
-            sys,
-            &["systemctl", "reset-failed", &format!("{UNIT}.service")],
-        )?;
-        let mut argv = vec![
-            "systemd-run",
-            "--quiet",
-            unit_arg.as_str(),
-            "-p",
-            "Restart=on-failure",
-            "-p",
-            "KillMode=mixed",
-            "-p",
-            "TimeoutStopSec=10",
-        ];
-        argv.extend(tail);
-        run_ok(sys, &argv)?;
-    } else {
-        sys.spawn_detached(&tail, &log_path(f))?;
-    }
-    let sock = sock_path(f);
-    let mut waited = 0;
-    let last;
-    loop {
-        let why = match sys.unix_request(&sock, "state\n") {
-            Ok(reply) => match parse_state(&reply) {
-                Ok(doc) if doc["ready"] == true => return Ok(doc),
-                Ok(_) => "engine answered but is not ready".to_string(),
-                Err(e) => e.to_string(),
-            },
-            Err(e) => e.to_string(),
-        };
-        if waited >= START_WAIT_MS {
-            last = why;
-            break;
-        }
-        sys.sleep(std::time::Duration::from_millis(POLL_MS));
-        waited += POLL_MS;
-    }
-    let logs = if systemd {
-        format!("systemctl status {UNIT}; journalctl -u {UNIT}")
-    } else {
-        log_path(f)
-    };
-    let log = engine_log(sys, f, systemd);
-    if let Some(line) = bfd_bind_error_line(&log, f.bfd_port) {
-        return Err(Error::fatal(format!(
-            "engine start failed: {line}\n  remedy: {}. See {logs}",
-            bfd_bind_remedy(line, f.bfd_port)
-        )));
-    }
-    Err(Error::fatal(format!(
-        "engine did not become ready within {}s ({last}); see {logs}",
-        START_WAIT_MS / 1000
-    )))
-}
-
-/// The engine's own last words: the journal on a systemd host, the detached log otherwise.
-/// Best effort — a missing log is not itself an error, it just leaves the generic message.
-pub fn engine_log(sys: &mut dyn Sys, f: &Fabric, systemd: bool) -> String {
-    if systemd {
-        sys.run(&["journalctl", "-u", UNIT, "-n", "200", "--no-pager"])
-            .map(|o| o.stdout)
-            .unwrap_or_default()
-    } else {
-        sys.read(&log_path(f)).unwrap_or_default()
-    }
-}
-
-/// What holo-bfd prints before exiting 1 when its Rx socket cannot be bound.
-const BFD_BIND_ERROR: &str = "bfd: cannot bind udp ";
-
-/// The engine's BFD bind failure for this port, if the log holds one (the tracing prefix — level,
-/// timestamp, target — is cut, so the message reads the same from the journal and from the file).
-pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
-    log.lines()
-        .filter_map(|l| l.find(BFD_BIND_ERROR).map(|i| l[i..].trim_end()))
-        .find(|l| l.contains(&format!(":{port}:")))
-}
-
-/// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
-/// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
-/// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
-/// One spelling, shared by `up` (which hits this at start) and `status` (which diagnoses it).
-pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
-    let stop = if line.contains("bfdd") || line.contains("frr") {
-        "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
-    } else if line.contains("holder unknown") {
-        format!("find the holder (ss -ulpn | grep ':{port}') and stop it")
-    } else {
-        "stop the daemon named in the line above".to_string()
-    };
-    format!(
-        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.conf on EVERY member — \
-         every peer of a session must use the same port"
-    )
-}
-
 /// One state read; fatal when the socket does not answer.
 pub fn state(sys: &mut dyn Sys, f: &Fabric) -> Result<Value> {
     let sock = sock_path(f);
     let reply = sys
         .unix_request(&sock, "state\n")
-        .map_err(|e| Error::fatal(format!("engine not running; run cfab up ({e})")))?;
+        .map_err(|e| Error::fatal(format!("engine not running; start it with cfab run ({e})")))?;
     parse_state(&reply)
 }
 
@@ -884,119 +757,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stop_uses_systemd_where_present() {
-        let f = fabric();
-        let mut sys = MockSys::default().file("/run/systemd/system", "");
-        stop_and_sweep(&mut sys, &f).unwrap();
-        assert!(sys.ran("systemctl stop cfab-engine.service"));
-        assert!(!sys.ran("kill"));
-    }
-
-    #[test]
-    fn start_returns_the_ready_document_or_names_the_logs() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
-        let doc = healthy_doc(&view).to_string();
-        let mut sys = MockSys::default().socket("/run/cfab/engine.sock", &doc);
-        let got = start_and_wait(
-            &mut sys,
-            &f,
-            "/usr/bin/cfab",
-            "/etc/cfab/fabric.conf",
-            "pve3-tb",
-        )
-        .unwrap();
-        assert_eq!(got["ready"], true);
-        assert!(sys.ran(
-            "spawn_detached /usr/bin/cfab --config /etc/cfab/fabric.conf --host pve3-tb engine \
-             >> /run/cfab/engine.log"
-        ));
-        let mut sys = MockSys::default();
-        let e = start_and_wait(
-            &mut sys,
-            &f,
-            "/usr/bin/cfab",
-            "/etc/cfab/fabric.conf",
-            "pve3-tb",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("see /run/cfab/engine.log"), "{e}");
-        let mut sys = MockSys::default().file("/run/systemd/system", "");
-        let e = start_and_wait(
-            &mut sys,
-            &f,
-            "/usr/bin/cfab",
-            "/etc/cfab/fabric.conf",
-            "pve1-tb",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(sys.ran("systemd-run --quiet --unit=cfab-engine -p Restart=on-failure"));
-        assert!(
-            e.contains("see systemctl status cfab-engine; journalctl -u cfab-engine"),
-            "{e}"
-        );
-        assert_eq!(sys.slept.len(), 60, "30 s in 500 ms steps");
-    }
-
-    /// A squatter on the BFD port: the engine exits 1 with holo's line, and `up` must hand the
-    /// operator the remedy — which daemon, and that the port is fabric-wide.
-    #[test]
-    fn a_bfd_bind_failure_becomes_the_remedy_not_a_timeout() {
-        let f = fabric();
-        let log = "2026-09-05T00:00:00Z ERROR bfd: cannot bind udp 0.0.0.0:3784: \
-                   address in use (held by bfdd pid 812)\n";
-        let mut sys = MockSys::default().file("/run/cfab/engine.log", log);
-        let e = start_and_wait(
-            &mut sys,
-            &f,
-            "/usr/bin/cfab",
-            "/etc/cfab/fabric.conf",
-            "pve3-tb",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            e.contains(
-                "engine start failed: bfd: cannot bind udp 0.0.0.0:3784: address in use \
-                 (held by bfdd pid 812)"
-            ),
-            "{e}"
-        );
-        assert!(
-            e.contains("remedy: stop FRR, which owns bfdd: systemctl disable --now frr"),
-            "{e}"
-        );
-        assert!(
-            e.contains(
-                "or declare a free BFD_PORT (now 3784) in fabric.conf on EVERY member — every \
-                 peer of a session must use the same port. See /run/cfab/engine.log"
-            ),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn the_remedy_is_only_for_our_port_and_names_an_unknown_holder() {
-        let ours = "bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)";
-        let other = "bfd: cannot bind udp 0.0.0.0:4784: address in use (held by bfdd pid 1)";
-        assert_eq!(bfd_bind_error_line(ours, 3784), Some(ours));
-        assert_eq!(bfd_bind_error_line(other, 3784), None);
-        assert_eq!(bfd_bind_error_line("engine starting\n", 3784), None);
-        let e = bfd_bind_remedy(ours, 3784);
-        assert!(
-            e.starts_with("find the holder (ss -ulpn | grep ':3784') and stop it;"),
-            "{e}"
-        );
-    }
-
-    #[test]
     fn state_fails_loud_without_an_engine() {
         let f = fabric();
         let mut sys = MockSys::default();
         let e = state(&mut sys, &f).unwrap_err().to_string();
-        assert!(e.contains("engine not running; run cfab up"), "{e}");
+        assert!(
+            e.contains("engine not running; start it with cfab run"),
+            "{e}"
+        );
         let mut sys = MockSys::default().socket("/run/cfab/engine.sock", "{\"error\":\"boom\"}\n");
         let e = state(&mut sys, &f).unwrap_err().to_string();
         assert!(e.contains("engine state request failed: boom"), "{e}");

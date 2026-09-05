@@ -59,15 +59,15 @@ enum Command {
         #[arg(long)]
         permissive: bool,
     },
-    /// Membership-reactive shaping daemon (started by `up` as cfab-shape.service)
+    /// Membership-reactive shaping daemon (a supervised child of `cfab run`)
     ShapeDaemon {
         /// Quiet-gap debounce after a link event burst, in seconds
         #[arg(long, default_value_t = 0.5)]
         debounce: f64,
     },
-    /// One fail-closed forwarding-posture check (run by the cfab-fwd-watchdog timer)
+    /// One fail-closed forwarding-posture check (run periodically by the `cfab run` supervisor)
     FwdWatchdog,
-    /// Cluster config-sync daemon (started by `up` as cfab-conf-sync.service when clustered)
+    /// Cluster config-sync daemon (a supervised child of `cfab run` when clustered)
     ConfSync,
     /// Flood a fabric peer on one NIC and record the wire's measured capacity
     MeasureCap {
@@ -91,7 +91,7 @@ enum Command {
         #[command(subcommand)]
         action: ConfAction,
     },
-    /// The resident routing engine (started by `up` as cfab-engine.service; root)
+    /// The resident routing engine (a supervised child of `cfab run`; root)
     Engine {
         /// Gate-0 teeth: install routes without preferred sources (the oracle must go RED)
         #[arg(long, hide = true)]
