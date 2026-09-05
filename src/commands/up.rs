@@ -8,7 +8,7 @@ use crate::commands::common::{
     proc_sysctl,
 };
 use crate::commands::engine_ctl;
-use crate::derive::View;
+use crate::derive::{RescueRow, View};
 use crate::emit;
 use crate::error::{Error, Result};
 use crate::model::{MemberKind, Role};
@@ -198,7 +198,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             &r.ifname,
             &r.wire,
             r.vid,
-            &format!("{}/24", view.segment_addr(z, r.seg)),
+            Some(&format!("{}/24", view.segment_addr(z, r.seg))),
+            true,
             &[
                 &format!("0:{}", z.pcp),
                 &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
@@ -216,13 +217,30 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             &r.ifname,
             &r.wire,
             r.vid,
-            &gw.leg_cidr(n),
+            Some(&gw.leg_cidr(n)),
+            true,
             &[
                 &format!("0:{}", z.pcp),
                 &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
             ],
         )?;
         class_sysctls(sys, &r.ifname, Role::Backup)?;
+    }
+    // The rescue leg: one active-backup bond per zone over a tagged sub-interface of every
+    // wire, so the member keeps a path in the zone when the physical islands are disjointly
+    // isolated. Not a class row and not a wire: nothing that treats a segment as a wire (the
+    // shaper, the qdisc sweep, verify's link-speed checks) ever sees it.
+    for r in &view.rescue_rows() {
+        let z = f.zone(&r.zone)?;
+        mk_rescue(
+            sys,
+            r,
+            &format!("{}/24", view.segment_addr(z, r.seg)),
+            &[
+                &format!("0:{}", z.pcp),
+                &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
+            ],
+        )?;
     }
 
     // ---- return path (ZONE_TABLE gw): identity-sourced traffic never leaves untagged ---------
@@ -367,7 +385,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     engine_ctl::readback(view, &doc)?;
     // Operationally down is a warning, never a refusal: one wire without carrier must not
     // cost the host the fabric it can still have on the others.
-    let down = engine_ctl::settled_down_ifs(sys, view, &doc)?;
+    let down = describe_down(view, &engine_ctl::settled_down_ifs(sys, view, &doc)?);
     if !down.is_empty() {
         eprintln!(
             "cfab: warn: ospf interfaces still down after {}s: {} — no adjacency forms on them \
@@ -500,12 +518,16 @@ fn mk_identity(sys: &mut dyn Sys, name: &str, cidr: &str) -> Result<()> {
     Ok(())
 }
 
+/// A tagged sub-interface on `lower`. `addr` is `None` for a link that carries no L3 of its
+/// own (a rescue bond's slave: the bond holds the address), and `bring_up` is false for a link
+/// something else brings up later (enslaving wants the slave down first).
 fn mk_vlan(
     sys: &mut dyn Sys,
     name: &str,
     lower: &str,
     vid: u16,
-    cidr: &str,
+    addr: Option<&str>,
+    bring_up: bool,
     qos_map: &[&str],
 ) -> Result<()> {
     let vid_s = vid.to_string();
@@ -532,9 +554,129 @@ fn mk_vlan(
         argv.extend_from_slice(qos_map);
         run_ok(sys, &argv)?;
     }
-    run_ok(sys, &["ip", "addr", "replace", cidr, "dev", name])?;
-    run_ok(sys, &["ip", "link", "set", name, "up"])?;
+    if let Some(cidr) = addr {
+        run_ok(sys, &["ip", "addr", "replace", cidr, "dev", name])?;
+    }
+    if bring_up {
+        run_ok(sys, &["ip", "link", "set", name, "up"])?;
+    }
     Ok(())
+}
+
+/// Bond `updelay` in ms. **0 is the measured configuration** (the spike migrated losslessly
+/// four times per `fail_over_mac` mode at this value). 500 ms is the target James accepted, but
+/// it is INFERRED — Task 7.2(d) sweeps 0/200/500 on hardware and decides; this constant is the
+/// one line that changes.
+const RESCUE_UPDELAY_MS: &str = "0";
+/// `fail_over_mac`. **`none` is the build default** — measured nil difference against `active`
+/// on veth, and it keeps one MAC across a migration. A real NIC must accept the bond MAC in its
+/// unicast filter (INFERRED); Task 7's hardware step measures that and flips this to `active`
+/// if it does not. One line, deliberately not a config knob.
+const RESCUE_FAIL_OVER_MAC: &str = "none";
+/// Carrier poll, ms: measured switch at +0.014…0.059 s after carrier loss through the VLAN.
+const RESCUE_MIIMON_MS: &str = "100";
+/// Gratuitous ARPs per migration: measured exactly 3, at +0.050/+0.050/+0.152 s.
+const RESCUE_NUM_GRAT_ARP: &str = "3";
+/// Return to the home wire whenever it comes back — a deterministic steady state `verify` can
+/// expect. The return migration is lossless (measured), so it costs nothing.
+const RESCUE_PRIMARY_RESELECT: &str = "always";
+
+/// One rescue leg: an active-backup bond over a tagged sub-interface of every wire this member
+/// has, addressed like a segment. Idempotent, and refuse-unless-ours on every netdev it touches.
+fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> Result<()> {
+    // (1) the bond. Unlike a vlan of the wrong id, a same-named foreign netdev here is not
+    // ours to delete — refuse and say so.
+    if link_exists(sys, &r.ifname)? {
+        if !link_kind_is(sys, &r.ifname, " bond ")? {
+            return Err(Error::fatal(format!(
+                "REFUSING: {} exists but is not a bond",
+                r.ifname
+            )));
+        }
+    } else {
+        run_ok(
+            sys,
+            &[
+                "ip",
+                "link",
+                "add",
+                &r.ifname,
+                "type",
+                "bond",
+                "mode",
+                "active-backup",
+                "miimon",
+                RESCUE_MIIMON_MS,
+                "num_grat_arp",
+                RESCUE_NUM_GRAT_ARP,
+                "updelay",
+                RESCUE_UPDELAY_MS,
+                "fail_over_mac",
+                RESCUE_FAIL_OVER_MAC,
+            ],
+        )?;
+    }
+    // (2) the slaves: created DOWN and with no address — the bond holds the L3, and enslaving
+    // a link the kernel is bringing up is a race. The egress-qos map lives HERE: the tag is
+    // applied on the slave, and PCP is per frame, so control on the rescue path is queued like
+    // control anywhere.
+    for s in &r.slaves {
+        mk_vlan(sys, &s.ifname, &s.wire, r.vid, None, false, qos_map)?;
+        // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
+        // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
+        // to whom (the master link cannot be read as a file — it is a symlink to a directory).
+        let enslaved_here = sys.exists(&format!("/sys/class/net/{}/master", s.ifname))
+            && link_kind_is(sys, &s.ifname, &format!(" master {} ", r.ifname))?;
+        if !enslaved_here {
+            run_ok(sys, &["ip", "link", "set", &s.ifname, "master", &r.ifname])?;
+        }
+        run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
+    }
+    // (4) AFTER the slaves exist: `primary` names a SLAVE, and at `ip link add` time no slave
+    // exists yet, so setting it there is a silent no-op.
+    let home = r.slaves.iter().find(|s| s.wire == r.home).ok_or_else(|| {
+        Error::fatal(format!(
+            "{}: home wire {} carries no slave of this bond",
+            r.ifname, r.home
+        ))
+    })?;
+    run_ok(
+        sys,
+        &[
+            "ip",
+            "link",
+            "set",
+            &r.ifname,
+            "type",
+            "bond",
+            "primary",
+            &home.ifname,
+            "primary_reselect",
+            RESCUE_PRIMARY_RESELECT,
+        ],
+    )?;
+    // (5) the bond is the segment: address, segment sysctls, up.
+    run_ok(sys, &["ip", "addr", "replace", cidr, "dev", &r.ifname])?;
+    class_sysctls(sys, &r.ifname, Role::Rescue)?;
+    run_ok(sys, &["ip", "link", "set", &r.ifname, "up"])?;
+    Ok(())
+}
+
+/// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A rescue bond is not a
+/// wire: it is `down` exactly when not one of its slaves has carrier, so the warning must name
+/// that condition — "ip -br link show cfab-st-rs" would only show an interface that is UP.
+fn describe_down(view: &View, down: &[String]) -> Vec<String> {
+    let rescue: Vec<String> = view.rescue_rows().into_iter().map(|r| r.ifname).collect();
+    down.iter()
+        .map(|entry| {
+            let ifname = entry.rsplit('/').next().unwrap_or(entry);
+            if rescue.iter().any(|r| r == ifname) {
+                format!("{entry} (no wire with carrier under {ifname})")
+            } else {
+                entry.clone()
+            }
+        })
+        .collect()
 }
 
 /// Measured live: arp_ignore=1 (NOT arp_filter — it flaps BFD); rp_filter LOOSE on every role
@@ -570,6 +712,12 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     for r in view.gw_rows() {
+        proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
+    }
+    // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
+    // `verify` and the watchdog grade against `owned_forwarding()`, which lists the bond as
+    // transit — leaving it out here would make every `up` report DEGRADED three seconds later.
+    for r in view.rescue_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     if f.vrrp_gw {
@@ -630,9 +778,12 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut doc = engine_ctl::tests::healthy_doc(&view);
         doc["ospf"].as_object_mut().unwrap().remove("mgmt");
-        let mut sys = MockSys::default()
-            .socket("/run/cfab/engine.sock", &doc.to_string())
-            .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n");
+        let mut sys = absent_rescue_netdevs(
+            MockSys::default()
+                .socket("/run/cfab/engine.sock", &doc.to_string())
+                .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
+            &view,
+        );
         let pmxcfs = tempfile::tempdir().unwrap();
         let opts = UpOpts {
             exe: "/usr/bin/cfab".into(),
@@ -658,6 +809,253 @@ mod tests {
         assert!(first_sweep < start);
     }
 
+    /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC
+    /// addressed, and the forward chain readable — the shape a first bringup sees.
+    fn up_sys(view: &View) -> MockSys {
+        let doc = engine_ctl::tests::healthy_doc(view);
+        MockSys::default()
+            .socket("/run/cfab/engine.sock", &doc.to_string())
+            .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n")
+            .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
+            .on_stdout(&["ip", "link", "show", "eth0"], "2: eth0: <UP>\n")
+            .on_stdout(&["ip", "link", "show", "eth1"], "3: eth1: <UP>\n")
+            .on_stdout(&["ip", "link", "show", "eth9"], "4: eth9: <UP>\n")
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
+                "eth0 UP 192.168.10.1/24\n",
+            )
+            .on_stdout(
+                &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+                "table inet cfab-fwd {\n chain forward {\n type filter hook forward priority 0; policy drop;\n}\n}\n",
+            )
+    }
+
+    /// The older mocks answer every `ip link show` with success, so a rescue bond would look
+    /// present and of an unknown kind — a refusal. Mark the bonds absent: a fresh member.
+    fn absent_rescue_netdevs(mut sys: MockSys, view: &View) -> MockSys {
+        for r in view.rescue_rows() {
+            sys = sys.on_fail(
+                &["ip", "link", "show", &r.ifname],
+                1,
+                "Device does not exist",
+            );
+        }
+        sys
+    }
+
+    fn opts() -> (tempfile::TempDir, UpOpts) {
+        let pmxcfs = tempfile::tempdir().unwrap();
+        let o = UpOpts {
+            exe: "/usr/bin/cfab".into(),
+            config: "/etc/cfab/fabric.conf".into(),
+            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
+        };
+        (pmxcfs, o)
+    }
+
+    fn calls_for(sys: &MockSys, needle: &str) -> Vec<String> {
+        sys.calls
+            .iter()
+            .filter(|c| c.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// Calls naming exactly this device (token equality: `cfab-st` never matches `cfab-st-bk`).
+    fn calls_for_dev(sys: &MockSys, dev: &str) -> Vec<String> {
+        sys.calls
+            .iter()
+            .filter(|c| c.split_whitespace().any(|t| t == dev))
+            .cloned()
+            .collect()
+    }
+
+    /// The whole rescue leg for one zone, argv by argv, on a member with three wires: the bond
+    /// first, each slave created DOWN and address-less then enslaved and brought up, `primary`
+    /// only AFTER the slaves exist (at `add` time it is a silent no-op), then the address,
+    /// the segment sysctls and the bond up. storage's home wire is eth9 (its cheapest class
+    /// row is on the st island), so `primary` names the st SLAVE, never the wire.
+    #[test]
+    fn a_rescue_leg_is_built_bond_slaves_primary_address() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view);
+        let (_tmp, o) = opts();
+        run(&mut sys, &view, &o).unwrap();
+        assert_eq!(
+            calls_for(&sys, "cfab-st-rs"),
+            [
+                "ip link show cfab-st-rs",
+                "ip link add cfab-st-rs type bond mode active-backup miimon 100 num_grat_arp 3 updelay 0 fail_over_mac none",
+                "ip link show cfab-st-rs-st",
+                // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
+                "ip link show cfab-st-rs-st",
+                "ip link add link eth9 name cfab-st-rs-st type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-rs-st master cfab-st-rs",
+                "ip link set cfab-st-rs-st up",
+                "ip link show cfab-st-rs-cl",
+                // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
+                "ip link show cfab-st-rs-cl",
+                "ip link add link eth1 name cfab-st-rs-cl type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-rs-cl master cfab-st-rs",
+                "ip link set cfab-st-rs-cl up",
+                "ip link show cfab-st-rs-mg",
+                // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
+                "ip link show cfab-st-rs-mg",
+                "ip link add link eth0 name cfab-st-rs-mg type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-rs-mg master cfab-st-rs",
+                "ip link set cfab-st-rs-mg up",
+                "ip link set cfab-st-rs type bond primary cfab-st-rs-st primary_reselect always",
+                "ip addr replace 10.99.9.1/24 dev cfab-st-rs",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs/arp_ignore",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs/rp_filter",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs/send_redirects",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs/forwarding",
+                "ip link set cfab-st-rs up",
+                // enable_forwarding, after the policy is loaded and read back
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs/forwarding",
+            ]
+        );
+    }
+
+    /// A slave already in OUR bond is not re-enslaved: `ip link set <slave> master <bond>` on
+    /// it is EBUSY, so the second `up` would fail outright. A slave that is not gets enslaved.
+    #[test]
+    fn a_second_up_does_not_re_enslave_a_slave_already_in_the_bond() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view)
+            .file("/sys/class/net/cfab-st-rs-st/master", "")
+            .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs"],
+                "9: cfab-st-rs: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st@eth9: master cfab-st-rs state UP vlan protocol 802.1Q id 300 \n",
+            );
+        run(&mut sys, &view, &o).unwrap();
+        assert!(
+            !sys.ran("ip link set cfab-st-rs-st master"),
+            "{:?}",
+            calls_for(&sys, "cfab-st-rs-st")
+        );
+        assert!(!sys.ran("ip link add cfab-st-rs type bond"), "bond kept");
+        // and the ones that are not enslaved still are
+        assert!(sys.ran("ip link set cfab-st-rs-cl master cfab-st-rs"));
+    }
+
+    /// A netdev already carrying a rescue bond's name but of another kind is not ours to
+    /// delete (unlike a vlan of the wrong id, which cfab created and can recreate): refuse.
+    #[test]
+    fn up_refuses_a_foreign_netdev_named_like_a_rescue_bond() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs"],
+                "9: cfab-st-rs: bridge \n",
+            );
+        let e = run(&mut sys, &view, &o).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-rs exists but is not a bond"),
+            "{e}"
+        );
+        assert!(
+            !sys.ran("ip link del cfab-st-rs"),
+            "never deletes a stranger"
+        );
+    }
+
+    /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a rescue bond left
+    /// out of it would leave every `up` DEGRADED and make the watchdog "correct" a flag cfab
+    /// never set. The slaves stay 0: a slave carries no L3.
+    #[test]
+    fn rescue_bonds_forward_and_their_slaves_never_do() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view);
+        run(&mut sys, &view, &o).unwrap();
+        for zone_if in ["cfab-st-rs", "cfab-cl-rs", "cfab-mg-rs"] {
+            assert_eq!(
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{zone_if}/forwarding")),
+                Some("1"),
+                "{zone_if}"
+            );
+        }
+        for slave in ["cfab-st-rs-st", "cfab-st-rs-cl", "cfab-st-rs-mg"] {
+            assert_eq!(
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
+                None,
+                "{slave} is L2 only"
+            );
+        }
+    }
+
+    /// The rescue leg extended `mk_vlan` with `addr`/`bring_up`. A class row and an ingress
+    /// leg must still produce exactly the argv they produced before it — this pins them.
+    #[test]
+    fn class_and_gw_sub_interfaces_are_created_exactly_as_before() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view);
+        run(&mut sys, &view, &o).unwrap();
+        assert_eq!(
+            calls_for_dev(&sys, "cfab-st"),
+            [
+                "ip link show cfab-st",
+                "ip link show cfab-st",
+                "ip link add link eth9 name cfab-st type vlan id 100 egress-qos-map 0:0 6:6",
+                "ip addr replace 10.99.1.1/24 dev cfab-st",
+                "ip link set cfab-st up",
+                // the VRRP macvlan hangs off the storage primary — not a mk_vlan call
+                "ip link add cfab-st-vr link cfab-st type macvlan mode bridge",
+            ]
+        );
+        assert_eq!(
+            calls_for_dev(&sys, "cfab-gw249"),
+            [
+                "ip link show cfab-gw249",
+                "ip link show cfab-gw249",
+                "ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip addr replace 192.168.249.1/24 dev cfab-gw249",
+                "ip link set cfab-gw249 up",
+            ]
+        );
+    }
+
+    /// 3.3: a bond with no carrier is a bond whose every slave lost carrier. Naming the bond
+    /// alone would send the operator to `ip -br link show cfab-st-rs`, which shows it UP.
+    #[test]
+    fn a_down_rescue_bond_is_reported_as_no_wire_with_carrier() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let got = describe_down(
+            &view,
+            &[
+                "storage/cfab-st".to_string(),
+                "storage/cfab-st-rs".to_string(),
+            ],
+        );
+        assert_eq!(
+            got,
+            [
+                "storage/cfab-st".to_string(),
+                "storage/cfab-st-rs (no wire with carrier under cfab-st-rs)".to_string(),
+            ]
+        );
+    }
+
     /// Availability-first: a segment wire with no carrier at `up` time is a real OSPF `down`,
     /// and must not cost the host its whole fabric. `up` completes (warning on stderr); the
     /// loss is `verify`'s to grade degraded.
@@ -667,9 +1065,12 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut doc = engine_ctl::tests::healthy_doc(&view);
         doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = serde_json::json!("down");
-        let mut sys = MockSys::default()
-            .socket("/run/cfab/engine.sock", &doc.to_string())
-            .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n");
+        let mut sys = absent_rescue_netdevs(
+            MockSys::default()
+                .socket("/run/cfab/engine.sock", &doc.to_string())
+                .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
+            &view,
+        );
         let pmxcfs = tempfile::tempdir().unwrap();
         let opts = UpOpts {
             exe: "/usr/bin/cfab".into(),

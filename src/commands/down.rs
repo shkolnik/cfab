@@ -111,6 +111,32 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
         run_ok(sys, &["ip", "link", "del", &f.vrrp_if])?;
     }
+    // Rescue legs, bonds before slaves: `ip link del <bond>` RELEASES its slaves, it does not
+    // delete them, which is why the second loop exists. The engine is already stopped and its
+    // routes swept above, so this order is ownership-proof clarity, nothing more.
+    let rescue_rows = view.rescue_rows();
+    for r in &rescue_rows {
+        if link_exists(sys, &r.ifname)? {
+            if !link_kind_is(sys, &r.ifname, " bond ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {} exists but is not a bond",
+                    r.ifname
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", &r.ifname])?;
+        }
+    }
+    for s in rescue_rows.iter().flat_map(|r| &r.slaves) {
+        if link_exists(sys, &s.ifname)? {
+            if !link_kind_is(sys, &s.ifname, " vlan ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {} exists but is not a vlan",
+                    s.ifname
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", &s.ifname])?;
+        }
+    }
     let mut ifnames: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
     ifnames.extend(view.gw_rows().into_iter().map(|r| r.ifname));
     for dev in &ifnames {
@@ -182,6 +208,75 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap();
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Every netdev absent except the rescue leg of the storage zone, correctly typed.
+    fn sys_with_a_storage_rescue_leg() -> MockSys {
+        MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
+            .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs"],
+                "9: cfab-st-rs: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st@eth9: vlan protocol 802.1Q id 300 \n",
+            )
+    }
+
+    /// `ip link del <bond>` RELEASES its slaves, it does not delete them — so the slaves get
+    /// their own deletes, and the bond goes first (ownership-proof clarity: the engine is
+    /// already stopped and swept before any netdev is touched).
+    #[test]
+    fn down_deletes_a_rescue_bond_before_its_slaves() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_rescue_leg();
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            ["ip link del cfab-st-rs", "ip link del cfab-st-rs-st"]
+        );
+    }
+
+    /// Prove ownership before destroy: a stranger wearing the bond's name is refused, and a
+    /// slave name carrying something that is not a vlan is refused too.
+    #[test]
+    fn down_refuses_a_rescue_netdev_of_the_wrong_kind() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+
+        let mut sys = sys_with_a_storage_rescue_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-rs"],
+            "9: cfab-st-rs: bridge \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-rs exists but is not a bond"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-st-rs"));
+
+        let mut sys = sys_with_a_storage_rescue_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-rs-st"],
+            "10: cfab-st-rs-st: macvlan \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-rs-st exists but is not a vlan"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-st-rs-st"));
     }
 
     /// Routes the engine left behind (a crash) are swept by `down`, one delete per route,
