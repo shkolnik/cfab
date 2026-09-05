@@ -797,24 +797,34 @@ fn return_path_and_ingress(
         let Some(gw) = &z.gw else { continue };
         let table = sys.run(&["ip", "route", "show", "table", &id])?.stdout;
         // Two distinct failures, each with its own wording (neither reachable for the other):
-        // no default line at all, versus a default line the kernel has marked inactive.
-        match table.lines().find(|l| l.starts_with("default ")) {
-            None => c.note(format!(
+        // no default line at all, versus a default line the kernel has marked inactive. A
+        // table can (transiently, or via a stale entry) hold more than one `default ` line, so
+        // every one of them is checked: any single dead line makes the return path degraded,
+        // even if another `default ` line in the same table reads healthy.
+        let default_lines: Vec<&str> = table
+            .lines()
+            .filter(|l| l.starts_with("default "))
+            .collect();
+        if default_lines.is_empty() {
+            c.note(format!(
                 "{} gw {} unreachable (table {id} has no default)",
                 z.name, gw.router
-            )),
+            ));
+        } else if default_lines
+            .iter()
             // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
             // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
             // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
             // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
             // degraded the zone; cfab must not read healthier than the FRR build did. If E3
             // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
-            Some(l) if l.contains("linkdown") || l.contains("dead") => c.note(format!(
+            .any(|l| l.contains("linkdown") || l.contains("dead"))
+        {
+            c.note(format!(
                 "{} gw {} unreachable (table {id} default is linkdown — the ingress leg has no \
                  carrier)",
                 z.name, gw.router
-            )),
-            Some(_) => {}
+            ));
         }
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
@@ -2090,6 +2100,38 @@ mod tests {
         assert!(
             !report.output.contains("has no default"),
             "the linkdown wording must not spill into the no-default condition: {}",
+            report.output
+        );
+    }
+
+    /// A table can hold more than one `default ` line (transient ECMP, a stale entry before a
+    /// `replace` lands). The FIRST one here is healthy; the SECOND is `linkdown`. Every
+    /// `default ` line must be checked, not just the first — an old `.find()`-first check would
+    /// stop at the healthy first line and never notice the dead second, silently masking a
+    /// degraded return path.
+    #[test]
+    fn a_second_default_line_flagged_linkdown_still_degrades() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+            ]),
+        )
+        .on_stdout(
+            &["ip", "route", "show", "table", "249"],
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n\
+             default via 10.249.3.2 dev cfab-mg proto ospf metric 30 linkdown\n",
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown — the \
+                 ingress leg has no carrier)"
+            ),
+            "a dead second `default ` line must degrade the return path even though the first \
+             `default ` line is healthy: {}",
             report.output
         );
     }
