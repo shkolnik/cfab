@@ -818,16 +818,29 @@ fn return_path_and_ingress(
             ));
         }
         let Some(doc) = doc else { continue };
-        let state = doc["bgp"]
+        let entry = doc["bgp"]
             .as_array()
             .into_iter()
             .flatten()
-            .find(|n| n["peer"] == gw.router.as_str())
+            .find(|n| n["peer"] == gw.router.as_str());
+        let state = entry
             .and_then(|n| n["state"].as_str())
             .unwrap_or("absent")
             .to_string();
         if state != "Established" {
-            c.note(format!("{} ingress: bgp {} {state}", z.name, gw.router));
+            c.note(format!(
+                "{} ingress: bgp {} {state} (not Established — the router is not \
+                 learning this zone's identities)",
+                z.name, gw.router
+            ));
+        } else if entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0) == 0 {
+            // Established but advertising nothing is the exact signature of a missing neighbor
+            // afi-safi export policy: the session is healthy, the zone's identities never leave.
+            c.note(format!(
+                "{} ingress: bgp {} Established but advertising nothing (0 sent prefixes \
+                 — the neighbor afi-safi export policy is not attached)",
+                z.name, gw.router
+            ));
         }
     }
     Ok(())
@@ -1963,6 +1976,75 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    /// A host peering with its zone's ingress router. The mgmt zone is the only one with a gw in
+    /// the shipped fabric, so it is the only zone that can produce an ingress bgp reason line.
+    fn ingress_host_sys(host: &View, bgp: serde_json::Value) -> MockSys {
+        let mut doc = engine_value(host, &[]);
+        doc["bgp"] = bgp;
+        host_env(host).socket("/run/cfab/engine.sock", &doc.to_string())
+    }
+
+    /// A session that is not Established: the router is not learning the zone, named in the one
+    /// spelling with its reason.
+    #[test]
+    fn ingress_bgp_not_established_is_a_reason() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Idle", "pfx_rcd": 0, "pfx_snt": 0 }
+            ]),
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "mgmt ingress: bgp 192.168.249.254 Idle (not Established — the router is \
+                 not learning this zone's identities)"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The failure a missing neighbor afi-safi export policy causes: the session is Established but
+    /// zero prefixes are advertised, so the outside can reach nothing in the zone.
+    #[test]
+    fn ingress_bgp_established_advertising_nothing_is_a_reason() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 0 }
+            ]),
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "mgmt ingress: bgp 192.168.249.254 Established but advertising nothing \
+                 (0 sent prefixes — the neighbor afi-safi export policy is not attached)"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Established and advertising: no ingress bgp reason at all.
+    #[test]
+    fn ingress_bgp_established_and_advertising_is_silent() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = ingress_host_sys(
+            &host,
+            serde_json::json!([
+                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+            ]),
+        );
+        let report = run(&mut sys, &host, 0, false).unwrap();
+        assert!(!report.output.contains("ingress: bgp"), "{}", report.output);
     }
 
     /// Intent: no run dir = `down` was run (or `up` never was). DOWN, exit 3, and nothing is
