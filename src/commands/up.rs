@@ -777,7 +777,7 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     }
     // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
     // `status` and the watchdog grade against `owned_forwarding()`, which lists the bond as
-    // transit — leaving it out here would make every `up` report DEGRADED three seconds later.
+    // transit — leaving it out here would make every `up` report UP-DEGRADED three seconds later.
     for r in view.fallback_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a fallback bond left
-    /// out of it would leave every `up` DEGRADED and make the watchdog "correct" a flag cfab
+    /// out of it would leave every `up` UP-DEGRADED and make the watchdog "correct" a flag cfab
     /// never set. The slaves are written 0 EXPLICITLY: they carry no L3, and inheriting
     /// conf/default (1 on a leaf whose external owner keeps ip_forward=1) would contradict
     /// `owned_forwarding()` with nothing in `up` to correct it.
