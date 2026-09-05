@@ -304,7 +304,7 @@ pub struct Fabric {
     pub bgp_connect_s: u32,
     /// `(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.
     pub usb_nics: Vec<(String, String)>,
-    /// Runtime state dir written by `up`, read by `verify` and the daemons (CFAB_RUN).
+    /// Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).
     pub run_dir: String,
     pub fabric_domain: String,
 }

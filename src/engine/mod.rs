@@ -14,7 +14,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use crate::derive::View;
-use crate::emit::engine::{PROTO_BASE, generate, prefsrc_rules};
+use crate::emit::engine::{PROTO_BASE, TransitCost, generate, generate_at, prefsrc_rules};
 use crate::error::{Error, Result};
 use crate::model::Fabric;
 
@@ -59,7 +59,7 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
     rt.block_on(async {
         info!(member = %view.member.name, "engine starting");
         let mut nb = northbound::Northbound::start(&view.member.name, policy, bfd_policy);
-        let result = serve(&mut nb, &cfg, fabric, &sock_path, &pid_path).await;
+        let result = serve(&mut nb, view, &cfg, fabric, &sock_path, &pid_path).await;
         // Every exit, healthy or not, is holod's teardown: stop answering, drop the
         // providers, wait for every task (holo-routing uninstalls its routes on that path).
         cleanup(&sock_path, &pid_path);
@@ -83,6 +83,7 @@ fn bfd_socket_policy(fabric: &Fabric) -> BfdSocketPolicy {
 /// Commit, publish readiness (pid + socket), answer state requests until a signal.
 async fn serve(
     nb: &mut northbound::Northbound,
+    view: &View<'_>,
     cfg: &serde_json::Value,
     fabric: &Fabric,
     sock_path: &std::path::Path,
@@ -108,12 +109,39 @@ async fn serve(
         .map_err(|e| Error::fatal(format!("cannot write {}: {e}", pid_path.display())))?;
     let listener = sock::bind(sock_path, pid_path)?;
 
+    // One event at a time, handled AFTER the select: `transit-cost` needs `&mut nb`, which
+    // it cannot take while the select's other arms hold borrows of it.
+    enum Ev {
+        Accepted(tokio::net::UnixStream),
+        Ignore,
+        ProvidersGone,
+        Signal(&'static str),
+    }
+
     loop {
-        tokio::select! {
+        let ev = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    let nb = &*nb;
-                    sock::serve_one(stream, async move || {
+                Ok((stream, _)) => Ev::Accepted(stream),
+                Err(e) => { warn!(%e, "engine.sock accept failed"); Ev::Ignore }
+            },
+            notification = nb.rx_providers.recv() => match notification {
+                Some(n) => { tracing::debug!(path = %n.path, "YANG notification"); Ev::Ignore }
+                // All providers have exited on their own: nothing left to run.
+                None => Ev::ProvidersGone,
+            },
+            _ = sigterm.recv() => Ev::Signal("SIGTERM"),
+            _ = sigint.recv() => Ev::Signal("SIGINT"),
+        };
+        match ev {
+            Ev::Ignore => {}
+            Ev::ProvidersGone => return Err(Error::fatal("engine: every provider exited")),
+            Ev::Signal(sig) => {
+                info!("received {sig}");
+                return Ok(());
+            }
+            Ev::Accepted(stream) => {
+                sock::serve_one(stream, async |req| match req {
+                    sock::Request::State => {
                         // A provider that stops answering Get must not wedge the engine
                         // (this loop also handles SIGTERM): bounded, logged by serve_one.
                         let tree = tokio::time::timeout(STATE_TIMEOUT, nb.get_state())
@@ -124,20 +152,37 @@ async fn serve(
                                 ))
                             })??;
                         Ok(state::document(true, cfg, &[tree]))
-                    })
-                    .await;
-                }
-                Err(e) => warn!(%e, "engine.sock accept failed"),
-            },
-            notification = nb.rx_providers.recv() => match notification {
-                Some(n) => tracing::debug!(path = %n.path, "YANG notification"),
-                // All providers have exited on their own: nothing left to run.
-                None => return Err(Error::fatal("engine: every provider exited")),
-            },
-            _ = sigterm.recv() => { info!("received SIGTERM"); return Ok(()); }
-            _ = sigint.recv() => { info!("received SIGINT"); return Ok(()); }
+                    }
+                    sock::Request::TransitCost(at) => {
+                        set_transit_cost(nb, view, at).await?;
+                        Ok(serde_json::json!({ "transit_cost": at.word() }))
+                    }
+                })
+                .await;
+            }
         }
     }
+}
+
+/// Re-advertise this member's transit links at `at` (spec §12 (b)): regenerate the tree with
+/// the new costs and re-commit it. `Northbound::commit` diffs against running, so re-asking
+/// for the cost already in force is free — the watchdog re-asserts on every tick rather than
+/// keeping a state file that could disagree with the engine. VERIFIED on the container fixture
+/// 2026-09-05: a cost-only diff re-originates the Router-LSA (+30000 on every transit link)
+/// in 2.8 ms with no carrier change and no adjacency or BFD session drop.
+async fn set_transit_cost(
+    nb: &mut northbound::Northbound,
+    view: &View<'_>,
+    at: TransitCost,
+) -> Result<()> {
+    let tree = generate_at(view, at)?;
+    let candidate = northbound::parse_candidate(&tree)?;
+    // The watchdog re-asserts on every tick; only a tick that actually moved the cost is
+    // worth a log line, or the record of the change drowns in the record of no change.
+    if nb.commit(candidate).await? {
+        info!(?at, "transit cost re-committed");
+    }
+    Ok(())
 }
 
 /// Remove the readiness files, but only when engine.pid names this process: an engine

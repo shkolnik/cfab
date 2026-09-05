@@ -1,7 +1,96 @@
-//! Helpers shared by the imperative commands (up/down/verify/daemons).
+//! Helpers shared by the imperative commands (up/down/status/daemons).
 
+use crate::derive::View;
 use crate::error::Result;
 use crate::sys::{Sys, run_ok, run_optional};
+
+/// One `ip rule` cfab owns: the pref it lives at, the substring that proves it is present, and
+/// the `ip rule add` tail that creates it. One definition, two consumers — `up` installs them
+/// and the watchdog restores them, and a rule whose two spellings drift is a rule the watchdog
+/// re-adds forever or never notices at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricRule {
+    pub pref: String,
+    pub needle: String,
+    pub add: Vec<String>,
+}
+
+impl FabricRule {
+    fn new(pref: &str, needle: String, add: &[&str]) -> Self {
+        FabricRule {
+            pref: pref.to_string(),
+            needle,
+            add: add.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// The leaf leak guard: a fabric block is looked up in main ONLY when locally originated;
+/// anything arriving on another interface bound for a fabric block is refused. Leaf only.
+pub fn leak_guard_rules(view: &View) -> Vec<FabricRule> {
+    let mut out = Vec::new();
+    for z in &view.fabric.zones {
+        let blk = format!("{}.0.0/16", z.block());
+        out.push(FabricRule::new(
+            "1000",
+            format!("to {blk} iif lo lookup main"),
+            &["to", &blk, "iif", "lo", "lookup", "main"],
+        ));
+        out.push(FabricRule::new(
+            "1001",
+            format!("to {blk} unreachable"),
+            &["to", &blk, "unreachable"],
+        ));
+    }
+    out
+}
+
+/// Return path per zone: identity-sourced traffic never leaves untagged.
+pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
+    let mut out = Vec::new();
+    for z in &view.fabric.zones {
+        let blk = format!("{}.0.0/16", z.block());
+        let id = z.id.to_string();
+        out.push(FabricRule::new(
+            "2000",
+            format!("from {blk} to {blk} lookup main suppress_prefixlength 0"),
+            &[
+                "from",
+                &blk,
+                "to",
+                &blk,
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ],
+        ));
+        // The substring "lookup <id>" is unique within this pref's rules.
+        out.push(FabricRule::new(
+            "2001",
+            format!("from {blk} lookup {id}"),
+            &["from", &blk, "lookup", &id],
+        ));
+        out.push(FabricRule::new(
+            "2002",
+            format!("from {blk} unreachable"),
+            &["from", &blk, "unreachable"],
+        ));
+    }
+    out
+}
+
+pub fn fabric_rule_present(sys: &mut dyn Sys, r: &FabricRule) -> Result<bool> {
+    Ok(sys
+        .run(&["ip", "rule", "show", "pref", &r.pref])?
+        .stdout
+        .contains(&r.needle))
+}
+
+pub fn ensure_fabric_rule(sys: &mut dyn Sys, r: &FabricRule) -> Result<()> {
+    let add: Vec<&str> = r.add.iter().map(String::as_str).collect();
+    ensure_rule(sys, &r.pref, &r.needle, &add)
+}
 
 pub fn link_exists(sys: &mut dyn Sys, dev: &str) -> Result<bool> {
     Ok(sys.run(&["ip", "link", "show", dev])?.ok())

@@ -1,7 +1,7 @@
 //! The embedded routing engine's lifecycle from the outside: start it (systemd where there
 //! is one, `setsid` in a container), wait for its state socket to report ready, stop it and
 //! sweep the kernel routes it owns, read its state, and check that the running engine took
-//! the configuration `up` meant (spec §9 readback). Shared by up/down/verify.
+//! the configuration `up` meant (spec §9 readback). Shared by up/down/status.
 
 use serde_json::Value;
 
@@ -249,7 +249,7 @@ pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
 /// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
 /// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
 /// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
-/// One spelling, shared by `up` (which hits this at start) and `verify` (which diagnoses it).
+/// One spelling, shared by `up` (which hits this at start) and `status` (which diagnoses it).
 pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
     let stop = if line.contains("bfdd") || line.contains("frr") {
         "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
@@ -444,7 +444,7 @@ fn down_ifs(view: &View, doc: &Value) -> Vec<String> {
 /// Never fatal, by design: a wire with no carrier at `up` time is a genuine `down` (a VLAN
 /// over a carrier-less lower wire is IFF_UP but not IFF_RUNNING, which is what holo reads),
 /// and refusing the apply for it would leave the host with no fabric at all where it would
-/// otherwise have come up on its surviving wires. `verify` grades the same condition
+/// otherwise have come up on its surviving wires. `status` grades the same condition
 /// degraded. Whether a whole zone being down should instead refuse is James's call.
 pub fn settled_down_ifs(sys: &mut dyn Sys, view: &View, doc: &Value) -> Result<Vec<String>> {
     let mut down = down_ifs(view, doc);
@@ -911,7 +911,7 @@ pub(crate) mod tests {
         let f = fabric();
         for cmdline in [
             "/usr/sbin/sshd\0-D\0",
-            "/usr/bin/cfab\0verify\0",
+            "/usr/bin/cfab\0status\0",
             "/usr/bin/some-engine\0engine\0",
             "",
         ] {

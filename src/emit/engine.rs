@@ -28,7 +28,32 @@ pub const PROTO_BASE: u8 = 201;
 const SPF_LONG_DELAY_MS: u32 = 100;
 const SPF_HOLD_DOWN_MS: u32 = 3000;
 
+/// What a transit link's OSPF cost is generated at. A leaf is always offset (it cannot
+/// transit); a host is offset only while its forward policy has failed closed, so that no
+/// peer keeps choosing it as transit while its own forwarding is off (spec §12 (b)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitCost {
+    /// The cost the declaration asks for.
+    Declared,
+    /// The declared cost plus `LEAF_COST_OFFSET`: reachable, never chosen as a path through.
+    LeafOffset,
+}
+
+impl TransitCost {
+    /// The wire word, in the `transit-cost` request and in the engine's reply. One spelling.
+    pub fn word(self) -> &'static str {
+        match self {
+            TransitCost::Declared => "normal",
+            TransitCost::LeafOffset => "leaf",
+        }
+    }
+}
+
 pub fn generate(view: &View) -> Result<Value> {
+    generate_at(view, TransitCost::Declared)
+}
+
+pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
     let f = view.fabric;
     let class_rows = view.class_rows();
     let fallback_rows = view.fallback_rows();
@@ -66,11 +91,7 @@ pub fn generate(view: &View) -> Result<Value> {
         let mut ospf_ifs: Vec<Value> = Vec::new();
         // Segments: a leaf's transit links carry cost + LEAF_COST_OFFSET (never a transit).
         for r in class_rows.iter().filter(|r| r.zone == z.name) {
-            let cost = if view.kind() == MemberKind::Leaf {
-                r.ospf_cost + f.leaf_cost_offset
-            } else {
-                r.ospf_cost
-            };
+            let cost = link_cost(view, transit, r.ospf_cost);
             // ietf-bfd intervals are microseconds; fabric.conf declares milliseconds.
             ospf_ifs.push(json!({
                 "name": r.ifname,
@@ -91,11 +112,7 @@ pub fn generate(view: &View) -> Result<Value> {
         // migrates between wires in ~50 ms; a session would only re-establish per migration.
         // OSPF's dead interval is its detector, as it is for the ingress leg.
         for r in fallback_rows.iter().filter(|r| r.zone == z.name) {
-            let cost = if view.kind() == MemberKind::Leaf {
-                r.ospf_cost + f.leaf_cost_offset
-            } else {
-                r.ospf_cost
-            };
+            let cost = link_cost(view, transit, r.ospf_cost);
             ospf_ifs.push(json!({
                 "name": r.ifname,
                 "interface-type": "broadcast",
@@ -137,6 +154,16 @@ pub fn generate(view: &View) -> Result<Value> {
         json!({ "control-plane-protocols": { "control-plane-protocol": protocols } }),
     );
     Ok(Value::Object(tree))
+}
+
+/// The one place the leaf offset is added. A leaf is offset by what it is; a host is offset
+/// only when it is asked to be — the two callers of `generate_at`.
+fn link_cost(view: &View, transit: TransitCost, declared: u32) -> u32 {
+    if view.kind() == MemberKind::Leaf || transit == TransitCost::LeafOffset {
+        declared + view.fabric.leaf_cost_offset
+    } else {
+        declared
+    }
 }
 
 /// Source pinning, one rule per zone in ZONE_TABLE order: a route inside the zone's `/16`
@@ -280,6 +307,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spec §12 (b): a fail-closed transit host advertises every transit link at the declared
+    /// cost + LEAF_COST_OFFSET, so no peer keeps choosing it as a path through — and back at
+    /// the declared cost when the policy is restored. Asserted on the candidate the engine
+    /// commits, which is the only thing the peers ever see.
+    #[test]
+    fn a_fail_closed_host_advertises_transit_links_at_the_leaf_offset() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let normal = generate_at(&v, TransitCost::Declared).unwrap();
+        let offset = generate_at(&v, TransitCost::LeafOffset).unwrap();
+        assert_eq!(
+            normal,
+            generate(&v).unwrap(),
+            "Declared is what `up` commits"
+        );
+        for (zone, ifn, declared) in [
+            ("storage", "cfab-st", 10),
+            ("storage", "cfab-st-bk", 100),
+            ("cluster", "cfab-cl", 10),
+            ("mgmt", "cfab-mg", 10),
+            // The fallback bond is a transit link too: offset with the rest.
+            ("storage", "cfab-st-fb", 5000),
+        ] {
+            assert_eq!(ospf_if(instance(&normal, zone), ifn)["cost"], declared);
+            assert_eq!(
+                ospf_if(instance(&offset, zone), ifn)["cost"],
+                declared + 30000,
+                "{zone} {ifn}"
+            );
+        }
+        // Only the costs move: the identity, the ingress leg, BFD, the timers, everything
+        // else must be byte-identical, or this is a reconfiguration and not a re-advertisement.
+        let strip = |t: &Value| {
+            let s = serde_json::to_string(t).unwrap();
+            let mut out = String::new();
+            let mut rest = s.as_str();
+            while let Some(at) = rest.find("\"cost\":") {
+                out.push_str(&rest[..at]);
+                out.push_str("\"cost\":X");
+                rest = &rest[at + 7..];
+                rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            }
+            out.push_str(rest);
+            out
+        };
+        assert_eq!(strip(&normal), strip(&offset));
+    }
+
+    /// A leaf cannot transit and is already offset by what it is: asking it to fail closed
+    /// changes nothing it advertises.
+    #[test]
+    fn a_leaf_is_unaffected_by_the_transit_cost_request() {
+        let f = fabric();
+        let v = View::new(&f, "pve3-tb").unwrap();
+        assert_eq!(
+            generate_at(&v, TransitCost::Declared).unwrap(),
+            generate_at(&v, TransitCost::LeafOffset).unwrap()
+        );
     }
 
     #[test]

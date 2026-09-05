@@ -3,9 +3,9 @@
 //! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → routing
 //! engine (restart + readback) → fail-closed watchdog.
 
+use crate::commands::common;
 use crate::commands::common::{
-    conf_interfaces, ensure_foreign_transit_accept, ensure_rule, link_exists, link_kind_is,
-    proc_sysctl,
+    conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::commands::engine_ctl;
 use crate::derive::{GwRow, Slave, View};
@@ -241,7 +241,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     // The fallback leg: one active-backup bond per zone over a tagged sub-interface of every
     // wire, so the member keeps a path in the zone when the physical islands are disjointly
     // isolated. Not a class row and not a wire: nothing that treats a segment as a wire (the
-    // shaper, the qdisc sweep, verify's link-speed checks) ever sees it.
+    // shaper, the qdisc sweep, status's link-speed checks) ever sees it.
     for r in &view.fallback_rows() {
         let z = f.zone(&r.zone)?;
         mk_bond_leg(
@@ -262,37 +262,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
 
     // ---- return path (ZONE_TABLE gw): identity-sourced traffic never leaves untagged ---------
-    for z in &f.zones {
-        let blk = format!("{}.0.0/16", z.block());
-        let id = z.id.to_string();
-        ensure_rule(
-            sys,
-            "2000",
-            &format!("from {blk} to {blk} lookup main suppress_prefixlength 0"),
-            &[
-                "from",
-                &blk,
-                "to",
-                &blk,
-                "lookup",
-                "main",
-                "suppress_prefixlength",
-                "0",
-            ],
-        )?;
-        // The substring "lookup <id>" is unique within this pref's rules.
-        ensure_rule(
-            sys,
-            "2001",
-            &format!("from {blk} lookup {id}"),
-            &["from", &blk, "lookup", &id],
-        )?;
-        ensure_rule(
-            sys,
-            "2002",
-            &format!("from {blk} unreachable"),
-            &["from", &blk, "unreachable"],
-        )?;
+    for r in common::return_path_rules(view) {
+        common::ensure_fabric_rule(sys, &r)?;
     }
 
     // ---- forward policy + per-interface forwarding ------------------------------
@@ -356,7 +327,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         eprintln!(
             "cfab: warn: ospf interfaces still down after {}s: {} — no adjacency forms on them \
              and nothing routes over those wires. Usual cause is no carrier on the wire \
-             underneath (ip -br link show). The fabric is up on the rest; cfab verify grades \
+             underneath (ip -br link show). The fabric is up on the rest; cfab status grades \
              this degraded",
             engine_ctl::SETTLE_MS / 1000,
             down.join(", ")
@@ -443,13 +414,13 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
     if kind == MemberKind::Host {
         msg.push_str(&format!(
-            "up OK on {host} (node {n}, host); forward={} shape={} wires; run cfab verify\n",
+            "up OK on {host} (node {n}, host); forward={} shape={} wires; run cfab status\n",
             u8::from(f.host_forward),
             wires.len()
         ));
     } else {
         msg.push_str(&format!(
-            "up OK on {host} (node {n}, leaf); no transit (cost +{}, forwarding=0, leak guard); run cfab verify\n",
+            "up OK on {host} (node {n}, leaf); no transit (cost +{}, forwarding=0, leak guard); run cfab status\n",
             f.leaf_cost_offset
         ));
     }
@@ -531,7 +502,7 @@ fn mk_vlan(
 /// Bond `updelay` in ms — how long a returning wire must hold carrier before it is reselected.
 /// **500 is MEASURED, not a target** (sweep of 0/200/500, n=1 per value, container fixture on a
 /// three-member testbed): it costs a 0.574 s window after a *legitimate* return in which
-/// `verify` reads DEGRADED (0.074 s at 0), with **zero**
+/// `status` reads UP-DEGRADED (0.074 s at 0), with **zero**
 /// packets lost at every value, and it buys a 10x reduction in migrations on a bouncing wire —
 /// 2 versus 20 active-slave switches over ten 250 ms flaps, each avoided switch an avoided GARP
 /// burst and MAC move on every switch in the path. `updelay` never delays the failover AWAY from
@@ -551,7 +522,7 @@ const FALLBACK_BOND_MODE: &str = "active-backup";
 const FALLBACK_MIIMON_MS: &str = "100";
 /// Gratuitous ARPs per migration: measured exactly 3, at +0.050/+0.050/+0.152 s.
 const FALLBACK_NUM_GRAT_ARP: &str = "3";
-/// Return to the home wire whenever it comes back — a deterministic steady state `verify` can
+/// Return to the home wire whenever it comes back — a deterministic steady state `status` can
 /// expect. The return migration is lossless (measured), so it costs nothing.
 const FALLBACK_PRIMARY_RESELECT: &str = "always";
 
@@ -768,7 +739,7 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
         ));
     }
     let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab-fwd"])?;
-    sys.write(&format!("{}/policy.applied", f.run_dir), &applied.stdout)?; // verify drift baseline
+    sys.write(&format!("{}/policy.applied", f.run_dir), &applied.stdout)?; // status drift baseline
     for r in view.class_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
@@ -776,8 +747,8 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
-    // `verify` and the watchdog grade against `owned_forwarding()`, which lists the bond as
-    // transit — leaving it out here would make every `up` report DEGRADED three seconds later.
+    // `status` and the watchdog grade against `owned_forwarding()`, which lists the bond as
+    // transit — leaving it out here would make every `up` report UP-DEGRADED three seconds later.
     for r in view.fallback_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
@@ -796,20 +767,8 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
 /// interface bound for a fabric block is refused — no netfilter needed (DSM kernels may lack
 /// nf_tables).
 fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
-    for z in &view.fabric.zones {
-        let blk = format!("{}.0.0/16", z.block());
-        ensure_rule(
-            sys,
-            "1000",
-            &format!("to {blk} iif lo lookup main"),
-            &["to", &blk, "iif", "lo", "lookup", "main"],
-        )?;
-        ensure_rule(
-            sys,
-            "1001",
-            &format!("to {blk} unreachable"),
-            &["to", &blk, "unreachable"],
-        )?;
+    for r in common::leak_guard_rules(view) {
+        common::ensure_fabric_rule(sys, &r)?;
     }
     Ok(())
 }
@@ -1191,7 +1150,7 @@ mod tests {
     }
 
     /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a fallback bond left
-    /// out of it would leave every `up` DEGRADED and make the watchdog "correct" a flag cfab
+    /// out of it would leave every `up` UP-DEGRADED and make the watchdog "correct" a flag cfab
     /// never set. The slaves are written 0 EXPLICITLY: they carry no L3, and inheriting
     /// conf/default (1 on a leaf whose external owner keeps ip_forward=1) would contradict
     /// `owned_forwarding()` with nothing in `up` to correct it.
@@ -1379,7 +1338,7 @@ mod tests {
 
     /// Availability-first: a segment wire with no carrier at `up` time is a real OSPF `down`,
     /// and must not cost the host its whole fabric. `up` completes (warning on stderr); the
-    /// loss is `verify`'s to grade degraded.
+    /// loss is `status`'s to grade degraded.
     #[test]
     fn up_completes_when_a_segment_interface_is_down() {
         let f = fabric();

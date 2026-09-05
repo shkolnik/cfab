@@ -197,6 +197,9 @@ pub mod mock {
     pub struct MockSys {
         pub files: BTreeMap<String, String>,
         pub writable: Vec<String>,
+        /// Paths whose `write` fails (a read-only `/proc`, an EPERM sysctl): the only way to
+        /// exercise "the restore itself could not be done".
+        pub write_fails: Vec<String>,
         /// (argv-prefix, output) — the LAST matching rule wins; unmatched commands succeed
         /// silently (status 0, empty output).
         pub cmd_rules: Vec<(Vec<String>, Output)>,
@@ -258,6 +261,12 @@ pub mod mock {
             )
         }
 
+        /// Make `write` to this path fail, as a read-only or EPERM path does.
+        pub fn write_fail(mut self, path: &str) -> Self {
+            self.write_fails.push(path.to_string());
+            self
+        }
+
         pub fn ran(&self, needle: &str) -> bool {
             self.calls.iter().any(|c| c.contains(needle))
         }
@@ -291,6 +300,11 @@ pub mod mock {
 
         fn write(&mut self, path: &str, content: &str) -> Result<()> {
             self.calls.push(format!("write {path}"));
+            if self.write_fails.iter().any(|p| p == path) {
+                return Err(Error::fatal(format!(
+                    "cannot write {path}: permission denied"
+                )));
+            }
             self.files.insert(path.to_string(), content.to_string());
             Ok(())
         }

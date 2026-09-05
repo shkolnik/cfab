@@ -51,7 +51,7 @@ Print the floor+borrow HTB derivation for one physical NIC.
 prints the tc program instead;
 .B \-\-expect
 prints the "classid effective-rate" lines
-.B verify
+.B status
 diffs against the live qdisc tree.
 .TP
 .B up
@@ -76,11 +76,65 @@ Remove everything
 created and restore FRR to its pre-fabric state. Never touches interfaces or
 firewall state the fabric does not own.
 .TP
-.BR verify " [\fB\-\-timeout\fR \fIN\fR]"
-Full health check: posture, drift against the declaration, and convergence
-(BFD sessions, OSPF routes, BGP ingress). Waits up to
+.BR status " [\fB\-\-wait\fR \fIN\fR] [\fB\-\-permissive\fR]"
+What this member's fabric is doing right now, in one of four states:
+.BR UP ", " UP\-DEGRADED ", " FAILED " or " DOWN
+(exit 0, 1, 2, 3). The headline carries three fixed counts,
+.RI ( peers " | " links " | " fallbacks ),
+each
+.IR n / N :
+.B peers
+= peers with at least one available adjacency (self is never counted);
+.B links
+= BFD sessions, one per (peer, zone, segment) the two members share;
+.B fallbacks
+= OSPF neighbors on the fallback segment, one per peer carrying that zone's
+row, available at 2\-Way or better. All three denominators come from
+.BR fabric.conf ,
+so a cable pull moves the numerator and never the denominator. A member
+declaring no fallback row prints
+.BR 0/0 ,
+never a missing field.
+.IP
+One indented line per condition follows the headline, sorted, each condition
+named once.
+.B status
+never writes: a condition that makes a link unsafe is brought down by
+.BR "cfab fwd\-watchdog" ,
+and the state then follows from the counts; everything else is a reason line
+that does not move the state.
+.IP
+.B \-\-wait
 .I N
-seconds (default 60) for convergence before failing.
+re\-reads every 2\ s until the state is UP or
+.I N
+seconds pass, then reports whatever state was reached \(em there is no
+"not converged" verdict.
+.B DOWN
+ends the wait at once (there is no intent to wait for);
+.B FAILED
+and
+.B UP\-DEGRADED
+do not, because a fabric coming up passes through both. Default
+.BR "\-\-wait 0" ,
+one instant read.
+.B \-\-permissive
+exits 0 for
+.B UP\-DEGRADED
+as well as
+.BR UP ;
+it never masks
+.B FAILED
+or
+.BR DOWN .
+.IP
+.B Bootstrap:
+the first member of a fresh fabric has no peer to be adjacent to, so it
+honestly reads
+.BR "FAILED (0/P | 0/L | 0/F)" ,
+and
+.B \-\-permissive
+does not hide it. The second member turns both UP.
 .TP
 .BI "measure\-cap " "DEV PEER " [ SECS ]
 Flood
@@ -172,11 +226,14 @@ to
 installs the published text, and re-execs its own binary's
 .B up
 and
-.B verify
-(exit 0 or 2 counts as carrying traffic). It then writes its ack file and
+.B status
+(exit 0 or 1 \(em UP or UP\-DEGRADED \(em counts as carrying traffic). It then
+writes its ack file and
 waits up to 60\ s for an ack from at least one
 .I different
-member. No peer ack, a failed verify, or a failed ack write (the severed-node
+member. No peer ack, a
+.B status
+of FAILED or DOWN, or a failed ack write (the severed\-node
 signal: a member that cannot write acks cannot see them either) \(em all
 REVERT to the previous conf and re-run
 .BR up .
@@ -208,22 +265,49 @@ else the kernel hostname.
 .BR \-h ", " \-\-help ", " \-V ", " \-\-version
 Standard help and version output.
 .SH EXIT STATUS
+.B status
+maps its state to the exit code, Nagios\-style. Every other subcommand uses 0
+for success and 1 for failure.
 .TP
 .B 0
-Success; for
-.BR verify ,
-the fabric is fully healthy.
-.TP
-.B 2
-.B verify
-only: degraded \(em the fabric carries traffic but something is reduced
-(a wire down, a session not yet established).
+.B status
+.BR UP :
+every expected adjacency available. For every other subcommand, success.
 .TP
 .B 1
-Failure: validation error, a failed apply, an unhealthy fabric, a bitten
-watchdog, or
+.B status
+.BR UP\-DEGRADED :
+up and carrying traffic, but some expected adjacency is down (a wire pulled, a
+session not yet established) \(em 0 under
+.BR \-\-permissive .
+For every other subcommand, failure: a validation error, a failed apply, a
+bitten watchdog, or
 .B policy\-teeth
-finding the policy (or its own teeth) broken.
+finding the policy (or its own teeth) broken. A
+.B fabric.conf
+that is present but unparseable also exits 1, from any subcommand
+.B status
+included \(em we cannot know what was desired.
+.TP
+.B 2
+.B status
+.BR FAILED :
+no adjacency is available at all while up is desired.
+.B \-\-permissive
+does not mask it.
+.TP
+.B 3
+.B status
+.BR DOWN :
+up is not desired: there is no run dir \(em
+.B cfab down
+was run, or
+.B cfab up
+never was \(em or there is no
+.B fabric.conf
+on this host at all.
+.B \-\-permissive
+does not mask it.
 .SH ENVIRONMENT
 .TP
 .B CFAB_HOST

@@ -25,8 +25,8 @@ use crate::sys::Sys;
 pub const TICK: Duration = Duration::from_secs(1);
 /// Witness window: 1 s ack polls before a lone applier reverts.
 pub const WITNESS_POLLS: u32 = 60;
-/// Passed to the re-exec'd `verify`.
-pub const VERIFY_TIMEOUT_SECS: u64 = 30;
+/// Passed to the re-exec'd `status`.
+pub const STATUS_WAIT_SECS: u64 = 30;
 
 /// What one tick did — the loop body's whole outcome, so every ordering is unit-testable.
 #[derive(Debug, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub enum Tick {
         applied: bool,
         witness: String,
     },
-    /// Applied but not witnessed (or verify/ack failed) — previous conf restored.
+    /// Applied but not witnessed (or status/ack failed) — previous conf restored.
     Reverted { generation: u64, reason: String },
 }
 
@@ -181,18 +181,18 @@ impl ConfSync {
         if !up.ok() {
             return self.revert(sys, generation, format!("up exited {}", up.status));
         }
-        let timeout = VERIFY_TIMEOUT_SECS.to_string();
-        let verify = sys.run(&[
+        let wait = STATUS_WAIT_SECS.to_string();
+        let status = sys.run(&[
             &self.exe,
             "--config",
             &local_conf,
-            "verify",
-            "--timeout",
-            &timeout,
+            "status",
+            "--wait",
+            &wait,
         ])?;
-        // 0 = healthy, 2 = degraded-but-carrying: both count as carrying traffic.
-        if verify.status != 0 && verify.status != 2 {
-            return self.revert(sys, generation, format!("verify exited {}", verify.status));
+        // 0 = UP, 1 = UP-DEGRADED: both carry traffic. 2 = FAILED and 3 = DOWN do not.
+        if status.status > 1 {
+            return self.revert(sys, generation, format!("status exited {}", status.status));
         }
 
         // Witness. The ack write is retried across the whole window, not treated as terminal
@@ -205,7 +205,7 @@ impl ConfSync {
         let mut last_ack_err = String::new();
         for _ in 0..WITNESS_POLLS {
             if !acked {
-                match self.write_ack(generation, verify.status) {
+                match self.write_ack(generation, status.status) {
                     Ok(()) => acked = true,
                     Err(e) => last_ack_err = e.to_string(),
                 }
@@ -278,15 +278,15 @@ impl ConfSync {
         Ok(Tick::Reverted { generation, reason })
     }
 
-    /// Ack file for this member: one line, member name + verify exit code, written with the
+    /// Ack file for this member: one line, member name + status exit code, written with the
     /// atomic tmp+rename publish (a rename is one totally-ordered cluster message).
-    fn write_ack(&self, generation: u64, verify_status: i32) -> Result<()> {
+    fn write_ack(&self, generation: u64, status_code: i32) -> Result<()> {
         let dir = self.pmx.acks_dir(generation);
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::fatal(format!("cannot create {}: {e}", dir.display())))?;
         self.pmx.publish(
             &self.pmx.ack_path(generation, &self.member),
-            &format!("{} {verify_status}\n", self.member),
+            &format!("{} {status_code}\n", self.member),
         )
     }
 
@@ -473,11 +473,8 @@ mod tests {
         format!("{EXE} --config {} up", f.local_conf.display())
     }
 
-    fn verify_argv(f: &Fixture) -> String {
-        format!(
-            "{EXE} --config {} verify --timeout 30",
-            f.local_conf.display()
-        )
+    fn status_argv(f: &Fixture) -> String {
+        format!("{EXE} --config {} status --wait 30", f.local_conf.display())
     }
 
     fn state(f: &Fixture, name: &str) -> Option<String> {
@@ -504,8 +501,8 @@ mod tests {
                 witness: "witnessed by pve2-tb".to_string()
             }
         );
-        // Exact re-exec argv, in order: up then verify.
-        assert_eq!(sys.calls, vec![up_argv(&f), verify_argv(&f)]);
+        // Exact re-exec argv, in order: up then status.
+        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f)]);
         assert!(sys.slept.is_empty(), "peer ack present: no witness wait");
         // Local cache chain updated; state files persisted.
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), conf);
@@ -536,8 +533,8 @@ mod tests {
             }
         );
         assert_eq!(sys.slept.len(), 60, "full witness window polled");
-        // up (apply), verify, up (revert) — exactly.
-        assert_eq!(sys.calls, vec![up_argv(&f), verify_argv(&f), up_argv(&f)]);
+        // up (apply), status, up (revert) — exactly.
+        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
         // Previous conf back in place; attempted recorded, committed not.
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
         assert_eq!(state(&f, "conf-sync-attempted").as_deref(), Some("1"));
@@ -579,8 +576,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
     }
 
+    /// FAILED (2) is the revert signal: a member with no adjacency at all is not carrying the
+    /// new conf, whatever its posture says.
     #[test]
-    fn verify_fail_reverts_without_ack() {
+    fn status_failed_exit_2_reverts_without_ack() {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         let mut sys = MockSys::default().on_fail(
@@ -588,27 +587,55 @@ mod tests {
                 EXE,
                 "--config",
                 &f.local_conf.display().to_string(),
-                "verify",
+                "status",
             ],
-            1,
-            "degraded past carrying",
+            2,
+            "no adjacency available",
         );
         let t = f.cs.tick(&mut sys).unwrap();
         assert_eq!(
             t,
             Tick::Reverted {
                 generation: 1,
-                reason: "verify exited 1".to_string()
+                reason: "status exited 2".to_string()
             }
         );
-        assert_eq!(sys.calls, vec![up_argv(&f), verify_argv(&f), up_argv(&f)]);
+        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
-        // No ack for a conf that failed verify.
+        // No ack for a conf the member could not carry.
         assert!(!Pmxcfs::at(&f.pmx_root).ack_path(1, MEMBER).exists());
     }
 
+    /// DOWN (3) too: the exit codes are ordered, so anything above UP-DEGRADED reverts.
     #[test]
-    fn verify_degraded_exit_2_still_counts_as_carrying() {
+    fn status_down_exit_3_reverts() {
+        let conf = valid_conf();
+        let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
+        let mut sys = MockSys::default().on_fail(
+            &[
+                EXE,
+                "--config",
+                &f.local_conf.display().to_string(),
+                "status",
+            ],
+            3,
+            "fabric not applied",
+        );
+        let t = f.cs.tick(&mut sys).unwrap();
+        assert_eq!(
+            t,
+            Tick::Reverted {
+                generation: 1,
+                reason: "status exited 3".to_string()
+            }
+        );
+    }
+
+    /// UP-DEGRADED (1) does NOT revert: the member is up and carrying, some adjacency is down.
+    /// Under the old exit codes this value meant "not converged" and reverted, so this test is
+    /// the one that would have caught the inversion.
+    #[test]
+    fn status_degraded_exit_1_still_counts_as_carrying() {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         let pmx = Pmxcfs::at(&f.pmx_root);
@@ -619,9 +646,9 @@ mod tests {
                 EXE,
                 "--config",
                 &f.local_conf.display().to_string(),
-                "verify",
+                "status",
             ],
-            2,
+            1,
             "",
         );
         let t = f.cs.tick(&mut sys).unwrap();
@@ -639,7 +666,7 @@ mod tests {
         // The ack records the degraded exit code.
         assert_eq!(
             std::fs::read_to_string(pmx.ack_path(1, MEMBER)).unwrap(),
-            "pve1-tb 2\n"
+            "pve1-tb 1\n"
         );
     }
 
@@ -686,7 +713,7 @@ mod tests {
         );
         assert!(
             sys.calls.is_empty(),
-            "no up/verify re-exec: {:?}",
+            "no up/status re-exec: {:?}",
             sys.calls
         );
         assert!(sys.slept.is_empty(), "no witness wait for a no-op");
@@ -728,7 +755,7 @@ mod tests {
             }
         );
         assert!(sys.slept.is_empty(), "no witness polling");
-        assert_eq!(sys.calls, vec![up_argv(&f), verify_argv(&f)]);
+        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f)]);
         // The lone member still writes its ack (a joining peer can read history).
         let pmx = Pmxcfs::at(&f.pmx_root);
         assert_eq!(
@@ -766,7 +793,7 @@ mod tests {
             panic!("expected Reverted, got {t:?}");
         }
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
-        assert_eq!(sys.calls, vec![up_argv(&f), verify_argv(&f), up_argv(&f)]);
+        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
         // The whole window was spent retrying, one poll per tick.
         assert_eq!(sys.slept.len(), 60);
     }
