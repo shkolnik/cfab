@@ -217,6 +217,7 @@ fn read(
     posture(sys, view, doc.as_ref(), c)?;
     return_path_and_ingress(sys, view, doc.as_ref(), c)?;
     mark_drift(sys, view, c)?;
+    ceiling_counters(sys, view, c)?;
     shape_posture(sys, view, c)?;
     link_speeds(sys, view, c)?;
 
@@ -856,6 +857,40 @@ fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+/// The fallback control-egress ceiling's drop counters. Host only, like the table that holds
+/// them. A tripped ceiling is the containment working — it protects every switch port the
+/// fallback broadcast domain reaches — so it is a reason line and never moves the state: the
+/// links axis already reports what a lost fallback adjacency costs. A ceiling rule that is gone
+/// while up is desired is mark drift, reported by `mark_drift` above; there is no second
+/// detector here and nothing actuates on it (`cfab fwd-watchdog` restores sysctls, bond
+/// membership and `ip rule`s — never an nft table).
+fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+    if view.kind() != MemberKind::Host {
+        return Ok(());
+    }
+    let ceilings = emit::mark::ceilings(view);
+    if ceilings.is_empty() {
+        return Ok(());
+    }
+    // Stateful listing: `-s` is what `mark.applied` is compared against and deliberately omits
+    // the counters this reads.
+    let table = sys.run(&["nft", "list", "table", "inet", "cfab"])?;
+    if !table.ok() {
+        return Ok(()); // mark_drift already said the table is not loaded
+    }
+    for ce in ceilings {
+        if let Some(n) = counter_packets(&table.stdout, &format!("ceiling-{}", ce.zone))
+            && n > 0
+        {
+            c.note(format!(
+                "fallback {}: control egress ceiling tripped ({n} drops, limit {}/s)",
+                ce.zone, ce.rate_pps
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The daemon must be alive, and every wire with carrier must carry exactly the tree the shape
 /// derivation gives for the current up-set. A wire without carrier may hold a stale tree
 /// (left alone).
@@ -972,8 +1007,13 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
         .lines()
         .find(|l| l.contains(&format!("comment \"{comment}\"")))?;
     let words: Vec<&str> = line.split_whitespace().collect();
-    let i = words.iter().position(|w| *w == "packets")?;
-    words.get(i + 1)?.parse().ok()
+    // Anchored on `counter`, not on the first `packets`: a rule carrying `burst 160 packets`
+    // (the ceiling) has that word before the counter's own.
+    let i = words.iter().position(|w| *w == "counter")?;
+    if words.get(i + 1) != Some(&"packets") {
+        return None;
+    }
+    words.get(i + 2)?.parse().ok()
 }
 
 /// The cap the shape derivation prefers over the declared link speed: the shared chain (local
@@ -1166,6 +1206,34 @@ mod tests {
             .socket("/run/cfab/engine.sock", &engine_doc(view, &all_bfd_up(f)))
     }
 
+    /// `nft list table inet cfab` as nftables 1.1.3 prints the ceiling rules, with `drops`
+    /// packets counted on every one of them. The `burst <n> packets` before the counter is the
+    /// reason `counter_packets` anchors on the word `counter`.
+    fn ceiling_listing(view: &View, drops: u64) -> String {
+        let mut out = String::from(
+            "table inet cfab {\n\tchain out {\n\t\ttype filter hook output priority mangle; policy accept;\n",
+        );
+        let emitted = crate::emit::mark::generate(view).unwrap();
+        for c in crate::emit::mark::ceilings(view) {
+            // The fixture is only honest while `up` actually installs the rule this parses.
+            assert!(
+                emitted.contains(&format!("comment \"ceiling-{}\"", c.zone)),
+                "no ceiling rule is emitted for {}: the fixture would be inventing one",
+                c.zone
+            );
+            out.push_str(&format!(
+                "\t\toifname {{ \"{}\" }} ip protocol ospf limit rate over {}/second burst {} packets counter packets {drops} bytes {} drop comment \"ceiling-{}\"\n",
+                c.ifname,
+                c.rate_pps,
+                c.burst_pkts,
+                drops * 78,
+                c.zone
+            ));
+        }
+        out.push_str("\t}\n}\n");
+        out
+    }
+
     /// A forwarding host's healthy environment. The host arm of `posture` is the widest
     /// surface `status` touches — policy and mark drift, nft counters, shaping, link speeds —
     /// so the never-writes invariant is only worth something if it runs over this too.
@@ -1247,6 +1315,10 @@ mod tests {
             "table inet cfab-fwd\n",
         )
         .on_stdout(&["nft", "-s", "list", "table", "inet", "cfab"], "table inet cfab\n")
+        .on_stdout(
+            &["nft", "list", "table", "inet", "cfab"],
+            &ceiling_listing(view, 0),
+        )
         .on_stdout(
             &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
             "chain forward {\n  type filter hook forward priority filter; policy drop;\n               iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n               oifname @admin counter packets 0 bytes 0 drop comment \"admin-out\"\n               counter packets 0 bytes 0 comment \"default-deny\"\n}",
@@ -1456,6 +1528,15 @@ mod tests {
             &host,
             0,
         );
+        assert_never_writes(
+            "a tripped control-egress ceiling",
+            &mut healthy_host(&f, &host).on_stdout(
+                &["nft", "list", "table", "inet", "cfab"],
+                &ceiling_listing(&host, 28),
+            ),
+            &host,
+            0,
+        );
 
         // The runtime-disjoint shape, over the fabric that has no fallback rows at all.
         let text =
@@ -1553,6 +1634,66 @@ mod tests {
             !report.output.contains("transit disabled"),
             "{}",
             report.output
+        );
+    }
+
+    /// A healthy fabric never trips the ceiling, and a zero counter says nothing: the fixture's
+    /// ceilings all read 0, so the whole report is silent about them.
+    #[test]
+    fn an_untripped_ceiling_is_silent() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up);
+        assert!(!report.output.contains("ceiling"), "{}", report.output);
+    }
+
+    /// A tripped ceiling is the containment working: one reason line per zone naming the drops
+    /// and the derived limit, the state still UP, the exit code still 0. It protects the switch
+    /// and every port the fallback broadcast domain reaches; it does not make a link unsafe.
+    #[test]
+    fn a_tripped_ceiling_is_one_reason_line_and_the_state_stays_up() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).on_stdout(
+            &["nft", "list", "table", "inet", "cfab"],
+            &ceiling_listing(&view, 28),
+        );
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(report.code, 0);
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)"
+        );
+        for zone in ["storage", "cluster", "mgmt"] {
+            let want =
+                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+            assert!(
+                report.output.lines().filter(|l| *l == want).count() == 1,
+                "expected exactly one {want:?} in:\n{}",
+                report.output
+            );
+        }
+        // Nothing else moved: the mark table still matches what was applied.
+        assert!(!report.output.contains("mark drift"), "{}", report.output);
+    }
+
+    /// `burst 160 packets` sits before the counter on a ceiling rule, so a parse anchored on
+    /// the first `packets` reads the burst size (or fails) instead of the drop count.
+    #[test]
+    fn counter_packets_reads_the_counter_not_the_burst() {
+        let line = "oifname { \"cfab-st-fb\" } ip protocol ospf limit rate over 80/second \
+                    burst 160 packets counter packets 28 bytes 2184 drop comment \"ceiling-storage\"";
+        assert_eq!(counter_packets(line, "ceiling-storage"), Some(28));
+        assert_eq!(counter_packets(line, "ceiling-cluster"), None);
+        assert_eq!(
+            counter_packets(
+                "iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"",
+                "admin-in"
+            ),
+            Some(0)
         );
     }
 
