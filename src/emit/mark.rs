@@ -57,3 +57,50 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("  }\n}\n");
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RawConfig;
+    use crate::model::Fabric;
+
+    fn fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
+    /// fallback bond, and this generator's `oifname { ifs }` group is built straight from it — no
+    /// mark.rs code changed for this task. This is what makes the shaping claim true: the bond
+    /// gets the zone's DSCP/PCP output-hook rules, so a fallback frame is marked like any other
+    /// frame in its zone. The on-wire PCP itself then comes from the ACTIVE SLAVE's
+    /// egress-qos-map (set by `up`, not by this generator) mapping the PCP-plane skb-priority
+    /// this rule sets — that half is INFERRED here, confirmed on hardware in a later task.
+    #[test]
+    fn the_oifname_group_carries_the_fallback_bond_never_a_slave() {
+        for member in ["pve1-tb", "pve3-tb"] {
+            let f = fabric();
+            let v = View::new(&f, member).unwrap();
+            let out = generate(&v).unwrap();
+            for row in v.fallback_rows() {
+                let want = format!("\"{}\"", row.ifname);
+                assert!(
+                    out.contains(&want),
+                    "{member}: no marking rule mentions the fallback bond {}",
+                    row.ifname
+                );
+                for slave in &row.slaves {
+                    let slave_tag = format!("\"{}\"", slave.ifname);
+                    assert!(
+                        !out.contains(&slave_tag),
+                        "{member}: marking rule names a fallback slave {}: it is L2 only, the \
+                         PCP tag comes from its own egress-qos-map, not a mark rule",
+                        slave.ifname
+                    );
+                }
+            }
+        }
+    }
+}
