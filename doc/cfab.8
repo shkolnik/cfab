@@ -293,6 +293,60 @@ to it on first use).
 .IR /etc/pve/priv/lock/cfab\-conf ", " /etc/pve/priv/lock/cfab\-measure
 The publish cluster lock and the measurement lease (mkdir locks; pmxcfs
 expires a crashed holder's lock after 120\ s).
+.TP
+.I /usr/lib/systemd/system/cfab\-fabric.service
+The packaged systemd unit (see
+.BR SYSTEMD ).
+.TP
+.I /etc/default/cfab
+Optional environment file for that unit (a conffile): where to set
+.B CFAB_HOST
+when this member's row is not named by the kernel hostname.
+.SH SYSTEMD
+The Debian package ships
+.BR cfab\-fabric.service ,
+installed
+.B disabled and not started
+\(em installing cfab never changes the network. Write
+.I /etc/cfab/fabric.conf
+first, then
+.BR "systemctl enable \-\-now cfab\-fabric" .
+.PP
+The unit is
+.B Type=oneshot
+with
+.BR RemainAfterExit=yes .
+.B ExecStart
+and
+.B ExecReload
+are
+.BR "cfab up" ;
+.B ExecStop
+is
+.BR "cfab down" .
+.B ConditionPathExists=/etc/cfab/fabric.conf
+skips it on a host that has the package but no declaration, so that host boots clean
+instead of failing.
+.PP
+A package upgrade neither stops nor restarts the unit: stopping it would run
+.B down
+and take every identity on the host with it. The engine that is already running keeps
+the old binary's inode. The new binary takes effect at the next
+.RB ( "systemctl reload cfab\-fabric" ),
+which is
+.B up
+again \(em and
+.B up
+always stops and restarts the routing engine, so this member's adjacencies drop and
+re\-form.
+.PP
+.B "apt remove"
+stops the unit (that is
+.BR down ,
+which is correct: the binary is going away) and disables it;
+.B "apt purge"
+also removes
+.IR /etc/default/cfab .
 .SH SEE ALSO
 .BR ip (8),
 .BR nft (8),
