@@ -12,7 +12,7 @@
 //! never corrected: every base chain at a hook runs and any one drop verdict ends the packet,
 //! so cfab cannot out-accept them, and switching our own forwarding off would not restore a
 //! single packet. Silence here was a real bug — with Docker running, transit was 100 % dead
-//! while cfab's own counters recorded accepts and `verify` printed `posture ok`.
+//! while cfab's own counters recorded accepts and `cfab status` reported a healthy posture.
 
 use crate::commands::common::{
     conf_interfaces, ensure_foreign_transit_accept, foreign_forward_remedy,

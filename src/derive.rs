@@ -1,5 +1,5 @@
 //! Derivations from the typed model — the resolved, per-member view the runtime works from.
-//! Pure functions, no I/O: everything downstream (generators, `up`, `verify`) reads the
+//! Pure functions, no I/O: everything downstream (generators, `up`, `status`) reads the
 //! `View`, never the declaration tables directly.
 
 use std::collections::BTreeSet;
@@ -625,7 +625,7 @@ mod tests {
     fn wires_and_segments_of_never_see_the_fallback_bond_or_its_slaves() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        // wires() feeds the shaper, down's qdisc sweep and verify's link-speed checks: a
+        // wires() feeds the shaper, down's qdisc sweep and status's link-speed checks: a
         // fallback row must never enter it (only class_rows() does).
         assert_eq!(v.wires(), vec!["eth0", "eth1", "eth9"]);
         assert!(!v.wires().iter().any(|w| w.contains("-fb")));

@@ -5,7 +5,7 @@
 //! floor on every wire, so its failover needs NO shaping re-derivation.
 //!
 //! On ANY exit (stop/signal) restores fq_codel on every fabric wire: the service being down =
-//! no floors, which `cfab verify` reports. Touches ONLY the CLASS_TABLE wires.
+//! no floors, which `cfab status` reports. Touches ONLY the CLASS_TABLE wires.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -134,7 +134,7 @@ fn read_cap(sys: &mut dyn Sys, view: &View, dev: &str) -> Option<u64> {
     )
 }
 
-/// Restore fq_codel on every fabric wire (the exit path — floors gone, verify reports it).
+/// Restore fq_codel on every fabric wire (the exit path — floors gone, status reports it).
 pub fn teardown(sys: &mut dyn Sys, devs: &[String]) -> Result<()> {
     for d in devs {
         run_ignore(sys, &["tc", "qdisc", "del", "dev", d, "root"])?;
