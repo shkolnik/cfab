@@ -80,7 +80,7 @@ mod tests {
     }
 
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
-    /// rescue bond after a zone's segments, and this generator just emits whatever `zone_ifs`
+    /// fallback bond after a zone's segments, and this generator just emits whatever `zone_ifs`
     /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
     /// (so `FORWARD_ALLOW storage>storage` covers island-disjoint transit through it) and in
     /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
@@ -90,12 +90,12 @@ mod tests {
     /// owns," not "an interface that transits," and a slave's own traffic (the bond's frames on
     /// the wire) must not fall into the blanket `iifname != @cfab` foreign-transit accept.
     #[test]
-    fn zone_set_carries_the_rescue_bond_never_a_slave_owned_set_carries_both() {
+    fn zone_set_carries_the_fallback_bond_never_a_slave_owned_set_carries_both() {
         for member in ["pve1-tb", "pve3-tb"] {
             let f = fabric();
             let v = View::new(&f, member).unwrap();
             let out = generate(&v).unwrap();
-            for row in v.rescue_rows() {
+            for row in v.fallback_rows() {
                 let want = format!("\"{}\"", row.ifname);
                 let set_line = out
                     .lines()
@@ -103,7 +103,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{member}: missing set line for {}", row.zone));
                 assert!(
                     set_line.contains(&want),
-                    "{member}: zone set for {} missing the rescue bond: {set_line}",
+                    "{member}: zone set for {} missing the fallback bond: {set_line}",
                     row.zone
                 );
                 let cfab_line = out
@@ -112,20 +112,20 @@ mod tests {
                     .unwrap();
                 assert!(
                     cfab_line.contains(&want),
-                    "{member}: cfab owned set missing the rescue bond: {cfab_line}"
+                    "{member}: cfab owned set missing the fallback bond: {cfab_line}"
                 );
                 for slave in &row.slaves {
                     let slave_tag = format!("\"{}\"", slave.ifname);
                     assert!(
                         !set_line.contains(&slave_tag),
-                        "{member}: zone set for {} names a rescue slave {}: it carries no zone \
+                        "{member}: zone set for {} names a fallback slave {}: it carries no zone \
                          traffic of its own, the bond does",
                         row.zone,
                         slave.ifname
                     );
                     assert!(
                         cfab_line.contains(&slave_tag),
-                        "{member}: cfab owned set missing the rescue slave {} \
+                        "{member}: cfab owned set missing the fallback slave {} \
                          (owned_forwarding lists it with transit=false)",
                         slave.ifname
                     );

@@ -21,7 +21,7 @@ pub struct ClassRow {
 }
 
 /// An ingress leg this member carries (hosts only: leaves never peer). Shaped exactly like
-/// `RescueRow`: on a physical gw island the leg is a plain sub-interface on `home` and
+/// `FallbackRow`: on a physical gw island the leg is a plain sub-interface on `home` and
 /// `slaves` is empty; on island `any` it is a bond over `slaves`, one per wire, and `home`
 /// names the wire the bond takes as `primary` — so the leg survives an island's isolation
 /// with one leg and one BGP session, not two.
@@ -42,7 +42,7 @@ impl GwRow {
     }
 }
 
-/// One slave of a bond leg (a rescue segment, or a migrating ingress leg): a physical wire,
+/// One slave of a bond leg (a fallback segment, or a migrating ingress leg): a physical wire,
 /// tagged with that leg's vid.
 #[derive(Debug, Clone)]
 pub struct Slave {
@@ -51,11 +51,11 @@ pub struct Slave {
     pub island: Island,
 }
 
-/// A rescue segment resolved for one member: an active-backup bond over every wire the
+/// A fallback segment resolved for one member: an active-backup bond over every wire the
 /// member has, one VLAN sub-interface per wire as a slave. `home` is the wire carrying this
 /// zone's cheapest class segment this member actually has — derived, never declared.
 #[derive(Debug, Clone)]
-pub struct RescueRow {
+pub struct FallbackRow {
     pub ifname: String,
     pub zone: String,
     pub seg: u8,
@@ -97,13 +97,13 @@ impl<'a> View<'a> {
         gw_rows_of(self.fabric, self.member)
     }
 
-    /// This member's rescue segments, one per zone this member has a rescue row for (table
+    /// This member's fallback segments, one per zone this member has a fallback row for (table
     /// order), each a bond over every wire the member has.
-    pub fn rescue_rows(&self) -> Vec<RescueRow> {
-        rescue_rows_of(self.fabric, self.member)
+    pub fn fallback_rows(&self) -> Vec<FallbackRow> {
+        fallback_rows_of(self.fabric, self.member)
     }
 
-    /// This member's interfaces in a zone: segments (table order), then the rescue bond, then
+    /// This member's interfaces in a zone: segments (table order), then the fallback bond, then
     /// the ingress leg — adjacency interfaces before the router-facing one.
     pub fn zone_ifs(&self, zone: &str) -> Vec<String> {
         let mut ifs: Vec<String> = self
@@ -113,7 +113,7 @@ impl<'a> View<'a> {
             .map(|r| r.ifname)
             .collect();
         ifs.extend(
-            self.rescue_rows()
+            self.fallback_rows()
                 .into_iter()
                 .filter(|r| r.zone == zone)
                 .map(|r| r.ifname),
@@ -143,9 +143,9 @@ impl<'a> View<'a> {
     }
 
     /// Every interface cfab owns on this member with the forwarding flag cfab sets on it:
-    /// declared wires and the admin NIC (never), class-table segments, ingress legs, rescue
-    /// bonds (transit like a segment — a rescue leg for one zone can carry another zone's
-    /// island-disjoint traffic) and the VRRP macvlan (only a forwarding host), rescue slaves
+    /// declared wires and the admin NIC (never), class-table segments, ingress legs, fallback
+    /// bonds (transit like a segment — a fallback leg for one zone can carry another zone's
+    /// island-disjoint traffic) and the VRRP macvlan (only a forwarding host), fallback slaves
     /// and identity veths (never: a slave is L2 only, the bond is the L3 interface). Scoped
     /// posture: cfab's forwarding authority is exactly this set — it neither reads nor writes
     /// the flag on any other interface, so a foreign forwarder (Docker, a routed bridge, a
@@ -166,12 +166,12 @@ impl<'a> View<'a> {
         }
         for r in self.gw_rows() {
             out.push((r.ifname, transit));
-            // A migrating leg's slaves, like a rescue leg's: L2 only, never transit.
+            // A migrating leg's slaves, like a fallback leg's: L2 only, never transit.
             for s in r.slaves {
                 out.push((s.ifname, false));
             }
         }
-        for r in self.rescue_rows() {
+        for r in self.fallback_rows() {
             out.push((r.ifname, transit));
             for s in r.slaves {
                 out.push((s.ifname, false));
@@ -263,7 +263,7 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
 }
 
 /// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member
-/// has, in st/cl/mg order, named `<ifname>-<island>`. Shared by the rescue segment and a
+/// has, in st/cl/mg order, named `<ifname>-<island>`. Shared by the fallback segment and a
 /// migrating ingress leg — one fan-out, so the two legs cannot drift apart.
 fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
     [Island::St, Island::Cl, Island::Mg]
@@ -278,7 +278,7 @@ fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
         .collect()
 }
 
-/// The wire carrying this member's cheapest class segment of `zone` — the rescue leg's home,
+/// The wire carrying this member's cheapest class segment of `zone` — the fallback leg's home,
 /// derived (never declared). Ties keep the first row in CLASS_TABLE order.
 fn home_wire(fabric: &Fabric, member: &Member, zone: &str) -> Option<String> {
     let mut best: Option<(u32, String)> = None;
@@ -293,26 +293,26 @@ fn home_wire(fabric: &Fabric, member: &Member, zone: &str) -> Option<String> {
     best.map(|(_, wire)| wire)
 }
 
-/// This member's rescue segments (table order): each `any` row fanned out over the member's
+/// This member's fallback segments (table order): each `any` row fanned out over the member's
 /// wires in st/cl/mg order, one slave per wire, homed on the zone's cheapest wire this member
-/// has. A member with no wires at all has no rescue row (it has no fabric).
-pub fn rescue_rows_of(fabric: &Fabric, member: &Member) -> Vec<RescueRow> {
+/// has. A member with no wires at all has no fallback row (it has no fabric).
+pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
     if member.wires.iter().all(Option::is_none) {
         return Vec::new();
     }
     fabric
         .class_table
         .iter()
-        .filter(|r| r.role == Role::Rescue)
+        .filter(|r| r.role == Role::Fallback)
         .filter_map(|r| {
-            // A zone with a rescue row but no class row on this member has no cheapest wire,
+            // A zone with a fallback row but no class row on this member has no cheapest wire,
             // and the row is DROPPED — deliberately, and the opposite of what `gw_rows_of`
             // does with the same condition (it falls back to the member's first wire rather
-            // than take the outside away silently). Whether a home-less rescue leg should
+            // than take the outside away silently). Whether a home-less fallback leg should
             // exist at all is an open question; the two sides are not reconciled yet.
             let home = home_wire(fabric, member, &r.zone)?;
             let slaves = slaves_of(member, &r.ifname);
-            Some(RescueRow {
+            Some(FallbackRow {
                 ifname: r.ifname.clone(),
                 zone: r.zone.clone(),
                 seg: r.seg,
@@ -340,7 +340,7 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
                 Island::St | Island::Cl | Island::Mg => {
                     (member.wire(gw.island)?.name.clone(), Vec::new())
                 }
-                // Every island: a bond, homed like a rescue leg on the wire carrying this
+                // Every island: a bond, homed like a fallback leg on the wire carrying this
                 // zone's cheapest segment. A zone can have an ingress and no segment on this
                 // member, and then there is no cheapest wire — fall back to the first wire in
                 // st/cl/mg order rather than dropping the leg, which would take the outside
@@ -399,7 +399,7 @@ mod tests {
 
     /// The tie rule is load-bearing, not incidental: `home_wire`'s strict `<` keeps the
     /// FIRST CLASS_TABLE row of the zone when two segments cost the same, and that choice
-    /// decides which slave the rescue bond takes as `primary`. Storage's two cheapest rows
+    /// decides which slave the fallback bond takes as `primary`. Storage's two cheapest rows
     /// sit on different wires (st = eth9 first, cl = eth1 second); tie them and eth9 must
     /// still win. A `<=` would silently hand `primary` to the last row instead.
     #[test]
@@ -450,7 +450,7 @@ mod tests {
     }
 
     /// Task 9: a gw island of `any` fans the leg out into a bond over every wire, exactly
-    /// like a rescue leg — same slave naming, same home rule (mgmt's cheapest segment is on
+    /// like a fallback leg — same slave naming, same home rule (mgmt's cheapest segment is on
     /// the mg island, so the bond homes on eth0), and still hosts only.
     #[test]
     fn a_gw_island_of_any_fans_out_into_a_bond() {
@@ -488,7 +488,7 @@ mod tests {
     }
 
     /// A migrating leg's slaves are cfab's and never forward — the bond holds the L3, as for
-    /// a rescue leg. The bond itself stays `transit` on a forwarding host.
+    /// a fallback leg. The bond itself stays `transit` on a forwarding host.
     #[test]
     fn owned_forwarding_carries_a_migrating_gw_bond_and_its_slaves() {
         let f = fabric_with_a_migrating_gw();
@@ -515,13 +515,13 @@ mod tests {
                 "cfab-mg",
                 "cfab-mg-bk",
                 "cfab-mg-b2",
-                "cfab-mg-rs",
+                "cfab-mg-fb",
                 "cfab-gw249"
             ]
         );
         assert_eq!(
             v.zone_ifs("storage"),
-            vec!["cfab-st", "cfab-st-bk", "cfab-st-b2", "cfab-st-rs"]
+            vec!["cfab-st", "cfab-st-bk", "cfab-st-b2", "cfab-st-fb"]
         );
     }
 
@@ -546,37 +546,37 @@ mod tests {
                 "cfab-cl",
                 "cfab-cl-b2",
                 "cfab-cl-bk",
-                "cfab-cl-rs",
+                "cfab-cl-fb",
                 "cfab-gw249",
                 "cfab-mg",
                 "cfab-mg-b2",
                 "cfab-mg-bk",
-                "cfab-mg-rs",
+                "cfab-mg-fb",
                 "cfab-st",
                 "cfab-st-b2",
                 "cfab-st-bk",
-                "cfab-st-rs",
+                "cfab-st-fb",
                 "cfab-st-vr"
             ]
         );
         assert_eq!(
             off,
             vec![
-                "cfab-cl-rs-cl",
-                "cfab-cl-rs-mg",
-                "cfab-cl-rs-st",
+                "cfab-cl-fb-cl",
+                "cfab-cl-fb-mg",
+                "cfab-cl-fb-st",
                 "cfab-id199",
                 "cfab-id199-peer",
                 "cfab-id249",
                 "cfab-id249-peer",
                 "cfab-id99",
                 "cfab-id99-peer",
-                "cfab-mg-rs-cl",
-                "cfab-mg-rs-mg",
-                "cfab-mg-rs-st",
-                "cfab-st-rs-cl",
-                "cfab-st-rs-mg",
-                "cfab-st-rs-st",
+                "cfab-mg-fb-cl",
+                "cfab-mg-fb-mg",
+                "cfab-mg-fb-st",
+                "cfab-st-fb-cl",
+                "cfab-st-fb-mg",
+                "cfab-st-fb-st",
                 "eth0",
                 "eth1",
                 "eth9"
@@ -615,16 +615,16 @@ mod tests {
     }
 
     #[test]
-    fn rescue_rows_fan_out_over_every_wire_homed_on_the_cheapest_segment() {
+    fn fallback_rows_fan_out_over_every_wire_homed_on_the_cheapest_segment() {
         for name in ["pve1-tb", "pve3-tb"] {
             let f = fabric();
             let v = View::new(&f, name).unwrap();
-            let rows = v.rescue_rows();
-            assert_eq!(rows.len(), 3, "{name}: one rescue row per zone");
+            let rows = v.fallback_rows();
+            assert_eq!(rows.len(), 3, "{name}: one fallback row per zone");
             let expect_home = [
-                ("cfab-st-rs", "eth9"),
-                ("cfab-cl-rs", "eth1"),
-                ("cfab-mg-rs", "eth0"),
+                ("cfab-st-fb", "eth9"),
+                ("cfab-cl-fb", "eth1"),
+                ("cfab-mg-fb", "eth0"),
             ];
             for (i, (ifname, home)) in expect_home.into_iter().enumerate() {
                 let row = &rows[i];
@@ -654,14 +654,14 @@ mod tests {
     }
 
     #[test]
-    fn wires_and_segments_of_never_see_the_rescue_bond_or_its_slaves() {
+    fn wires_and_segments_of_never_see_the_fallback_bond_or_its_slaves() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         // wires() feeds the shaper, down's qdisc sweep and verify's link-speed checks: a
-        // rescue row must never enter it (only class_rows() does).
+        // fallback row must never enter it (only class_rows() does).
         assert_eq!(v.wires(), vec!["eth0", "eth1", "eth9"]);
-        assert!(!v.wires().iter().any(|w| w.contains("-rs")));
-        // segments_of feeds BFD pairing: no rescue segment, no BFD.
+        assert!(!v.wires().iter().any(|w| w.contains("-fb")));
+        // segments_of feeds BFD pairing: no fallback segment, no BFD.
         assert!(!segments_of(&f, v.member).iter().any(|s| s.contains(":9")));
     }
 

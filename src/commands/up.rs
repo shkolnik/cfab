@@ -209,7 +209,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
     // The ingress leg: the router's VLAN, this node's address in the router's /24. Same
     // sysctls as a backup segment; nothing else about it is a segment. On a gw island of
-    // `any` the leg is the same bond a rescue segment is, so it migrates between wires
+    // `any` the leg is the same bond a fallback segment is, so it migrates between wires
     // instead of dying with its island — one leg, one BGP session (James 2026-09-04).
     for r in &gw_rows {
         let z = f.zone(&r.zone)?;
@@ -238,11 +238,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
             class_sysctls(sys, &r.ifname, Role::Backup)?;
         }
     }
-    // The rescue leg: one active-backup bond per zone over a tagged sub-interface of every
+    // The fallback leg: one active-backup bond per zone over a tagged sub-interface of every
     // wire, so the member keeps a path in the zone when the physical islands are disjointly
     // isolated. Not a class row and not a wire: nothing that treats a segment as a wire (the
     // shaper, the qdisc sweep, verify's link-speed checks) ever sees it.
-    for r in &view.rescue_rows() {
+    for r in &view.fallback_rows() {
         let z = f.zone(&r.zone)?;
         mk_bond_leg(
             sys,
@@ -252,7 +252,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
                 home: &r.home,
                 slaves: &r.slaves,
                 cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
-                role: Role::Rescue,
+                role: Role::Fallback,
             },
             &[
                 &format!("0:{}", z.pcp),
@@ -537,7 +537,7 @@ fn mk_identity(sys: &mut dyn Sys, name: &str, cidr: &str) -> Result<()> {
 }
 
 /// A tagged sub-interface on `lower`. `addr` is `None` for a link that carries no L3 of its
-/// own (a rescue bond's slave: the bond holds the address), and `bring_up` is false for a link
+/// own (a fallback bond's slave: the bond holds the address), and `bring_up` is false for a link
 /// something else brings up later (enslaving wants the slave down first).
 fn mk_vlan(
     sys: &mut dyn Sys,
@@ -591,24 +591,24 @@ fn mk_vlan(
 /// a dead wire (0.026-0.042 s at every value), so it cannot lengthen an outage. It takes effect on
 /// an EXISTING member only after a `down`/`up` — `mk_bond_leg` never rewrites a live bond; it
 /// refuses when the running value diverges from this one and names that remedy.
-const RESCUE_UPDELAY_MS: &str = "500";
+const FALLBACK_UPDELAY_MS: &str = "500";
 /// `fail_over_mac`. **`none` is the build default** — measured nil difference against `active`
 /// on veth, and it keeps one MAC across a migration. A real NIC must accept the bond MAC in its
 /// unicast filter (INFERRED); Task 7's hardware step measures that and flips this to `active`
 /// if it does not. One line, deliberately not a config knob.
-const RESCUE_FAIL_OVER_MAC: &str = "none";
+const FALLBACK_FAIL_OVER_MAC: &str = "none";
 /// Bonding mode. Active-backup is the whole point of the leg: one wire carries it at a time, and
 /// a migration is invisible above L2. Not writable on a live bond — only `ip link add` sets it.
-const RESCUE_BOND_MODE: &str = "active-backup";
+const FALLBACK_BOND_MODE: &str = "active-backup";
 /// Carrier poll, ms: measured switch at +0.014…0.059 s after carrier loss through the VLAN.
-const RESCUE_MIIMON_MS: &str = "100";
+const FALLBACK_MIIMON_MS: &str = "100";
 /// Gratuitous ARPs per migration: measured exactly 3, at +0.050/+0.050/+0.152 s.
-const RESCUE_NUM_GRAT_ARP: &str = "3";
+const FALLBACK_NUM_GRAT_ARP: &str = "3";
 /// Return to the home wire whenever it comes back — a deterministic steady state `verify` can
 /// expect. The return migration is lossless (measured), so it costs nothing.
-const RESCUE_PRIMARY_RESELECT: &str = "always";
+const FALLBACK_PRIMARY_RESELECT: &str = "always";
 
-/// A migrating leg to build: a rescue segment, or an ingress leg on gw island `any`. The two
+/// A migrating leg to build: a fallback segment, or an ingress leg on gw island `any`. The two
 /// are the same netdev shape, so they are the same code — only the address and the (unused)
 /// role differ.
 struct BondLeg<'a> {
@@ -625,12 +625,12 @@ struct BondLeg<'a> {
 /// Every bond parameter this build creates a leg with, in `bonding/` sysfs spelling: the file
 /// name and the value `ip link add` was given. Read back on an existing bond so a changed
 /// constant cannot silently miss a member that already has the leg.
-const RESCUE_BOND_PARAMS: [(&str, &str); 5] = [
-    ("mode", RESCUE_BOND_MODE),
-    ("miimon", RESCUE_MIIMON_MS),
-    ("updelay", RESCUE_UPDELAY_MS),
-    ("num_grat_arp", RESCUE_NUM_GRAT_ARP),
-    ("fail_over_mac", RESCUE_FAIL_OVER_MAC),
+const FALLBACK_BOND_PARAMS: [(&str, &str); 5] = [
+    ("mode", FALLBACK_BOND_MODE),
+    ("miimon", FALLBACK_MIIMON_MS),
+    ("updelay", FALLBACK_UPDELAY_MS),
+    ("num_grat_arp", FALLBACK_NUM_GRAT_ARP),
+    ("fail_over_mac", FALLBACK_FAIL_OVER_MAC),
 ];
 
 /// An existing bond keeps whatever `ip link add` gave it: nothing in `up` re-asserts the
@@ -645,7 +645,7 @@ const RESCUE_BOND_PARAMS: [(&str, &str); 5] = [
 /// unreadable file is not health — it is an unproven bond — so it refuses too.
 fn bond_params_match(sys: &dyn Sys, ifname: &str) -> Result<()> {
     let mut diverged: Vec<String> = Vec::new();
-    for (param, want) in RESCUE_BOND_PARAMS {
+    for (param, want) in FALLBACK_BOND_PARAMS {
         let path = format!("/sys/class/net/{ifname}/bonding/{param}");
         let Ok(raw) = sys.read(&path) else {
             return Err(Error::fatal(format!(
@@ -694,21 +694,21 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
                 "type",
                 "bond",
                 "mode",
-                RESCUE_BOND_MODE,
+                FALLBACK_BOND_MODE,
                 "miimon",
-                RESCUE_MIIMON_MS,
+                FALLBACK_MIIMON_MS,
                 "num_grat_arp",
-                RESCUE_NUM_GRAT_ARP,
+                FALLBACK_NUM_GRAT_ARP,
                 "updelay",
-                RESCUE_UPDELAY_MS,
+                FALLBACK_UPDELAY_MS,
                 "fail_over_mac",
-                RESCUE_FAIL_OVER_MAC,
+                FALLBACK_FAIL_OVER_MAC,
             ],
         )?;
     }
     // (2) the slaves: created DOWN and with no address — the bond holds the L3, and enslaving
     // a link the kernel is bringing up is a race. The egress-qos map lives HERE: the tag is
-    // applied on the slave, and PCP is per frame, so control on the rescue path is queued like
+    // applied on the slave, and PCP is per frame, so control on the fallback path is queued like
     // control anywhere.
     for s in r.slaves {
         mk_vlan(sys, &s.ifname, &s.wire, r.vid, None, false, qos_map)?;
@@ -732,7 +732,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
         run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
         // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
         // means forwarding=1 — the same hazard `mk_identity` guards against. `up` only zeroes
-        // conf/default on a HOST; a LEAF has rescue rows and is deliberately left alone there,
+        // conf/default on a HOST; a LEAF has fallback rows and is deliberately left alone there,
         // so the explicit write is the only thing that holds `owned_forwarding()`'s false.
         proc_sysctl(sys, &s.ifname, "forwarding", "0")?;
     }
@@ -756,7 +756,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
             "primary",
             &home.ifname,
             "primary_reselect",
-            RESCUE_PRIMARY_RESELECT,
+            FALLBACK_PRIMARY_RESELECT,
         ],
     )?;
     // (5) the bond is the segment: address, segment sysctls, up.
@@ -766,12 +766,12 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A rescue bond is not a
+/// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A fallback bond is not a
 /// wire: it is `down` exactly when not one of its slaves has carrier, so the warning must name
-/// that condition — "ip -br link show cfab-st-rs" would only show an interface that is UP.
+/// that condition — "ip -br link show cfab-st-fb" would only show an interface that is UP.
 fn describe_down(view: &View, down: &[String]) -> Vec<String> {
-    let rescue: Vec<String> = view
-        .rescue_rows()
+    let fallback: Vec<String> = view
+        .fallback_rows()
         .into_iter()
         .map(|r| r.ifname)
         .chain(
@@ -784,7 +784,7 @@ fn describe_down(view: &View, down: &[String]) -> Vec<String> {
     down.iter()
         .map(|entry| {
             let ifname = entry.rsplit('/').next().unwrap_or(entry);
-            if rescue.iter().any(|r| r == ifname) {
+            if fallback.iter().any(|r| r == ifname) {
                 format!("{entry} (no wire with carrier under it)")
             } else {
                 entry.clone()
@@ -831,7 +831,7 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
     // `verify` and the watchdog grade against `owned_forwarding()`, which lists the bond as
     // transit — leaving it out here would make every `up` report DEGRADED three seconds later.
-    for r in view.rescue_rows() {
+    for r in view.fallback_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     if f.vrrp_gw {
@@ -892,7 +892,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut doc = engine_ctl::tests::healthy_doc(&view);
         doc["ospf"].as_object_mut().unwrap().remove("mgmt");
-        let mut sys = absent_rescue_netdevs(
+        let mut sys = absent_fallback_netdevs(
             MockSys::default()
                 .socket("/run/cfab/engine.sock", &doc.to_string())
                 .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
@@ -944,10 +944,10 @@ mod tests {
             )
     }
 
-    /// The older mocks answer every `ip link show` with success, so a rescue bond would look
+    /// The older mocks answer every `ip link show` with success, so a fallback bond would look
     /// present and of an unknown kind — a refusal. Mark the bonds absent: a fresh member.
-    fn absent_rescue_netdevs(mut sys: MockSys, view: &View) -> MockSys {
-        for r in view.rescue_rows() {
+    fn absent_fallback_netdevs(mut sys: MockSys, view: &View) -> MockSys {
+        for r in view.fallback_rows() {
             sys = sys.on_fail(
                 &["ip", "link", "show", &r.ifname],
                 1,
@@ -984,53 +984,53 @@ mod tests {
             .collect()
     }
 
-    /// The whole rescue leg for one zone, argv by argv, on a member with three wires: the bond
+    /// The whole fallback leg for one zone, argv by argv, on a member with three wires: the bond
     /// first, each slave created DOWN and address-less then enslaved and brought up, `primary`
     /// only AFTER the slaves exist (at `add` time it is a silent no-op), then the address,
     /// the segment sysctls and the bond up. storage's home wire is eth9 (its cheapest class
     /// row is on the st island), so `primary` names the st SLAVE, never the wire.
     #[test]
-    fn a_rescue_leg_is_built_bond_slaves_primary_address() {
+    fn a_fallback_leg_is_built_bond_slaves_primary_address() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
         let (_tmp, o) = opts();
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(
-            calls_for(&sys, "cfab-st-rs"),
+            calls_for(&sys, "cfab-st-fb"),
             [
-                "ip link show cfab-st-rs",
-                "ip link add cfab-st-rs type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
-                "ip link show cfab-st-rs-st",
+                "ip link show cfab-st-fb",
+                "ip link add cfab-st-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
+                "ip link show cfab-st-fb-st",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-rs-st",
-                "ip link add link eth9 name cfab-st-rs-st type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-rs-st master cfab-st-rs",
-                "ip link set cfab-st-rs-st up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs-st/forwarding",
-                "ip link show cfab-st-rs-cl",
+                "ip link show cfab-st-fb-st",
+                "ip link add link eth9 name cfab-st-fb-st type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-st master cfab-st-fb",
+                "ip link set cfab-st-fb-st up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-st/forwarding",
+                "ip link show cfab-st-fb-cl",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-rs-cl",
-                "ip link add link eth1 name cfab-st-rs-cl type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-rs-cl master cfab-st-rs",
-                "ip link set cfab-st-rs-cl up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs-cl/forwarding",
-                "ip link show cfab-st-rs-mg",
+                "ip link show cfab-st-fb-cl",
+                "ip link add link eth1 name cfab-st-fb-cl type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-cl master cfab-st-fb",
+                "ip link set cfab-st-fb-cl up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-cl/forwarding",
+                "ip link show cfab-st-fb-mg",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-rs-mg",
-                "ip link add link eth0 name cfab-st-rs-mg type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-rs-mg master cfab-st-rs",
-                "ip link set cfab-st-rs-mg up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs-mg/forwarding",
-                "ip link set cfab-st-rs type bond primary cfab-st-rs-st primary_reselect always",
-                "ip addr replace 10.99.9.1/24 dev cfab-st-rs",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs/arp_ignore",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs/rp_filter",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs/send_redirects",
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs/forwarding",
-                "ip link set cfab-st-rs up",
+                "ip link show cfab-st-fb-mg",
+                "ip link add link eth0 name cfab-st-fb-mg type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-mg master cfab-st-fb",
+                "ip link set cfab-st-fb-mg up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-mg/forwarding",
+                "ip link set cfab-st-fb type bond primary cfab-st-fb-st primary_reselect always",
+                "ip addr replace 10.99.9.1/24 dev cfab-st-fb",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb/arp_ignore",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb/send_redirects",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb/forwarding",
+                "ip link set cfab-st-fb up",
                 // enable_forwarding, after the policy is loaded and read back
-                "write /proc/sys/net/ipv4/conf/cfab-st-rs/forwarding",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb/forwarding",
             ]
         );
     }
@@ -1044,98 +1044,98 @@ mod tests {
         let (_tmp, o) = opts();
         // An existing bond must also present its bonding/ sysfs: `up` proves the parameters
         // before it touches a bond it did not just create.
-        let sys = bond_sysfs(up_sys(&view), "cfab-st-rs", &healthy_bond_params());
+        let sys = bond_sysfs(up_sys(&view), "cfab-st-fb", &healthy_bond_params());
         let mut sys = sys
-            .file("/sys/class/net/cfab-st-rs-st/master", "")
-            .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
+            .file("/sys/class/net/cfab-st-fb-st/master", "")
+            .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-rs"],
-                "9: cfab-st-rs: bond \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: bond \n",
             )
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-rs-st"],
-                "10: cfab-st-rs-st\n",
+                &["ip", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-rs-st"],
-                "10: cfab-st-rs-st@eth9: master cfab-st-rs state UP vlan protocol 802.1Q id 300 \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st@eth9: master cfab-st-fb state UP vlan protocol 802.1Q id 300 \n",
             );
         run(&mut sys, &view, &o).unwrap();
         assert!(
-            !sys.ran("ip link set cfab-st-rs-st master"),
+            !sys.ran("ip link set cfab-st-fb-st master"),
             "{:?}",
-            calls_for(&sys, "cfab-st-rs-st")
+            calls_for(&sys, "cfab-st-fb-st")
         );
-        assert!(!sys.ran("ip link add cfab-st-rs type bond"), "bond kept");
+        assert!(!sys.ran("ip link add cfab-st-fb type bond"), "bond kept");
         // and the ones that are not enslaved still are
-        assert!(sys.ran("ip link set cfab-st-rs-cl master cfab-st-rs"));
+        assert!(sys.ran("ip link set cfab-st-fb-cl master cfab-st-fb"));
     }
 
     /// A slave name that is already enslaved SOMEWHERE ELSE: the kernel would answer the
     /// `master` set with a bare "Device or resource busy". Refuse in cfab's own wording.
     #[test]
-    fn up_refuses_a_rescue_slave_enslaved_to_a_foreign_bond() {
+    fn up_refuses_a_fallback_slave_enslaved_to_a_foreign_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
         let mut sys = up_sys(&view)
-            .file("/sys/class/net/cfab-st-rs-st/master", "")
+            .file("/sys/class/net/cfab-st-fb-st/master", "")
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-rs-st"],
-                "10: cfab-st-rs-st\n",
+                &["ip", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-rs-st"],
-                "10: cfab-st-rs-st@eth9: master br0 state UP vlan protocol 802.1Q id 300 \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st@eth9: master br0 state UP vlan protocol 802.1Q id 300 \n",
             );
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         assert!(
-            e.contains("REFUSING: cfab-st-rs-st is enslaved to another bond"),
+            e.contains("REFUSING: cfab-st-fb-st is enslaved to another bond"),
             "{e}"
         );
         assert!(
-            !sys.ran("ip link set cfab-st-rs-st master"),
+            !sys.ran("ip link set cfab-st-fb-st master"),
             "never fights the kernel for it"
         );
     }
 
-    /// A netdev already carrying a rescue bond's name but of another kind is not ours to
+    /// A netdev already carrying a fallback bond's name but of another kind is not ours to
     /// delete (unlike a vlan of the wrong id, which cfab created and can recreate): refuse.
     #[test]
-    fn up_refuses_a_foreign_netdev_named_like_a_rescue_bond() {
+    fn up_refuses_a_foreign_netdev_named_like_a_fallback_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
         let mut sys = up_sys(&view)
-            .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
+            .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-rs"],
-                "9: cfab-st-rs: bridge \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: bridge \n",
             );
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         assert!(
-            e.contains("REFUSING: cfab-st-rs exists but is not a bond"),
+            e.contains("REFUSING: cfab-st-fb exists but is not a bond"),
             "{e}"
         );
         assert!(
-            !sys.ran("ip link del cfab-st-rs"),
+            !sys.ran("ip link del cfab-st-fb"),
             "never deletes a stranger"
         );
     }
 
-    /// An existing rescue bond, correctly typed, with every bonding parameter as this build
+    /// An existing fallback bond, correctly typed, with every bonding parameter as this build
     /// wants it — the steady state a second `up` meets.
-    fn existing_rescue_bond(sys: MockSys, params: &[(&str, &str)]) -> MockSys {
+    fn existing_fallback_bond(sys: MockSys, params: &[(&str, &str)]) -> MockSys {
         let sys = sys
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-rs"],
-                "9: cfab-st-rs: <UP>\n",
+                &["ip", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: <UP>\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-rs"],
-                "9: cfab-st-rs: bond mode active-backup \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: bond mode active-backup \n",
             );
-        bond_sysfs(sys, "cfab-st-rs", params)
+        bond_sysfs(sys, "cfab-st-fb", params)
     }
 
     /// A bond's `bonding/` sysfs as the kernel spells it, parameter by parameter.
@@ -1162,19 +1162,19 @@ mod tests {
     /// that already has the leg. `up` refuses instead of rewriting a live bond (`mode` and
     /// `fail_over_mac` are not writable on one at all) and names the remedy.
     #[test]
-    fn up_refuses_an_existing_rescue_bond_whose_parameters_diverge() {
+    fn up_refuses_an_existing_fallback_bond_whose_parameters_diverge() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
         let mut params = healthy_bond_params();
         params[2] = ("updelay", "0\n");
-        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let mut sys = existing_fallback_bond(up_sys(&view), &params);
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
-        assert!(e.contains("cfab-st-rs"), "{e}");
+        assert!(e.contains("cfab-st-fb"), "{e}");
         assert!(e.contains("updelay want 500 got 0"), "{e}");
         assert!(e.contains("cfab down"), "{e}");
         assert!(
-            !sys.ran("ip link set cfab-st-rs type bond updelay"),
+            !sys.ran("ip link set cfab-st-fb type bond updelay"),
             "never rewrites a live bond: {:?}",
             sys.calls
         );
@@ -1193,7 +1193,7 @@ mod tests {
             ("num_grat_arp", "1\n"),
             ("fail_over_mac", "active 1\n"),
         ];
-        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let mut sys = existing_fallback_bond(up_sys(&view), &params);
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         for want in [
             "mode want active-backup got balance-rr",
@@ -1212,18 +1212,18 @@ mod tests {
     /// The steady state: a bond that is already exactly right is accepted, `ip link add` is
     /// not re-issued, and `up` goes on to the slaves.
     #[test]
-    fn an_existing_rescue_bond_with_matching_parameters_is_accepted() {
+    fn an_existing_fallback_bond_with_matching_parameters_is_accepted() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
-        let mut sys = existing_rescue_bond(up_sys(&view), &healthy_bond_params());
+        let mut sys = existing_fallback_bond(up_sys(&view), &healthy_bond_params());
         run(&mut sys, &view, &o).unwrap();
         assert!(
-            !sys.ran("ip link add cfab-st-rs type bond"),
+            !sys.ran("ip link add cfab-st-fb type bond"),
             "an existing bond is never recreated"
         );
-        assert!(sys.ran("ip link set cfab-st-rs-st master cfab-st-rs"));
-        assert!(sys.ran("ip link set cfab-st-rs up"));
+        assert!(sys.ran("ip link set cfab-st-fb-st master cfab-st-fb"));
+        assert!(sys.ran("ip link set cfab-st-fb up"));
     }
 
     /// An unreadable bonding file is not health: it is an unproven bond. Refuse, and say
@@ -1237,35 +1237,35 @@ mod tests {
             .into_iter()
             .filter(|(n, _)| *n != "num_grat_arp")
             .collect();
-        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let mut sys = existing_fallback_bond(up_sys(&view), &params);
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         assert!(
-            e.contains("/sys/class/net/cfab-st-rs/bonding/num_grat_arp"),
+            e.contains("/sys/class/net/cfab-st-fb/bonding/num_grat_arp"),
             "{e}"
         );
         assert!(e.contains("cfab down"), "{e}");
     }
 
-    /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a rescue bond left
+    /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a fallback bond left
     /// out of it would leave every `up` DEGRADED and make the watchdog "correct" a flag cfab
     /// never set. The slaves are written 0 EXPLICITLY: they carry no L3, and inheriting
     /// conf/default (1 on a leaf whose external owner keeps ip_forward=1) would contradict
     /// `owned_forwarding()` with nothing in `up` to correct it.
     #[test]
-    fn rescue_bonds_forward_and_their_slaves_never_do() {
+    fn fallback_bonds_forward_and_their_slaves_never_do() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
         let mut sys = up_sys(&view);
         run(&mut sys, &view, &o).unwrap();
-        for zone_if in ["cfab-st-rs", "cfab-cl-rs", "cfab-mg-rs"] {
+        for zone_if in ["cfab-st-fb", "cfab-cl-fb", "cfab-mg-fb"] {
             assert_eq!(
                 sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{zone_if}/forwarding")),
                 Some("1"),
                 "{zone_if}"
             );
         }
-        for slave in ["cfab-st-rs-st", "cfab-st-rs-cl", "cfab-st-rs-mg"] {
+        for slave in ["cfab-st-fb-st", "cfab-st-fb-cl", "cfab-st-fb-mg"] {
             assert_eq!(
                 sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
                 Some("0"),
@@ -1283,7 +1283,7 @@ mod tests {
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
-    /// Task 9: a gw island of `any` builds the ingress leg as the very same bond a rescue
+    /// Task 9: a gw island of `any` builds the ingress leg as the very same bond a fallback
     /// leg is — same parameters, same slave-then-enslave order, same `primary`-after-slaves
     /// rule — addressed with the router's /24 leg address, not a segment address. mgmt's
     /// cheapest segment is on the mg island, so `primary` names the mg SLAVE.
@@ -1365,7 +1365,7 @@ mod tests {
         );
     }
 
-    /// The rescue leg extended `mk_vlan` with `addr`/`bring_up`. A class row and an ingress
+    /// The fallback leg extended `mk_vlan` with `addr`/`bring_up`. A class row and an ingress
     /// leg must still produce exactly the argv they produced before it — this pins them.
     #[test]
     fn class_and_gw_sub_interfaces_are_created_exactly_as_before() {
@@ -1399,23 +1399,23 @@ mod tests {
     }
 
     /// 3.3: a bond with no carrier is a bond whose every slave lost carrier. Naming the bond
-    /// alone would send the operator to `ip -br link show cfab-st-rs`, which shows it UP.
+    /// alone would send the operator to `ip -br link show cfab-st-fb`, which shows it UP.
     #[test]
-    fn a_down_rescue_bond_is_reported_as_no_wire_with_carrier() {
+    fn a_down_fallback_bond_is_reported_as_no_wire_with_carrier() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let got = describe_down(
             &view,
             &[
                 "storage/cfab-st".to_string(),
-                "storage/cfab-st-rs".to_string(),
+                "storage/cfab-st-fb".to_string(),
             ],
         );
         assert_eq!(
             got,
             [
                 "storage/cfab-st".to_string(),
-                "storage/cfab-st-rs (no wire with carrier under it)".to_string(),
+                "storage/cfab-st-fb (no wire with carrier under it)".to_string(),
             ]
         );
     }
@@ -1429,7 +1429,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut doc = engine_ctl::tests::healthy_doc(&view);
         doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = serde_json::json!("down");
-        let mut sys = absent_rescue_netdevs(
+        let mut sys = absent_fallback_netdevs(
             MockSys::default()
                 .socket("/run/cfab/engine.sock", &doc.to_string())
                 .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
