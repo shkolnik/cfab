@@ -136,10 +136,14 @@ pub fn generate(view: &View) -> Result<String> {
             .map(|i| format!("\"{i}\""))
             .collect::<Vec<_>>()
             .join(",");
-        // PCP plane: lift OSPF/BFD to PCP_CTRL on zones mapped below it.
+        // PCP plane: lift OSPF/BFD to PCP_CTRL on zones mapped below it. OSPF is matched by
+        // number: nft resolves `ip protocol ospf` through /etc/protocols (package netbase), which
+        // a slim container image does not have, and `nft -f` then refuses the whole ruleset
+        // (verified 2026-09-05 on debian:trixie-slim + nftables 1.1.3; the 0.1.0 deb got
+        // netbase only through its frr dependency). A number assumes nothing.
         if z.pcp != f.pcp_ctrl {
             out.push_str(&format!(
-                "    oifname {{ {ifs} }} ip protocol ospf meta priority set 0:{} comment \"pcp-{}-ctrl\"\n",
+                "    oifname {{ {ifs} }} ip protocol 89 meta priority set 0:{} comment \"pcp-{}-ctrl\"\n",
                 f.pcp_ctrl, z.name
             ));
             out.push_str(&format!(
@@ -158,7 +162,7 @@ pub fn generate(view: &View) -> Result<String> {
         ));
         if z.dscp != f.dscp_ctrl {
             out.push_str(&format!(
-                "    oifname {{ {ifs} }} ip protocol ospf ip dscp set {} comment \"dscp-{}-ctrl\"\n",
+                "    oifname {{ {ifs} }} ip protocol 89 ip dscp set {} comment \"dscp-{}-ctrl\"\n",
                 f.dscp_ctrl, z.name
             ));
             out.push_str(&format!(
@@ -177,13 +181,13 @@ pub fn generate(view: &View) -> Result<String> {
     //
     // OSPF only, and only on the bond: a fallback leg carries NO BFD by construction (`emit/
     // engine.rs` gives the bond no `bfd` key at all, and `segments_of()` keeps it out of BFD
-    // pairing), so `ip protocol ospf` is the whole control class on this interface. Only the
+    // pairing), so `ip protocol 89` (OSPF) is the whole control class on this interface. Only the
     // control class is policed — when a zone is island-disjoint the bond carries that zone's
     // real traffic, which is exactly what the fallback exists for.
     for ce in ceilings(view) {
         out.push_str(&ce.comment());
         out.push_str(&format!(
-            "    oifname {{ \"{}\" }} ip protocol ospf limit rate over {}/second burst {} packets counter drop comment \"ceiling-{}\"\n",
+            "    oifname {{ \"{}\" }} ip protocol 89 limit rate over {}/second burst {} packets counter drop comment \"ceiling-{}\"\n",
             ce.ifname, ce.rate_pps, ce.burst_pkts, ce.zone
         ));
     }
@@ -284,7 +288,7 @@ mod tests {
         assert_eq!(rules.len(), 3, "one per fallback bond: {out}");
         assert_eq!(
             rules[0].trim(),
-            "oifname { \"cfab-st-fb\" } ip protocol ospf limit rate over 80/second \
+            "oifname { \"cfab-st-fb\" } ip protocol 89 limit rate over 80/second \
              burst 160 packets counter drop comment \"ceiling-storage\""
         );
         assert!(out.contains(
