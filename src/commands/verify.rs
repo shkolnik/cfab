@@ -13,7 +13,7 @@ use crate::derive::{View, segments_of};
 use crate::emit;
 use crate::error::Result;
 use crate::model::MemberKind;
-use crate::sys::Sys;
+use crate::sys::{Sys, run_optional};
 
 pub struct VerifyReport {
     /// 0 = OK, 2 = DEGRADED, 1 = failed.
@@ -65,6 +65,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
     mark_drift(sys, view, &mut c)?;
     shape_posture(sys, view, &mut c)?;
     link_speeds(sys, view, &mut c)?;
+    bfd_port(sys, view, &mut c)?;
 
     // ---- convergence (waits) -----------------------------------------------------
     // One BFD session per (zone, segment) shared with each peer, keyed by the peer's segment
@@ -194,6 +195,51 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         code: 0,
         output: c.out,
     })
+}
+
+/// BFD port custody. The engine binds udp/BFD_PORT exclusively (no SO_REUSEADDR), so a second
+/// BFD daemon on this host cannot steal our packets while we hold it — but it takes the port the
+/// moment we restart, and then the engine refuses to start at all. Measured 2026-09-05: with
+/// SO_REUSEADDR on both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder
+/// silently took every packet. Present-but-stopped is therefore a warning, not health.
+fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+    let f = view.fabric;
+    let port = f.bfd_port;
+    let systemd = sys.exists("/run/systemd/system");
+    let log = engine_ctl::engine_log(sys, f, systemd);
+    if let Some(line) = engine_ctl::bfd_bind_error_line(&log, port) {
+        c.bad(&format!(
+            "bfd udp/{port}: the engine could not bind it — {line}"
+        ));
+    }
+    let mut found: Vec<String> = Vec::new();
+    for unit in ["frr", "bfdd"] {
+        let unit = format!("{unit}.service");
+        if let Some(out) = run_optional(sys, &["systemctl", "is-enabled", &unit])
+            && out.stdout.trim() == "enabled"
+        {
+            found.push(format!("{unit} enabled"));
+        }
+    }
+    for pid in sys.list_dir("/proc").unwrap_or_default() {
+        if !pid.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(comm) = sys.read(&format!("/proc/{pid}/comm"))
+            && comm.trim() == "bfdd"
+        {
+            found.push(format!("bfdd running (pid {pid})"));
+        }
+    }
+    if !found.is_empty() {
+        c.warn(&format!(
+            "bfd udp/{port}: another BFD daemon is on this host ({}) — it takes the port at our \
+             next engine restart; systemctl disable --now frr, or declare a free BFD_PORT on \
+             EVERY member",
+            found.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
@@ -1145,6 +1191,53 @@ mod tests {
                 report.output
             );
         }
+    }
+
+    /// A BFD-capable daemon on the host is a warning even while we hold the port: it takes it
+    /// at our next engine restart. Present, not just running: an enabled unit is enough.
+    #[test]
+    fn a_second_bfd_daemon_is_a_warning_while_we_are_up() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = primary_routes(leaf_env(&view), &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .on_stdout(&["systemctl", "is-enabled", "frr.service"], "enabled\n")
+            .file("/proc/812/comm", "bfdd\n");
+        let mut sys = sys;
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 0, "a warning does not change the grade");
+        assert!(
+            report.output.contains(
+                "  warn: bfd udp/3784: another BFD daemon is on this host (frr.service enabled, \
+                 bfdd running (pid 812)) — it takes the port at our next engine restart; \
+                 systemctl disable --now frr, or declare a free BFD_PORT on EVERY member\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The engine could not bind the port at all: a posture FAIL, with holo's own line.
+    #[test]
+    fn a_lost_bfd_port_is_a_posture_failure() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = primary_routes(leaf_env(&view), &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file(
+                "/run/cfab/engine.log",
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n",
+            );
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  FAIL: bfd udp/3784: the engine could not bind it — bfd: cannot bind udp \
+                 0.0.0.0:3784: address in use (held by bfdd pid 812)\n"
+            ),
+            "{}",
+            report.output
+        );
     }
 
     /// Pull one segment (dark) → DEGRADED with the session named.
