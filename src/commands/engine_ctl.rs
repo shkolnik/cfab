@@ -129,7 +129,7 @@ pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
 /// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
 /// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
 /// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
-/// One spelling, shared by `up` (which hits this at start) and `status` (which diagnoses it).
+/// Used by `status`, which diagnoses the failure from the engine's ring buffer.
 pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
     let stop = if line.contains("bfdd") || line.contains("frr") {
         "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
