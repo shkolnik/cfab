@@ -95,6 +95,12 @@ enum Command {
         #[arg(long, hide = true)]
         unsafe_no_prefsrc: bool,
     },
+    /// Arm parent-death like a supervised child, then block forever (test fixture)
+    #[command(name = "__pdeath-selftest", hide = true)]
+    PdeathSelftest {
+        /// Write this process's pid here once armed
+        pidfile: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,7 +198,59 @@ fn member_name(cli_host: &Option<String>) -> Result<String, Error> {
         .to_string())
 }
 
+/// The three verbs the supervisor spawns, plus the self-test fixture: each arms its own
+/// parent-death signal before anything else, iff `CFAB_SUPERVISOR_PID` says it is supervised
+/// (spec §7). A failed check is exit **5** — the supervisor vanished inside the fork window —
+/// never 4, which is the supervisor's own "instance lock already held".
+fn arm_supervised_child(command: &Command) -> Option<ExitCode> {
+    match command {
+        Command::Engine { .. }
+        | Command::ShapeDaemon { .. }
+        | Command::ConfSync
+        | Command::PdeathSelftest { .. } => {
+            let expected = std::env::var("CFAB_SUPERVISOR_PID")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            match cfab::supervisor::child::arm_parent_death(expected) {
+                Ok(()) => None,
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(ExitCode::from(5))
+                }
+            }
+        }
+        Command::Check
+        | Command::Schema
+        | Command::Gen { .. }
+        | Command::Up
+        | Command::Down
+        | Command::Status { .. }
+        | Command::FwdWatchdog
+        | Command::MeasureCap { .. }
+        | Command::PolicyTeeth
+        | Command::Cluster { .. }
+        | Command::Conf { .. } => None,
+    }
+}
+
 fn run(cli: Cli) -> Result<ExitCode, Error> {
+    if let Some(code) = arm_supervised_child(&cli.command) {
+        return Ok(code);
+    }
+    if let Command::PdeathSelftest { pidfile } = &cli.command {
+        // Armed above; now block forever so a test can watch what happens to us. The pid
+        // lands via a rename so a watcher never reads a half-written file.
+        if let Some(p) = pidfile {
+            let tmp = p.with_extension("tmp");
+            std::fs::write(&tmp, std::process::id().to_string())
+                .map_err(|e| Error::fatal(format!("cannot write {}: {e}", tmp.display())))?;
+            std::fs::rename(&tmp, p)
+                .map_err(|e| Error::fatal(format!("cannot rename to {}: {e}", p.display())))?;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
     let path = config_path(&cli.config);
     if let Command::Schema = cli.command {
         // Schema needs no config file at all.
@@ -228,7 +286,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     let view = View::new(&fabric, &member)?;
 
     match cli.command {
-        Command::Schema | Command::Cluster { .. } => unreachable!("handled above"),
+        Command::Schema | Command::Cluster { .. } | Command::PdeathSelftest { .. } => {
+            unreachable!("handled above")
+        }
         Command::Conf {
             action: ConfAction::Publish,
         } => {

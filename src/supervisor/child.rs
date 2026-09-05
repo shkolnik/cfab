@@ -157,6 +157,125 @@ impl Child {
     }
 }
 
+/// A live child process and the two pipes its output arrives on.
+pub struct Spawned {
+    pub pid: u32,
+    pub child: tokio::process::Child,
+    pub stdout: tokio::process::ChildStdout,
+    pub stderr: tokio::process::ChildStderr,
+}
+
+/// How the supervisor starts a child. Task 6 supervises against this trait so the whole
+/// lifecycle is testable without real processes; `RealSpawner` is the only implementation
+/// that forks.
+pub trait Spawner {
+    fn spawn(
+        &mut self,
+        name: &'static str,
+        argv: &[String],
+        supervisor_pid: u32,
+    ) -> std::io::Result<Spawned>;
+}
+
+pub struct RealSpawner;
+
+impl Spawner for RealSpawner {
+    fn spawn(
+        &mut self,
+        name: &'static str,
+        argv: &[String],
+        supervisor_pid: u32,
+    ) -> std::io::Result<Spawned> {
+        spawn(name, argv, supervisor_pid)
+    }
+}
+
+/// Start one child: both streams piped, `CFAB_SUPERVISOR_PID` set so the child arms its own
+/// parent-death signal, and the service manager's notification variables removed so a child
+/// that called `sd_notify` cannot talk to OUR service manager (spec §3).
+///
+/// **Every call site must be the main thread inside the root `block_on` future** — never a
+/// `tokio::spawn`ed task, never `spawn_blocking`. `PR_SET_PDEATHSIG` fires when the parent
+/// *thread* that forked terminates, not when the parent process does (prctl(2): "the
+/// parent-death signal is sent upon subsequent termination of the parent thread"), and
+/// tokio retires idle blocking-pool workers — so a child forked off a blocking worker is
+/// SIGTERMed for no reason when that worker retires. `block_in_place` on the root future is
+/// fine: it keeps running on the same thread. This is an invariant, not a preference (spec
+/// §7); `spawning_a_child_from_spawn_blocking_kills_it_when_that_thread_retires` reproduces
+/// the hazard.
+pub fn spawn(name: &'static str, argv: &[String], supervisor_pid: u32) -> std::io::Result<Spawned> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other(format!("{name}: empty argv")))?;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("CFAB_SUPERVISOR_PID", supervisor_pid.to_string())
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("WATCHDOG_USEC")
+        .env_remove("WATCHDOG_PID")
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other(format!("{name}: exited before it had a pid")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other(format!("{name}: no stdout pipe")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other(format!("{name}: no stderr pipe")))?;
+    Ok(Spawned {
+        pid,
+        child,
+        stdout,
+        stderr,
+    })
+}
+
+/// Pump one child stream until EOF: every line is re-emitted on our own stderr prefixed
+/// `<name>: ` — one journal stream, children tagged, and the same text in a container with
+/// no journal — and handed to `sink`, which appends it to that child's ring buffer.
+pub async fn tag_lines<R, F>(name: &str, reader: R, mut sink: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&str),
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        eprintln!("{name}: {line}");
+        sink(&line);
+    }
+}
+
+/// Arm this process's parent-death signal, but **only when supervised** (spec §7).
+///
+/// `None` (no `CFAB_SUPERVISOR_PID` in the environment) does nothing at all — no prctl, no
+/// `getppid`: a standalone `cfab engine` must survive its launcher exiting, and
+/// `scripts/engine-oracle.sh` runs it under `setsid -f`, whose intermediate parent exits
+/// immediately. `Some(p)` arms SIGTERM first and only then compares `getppid()` with `p`, so
+/// a supervisor that dies inside the fork window cannot slip between the check and the arm;
+/// the mismatch is this child's own exit 5, never the supervisor's 4.
+pub fn arm_parent_death(expected_ppid: Option<u32>) -> crate::error::Result<()> {
+    let Some(expected) = expected_ppid else {
+        return Ok(());
+    };
+    nix::sys::prctl::set_pdeathsig(Some(nix::sys::signal::Signal::SIGTERM))
+        .map_err(|e| crate::error::Error::fatal(format!("cannot arm parent-death signal: {e}")))?;
+    let actual = nix::unistd::getppid().as_raw() as u32;
+    if actual != expected {
+        return Err(crate::error::Error::fatal(format!(
+            "the supervisor vanished at spawn (CFAB_SUPERVISOR_PID={expected}, parent is now {actual})"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +357,63 @@ mod tests {
         assert_eq!(tail.len(), 200);
         assert_eq!(tail[0], "line 51");
         assert_eq!(tail[199].len(), 2048);
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    #[test]
+    fn a_vanished_supervisor_is_its_own_exit_code() {
+        // getppid() != expected → Err; main.rs turns it into exit 5, never 4 (the lock's code).
+        assert!(arm_parent_death(Some(u32::MAX)).is_err());
+        // Disarm: the call above armed PDEATHSIG on this test process too, and the test
+        // binary must not be SIGTERMed if cargo's forking thread ever retires.
+        nix::sys::prctl::set_pdeathsig(None).unwrap();
+    }
+
+    #[test]
+    fn no_supervisor_in_the_environment_arms_nothing() {
+        assert!(
+            arm_parent_death(None).is_ok(),
+            "no env var ⇒ no prctl, no getppid check"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_output_is_tagged_and_ringed() {
+        let Spawned {
+            pid,
+            mut child,
+            stdout,
+            stderr,
+        } = spawn(
+            "engine",
+            &["sh".into(), "-c".into(), "echo hi; echo bad >&2".into()],
+            std::process::id(),
+        )
+        .unwrap();
+        assert!(pid > 0);
+        let ring = std::sync::Arc::new(std::sync::Mutex::new(Child::new("engine")));
+        let (r1, r2) = (ring.clone(), ring.clone());
+        let a = tokio::spawn(async move {
+            tag_lines("engine", stdout, move |l| r1.lock().unwrap().push_log(l)).await
+        });
+        let b = tokio::spawn(async move {
+            tag_lines("engine", stderr, move |l| r2.lock().unwrap().push_log(l)).await
+        });
+        a.await.unwrap();
+        b.await.unwrap();
+        let _ = child.wait().await;
+        let tail = ring.lock().unwrap().log_tail(10);
+        assert!(
+            tail.contains(&"hi".to_string()),
+            "stdout line missing: {tail:?}"
+        );
+        assert!(
+            tail.contains(&"bad".to_string()),
+            "stderr line missing: {tail:?}"
+        );
     }
 }
