@@ -18,8 +18,9 @@ use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 
 pub struct ApplyOpts {
     /// pmxcfs mount root probed to decide whether to start conf-sync (/etc/pve in
-    /// production; a tempdir in tests). Read here only; conf-sync itself is spawned by
-    /// the supervisor.
+    /// production; a tempdir in tests). Unused by `apply::run` itself in this gate — kept on
+    /// the type for the supervisor, which reads it to decide whether to spawn conf-sync;
+    /// conf-sync itself is spawned by the supervisor, never by `apply`.
     pub pmxcfs_root: String,
 }
 
@@ -37,16 +38,20 @@ fn absent_wire_warning(dev: &str) -> String {
     )
 }
 
-/// Bring up every declared wire, releasing it from a manager it does not belong to. One
-/// presence check per wire: `ip link set <dev> up` fails when the netdev does not exist —
-/// RULED (James, 2026-09-05) to be a warning, never a refusal, because under a supervisor
-/// the old refusal would leave an unattended host with no supervisor at all.
+/// Bring up every declared wire, releasing it from a manager it does not belong to. Absence
+/// is decided by `link_exists` (the netdev genuinely does not exist) — RULED (James,
+/// 2026-09-05) to be a warning, never a refusal, because under a supervisor the old refusal
+/// would leave an unattended host with no supervisor at all. A wire that DOES exist but
+/// cannot be brought up (EPERM, EBUSY, a wedged driver) is a different condition — still a
+/// refusal, not silently dropped from the apply and not misreported as absent.
 fn own_wires(sys: &mut dyn Sys, view: &View) -> Result<AbsentWires> {
     let mut absent = AbsentWires::new();
     for dev in &view.wires() {
-        if run_ok(sys, &["ip", "link", "set", dev, "up"]).is_err() {
+        if !link_exists(sys, dev)? {
             absent.insert(dev.clone());
+            continue;
         }
+        run_ok(sys, &["ip", "link", "set", dev, "up"])?;
     }
     Ok(absent)
 }
@@ -150,8 +155,18 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         if sys.run(&["pgrep", "-f", &format!("dhcpcd.*{dev}")])?.ok() {
             run_ignore(sys, &["dhcpcd", "-k", dev])?;
         }
+        // Review finding 3 (2026-09-05): the predicate that used to gate this was "is
+        // NetworkManager RUNNING" (`systemctl is-active`), which Task 5 had to drop (no
+        // systemd probe in apply); "is nmcli INSTALLED" is a different, weaker condition —
+        // a host with NM installed but masked would now run a command that fails every
+        // apply. Ask NM itself instead of systemd or the binary's mere presence, and refuse
+        // (not ignore) when a genuinely running NM keeps fighting cfab for the wire's
+        // addresses — that refusal is the whole reason this block exists.
         if have_tool(sys, "nmcli")? {
-            run_ignore(sys, &["nmcli", "device", "set", dev, "managed", "no"])?;
+            let nm = sys.run(&["nmcli", "-t", "-f", "RUNNING", "general"])?;
+            if nm.stdout.trim() == "running" {
+                run_ok(sys, &["nmcli", "device", "set", dev, "managed", "no"])?;
+            }
         }
         let dhcp = sys.run(&["pgrep", "-af", "dhclient|udhcpc"])?;
         if dhcp
@@ -321,7 +336,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     if kind == MemberKind::Leaf {
         leaf_guard(sys, view)?;
     } else if f.host_forward {
-        enable_forwarding(sys, view)?;
+        enable_forwarding(sys, view, &absent)?;
     } else {
         run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
         sys.remove(&format!("{}/policy.nft", f.run_dir))?;
@@ -354,12 +369,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         }
     }
 
-    // Starting the routing engine (stop/sweep/start/readback/settle), the shape daemon, the
-    // fail-closed watchdog and conf-sync is the supervisor's job now (`cfab run`): a child
-    // lifecycle, not part of this idempotent apply. `describe_down` stays exported for it.
+    // The routing engine, shape daemon, fail-closed watchdog and conf-sync are the
+    // supervisor's job (`cfab run`), not this idempotent apply's. `describe_down` stays
+    // exported for it.
     if kind == MemberKind::Host {
         warnings.push(format!(
-            "apply OK on {host} (node {n}, host); forward={} {} wires",
+            "apply OK on {host} (node {n}, host); forward={} shape={} wires",
             u8::from(f.host_forward),
             wires.len() - absent.len()
         ));
@@ -666,9 +681,24 @@ fn class_sysctls(sys: &mut dyn Sys, ifname: &str, _role: Role) -> Result<()> {
     Ok(())
 }
 
+/// Whether a gw or fallback leg was actually built by the per-class-netdevs section above,
+/// given the same `absent` set and the same rule that section used to skip it: a migrating
+/// (bond) leg needs `present_slaves` to find a survivor; a non-migrating leg just needs its
+/// one `home` wire present. Anything this returns `false` for has no netdev at all — a
+/// per-interface sysctl on it would fail loud on real Linux (`RealSys::write` maps ENOENT to
+/// `Error::fatal`) even though the mock accepts any path unconditionally.
+fn leg_was_built(migrates: bool, slaves: &[Slave], home: &str, absent: &AbsentWires) -> bool {
+    if migrates {
+        present_slaves(slaves, home, absent).is_some()
+    } else {
+        !absent.contains(home)
+    }
+}
+
 /// Load the policy atomically, read it back, and only then enable forwarding — on exactly the
-/// class-table interfaces, never a wire, never the untagged admin NIC.
-fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
+/// class-table interfaces that were actually built, never an absent wire's segment, never a
+/// wire itself, never the untagged admin NIC.
+fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Result<()> {
     let f = view.fabric;
     let policy = emit::policy::generate(view)?;
     let path = format!("{}/policy.nft", f.run_dir);
@@ -685,16 +715,28 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     }
     let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab-fwd"])?;
     sys.write(&format!("{}/policy.applied", f.run_dir), &applied.stdout)?; // status drift baseline
-    for r in view.class_rows() {
+    for r in view
+        .class_rows()
+        .iter()
+        .filter(|r| !absent.contains(&r.wire))
+    {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
-    for r in view.gw_rows() {
+    for r in view
+        .gw_rows()
+        .iter()
+        .filter(|r| leg_was_built(r.migrates(), &r.slaves, &r.home, absent))
+    {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
     // `status` and the watchdog grade against `owned_forwarding()`, which lists the bond as
     // transit — leaving it out here would make every `up` report UP-DEGRADED three seconds later.
-    for r in view.fallback_rows() {
+    for r in view
+        .fallback_rows()
+        .iter()
+        .filter(|r| leg_was_built(true, &r.slaves, &r.home, absent))
+    {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
     if let Some(admin) = view.admin_if() {
@@ -750,15 +792,23 @@ mod tests {
 
     /// Task 5b (RULED, James 2026-09-05): the netdev does not exist. Today this refuses the
     /// whole apply; it must warn instead, skip that wire entirely, and say WHICH condition it
-    /// hit.
+    /// hit. Review finding 1 (2026-09-05): the skip must reach the forwarding sysctls too —
+    /// `write_fail` on the segment's forwarding path stands in for the real ENOENT a deleted
+    /// VLAN sub-interface's `/proc/sys/net/ipv4/conf/<if>` gives on real Linux; a missed
+    /// filter anywhere in `enable_forwarding` now fails this test instead of passing silently
+    /// (the previous version of this test could not catch it: `MockSys::write` succeeded for
+    /// any path).
     #[test]
     fn an_absent_wire_warns_and_the_apply_continues() {
         let (mut sys, view) = up_sys_and_view();
-        sys = sys.on_fail(
-            &["ip", "link", "set", "eth9"],
-            1,
-            "Cannot find device \"eth9\"",
-        );
+        // Genuine absence per `link_exists`: `ip link show eth9` itself reports no such
+        // device (the last-added `on_fail` rule wins over `up_sys`'s default success).
+        // `fabric()` (examples/fabric.conf) already declares HOST_FORWARD=1 for pve1-tb, so
+        // this exercises the exact motivating scenario: a forwarding host with an absent wire.
+        assert!(view.fabric.host_forward, "test assumes HOST_FORWARD=1");
+        sys = sys
+            .on_fail(&["ip", "link", "show", "eth9"], 1, "Device does not exist")
+            .write_fail("/proc/sys/net/ipv4/conf/cfab-st/forwarding");
         let warnings = run(&mut sys, &view, &opts()).unwrap();
         assert!(
             warnings.iter().any(|w| w
@@ -766,20 +816,75 @@ mod tests {
                     fabric is up on the rest"),
             "{warnings:?}"
         );
-        // Nothing else may touch it: no sub-if, no bond slave, no sysctl.
+        // Nothing else may touch it: no sub-if, no bond slave, no sysctl, no forwarding write —
+        // checked by exact ifname token, not substring (CLASS_TABLE reuses "cfab-st" as a
+        // PREFIX for segments that live on other wires entirely: cfab-st-bk is island cl,
+        // cfab-st-b2 is island mg — only cfab-st itself is eth9's segment).
         for c in sys
             .calls
             .iter()
-            .skip_while(|c| !c.contains("ip link set eth9"))
+            .skip_while(|c| !c.contains("ip link show eth9"))
             .skip(1)
         {
+            let words: Vec<&str> = c.split_whitespace().collect();
             assert!(
-                !c.contains("eth9"),
+                !words.contains(&"eth9") && !words.contains(&"cfab-st"),
                 "the apply kept using an absent wire: {c}"
             );
         }
         // And the other wires were still configured.
         assert!(sys.ran("ip link add link eth0"));
+    }
+
+    /// Review finding 2 (2026-09-05): a wire that genuinely exists but cannot be brought up
+    /// (EPERM, EBUSY, a wedged driver) is a DIFFERENT condition from absence — still a
+    /// refusal, and the message must not claim the netdev does not exist (that would disagree
+    /// with `status`, which reads `/sys/class/net/<wire>` and would show the wire present).
+    #[test]
+    fn a_present_wire_that_cannot_be_brought_up_still_refuses() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys.on_fail(
+            &["ip", "link", "set", "eth9", "up"],
+            1,
+            "Operation not permitted",
+        );
+        let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert!(!err.contains("absent (no such netdev)"), "{err}");
+    }
+
+    /// Review finding 3 (2026-09-05): whether nmcli is INSTALLED and whether NetworkManager is
+    /// RUNNING are different conditions; only the latter is cfab's business, and only a
+    /// genuinely running NM that refuses to release the wire is a refusal.
+    #[test]
+    fn a_running_networkmanager_that_refuses_to_release_a_wire_refuses_the_apply() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys
+            .on_stdout(
+                &["/usr/bin/env", "sh", "-c", "command -v nmcli"],
+                "/usr/bin/nmcli\n",
+            )
+            .on_stdout(&["nmcli", "-t", "-f", "RUNNING", "general"], "running\n")
+            .on_fail(
+                &["nmcli", "device", "set", "eth1", "managed", "no"],
+                1,
+                "Error: Device 'eth0' not managed.",
+            );
+        let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert!(err.contains("nmcli device set eth1 managed no"), "{err}");
+    }
+
+    /// nmcli installed but NetworkManager not running (masked, stopped): nothing to release,
+    /// no command even attempted — the old `systemctl is-active` skip, re-expressed without
+    /// systemd.
+    #[test]
+    fn an_installed_but_not_running_networkmanager_is_never_asked_to_release_anything() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys.on_stdout(
+            &["/usr/bin/env", "sh", "-c", "command -v nmcli"],
+            "/usr/bin/nmcli\n",
+        );
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(!sys.ran("nmcli device set"));
     }
 
     /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC
