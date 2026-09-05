@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+# cargo-deb emits a daemon-reload only from its start/restart snippets, and this package
+# deliberately has neither (installing cfab must not touch the network, and an upgrade must
+# not stop the fabric). Without this, an upgrade that changes cfab-fabric.service leaves
+# systemd running the old unit definition until something else reloads it.
+if [ -d /run/systemd/system ]; then
+	systemctl --system daemon-reload >/dev/null || true
+fi
