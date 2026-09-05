@@ -65,6 +65,11 @@ and `up` always stops and restarts the routing engine, so this member's adjacenc
 re-form. `apt remove` stops the unit (`cfab down`, correct: the binary is going away) and
 disables it; `apt purge` also removes `/etc/default/cfab`.
 
+The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the engine's private
+kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other`
+204) so `ip route` prints them instead of bare numbers — cosmetic only; cfab's own sweep
+matches the numeric ids.
+
 ## Cluster coordination (optional, never required)
 
 On a Proxmox cluster, `cfab` additionally coordinates through pmxcfs (`/etc/pve`) — probed at
