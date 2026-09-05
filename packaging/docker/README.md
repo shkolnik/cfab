@@ -57,7 +57,7 @@ services:
       CFAB_HOST: ${CFAB_HOST:-}
 ```
 
-`docker compose up -d` runs `cfab up` then `cfab verify` once (informational: a member that
+`docker compose up -d` runs `cfab up` then `cfab status` once (informational: a member that
 cannot converge stays up for inspection instead of restart-looping); `docker compose down`
 (SIGTERM) runs `cfab down`, tearing down everything cfab created.
 
@@ -83,7 +83,7 @@ bakes its own `fabric.conf` and a leaf-specific entrypoint, and is the thing act
 - **No diagnostic tools** (`tcpdump`, `python3`, `jq`, ...) baked in — they are fixture/test
   conveniences, not part of the runtime contract; add them in a derived `FROM cfab` image if a
   deployment wants them.
-- **The entrypoint here is a generalization of `leaf-entrypoint.sh`** (up / verify-once /
+- **The entrypoint here is a generalization of `leaf-entrypoint.sh`** (up / status-once /
   wait / SIGTERM→down), with the baked `fabric.conf` and hostname assumption removed. Behavior
   is otherwise identical, so `cfab-leaf`'s compose project (`/root/leaf-cfab` on pve3) stays the
   reference for the one member actually running this way.
