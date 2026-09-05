@@ -1134,6 +1134,11 @@ mod tests {
         engine_first_quick: bool,
         /// Children that trap and ignore SIGTERM, so the stop sequence must escalate to SIGKILL.
         ignore_term: std::collections::HashSet<&'static str>,
+        /// Where an `ignore_term` child touches `<name>.trapped` once its trap is installed, so
+        /// the driver can wait for that confirmation before firing the stop (no startup race
+        /// between `trap '' TERM` and an early SIGTERM). `None` ⇒ no marker (the trap is still
+        /// installed, but nothing waits on it).
+        trap_marker_dir: Option<std::path::PathBuf>,
     }
 
     struct Rec {
@@ -1147,7 +1152,7 @@ mod tests {
             _argv: &[String],
             _sup_pid: u32,
         ) -> std::io::Result<Spawned> {
-            let (quick, ignores_term) = {
+            let (quick, ignores_term, marker_dir) = {
                 let mut st = self.inner.lock().unwrap();
                 st.spawned.push(name.to_string());
                 st.threads.push(std::thread::current().id());
@@ -1155,22 +1160,30 @@ mod tests {
                 if name == "engine" {
                     st.engine_calls += 1;
                 }
-                (q, st.ignore_term.contains(name))
+                (q, st.ignore_term.contains(name), st.trap_marker_dir.clone())
             };
             // A long-lived child killed promptly by SIGTERM's default disposition (no trap: a
             // trapped signal can be deferred behind the running `sleep`, which would wedge a
             // restart's wait). `exit 0` is the crash-loop fixture. A child in `ignore_term`
-            // traps and ignores SIGTERM, so the stop sequence must escalate to SIGKILL.
-            let script = if ignores_term {
-                "trap '' TERM; sleep 60"
+            // traps and ignores SIGTERM, so the stop sequence must escalate to SIGKILL — and it
+            // touches its marker *after* the trap is installed, so the driver can gate the stop
+            // on that confirmation instead of racing the shell's startup.
+            let script: String = if ignores_term {
+                match &marker_dir {
+                    Some(dir) => format!(
+                        "trap '' TERM; touch '{}'; sleep 60",
+                        dir.join(format!("{name}.trapped")).display()
+                    ),
+                    None => "trap '' TERM; sleep 60".to_string(),
+                }
             } else if quick {
-                "exit 0"
+                "exit 0".to_string()
             } else {
-                "exec sleep 60"
+                "exec sleep 60".to_string()
             };
             let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
-                .arg(script)
+                .arg(&script)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -1739,8 +1752,10 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut sys = stop_fixture_sys(&view, tmp.path(), calls.clone());
+        let marker_dir = tmp.path().to_path_buf();
         let inner = Arc::new(Mutex::new(RecState {
             ignore_term: ignore_term.iter().copied().collect(),
+            trap_marker_dir: Some(marker_dir.clone()),
             ..RecState::default()
         }));
         let mut spawner = Rec {
@@ -1751,8 +1766,27 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let driver_tx = cmd_tx.clone();
         let trace = calls.clone();
+        let trap_children: Vec<&'static str> = ignore_term.to_vec();
         let driver = tokio::spawn(async move {
             ready_rx.await.ok();
+            // Gate the stop on every `ignore_term` child having installed its SIGTERM trap: the
+            // `on_ready` hook fires when the SUPERVISOR reaches its loop, which is after the
+            // child is forked but before its shell has run `trap '' TERM`. Waiting for the marker
+            // closes that startup race, so a survivor is genuinely a survivor every run — no
+            // wall-clock guess (bounded only to fail loud if a marker never appears).
+            for name in &trap_children {
+                let marker = marker_dir.join(format!("{name}.trapped"));
+                let mut waited = 0;
+                while !marker.exists() {
+                    assert!(
+                        waited < 5_000,
+                        "trap marker {} never appeared",
+                        marker.display()
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    waited += 2;
+                }
+            }
             // Start fresh at the stop boundary: the apply's calls fall away, so the trace holds
             // only what the stop sequence did.
             trace.lock().unwrap().clear();
