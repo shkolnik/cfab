@@ -154,7 +154,8 @@ fn bfd_sessions(proto: &Value) -> Vec<Value> {
 }
 
 /// One entry per `ietf-bgp:bgp` neighbor: the remote address, the FRR-worded session state, and
-/// the ipv4-unicast prefix counts `cfab status` reads to judge ingress.
+/// the ipv4-unicast sent-prefix count `cfab status` reads to judge ingress (a session Established
+/// but advertising nothing is the signature of a missing neighbor afi-safi export policy).
 fn bgp_neighbors(proto: &Value) -> Vec<Value> {
     list(&proto[BGP], "neighbors", "neighbor")
         .map(|n| {
@@ -163,15 +164,10 @@ fn bgp_neighbors(proto: &Value) -> Vec<Value> {
             let v4 = list(n, "afi-safis", "afi-safi")
                 .find(|a| local_name(&a["name"]) == Some("ipv4-unicast"));
             let prefixes = v4.map(|a| &a["prefixes"]);
-            // FRR's PfxRcd is the ACCEPTED count and cfab's status labels it "accepted"; holo's
-            // `received` is the pre-policy count, so the accepted number is `installed` (advertised
-            // prefixes installed in the Loc-RIB), never `received`.
-            let pfx_rcd = prefixes.and_then(|p| p["installed"].as_u64()).unwrap_or(0);
             let pfx_snt = prefixes.and_then(|p| p["sent"].as_u64()).unwrap_or(0);
             json!({
                 "peer": n["remote-address"],
                 "state": bgp_state(local_name(&n["session-state"])),
-                "pfx_rcd": pfx_rcd,
                 "pfx_snt": pfx_snt,
             })
         })
@@ -317,9 +313,10 @@ mod tests {
         assert_eq!(bfd[1]["peer"], "10.99.1.2");
     }
 
-    /// A control-plane-protocol of type `ietf-bgp:bgp` with one established neighbor: the four
-    /// fields, with `pfx_rcd` taken from `installed` (the accepted count) and `pfx_snt` from `sent`.
-    fn bgp_state_tree(session_state: &str, installed: u64, sent: u64) -> Value {
+    /// A control-plane-protocol of type `ietf-bgp:bgp` with one established neighbor: the three
+    /// fields, with `pfx_snt` taken from `sent`. The fixture also carries `received`/`installed`
+    /// (realistic FRR/holo shape) even though only `sent` is read.
+    fn bgp_state_tree(session_state: &str, sent: u64) -> Value {
         serde_json::from_str(&format!(
             r#"{{
             "ietf-routing:routing": {{ "control-plane-protocols": {{ "control-plane-protocol": [
@@ -328,7 +325,7 @@ mod tests {
                         {{ "remote-address": "192.168.249.254", "session-state": "{session_state}",
                            "afi-safis": {{ "afi-safi": [
                                {{ "name": "iana-bgp-types:ipv4-unicast", "prefixes": {{
-                                   "received": 99, "installed": {installed}, "sent": {sent} }} }},
+                                   "received": 99, "installed": 12, "sent": {sent} }} }},
                                {{ "name": "iana-bgp-types:ipv6-unicast", "prefixes": {{
                                    "received": 7, "installed": 7, "sent": 7 }} }}
                            ] }} }}
@@ -348,14 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn an_established_neighbor_distills_the_four_fields() {
-        let d = document(true, &cfg(), &[bgp_state_tree("established", 12, 34)]);
+    fn an_established_neighbor_distills_the_three_fields() {
+        let d = document(true, &cfg(), &[bgp_state_tree("established", 34)]);
         assert_eq!(
             d["bgp"],
             json!([{
                 "peer": "192.168.249.254",
                 "state": "Established",
-                "pfx_rcd": 12,
                 "pfx_snt": 34,
             }])
         );
@@ -371,17 +367,17 @@ mod tests {
             ("openconfirm", "OpenConfirm"),
             ("established", "Established"),
         ] {
-            let d = document(true, &cfg(), &[bgp_state_tree(yang, 0, 0)]);
+            let d = document(true, &cfg(), &[bgp_state_tree(yang, 0)]);
             assert_eq!(d["bgp"][0]["state"], frr, "{yang}");
         }
         // Specifically: opensent must not become the capitalize-first "Opensent".
-        let d = document(true, &cfg(), &[bgp_state_tree("opensent", 0, 0)]);
+        let d = document(true, &cfg(), &[bgp_state_tree("opensent", 0)]);
         assert_ne!(d["bgp"][0]["state"], "Opensent");
     }
 
     #[test]
     fn an_unknown_session_state_passes_through_unchanged() {
-        let d = document(true, &cfg(), &[bgp_state_tree("clearing", 0, 0)]);
+        let d = document(true, &cfg(), &[bgp_state_tree("clearing", 0)]);
         assert_eq!(d["bgp"][0]["state"], "clearing");
     }
 

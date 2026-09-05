@@ -2019,7 +2019,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Idle", "pfx_rcd": 0, "pfx_snt": 0 }
+                { "peer": "192.168.249.254", "state": "Idle", "pfx_snt": 0 }
             ]),
         );
         let report = run(&mut sys, &host, 0, false).unwrap();
@@ -2042,7 +2042,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 0 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 0 }
             ]),
         );
         let report = run(&mut sys, &host, 0, false).unwrap();
@@ -2064,7 +2064,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         );
         let report = run(&mut sys, &host, 0, false).unwrap();
@@ -2081,7 +2081,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         )
         .on_stdout(
@@ -2116,7 +2116,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         )
         .on_stdout(
@@ -2144,7 +2144,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         )
         .on_stdout(&["ip", "route", "show", "table", "249"], "");
@@ -2171,7 +2171,7 @@ mod tests {
         let mut sys = ingress_host_sys(
             &host,
             serde_json::json!([
-                { "peer": "192.168.249.254", "state": "Established", "pfx_rcd": 3, "pfx_snt": 5 }
+                { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         );
         let report = run(&mut sys, &host, 0, false).unwrap();
