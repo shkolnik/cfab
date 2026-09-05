@@ -11,7 +11,7 @@ use crate::commands::engine_ctl;
 use crate::derive::{Slave, View};
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
-use crate::sys::{Sys, have_tool, run_ignore, run_ok};
+use crate::sys::{Sys, UnixProbe, have_tool, run_ignore, run_ok};
 
 /// Stage one of the teardown, callable alone: forwarding OFF, the forward policy off, and the
 /// foreign-stack accept removed. Run before anything that can fail or block — this is what
@@ -53,29 +53,31 @@ pub fn forwarding_off(sys: &mut dyn Sys, view: &View) -> Result<()> {
 /// the wrong remedy.
 pub fn run_cli(sys: &mut dyn Sys, view: &View) -> Result<String> {
     let sock = PathBuf::from(&view.fabric.run_dir).join("cfab.sock");
-    if let Some(pid) = supervisor_answering(sys, &sock) {
-        return Err(Error::fatal(format!(
-            "REFUSING: a cfab supervisor is running (pid {pid}) — stop the service instead \
-             (systemctl stop cfab, or docker stop <container>)"
-        )));
+    match sys.unix_probe(&sock.to_string_lossy(), "components\n") {
+        // Provably nobody home: this is the SIGKILLed-supervisor / no-service recovery path.
+        UnixProbe::NotListening => run(sys, view),
+        // A reply proves a supervisor owns the teardown — name its pid if we can read it.
+        UnixProbe::Answered(reply) => Err(supervisor_refusal(&pid_of(&reply))),
+        // Connected but silent (a live-but-slow supervisor, a read timeout). A successful
+        // connect already proves a listener: refuse, never infer absence from a late reply.
+        UnixProbe::Unreachable(_) => Err(supervisor_refusal("unknown")),
     }
-    run(sys, view)
 }
 
-/// The supervisor's pid if `cfab.sock` answers a `components` request, else `None` (nothing is
-/// listening — no supervisor). Any answer at all means refuse: a socket that replies but omits
-/// the pid still proves a supervisor owns the teardown, so it is named `unknown` rather than
-/// waved through.
-fn supervisor_answering(sys: &mut dyn Sys, sock: &Path) -> Option<String> {
-    let reply = sys
-        .unix_request(&sock.to_string_lossy(), "components\n")
-        .ok()?;
-    Some(
-        serde_json::from_str::<serde_json::Value>(&reply)
-            .ok()
-            .and_then(|v| v["supervisor"]["pid"].as_u64())
-            .map_or_else(|| "unknown".to_string(), |p| p.to_string()),
-    )
+/// The supervisor's pid from a `components` reply, or `unknown` when the reply does not parse or
+/// omits the field — either way the supervisor is running, so the refusal still fires.
+fn pid_of(reply: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(reply)
+        .ok()
+        .and_then(|v| v["supervisor"]["pid"].as_u64())
+        .map_or_else(|| "unknown".to_string(), |p| p.to_string())
+}
+
+fn supervisor_refusal(pid: &str) -> Error {
+    Error::fatal(format!(
+        "REFUSING: a cfab supervisor is running (pid {pid}) — stop the service instead \
+         (systemctl stop cfab, or docker stop <container>)"
+    ))
 }
 
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
@@ -547,9 +549,9 @@ mod tests {
         );
     }
 
-    /// With nothing listening on `cfab.sock` (an unregistered socket errs on request), `run_cli`
-    /// proceeds to the real teardown — this is the SIGKILLed-supervisor / no-service recovery
-    /// path the verb exists for.
+    /// With nothing listening on `cfab.sock` (an unregistered socket probes as `NotListening`),
+    /// `run_cli` proceeds to the real teardown — this is the SIGKILLed-supervisor / no-service
+    /// recovery path the verb exists for.
     #[test]
     fn down_proceeds_when_no_supervisor_answers() {
         let f = fabric();
@@ -557,6 +559,36 @@ mod tests {
         let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
         run_cli(&mut sys, &view).unwrap();
         assert!(sys.ran(&format!("rm {}", f.run_dir)));
+    }
+
+    /// A LIVE-but-slow supervisor accepts the connection but does not answer in time (a read
+    /// timeout). `RealSys::unix_probe` reports that as `Unreachable`, not `NotListening`, because
+    /// a successful `connect(2)` already proves a listener owns the socket. `run_cli` MUST refuse
+    /// — with pid `unknown`, since it never read one — and tear NOTHING down. Folding a
+    /// post-connect failure to "no supervisor" is the double-teardown race this guards.
+    #[test]
+    fn down_refuses_when_the_supervisor_connects_but_does_not_answer() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .socket_unreachable("/run/cfab/cfab.sock")
+            .on_fail(&["ip", "link", "show"], 1, "no");
+        let err = run_cli(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            err.contains("REFUSING: a cfab supervisor is running (pid unknown)"),
+            "{err}"
+        );
+        assert!(err.contains("systemctl stop cfab"), "{err}");
+        assert!(
+            sys.calls.iter().all(|c| !c.starts_with("ip link del")),
+            "a live-but-slow supervisor must not be torn down under: {:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.ran(&format!("rm {}", f.run_dir)),
+            "the run_dir must not be removed on a refusal: {:?}",
+            sys.calls
+        );
     }
 
     /// B4 (RULING, James 2026-09-05, on Gate A review finding 6): `forwarding_off` alone must

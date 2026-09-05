@@ -19,6 +19,24 @@ impl Output {
     }
 }
 
+/// The outcome of probing a Unix socket for a listener (`Sys::unix_probe`). The point of the
+/// three-way split is a safety one: a caller deciding whether it is safe to act as if nobody
+/// owns the socket must be able to tell "provably nothing is listening" from "connected, but no
+/// usable reply". A post-connect failure (a slow peer, a read timeout) is NOT absence — a
+/// successful `connect(2)` already proves a listener owns the socket.
+#[derive(Debug)]
+pub enum UnixProbe {
+    /// `connect(2)` failed with `ENOENT` (no socket file) or `ECONNREFUSED` (a socket file with
+    /// nothing accepting): provably nobody is listening.
+    NotListening,
+    /// Connected and read a reply to EOF.
+    Answered(String),
+    /// A listener may own the socket — connected but the exchange did not yield a usable reply
+    /// (a write/read error or the 5 s read timeout), or a connect error that does not prove
+    /// absence (e.g. `EACCES`). Carries a diagnostic. Callers must treat this as "occupied".
+    Unreachable(String),
+}
+
 pub trait Sys {
     /// Run argv, capture everything; a nonzero exit is a normal `Output`, not an `Err` (callers
     /// decide — `run_ok` when failure is fatal).
@@ -35,6 +53,17 @@ pub trait Sys {
     /// One request, one reply over a Unix stream socket: connect to `path`, write `line`, read
     /// until the peer closes. The engine's state socket speaks exactly this shape.
     fn unix_request(&mut self, path: &str, line: &str) -> Result<String>;
+    /// Like `unix_request`, but reports whether a listener owns the socket (`UnixProbe`). The
+    /// default cannot see the connect errno, so it maps any error to `Unreachable` — the safe
+    /// side, since a caller must never read a post-connect failure as "nobody home". `RealSys`
+    /// overrides it to read the connect errno; `MockSys` overrides it to model an unregistered
+    /// socket as `NotListening`.
+    fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+        match self.unix_request(path, line) {
+            Ok(reply) => UnixProbe::Answered(reply),
+            Err(e) => UnixProbe::Unreachable(e.to_string()),
+        }
+    }
     /// Start a long-lived process in its own session, stdin from /dev/null, stdout+stderr
     /// appended to `log`, and return as soon as it is launched — never waiting on it. This
     /// is the only way to start a daemon from here: `run` captures the child's output
@@ -180,6 +209,35 @@ impl Sys for RealSys {
             .map_err(|e| Error::fatal(format!("cannot read from {path}: {e}")))?;
         Ok(reply)
     }
+
+    fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+        use std::io::{ErrorKind, Read, Write};
+        let timeout = Some(Duration::from_secs(5));
+        let mut s = match std::os::unix::net::UnixStream::connect(path) {
+            Ok(s) => s,
+            // The only two outcomes that prove nobody is listening.
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return UnixProbe::NotListening;
+            }
+            // Any other connect error (EACCES, EADDRINUSE-races, …) does not prove absence.
+            Err(e) => return UnixProbe::Unreachable(format!("cannot connect to {path}: {e}")),
+        };
+        // From a successful connect on, every failure is "occupied", never "absent".
+        if let Err(e) = s
+            .set_read_timeout(timeout)
+            .and_then(|()| s.set_write_timeout(timeout))
+        {
+            return UnixProbe::Unreachable(format!("{path}: {e}"));
+        }
+        if let Err(e) = s.write_all(line.as_bytes()) {
+            return UnixProbe::Unreachable(format!("cannot write to {path}: {e}"));
+        }
+        let mut reply = String::new();
+        match s.read_to_string(&mut reply) {
+            Ok(_) => UnixProbe::Answered(reply),
+            Err(e) => UnixProbe::Unreachable(format!("cannot read from {path}: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +248,7 @@ pub mod mock {
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::Duration;
 
-    use super::{Output, Sys};
+    use super::{Output, Sys, UnixProbe};
     use crate::error::{Error, Result};
 
     #[derive(Default)]
@@ -208,6 +266,10 @@ pub mod mock {
         /// socket path → the replies `unix_request` hands back in order; the last one
         /// repeats forever. Unknown path → Err.
         pub sockets: HashMap<String, VecDeque<String>>,
+        /// Socket paths that `unix_probe` reports as `Unreachable`: a listener that accepts the
+        /// connection but yields no usable reply (a slow supervisor, a read timeout). Distinct
+        /// from an unregistered path, which probes as `NotListening`.
+        pub unreachable_sockets: Vec<String>,
         /// Test hook run on each sleep with the 1-based sleep count — lets a test mutate
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
@@ -230,6 +292,13 @@ pub mod mock {
         pub fn socket_seq(mut self, path: &str, replies: &[String]) -> Self {
             self.sockets
                 .insert(path.to_string(), replies.iter().cloned().collect());
+            self
+        }
+
+        /// A socket that `unix_probe` reports as `Unreachable` — connected, no usable reply:
+        /// the live-but-slow supervisor a `cfab down` must refuse rather than tear down under.
+        pub fn socket_unreachable(mut self, path: &str) -> Self {
+            self.unreachable_sockets.push(path.to_string());
             self
         }
 
@@ -375,6 +444,20 @@ pub mod mock {
                 Ok(q.pop_front().expect("len > 1"))
             } else {
                 Ok(q.front().cloned().unwrap_or_default())
+            }
+        }
+
+        fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+            self.calls
+                .push(format!("unix_probe {path} {}", line.trim_end()));
+            if self.unreachable_sockets.iter().any(|p| p == path) {
+                return UnixProbe::Unreachable(format!("{path}: connected, no reply (mock)"));
+            }
+            match self.sockets.get_mut(path) {
+                // A registered socket answers; an unregistered one models ENOENT/ECONNREFUSED.
+                Some(q) if q.len() > 1 => UnixProbe::Answered(q.pop_front().expect("len > 1")),
+                Some(q) => UnixProbe::Answered(q.front().cloned().unwrap_or_default()),
+                None => UnixProbe::NotListening,
             }
         }
     }

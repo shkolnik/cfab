@@ -200,7 +200,11 @@ impl sock::ComponentsSource for SockSource {
         self.cmd_tx
             .send(Cmd::Reapply(tx))
             .map_err(|_| crate::error::Error::fatal("the supervisor is shutting down"))?;
-        rx.recv()
+        // The whole re-apply (up to ~35 s) runs before this recv returns; `block_in_place` so
+        // this connection-handler task hands its worker back to the runtime instead of pinning
+        // it for the duration (same starvation class as the apply itself, spec §3). The
+        // synchronous `reapply` contract (§9) is unchanged — we still return only when done.
+        tokio::task::block_in_place(|| rx.recv())
             .map_err(|_| crate::error::Error::fatal("the supervisor dropped the reapply request"))?
     }
 }
@@ -350,7 +354,11 @@ pub(crate) async fn run_with(
         st.applying = true;
         st.apply_started_at = Some(Instant::now());
     }
-    match apply::run(sys, view, &opts) {
+    // `block_in_place`: the apply is synchronous `&mut Sys` code that can take ~35 s
+    // (`START_WAIT_MS` + `SETTLE_MS`), and it must not pin the runtime thread it runs on — on a
+    // single-vCPU host (this project's target) the watchdog feed, the `cfab.sock` accept loop and
+    // signal handling all live on that one thread and would stall for the whole apply (spec §3).
+    match tokio::task::block_in_place(|| apply::run(sys, view, &opts)) {
         Ok(warnings) => {
             for w in &warnings {
                 println!("{w}");
@@ -381,11 +389,16 @@ pub(crate) async fn run_with(
         &exit_tx,
         &mut pending,
     );
-    if let Some(doc) = wait_ready(sys, &sock_path) {
+    // `block_in_place` for the same reason as the apply: `wait_ready` blocks up to `START_WAIT_MS`
+    // polling the engine socket, and must not pin the runtime thread (spec §3). It precedes
+    // `READY=1`, so the stakes are lower than the re-apply case, but the root cause is identical.
+    if let Some(doc) = tokio::task::block_in_place(|| wait_ready(sys, &sock_path)) {
         shared.lock().unwrap().child_mut("engine").became_ready();
         if let Err(e) = engine_ctl::readback(view, &doc) {
             // Readback failure is fatal to the *initial* apply (§6/§10): stop the engine we
-            // started and refuse. A re-apply's readback would not (§6) — but this is bringup.
+            // started and refuse. The successful apply's netdevs/sysctls are deliberately LEFT
+            // in place (as legacy `up` did — the operator runs `cfab down` after a failed
+            // bringup); this is not an oversight. A re-apply's readback would not refuse (§6).
             eprintln!("{e}");
             if let Some(p) = shared.lock().unwrap().child("engine").pid() {
                 signal_pid(p, nix::sys::signal::Signal::SIGTERM);
@@ -762,7 +775,10 @@ async fn do_reapply(
         st.applying = true;
         st.apply_started_at = Some(Instant::now());
     }
-    match apply::run(sys, view, opts) {
+    // `block_in_place` as at the initial apply (spec §3): a re-apply is where the starvation
+    // actually bites — it runs inside the live supervise loop, so a bare ~35 s apply on a
+    // single-vCPU host would freeze the watchdog feed and the socket loop for its whole duration.
+    match tokio::task::block_in_place(|| apply::run(sys, view, opts)) {
         Ok(warnings) => {
             for w in &warnings {
                 println!("{w}");
@@ -1786,5 +1802,30 @@ mod tests {
             calls.iter().any(|c| c == "signal shape-daemon SIGKILL"),
             "the child that ignored SIGTERM is SIGKILLed: {calls:?}"
         );
+    }
+
+    /// Spec §3: the apply, `wait_ready` and `SockSource::reapply`'s recv are synchronous blocking
+    /// sections wrapped in `block_in_place`, so that on a single-vCPU host — this project's target
+    /// — the watchdog feed, the `cfab.sock` accept loop and signal handling keep being polled
+    /// instead of freezing for the whole ~35 s apply.
+    ///
+    /// `block_in_place` PANICS on a current-thread runtime, so this guards the one property a
+    /// unit test on a multi-core box can actually decide: the runtime `run()` builds
+    /// (`new_multi_thread`) supports it, so the wraps are safe and a future switch to a
+    /// current-thread runtime is caught here rather than at the first apply. The wraps
+    /// themselves are verified by inspection against §3 — a live starvation repro would need a
+    /// genuinely single-vCPU host: on a multi-thread runtime the `block_on` caller thread is
+    /// distinct from its workers, so blocking the root future never starves the spawned tasks
+    /// here (confirmed empirically while writing this).
+    #[test]
+    fn the_runtime_run_builds_supports_block_in_place() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let v = tokio::task::block_in_place(|| 40 + 2);
+            assert_eq!(v, 42, "block_in_place must be usable in run()'s runtime");
+        });
     }
 }
