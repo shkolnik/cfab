@@ -351,7 +351,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::Down => {
             let mut sys = RealSys;
-            print!("{}", commands::teardown::run(&mut sys, &view)?);
+            print!("{}", commands::teardown::run_cli(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { wait, permissive } => {

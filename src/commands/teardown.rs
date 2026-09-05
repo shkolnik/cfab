@@ -42,6 +42,42 @@ pub fn forwarding_off(sys: &mut dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
+/// `cfab down` from the command line. It is the out-of-band teardown — for a SIGKILLed
+/// supervisor, stale state, or a host with no service — so it must never race the supervisor's
+/// own stop sequence on the same netdevs (spec §10). If a supervisor answers on
+/// `<run_dir>/cfab.sock`, refuse and name the remedy, changing nothing; otherwise tear down.
+///
+/// This is distinct from the `engine.lock` refusal in `run` below (spec §14): that one guards a
+/// live *engine* still owning the run_dir; this one guards a live *supervisor* that owns the
+/// whole stop sequence. The two conditions have their own spellings so an operator is never told
+/// the wrong remedy.
+pub fn run_cli(sys: &mut dyn Sys, view: &View) -> Result<String> {
+    let sock = PathBuf::from(&view.fabric.run_dir).join("cfab.sock");
+    if let Some(pid) = supervisor_answering(sys, &sock) {
+        return Err(Error::fatal(format!(
+            "REFUSING: a cfab supervisor is running (pid {pid}) — stop the service instead \
+             (systemctl stop cfab, or docker stop <container>)"
+        )));
+    }
+    run(sys, view)
+}
+
+/// The supervisor's pid if `cfab.sock` answers a `components` request, else `None` (nothing is
+/// listening — no supervisor). Any answer at all means refuse: a socket that replies but omits
+/// the pid still proves a supervisor owns the teardown, so it is named `unknown` rather than
+/// waved through.
+fn supervisor_answering(sys: &mut dyn Sys, sock: &Path) -> Option<String> {
+    let reply = sys
+        .unix_request(&sock.to_string_lossy(), "components\n")
+        .ok()?;
+    Some(
+        serde_json::from_str::<serde_json::Value>(&reply)
+            .ok()
+            .and_then(|v| v["supervisor"]["pid"].as_u64())
+            .map_or_else(|| "unknown".to_string(), |p| p.to_string()),
+    )
+}
+
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     let f = view.fabric;
     let mut notes = Vec::new();
@@ -477,6 +513,49 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
         run(&mut sys, &view).unwrap();
+        assert!(sys.ran(&format!("rm {}", f.run_dir)));
+    }
+
+    /// Spec §10: `cfab down` is the out-of-band teardown and must never race the supervisor's
+    /// own stop sequence — so if a supervisor answers on `<run_dir>/cfab.sock`, `run_cli`
+    /// refuses, names the running pid and the remedy, and changes nothing (no `ip link del`).
+    #[test]
+    fn down_refuses_while_a_supervisor_answers() {
+        let f = fabric(); // CFAB_RUN=/run/cfab
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .socket(
+                "/run/cfab/cfab.sock",
+                "{\"supervisor\":{\"pid\":42},\"components\":[]}\n",
+            )
+            .on_fail(&["ip", "link", "show"], 1, "no");
+        let err = run_cli(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            err.contains("REFUSING: a cfab supervisor is running (pid 42)"),
+            "{err}"
+        );
+        assert!(err.contains("systemctl stop cfab"), "{err}");
+        assert!(
+            sys.calls.iter().all(|c| !c.starts_with("ip link del")),
+            "a refusal must change nothing: {:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.ran(&format!("rm {}", f.run_dir)),
+            "the run_dir must not be removed on a refusal: {:?}",
+            sys.calls
+        );
+    }
+
+    /// With nothing listening on `cfab.sock` (an unregistered socket errs on request), `run_cli`
+    /// proceeds to the real teardown — this is the SIGKILLed-supervisor / no-service recovery
+    /// path the verb exists for.
+    #[test]
+    fn down_proceeds_when_no_supervisor_answers() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run_cli(&mut sys, &view).unwrap();
         assert!(sys.ran(&format!("rm {}", f.run_dir)));
     }
 

@@ -51,6 +51,10 @@ pub const EXIT_LOCK_HELD: u8 = 4;
 const START_WAIT_MS: u64 = 30_000;
 const POLL_MS: u64 = 500;
 
+/// Each child gets this long to exit after its stop SIGTERM before the supervisor SIGKILLs it
+/// (spec §13 step 4). `TimeoutStopSec=60` in the unit carries the worst case with margin.
+const CHILD_STOP_GRACE: Duration = Duration::from_secs(10);
+
 /// A command reaching the main loop: a `reapply` request from the socket (with a reply
 /// channel), a SIGHUP re-apply, or a SIGTERM/SIGINT stop. Real Unix signals are forwarded onto
 /// this channel by `run`, and the socket server posts `Reapply`, so the loop has exactly one
@@ -209,6 +213,14 @@ pub(crate) struct Hooks {
     pub run_watchdog: bool,
     pub serve_socket: bool,
     pub shared: Option<Arc<Mutex<Shared>>>,
+    /// A test recorder the stop sequence appends its signal/wait/kill markers to, in order, so
+    /// a test can assert the stop ordering (spec §13) against a single merged trace shared with
+    /// a recording `Sys`. `None` in production — the stop path records nothing.
+    pub trace: Option<Arc<Mutex<Vec<String>>>>,
+    /// The per-child SIGTERM→SIGKILL grace in the stop sequence. Production is
+    /// `CHILD_STOP_GRACE` (10 s); a test shrinks it so the SIGKILL path is exercised without a
+    /// real 10 s wait.
+    pub stop_grace: Duration,
 }
 
 impl Hooks {
@@ -218,7 +230,17 @@ impl Hooks {
             run_watchdog: true,
             serve_socket: true,
             shared: None,
+            trace: None,
+            stop_grace: CHILD_STOP_GRACE,
         }
+    }
+}
+
+/// Append one stop-sequence marker to the test trace, if one is installed (spec §13). A no-op
+/// in production, where `trace` is `None`.
+fn trace_mark(trace: &Option<Arc<Mutex<Vec<String>>>>, s: String) {
+    if let Some(t) = trace {
+        t.lock().unwrap().push(s);
     }
 }
 
@@ -291,6 +313,9 @@ pub(crate) async fn run_with(
     let pid = std::process::id();
     let run_dir = view.fabric.run_dir.clone();
     let sock_path = format!("{run_dir}/{}", crate::engine::SOCK_NAME);
+    // Captured before `hooks` is partially moved below; both are used only in the stop sequence.
+    let trace = hooks.trace.clone();
+    let stop_grace = hooks.stop_grace;
 
     // 1. The instance lock, before anything (spec §14). The run dir must exist to hold a lock
     // file in it; `apply` creates it too, but the lock is taken first and no stub stands in.
@@ -582,7 +607,9 @@ pub(crate) async fn run_with(
     if let Err(e) = teardown::forwarding_off(sys, view) {
         eprintln!("cfab: warn: forwarding_off during stop: {e}");
     }
-    // 3. SIGTERM every child at once (they are independent).
+    // 3. SIGTERM every child at once (they are independent). The old "conf-sync first" ordering
+    // is obsolete: step 1 already set `want = false` and neutered `reapply`, so a conf-sync still
+    // breathing here has nothing it can apply.
     let targets: Vec<(&'static str, u32)> = {
         let st = shared.lock().unwrap();
         st.children
@@ -590,11 +617,13 @@ pub(crate) async fn run_with(
             .filter_map(|c| c.pid().map(|p| (c.name, p)))
             .collect()
     };
-    for (_, p) in &targets {
+    for (name, p) in &targets {
+        trace_mark(&trace, format!("signal {name} SIGTERM"));
         signal_pid(*p, nix::sys::signal::Signal::SIGTERM);
     }
-    // 4. Wait each out ≤ 10 s from the signal, then SIGKILL the survivors.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 4. Wait each out ≤ `stop_grace` from the signal, then SIGKILL the survivors.
+    trace_mark(&trace, "wait children".to_string());
+    let deadline = Instant::now() + stop_grace;
     let mut alive: Vec<&'static str> = targets.iter().map(|(n, _)| *n).collect();
     while !alive.is_empty() {
         let now = Instant::now();
@@ -615,6 +644,7 @@ pub(crate) async fn run_with(
     }
     for (n, p) in &targets {
         if alive.contains(n) {
+            trace_mark(&trace, format!("signal {n} SIGKILL"));
             signal_pid(*p, nix::sys::signal::Signal::SIGKILL);
         }
     }
@@ -1040,6 +1070,8 @@ mod tests {
         threads: Vec<std::thread::ThreadId>,
         engine_calls: u32,
         engine_first_quick: bool,
+        /// Children that trap and ignore SIGTERM, so the stop sequence must escalate to SIGKILL.
+        ignore_term: std::collections::HashSet<&'static str>,
     }
 
     struct Rec {
@@ -1053,7 +1085,7 @@ mod tests {
             _argv: &[String],
             _sup_pid: u32,
         ) -> std::io::Result<Spawned> {
-            let quick = {
+            let (quick, ignores_term) = {
                 let mut st = self.inner.lock().unwrap();
                 st.spawned.push(name.to_string());
                 st.threads.push(std::thread::current().id());
@@ -1061,12 +1093,19 @@ mod tests {
                 if name == "engine" {
                     st.engine_calls += 1;
                 }
-                q
+                (q, st.ignore_term.contains(name))
             };
             // A long-lived child killed promptly by SIGTERM's default disposition (no trap: a
             // trapped signal can be deferred behind the running `sleep`, which would wedge a
-            // restart's wait). `exit 0` is the crash-loop fixture.
-            let script = if quick { "exit 0" } else { "exec sleep 60" };
+            // restart's wait). `exit 0` is the crash-loop fixture. A child in `ignore_term`
+            // traps and ignores SIGTERM, so the stop sequence must escalate to SIGKILL.
+            let script = if ignores_term {
+                "trap '' TERM; sleep 60"
+            } else if quick {
+                "exit 0"
+            } else {
+                "exec sleep 60"
+            };
             let mut child = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(script)
@@ -1176,6 +1215,8 @@ mod tests {
             run_watchdog: false,
             serve_socket: false,
             shared: Some(shared),
+            trace: None,
+            stop_grace: CHILD_STOP_GRACE,
         }
     }
 
@@ -1205,6 +1246,8 @@ mod tests {
                 run_watchdog: false,
                 serve_socket: false,
                 shared: None,
+                trace: None,
+                stop_grace: CHILD_STOP_GRACE,
             },
         )
         .await;
@@ -1585,5 +1628,163 @@ mod tests {
             );
         }
         sys
+    }
+
+    /// A pmxcfs root whose `.members` reports a quorate cluster, so the conf-sync predicate
+    /// holds and the stop sequence has all three children to signal.
+    fn clustered_pmx(dir: &Path) -> String {
+        let root = dir.join("pve");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".members"),
+            r#"{"nodename":"pve1-tb","version":1,"cluster":{"name":"tb","version":1,"nodes":3,"quorate":1},"nodelist":{}}"#,
+        )
+        .unwrap();
+        root.to_string_lossy().into_owned()
+    }
+
+    /// The fresh-member apply fixture plus what the stop sequence's teardown acts on: an owned
+    /// interface under `/proc/.../conf` so `forwarding_off` writes it, and the storage identity
+    /// veth `cfab-id99` present (of the right kind, peer absent) so `teardown::run` performs an
+    /// `ip link del`. A present veth of the right kind is accepted by the apply's `mk_identity`
+    /// (a present bond, by contrast, triggers a params proof the mock cannot satisfy), so it
+    /// survives bringup and is deleted only at teardown. Wrapped in the recording `TestSys` that
+    /// appends every call to the shared `calls` trace.
+    fn stop_fixture_sys(view: &View, run_dir: &Path, calls: Arc<Mutex<Vec<String>>>) -> TestSys {
+        let inner = fresh_sys(view, run_dir)
+            .file("/proc/sys/net/ipv4/conf/cfab-st/forwarding", "1\n")
+            .on_stdout(
+                &["ip", "link", "show", "cfab-id99"],
+                "5: cfab-id99@cfab-id99-peer\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-id99"],
+                "5: cfab-id99: veth \n",
+            );
+        TestSys::new(inner, calls)
+    }
+
+    /// Run the whole lifecycle on a clustered host to READY, then clear the trace (so only the
+    /// stop sequence remains), send `Terminate`, and return the exit code and the single merged,
+    /// ordered trace of the stop sequence — `Sys` calls (`write …/forwarding`, `ip link del …`)
+    /// interleaved with the signal/wait/kill markers. `ignore_term` names children that trap
+    /// SIGTERM (so the SIGKILL path runs); `grace` is the per-child SIGTERM→SIGKILL window.
+    async fn drive_stop(ignore_term: &[&'static str], grace: Duration) -> (u8, Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sys = stop_fixture_sys(&view, tmp.path(), calls.clone());
+        let inner = Arc::new(Mutex::new(RecState {
+            ignore_term: ignore_term.iter().copied().collect(),
+            ..RecState::default()
+        }));
+        let mut spawner = Rec {
+            inner: inner.clone(),
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let trace = calls.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            // Start fresh at the stop boundary: the apply's calls fall away, so the trace holds
+            // only what the stop sequence did.
+            trace.lock().unwrap().clear();
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let hooks = Hooks {
+            on_ready: Some(ready_tx),
+            run_watchdog: false,
+            serve_socket: false,
+            shared: Some(shared),
+            trace: Some(calls.clone()),
+            stop_grace: grace,
+        };
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &clustered_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        driver.await.unwrap();
+        let merged = calls.lock().unwrap().clone();
+        (code, merged)
+    }
+
+    /// Spec §13 step 2 + invariant §16.5: forwarding goes off BEFORE any child is signalled or
+    /// waited on, and before the netdevs — so everything after it can be SIGKILLed by
+    /// `TimeoutStopSec` without a packet transiting a half-torn-down host. All three children are
+    /// signalled, with no ordering among them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarding_goes_off_before_any_child_signal_and_before_the_netdevs() {
+        let (code, calls) = drive_stop(&[], CHILD_STOP_GRACE).await;
+        assert_eq!(code, 0);
+        let fwd = calls
+            .iter()
+            .position(|c| c.contains("conf/cfab-st/forwarding"))
+            .unwrap_or_else(|| panic!("no forwarding-off in the stop trace: {calls:?}"));
+        let first_signal = calls
+            .iter()
+            .position(|c| c.starts_with("signal "))
+            .unwrap_or_else(|| panic!("no child signal: {calls:?}"));
+        let first_wait = calls
+            .iter()
+            .position(|c| c.starts_with("wait "))
+            .unwrap_or_else(|| panic!("no wait: {calls:?}"));
+        let del = calls
+            .iter()
+            .position(|c| c.starts_with("ip link del"))
+            .unwrap_or_else(|| panic!("no netdev deletion: {calls:?}"));
+        assert!(
+            fwd < first_signal,
+            "forwarding must be off before any child is signalled: {calls:?}"
+        );
+        assert!(fwd < first_wait, "and before any wait: {calls:?}");
+        assert!(fwd < del, "and before the netdevs: {calls:?}");
+        let sigterms = calls.iter().filter(|c| c.ends_with("SIGTERM")).count();
+        assert_eq!(
+            sigterms, 3,
+            "all three children signalled, no ordering among them: {calls:?}"
+        );
+    }
+
+    /// Spec §13 steps 3–4: every child is SIGTERMed at once (all before any wait), and the one
+    /// that traps SIGTERM is SIGKILLed after the grace — proven without a real 10 s wait by a
+    /// shrunk `stop_grace`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_signals_every_child_at_once_then_sigkills_the_one_that_ignores_sigterm() {
+        let (code, calls) = drive_stop(&["shape-daemon"], Duration::from_millis(300)).await;
+        assert_eq!(code, 0);
+        let first_wait = calls
+            .iter()
+            .position(|c| c.starts_with("wait "))
+            .unwrap_or_else(|| panic!("no wait: {calls:?}"));
+        let sigterms: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.ends_with("SIGTERM"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sigterms.len(),
+            3,
+            "every child SIGTERMed at once: {calls:?}"
+        );
+        assert!(
+            sigterms.iter().all(|i| *i < first_wait),
+            "all three signals precede the first wait (signalled at once): {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "signal shape-daemon SIGKILL"),
+            "the child that ignored SIGTERM is SIGKILLed: {calls:?}"
+        );
     }
 }
