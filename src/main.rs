@@ -40,9 +40,11 @@ enum Command {
         #[command(subcommand)]
         artifact: GenArtifact,
     },
-    /// Apply the fabric on this member (idempotent; root)
-    Up,
-    /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
+    /// Apply the fabric on this member and supervise its components (the systemd/container
+    /// entry point; root). Applies, keeps `cfab engine`, `cfab shape-daemon` and `cfab
+    /// conf-sync` running, re-applies on SIGHUP, and tears the fabric down on SIGTERM.
+    Run,
+    /// Remove everything `run` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
     /// This member's fabric state, from its adjacency counts: UP (exit 0), UP-DEGRADED (1),
     /// FAILED (2), DOWN (3). The headline carries three fixed counts, (peers | links |
@@ -222,7 +224,7 @@ fn arm_supervised_child(command: &Command) -> Option<ExitCode> {
         Command::Check
         | Command::Schema
         | Command::Gen { .. }
-        | Command::Up
+        | Command::Run
         | Command::Down
         | Command::Status { .. }
         | Command::FwdWatchdog
@@ -334,15 +336,18 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Up => {
-            let mut sys = RealSys;
-            let opts = commands::apply::ApplyOpts {
-                pmxcfs_root: "/etc/pve".to_string(),
-            };
-            for w in commands::apply::run(&mut sys, &view, &opts)? {
-                println!("{w}");
-            }
-            Ok(ExitCode::SUCCESS)
+        Command::Run => {
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
+                .to_string_lossy()
+                .into_owned();
+            let config = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned();
+            let code = cfab::supervisor::run(&fabric, &view, &exe, &config)?;
+            Ok(ExitCode::from(code))
         }
         Command::Down => {
             let mut sys = RealSys;
