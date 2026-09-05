@@ -2,3 +2,5 @@
 //! child processes (`cfab engine`, `cfab shape-daemon`, `cfab conf-sync`) running.
 
 pub mod child;
+pub mod report;
+pub mod sock;
