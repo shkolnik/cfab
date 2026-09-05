@@ -297,6 +297,9 @@ pub struct Fabric {
     pub bfd_rx_ms: u32,
     pub bfd_tx_ms: u32,
     pub bfd_mult: u32,
+    /// UDP port for single-hop BFD (RFC 5881: 3784). A port is an external contract — every
+    /// member and every peer must agree — so it is a declared key, not a derived threshold.
+    pub bfd_port: u16,
     pub ospf_hello: u32,
     pub ospf_dead: u32,
     pub bgp_as: u32,
@@ -332,6 +335,7 @@ pub const CONSUMED_KEYS: &[&str] = &[
     "BFD_RX_MS",
     "BFD_TX_MS",
     "BFD_MULT",
+    "BFD_PORT",
     "OSPF_HELLO",
     "OSPF_DEAD",
     "BGP_AS",
@@ -346,6 +350,26 @@ fn parse_num<T: std::str::FromStr>(raw: &RawConfig, key: &str) -> Result<T> {
     let v = raw.require(key)?;
     v.parse()
         .map_err(|_| Error::config(format!("{key}='{v}' is not a valid number")))
+}
+
+/// RFC 5881's single-hop port: what every BFD implementation binds unless told otherwise.
+pub const BFD_PORT_DEFAULT: u16 = 3784;
+
+/// An optional port key: absent = the default, present = a registered/dynamic port. Ports below
+/// 1024 are refused (the engine drops privileges to bind nothing else there) and 0 is not a port.
+fn parse_port(raw: &RawConfig, key: &str, default: u16) -> Result<u16> {
+    let Some(v) = raw.get(key) else {
+        return Ok(default);
+    };
+    let port: u16 = v
+        .parse()
+        .map_err(|_| Error::config(format!("{key}='{v}' is not a valid port")))?;
+    if !(1024..=65535).contains(&port) {
+        return Err(Error::config(format!(
+            "{key}={port} is outside 1024..65535"
+        )));
+    }
+    Ok(port)
 }
 
 fn parse_bool01(raw: &RawConfig, key: &str) -> Result<bool> {
@@ -392,6 +416,7 @@ impl Fabric {
             bfd_rx_ms: parse_num(raw, "BFD_RX_MS")?,
             bfd_tx_ms: parse_num(raw, "BFD_TX_MS")?,
             bfd_mult: parse_num(raw, "BFD_MULT")?,
+            bfd_port: parse_port(raw, "BFD_PORT", BFD_PORT_DEFAULT)?,
             ospf_hello: parse_num(raw, "OSPF_HELLO")?,
             ospf_dead: parse_num(raw, "OSPF_DEAD")?,
             bgp_as: parse_num(raw, "BGP_AS")?,
@@ -765,6 +790,31 @@ mod tests {
         );
         // No literal key in the real file is unknown to the model.
         assert_eq!(raw.unconsumed(CONSUMED_KEYS), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bfd_port_defaults_and_is_range_checked() {
+        // The shipped declaration states it; a declaration that omits it gets RFC 5881's port.
+        assert_eq!(parse_fabric(|_| {}).unwrap().bfd_port, 3784);
+        let f = parse_fabric(|t| *t = t.replace("BFD_PORT=3784\n", "")).unwrap();
+        assert_eq!(f.bfd_port, BFD_PORT_DEFAULT);
+        assert_eq!(
+            parse_fabric(|t| *t = t.replace("BFD_PORT=3784", "BFD_PORT=3785"))
+                .unwrap()
+                .bfd_port,
+            3785
+        );
+        for (bad, want) in [
+            ("BFD_PORT=1023", "BFD_PORT=1023 is outside 1024..65535"),
+            ("BFD_PORT=0", "BFD_PORT=0 is outside 1024..65535"),
+            ("BFD_PORT=70000", "BFD_PORT='70000' is not a valid port"),
+            ("BFD_PORT=bfd", "BFD_PORT='bfd' is not a valid port"),
+        ] {
+            let err = parse_fabric(|t| *t = t.replace("BFD_PORT=3784", bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{bad}: {err}");
+        }
     }
 
     fn parse_fabric(mut edit: impl FnMut(&mut String)) -> Result<Fabric> {

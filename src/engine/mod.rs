@@ -8,6 +8,7 @@ pub mod state;
 
 use std::path::PathBuf;
 
+use holo_utils::bfd::BfdSocketPolicy;
 use holo_utils::southbound::FibPolicy;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
@@ -40,6 +41,7 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         proto_base: Some(PROTO_BASE),
         prefsrc,
     };
+    let bfd_policy = bfd_socket_policy(fabric);
     let sock_path = PathBuf::from(&fabric.run_dir).join(SOCK_NAME);
     let pid_path = PathBuf::from(&fabric.run_dir).join(PID_NAME);
     // Before anything destructive: starting the providers purges the private-proto routes
@@ -56,7 +58,7 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         .map_err(|e| Error::fatal(format!("engine: cannot create async runtime: {e}")))?;
     rt.block_on(async {
         info!(member = %view.member.name, "engine starting");
-        let mut nb = northbound::Northbound::start(&view.member.name, policy);
+        let mut nb = northbound::Northbound::start(&view.member.name, policy, bfd_policy);
         let result = serve(&mut nb, &cfg, fabric, &sock_path, &pid_path).await;
         // Every exit, healthy or not, is holod's teardown: stop answering, drop the
         // providers, wait for every task (holo-routing uninstalls its routes on that path).
@@ -65,6 +67,17 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         info!("engine stopped");
         result
     })
+}
+
+/// The Rx sockets holo-bfd may bind: IPv4 single-hop on BFD_PORT and nothing else. cfab runs
+/// no multihop and no IPv6 BFD sessions, and every socket holo binds that we never read is one
+/// more wildcard address another BFD daemon on this host can collide with.
+fn bfd_socket_policy(fabric: &Fabric) -> BfdSocketPolicy {
+    BfdSocketPolicy {
+        single_hop_port: fabric.bfd_port,
+        ipv6: false,
+        ..Default::default()
+    }
 }
 
 /// Commit, publish readiness (pid + socket), answer state requests until a signal.
@@ -189,6 +202,26 @@ mod tests {
         std::fs::write(&pid, format!("{}\n", std::process::id())).unwrap();
         cleanup(&sock, &pid);
         assert!(!sock.exists() && !pid.exists());
+    }
+
+    #[test]
+    fn the_bfd_policy_asks_for_exactly_one_rx_socket() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        let mut fabric =
+            Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+        fabric.bfd_port = 3785;
+        let policy = bfd_socket_policy(&fabric);
+        assert_eq!(policy.port(holo_utils::bfd::PathType::IpSingleHop), 3785);
+        assert!(policy.binds_af(holo_utils::ip::AddressFamily::Ipv4));
+        assert!(!policy.binds_af(holo_utils::ip::AddressFamily::Ipv6));
+        // The multihop port keeps its default; cfab never opens a multihop session, so
+        // holo-bfd never starts a multihop Rx task and never binds it.
+        assert_eq!(
+            policy.port(holo_utils::bfd::PathType::IpMultihop),
+            BfdSocketPolicy::default().multihop_port
+        );
     }
 
     #[test]
