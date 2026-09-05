@@ -210,10 +210,58 @@ pub fn start_and_wait(
     } else {
         log_path(f)
     };
+    let log = engine_log(sys, f, systemd);
+    if let Some(line) = bfd_bind_error_line(&log, f.bfd_port) {
+        return Err(Error::fatal(format!(
+            "engine start failed: {line}\n  remedy: {}. See {logs}",
+            bfd_bind_remedy(line, f.bfd_port)
+        )));
+    }
     Err(Error::fatal(format!(
         "engine did not become ready within {}s ({last}); see {logs}",
         START_WAIT_MS / 1000
     )))
+}
+
+/// The engine's own last words: the journal on a systemd host, the detached log otherwise.
+/// Best effort — a missing log is not itself an error, it just leaves the generic message.
+pub fn engine_log(sys: &mut dyn Sys, f: &Fabric, systemd: bool) -> String {
+    if systemd {
+        sys.run(&["journalctl", "-u", UNIT, "-n", "200", "--no-pager"])
+            .map(|o| o.stdout)
+            .unwrap_or_default()
+    } else {
+        sys.read(&log_path(f)).unwrap_or_default()
+    }
+}
+
+/// What holo-bfd prints before exiting 1 when its Rx socket cannot be bound.
+const BFD_BIND_ERROR: &str = "bfd: cannot bind udp ";
+
+/// The engine's BFD bind failure for this port, if the log holds one (the tracing prefix — level,
+/// timestamp, target — is cut, so the message reads the same from the journal and from the file).
+pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
+    log.lines()
+        .filter_map(|l| l.find(BFD_BIND_ERROR).map(|i| l[i..].trim_end()))
+        .find(|l| l.contains(&format!(":{port}:")))
+}
+
+/// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
+/// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
+/// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
+/// One spelling, shared by `up` (which hits this at start) and `verify` (which diagnoses it).
+pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
+    let stop = if line.contains("bfdd") || line.contains("frr") {
+        "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
+    } else if line.contains("holder unknown") {
+        format!("find the holder (ss -ulpn | grep ':{port}') and stop it")
+    } else {
+        "stop the daemon named in the line above".to_string()
+    };
+    format!(
+        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.conf on EVERY member — \
+         every peer of a session must use the same port"
+    )
 }
 
 /// One state read; fatal when the socket does not answer.
@@ -963,6 +1011,57 @@ pub(crate) mod tests {
             "{e}"
         );
         assert_eq!(sys.slept.len(), 60, "30 s in 500 ms steps");
+    }
+
+    /// A squatter on the BFD port: the engine exits 1 with holo's line, and `up` must hand the
+    /// operator the remedy — which daemon, and that the port is fabric-wide.
+    #[test]
+    fn a_bfd_bind_failure_becomes_the_remedy_not_a_timeout() {
+        let f = fabric();
+        let log = "2026-09-05T00:00:00Z ERROR bfd: cannot bind udp 0.0.0.0:3784: \
+                   address in use (held by bfdd pid 812)\n";
+        let mut sys = MockSys::default().file("/run/cfab/engine.log", log);
+        let e = start_and_wait(
+            &mut sys,
+            &f,
+            "/usr/bin/cfab",
+            "/etc/cfab/fabric.conf",
+            "pve3-tb",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains(
+                "engine start failed: bfd: cannot bind udp 0.0.0.0:3784: address in use \
+                 (held by bfdd pid 812)"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains("remedy: stop FRR, which owns bfdd: systemctl disable --now frr"),
+            "{e}"
+        );
+        assert!(
+            e.contains(
+                "or declare a free BFD_PORT (now 3784) in fabric.conf on EVERY member — every \
+                 peer of a session must use the same port. See /run/cfab/engine.log"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_remedy_is_only_for_our_port_and_names_an_unknown_holder() {
+        let ours = "bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)";
+        let other = "bfd: cannot bind udp 0.0.0.0:4784: address in use (held by bfdd pid 1)";
+        assert_eq!(bfd_bind_error_line(ours, 3784), Some(ours));
+        assert_eq!(bfd_bind_error_line(other, 3784), None);
+        assert_eq!(bfd_bind_error_line("engine starting\n", 3784), None);
+        let e = bfd_bind_remedy(ours, 3784);
+        assert!(
+            e.starts_with("find the holder (ss -ulpn | grep ':3784') and stop it;"),
+            "{e}"
+        );
     }
 
     #[test]
