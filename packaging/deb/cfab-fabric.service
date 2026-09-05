@@ -1,0 +1,25 @@
+[Unit]
+Description=cfab fabric member
+Documentation=man:cfab(8)
+# The wires must exist and be named before `up` configures them; ifupdown2/PVE boot
+# ordering beyond this is unverified, and no ordering against frr.service is declared
+# (the Ansible precedent deadlocked its own stop job behind an frr ordering).
+After=network-online.target networking.service
+Wants=network-online.target
+# Installed but unconfigured is a clean boot, not a failure: with no declaration there
+# is nothing to apply, so the unit is skipped rather than started and failed.
+ConditionPathExists=/etc/cfab/fabric.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# CFAB_HOST only, and only when this member's row is not named by the kernel hostname.
+EnvironmentFile=-/etc/default/cfab
+ExecStart=/usr/bin/cfab up
+# up is idempotent, so reload is up again. Not free: it stops and restarts the routing
+# engine, so this member's adjacencies drop and re-form.
+ExecReload=/usr/bin/cfab up
+ExecStop=/usr/bin/cfab down
+
+[Install]
+WantedBy=multi-user.target

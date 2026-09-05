@@ -32,6 +32,15 @@ pub trait Sys {
     fn remove(&mut self, path: &str) -> Result<()>;
     fn rename(&mut self, from: &str, to: &str) -> Result<()>;
     fn sleep(&mut self, d: Duration);
+    /// One request, one reply over a Unix stream socket: connect to `path`, write `line`, read
+    /// until the peer closes. The engine's state socket speaks exactly this shape.
+    fn unix_request(&mut self, path: &str, line: &str) -> Result<String>;
+    /// Start a long-lived process in its own session, stdin from /dev/null, stdout+stderr
+    /// appended to `log`, and return as soon as it is launched — never waiting on it. This
+    /// is the only way to start a daemon from here: `run` captures the child's output
+    /// through pipes and reads them to EOF, so a detached child that keeps its stderr open
+    /// (the engine logs there for life) would block `run` forever.
+    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()>;
 }
 
 /// Run and require exit 0.
@@ -48,6 +57,12 @@ pub fn run_ok(sys: &mut dyn Sys, argv: &[&str]) -> Result<Output> {
 }
 
 /// Run, ignore failure (bash `|| true`).
+/// Run a command that may not be installed at all. An exec failure (`iptables` absent on a host
+/// that never had Docker) is `None`, not a fatal error; a nonzero exit is still `Some`.
+pub fn run_optional(sys: &mut dyn Sys, argv: &[&str]) -> Option<Output> {
+    sys.run(argv).ok()
+}
+
 pub fn run_ignore(sys: &mut dyn Sys, argv: &[&str]) -> Result<()> {
     let _ = sys.run(argv)?;
     Ok(())
@@ -121,6 +136,50 @@ impl Sys for RealSys {
     fn sleep(&mut self, d: Duration) {
         std::thread::sleep(d);
     }
+
+    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(|e| Error::fatal(format!("cannot open {log}: {e}")))?;
+        let err_file = log_file
+            .try_clone()
+            .map_err(|e| Error::fatal(format!("cannot dup {log}: {e}")))?;
+        // `setsid -f` forks the child into a new session and exits at once; the child keeps
+        // only the log fds, so `status()` returns as soon as the fork is done.
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .args(argv)
+            .stdin(std::process::Stdio::null())
+            .stdout(log_file)
+            .stderr(err_file)
+            .status()
+            .map_err(|e| Error::fatal(format!("cannot exec setsid: {e}")))?;
+        if !status.success() {
+            return Err(Error::Cmd {
+                cmd: format!("setsid -f {}", argv.join(" ")),
+                status: status.code().unwrap_or(-1),
+                stderr: format!("see {log}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
+        use std::io::{Read, Write};
+        let timeout = Some(Duration::from_secs(5));
+        let mut s = std::os::unix::net::UnixStream::connect(path)
+            .map_err(|e| Error::fatal(format!("cannot connect to {path}: {e}")))?;
+        s.set_read_timeout(timeout)?;
+        s.set_write_timeout(timeout)?;
+        s.write_all(line.as_bytes())
+            .map_err(|e| Error::fatal(format!("cannot write to {path}: {e}")))?;
+        let mut reply = String::new();
+        s.read_to_string(&mut reply)
+            .map_err(|e| Error::fatal(format!("cannot read from {path}: {e}")))?;
+        Ok(reply)
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +187,7 @@ pub mod mock {
     //! A scripted `Sys` for unit tests: file contents in a map, command outputs matched by
     //! prefix rules (later rules win), every call recorded for sequence assertions.
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::Duration;
 
     use super::{Output, Sys};
@@ -138,11 +197,17 @@ pub mod mock {
     pub struct MockSys {
         pub files: BTreeMap<String, String>,
         pub writable: Vec<String>,
+        /// Paths whose `write` fails (a read-only `/proc`, an EPERM sysctl): the only way to
+        /// exercise "the restore itself could not be done".
+        pub write_fails: Vec<String>,
         /// (argv-prefix, output) — the LAST matching rule wins; unmatched commands succeed
         /// silently (status 0, empty output).
         pub cmd_rules: Vec<(Vec<String>, Output)>,
         pub calls: Vec<String>,
         pub slept: Vec<Duration>,
+        /// socket path → the replies `unix_request` hands back in order; the last one
+        /// repeats forever. Unknown path → Err.
+        pub sockets: HashMap<String, VecDeque<String>>,
         /// Test hook run on each sleep with the 1-based sleep count — lets a test mutate
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
@@ -152,6 +217,19 @@ pub mod mock {
     impl MockSys {
         pub fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        /// One reply, answered to every request on `path`.
+        pub fn socket(self, path: &str, reply: &str) -> Self {
+            self.socket_seq(path, &[reply.to_string()])
+        }
+
+        /// Successive replies on `path`, one per request; the last repeats. Lets a test show
+        /// a value the engine changes between two reads (an interface leaving `down`).
+        pub fn socket_seq(mut self, path: &str, replies: &[String]) -> Self {
+            self.sockets
+                .insert(path.to_string(), replies.iter().cloned().collect());
             self
         }
 
@@ -181,6 +259,12 @@ pub mod mock {
                     stderr: stderr.to_string(),
                 },
             )
+        }
+
+        /// Make `write` to this path fail, as a read-only or EPERM path does.
+        pub fn write_fail(mut self, path: &str) -> Self {
+            self.write_fails.push(path.to_string());
+            self
         }
 
         pub fn ran(&self, needle: &str) -> bool {
@@ -216,6 +300,11 @@ pub mod mock {
 
         fn write(&mut self, path: &str, content: &str) -> Result<()> {
             self.calls.push(format!("write {path}"));
+            if self.write_fails.iter().any(|p| p == path) {
+                return Err(Error::fatal(format!(
+                    "cannot write {path}: permission denied"
+                )));
+            }
             self.files.insert(path.to_string(), content.to_string());
             Ok(())
         }
@@ -268,5 +357,126 @@ pub mod mock {
                 hook(n);
             }
         }
+
+        fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
+            self.calls
+                .push(format!("spawn_detached {} >> {log}", argv.join(" ")));
+            Ok(())
+        }
+
+        fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
+            self.calls
+                .push(format!("unix_request {path} {}", line.trim_end()));
+            let q = self
+                .sockets
+                .get_mut(path)
+                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))?;
+            if q.len() > 1 {
+                Ok(q.pop_front().expect("len > 1"))
+            } else {
+                Ok(q.front().cloned().unwrap_or_default())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    use super::mock::MockSys;
+    use super::{RealSys, Sys};
+
+    #[test]
+    fn mock_socket_replies_or_fails_loud() {
+        let mut sys = MockSys::default().socket("/run/cfab/engine.sock", "{\"ready\":true}\n");
+        assert_eq!(
+            sys.unix_request("/run/cfab/engine.sock", "state\n")
+                .unwrap(),
+            "{\"ready\":true}\n"
+        );
+        assert!(sys.ran("unix_request /run/cfab/engine.sock state"));
+        let err = sys
+            .unix_request("/run/cfab/other.sock", "state\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mock: no socket /run/cfab/other.sock")
+        );
+    }
+
+    #[test]
+    fn real_unix_request_round_trips_one_line() {
+        let dir = std::env::temp_dir().join(format!("cfab-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(format!("got {line}").as_bytes()).unwrap();
+            // Return drops the stream: EOF is the reply terminator.
+        });
+        let reply = RealSys
+            .unix_request(path.to_str().unwrap(), "state\n")
+            .unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(reply, "got state\n");
+    }
+
+    /// The launcher must return while the child lives and keeps the log open: a child that
+    /// sleeps 30 s and holds stderr must not hold `spawn_detached` (the `run`-through-pipes
+    /// hang this method exists to avoid).
+    #[test]
+    fn real_spawn_detached_returns_while_the_child_lives_and_logs_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("cfab-spawn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("engine.log");
+        let pid_file = dir.join("child.pid");
+        let script = "echo $$ >\"$1\"; echo hello-from-stderr >&2; exec sleep 30";
+        let started = std::time::Instant::now();
+        RealSys
+            .spawn_detached(
+                &["sh", "-c", script, "sh", pid_file.to_str().unwrap()],
+                log.to_str().unwrap(),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "blocked for {elapsed:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut pid = String::new();
+        while pid.trim().is_empty() && std::time::Instant::now() < deadline {
+            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            std::thread::yield_now();
+        }
+        let pid = pid.trim().to_string();
+        assert!(!pid.is_empty(), "child never wrote its pid");
+        // Still alive after the launcher returned, and its stderr landed in the log.
+        assert!(std::path::Path::new(&format!("/proc/{pid}/status")).exists());
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("hello-from-stderr"), "{logged:?}");
+        let killed = std::process::Command::new("sh")
+            .args(["-c", "kill \"$1\"", "sh", &pid])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn real_unix_request_missing_socket_names_path() {
+        let err = RealSys
+            .unix_request("/nonexistent/cfab/engine.sock", "state\n")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot connect to /nonexistent/cfab/engine.sock")
+        );
     }
 }

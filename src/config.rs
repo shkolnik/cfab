@@ -52,7 +52,7 @@ impl RawConfig {
                     }
                 }
                 if value.contains('$') {
-                    continue; // computed by the shell (e.g. VRRP_VIP) — the model derives it
+                    continue; // computed by the shell (e.g. CFAB_HOST) — the model derives it
                 }
                 cfg.insert(key, value);
             } else {
@@ -137,17 +137,16 @@ mod tests {
 
     #[test]
     fn computed_values_are_skipped() {
-        let text =
-            "CFAB_HOST=${CFAB_HOST:-$(hostname)}\nVRRP_VIP=\"$(zone_block storage).1.254\"\n";
+        let text = "CFAB_HOST=${CFAB_HOST:-$(hostname)}\nFABRIC_MEMBERS=\"$(member_rows)\"\n";
         let c = RawConfig::parse(text).unwrap();
         assert_eq!(c.get("CFAB_HOST"), None);
-        assert_eq!(c.get("VRRP_VIP"), None);
+        assert_eq!(c.get("FABRIC_MEMBERS"), None);
     }
 
     #[test]
     fn functions_and_control_flow_are_skipped() {
         let text = "member_rows() { printf '%s\\n' \"$MEMBER_TABLE\" | awk 'NF==6'; }\n\
-                    if [ -d /run ]; then frr_ctl() { systemctl \"$1\" frr; }\nfi\nA=1\n";
+                    if [ -d /run ]; then svc_ctl() { systemctl \"$1\" svc; }\nfi\nA=1\n";
         let c = RawConfig::parse(text).unwrap();
         assert_eq!(c.get("A"), Some("1"));
         assert_eq!(c.unconsumed(&["A"]), Vec::<&str>::new());

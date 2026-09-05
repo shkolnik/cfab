@@ -12,8 +12,19 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
+holo-yang = { path = "../holo/holo-yang" }
+holo-northbound = { path = "../holo/holo-northbound" }
+holo-protocol = { path = "../holo/holo-protocol" }
+holo-utils = { path = "../holo/holo-utils" }
+holo-interface = { path = "../holo/holo-interface" }
+holo-routing = { path = "../holo/holo-routing", features = ["ospf", "bfd"] }
+yang5 = { version = "0.3", features = ["bundled"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+ipnetwork = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
@@ -21,16 +32,37 @@ tempfile = "3"
 [package.metadata.deb]
 maintainer = "James Shkolnik <jshkolnik@gmail.com>"
 copyright = "2026 James Shkolnik"
-extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / FRR config from it, applies and verifies the fabric on this member, and tears it down. Installing this package pulls in the full runtime chain (FRR, nftables)."
+extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables)."
 section = "net"
 priority = "optional"
-depends = "frr (>= 8.0), nftables, iproute2, ethtool"
+depends = "nftables, iproute2, ethtool"
 assets = [
     ["target/release/cfab", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/cfab/", "644"],
     ["doc/cfab.8", "usr/share/man/man8/", "644"],
     ["examples/fabric.conf", "usr/share/doc/cfab/examples/fabric.conf.example", "644"],
+    ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
+    ["packaging/deb/rt_protos.d/cfab.conf", "etc/iproute2/rt_protos.d/cfab.conf", "644"],
 ]
+# No hand-written maintainer scripts: the directory is named only because cargo-deb
+# generates no systemd maintainer-script fragments at all unless this key is set
+# (cargo-deb 3.8.0, deb/control.rs generate_scripts). The unit would ship installed
+# but never enabled, stopped, or masked.
+maintainer-scripts = "packaging/deb"
+
+# cfab-fabric.service, installed disabled and never started by the package: installing
+# cfab must not change the network. The operator writes /etc/cfab/fabric.conf and runs
+# `systemctl enable --now cfab-fabric`.
+[package.metadata.deb.systemd-units]
+unit-scripts = "packaging/deb"
+unit-name = "cfab-fabric"
+enable = false
+start = false
+# An upgrade must not tear the fabric down: stopping the unit runs `cfab down`, an outage
+# for every identity on the host. Both false leaves the running unit alone; the new binary
+# takes effect on the next `systemctl reload cfab-fabric`.
+stop-on-upgrade = false
+restart-after-upgrade = false
 
 [lints.rust]
 unsafe_code = "forbid"

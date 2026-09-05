@@ -4,14 +4,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use cfab::derive::View;
-use cfab::model::MemberKind;
+use cfab::model::{MemberKind, Role};
 use cfab::sys::RealSys;
 use cfab::{Error, commands, emit, load_fabric};
 
 /// cfab — the per-host runtime of the resilient converged fabric.
 ///
 /// fabric.conf declares the fabric; this tool validates it, generates every artifact from it
-/// (nft policy/marking, HTB trees, frr config), applies and verifies the fabric on this
+/// (nft policy/marking, HTB trees, the routing engine's config tree), applies and verifies the fabric on this
 /// member, and tears it down.
 #[derive(Parser)]
 #[command(version, about, max_term_width = 100)]
@@ -42,13 +42,20 @@ enum Command {
     },
     /// Apply the fabric on this member (idempotent; root)
     Up,
-    /// Remove everything `up` created, restore FRR to the pre-fabric state (root)
+    /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
-    /// Full health check: posture, drift, convergence. Exit 0 OK / 2 degraded / 1 failed
-    Verify {
-        /// Seconds to wait for BFD/route convergence before failing
-        #[arg(long, default_value_t = 60)]
-        timeout: u64,
+    /// This member's fabric state, from its adjacency counts: UP (exit 0), UP-DEGRADED (1),
+    /// FAILED (2), DOWN (3). The headline carries three fixed counts, (peers | links |
+    /// fallbacks), each n/N: peers with at least one available adjacency (self never counted),
+    /// BFD sessions on declared segments, and OSPF neighbors on the fallback segment. One
+    /// indented line per condition follows. Never writes: the watchdog actuates, status reports.
+    Status {
+        /// Seconds to re-read (every 2 s) while the state is not UP; 0 = one instant read
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// Exit 0 for UP-DEGRADED as well as UP (FAILED and DOWN are unchanged)
+        #[arg(long)]
+        permissive: bool,
     },
     /// Membership-reactive shaping daemon (started by `up` as cfab-shape.service)
     ShapeDaemon {
@@ -82,6 +89,12 @@ enum Command {
         #[command(subcommand)]
         action: ConfAction,
     },
+    /// The resident routing engine (started by `up` as cfab-engine.service; root)
+    Engine {
+        /// Gate-0 teeth: install routes without preferred sources (the oracle must go RED)
+        #[arg(long, hide = true)]
+        unsafe_no_prefsrc: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,8 +115,8 @@ enum GenArtifact {
     Policy,
     /// The traffic-class marking (table inet cfab)
     Mark,
-    /// This member's /etc/frr/frr.conf
-    Frr,
+    /// This member's routing-engine configuration tree (JSON)
+    Engine,
     /// The floor+borrow HTB derivation for one physical NIC
     Shape {
         /// The physical NIC (a CLASS_TABLE wire)
@@ -111,7 +124,7 @@ enum GenArtifact {
         /// Print the tc program instead of the derivation
         #[arg(long, conflicts_with = "expect")]
         tc: bool,
-        /// Print the "classid effective-rate" lines that `verify` diffs
+        /// Print the "classid effective-rate" lines that `status` diffs
         #[arg(long)]
         expect: bool,
     },
@@ -128,6 +141,9 @@ fn main() -> ExitCode {
     }
 }
 
+/// The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.conf.
+const INSTALLED_CONFIG: &str = "/etc/cfab/fabric.conf";
+
 fn config_path(cli_config: &Option<PathBuf>) -> PathBuf {
     if let Some(p) = cli_config {
         return p.clone();
@@ -141,11 +157,24 @@ fn config_path(cli_config: &Option<PathBuf>) -> PathBuf {
         }
     }
     // The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.conf.
-    let etc = PathBuf::from("/etc/cfab/fabric.conf");
+    let etc = PathBuf::from(INSTALLED_CONFIG);
     if etc.exists() {
         return etc;
     }
     PathBuf::from("fabric.conf")
+}
+
+/// The DOWN line for a member with no declaration. `config_path`'s last resort is the bare
+/// relative `fabric.conf` (the from-a-checkout convenience), and on a host that never joined
+/// "no fabric.conf" says nothing about where a declaration belongs — so when nothing was asked
+/// for explicitly and nothing was found, name the installed location instead.
+fn no_config_line(cli_config: &Option<PathBuf>, resolved: &std::path::Path) -> String {
+    let named = if cli_config.is_none() && resolved == std::path::Path::new("fabric.conf") {
+        std::path::Path::new(INSTALLED_CONFIG)
+    } else {
+        resolved
+    };
+    format!("DOWN (no {})", named.display())
 }
 
 fn member_name(cli_host: &Option<String>) -> Result<String, Error> {
@@ -185,6 +214,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    // A member with no declaration cannot desire the fabric to be up: that is DOWN, not a
+    // failure. (A fabric.conf that is PRESENT but unparseable keeps its loud parse error and
+    // exit 1 below — we cannot know what was desired.)
+    if let Command::Status { .. } = cli.command
+        && !path.exists()
+    {
+        println!("{}", no_config_line(&cli.config, &path));
+        return Ok(ExitCode::from(3));
+    }
     let fabric = load_fabric(&path)?;
     let member = member_name(&cli.host)?;
     let view = View::new(&fabric, &member)?;
@@ -206,31 +244,20 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Check => {
-            let kind = match view.kind() {
-                MemberKind::Host => "host",
-                MemberKind::Leaf => "leaf",
-            };
-            println!(
-                "fabric.conf OK: {} zones, {} segments, {} members",
-                fabric.zones.len(),
-                fabric.class_table.len(),
-                fabric.members.len()
-            );
-            println!(
-                "this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} ingress leg(s)",
-                member,
-                view.node(),
-                view.class_rows().len(),
-                view.wires().join(" "),
-                view.gw_rows().len()
-            );
+            print!("{}", check_report(&fabric, &view));
             Ok(ExitCode::SUCCESS)
         }
         Command::Gen { artifact } => {
             match artifact {
                 GenArtifact::Policy => print!("{}", emit::policy::generate(&view)?),
                 GenArtifact::Mark => print!("{}", emit::mark::generate(&view)?),
-                GenArtifact::Frr => print!("{}", emit::frr::generate(&view)?),
+                GenArtifact::Engine => {
+                    let tree = emit::engine::generate(&view)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&tree).map_err(Error::fatal)?
+                    )
+                }
                 GenArtifact::Shape { dev, tc, expect } => {
                     let d = shape_for(&view, &fabric, &dev)?;
                     for w in &d.warnings {
@@ -268,9 +295,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             print!("{}", commands::down::run(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Verify { timeout } => {
+        Command::Status { wait, permissive } => {
             let mut sys = RealSys;
-            let report = commands::verify::run(&mut sys, &view, timeout)?;
+            let report = commands::status::run(&mut sys, &view, wait, permissive)?;
             print!("{}", report.output);
             Ok(ExitCode::from(report.code))
         }
@@ -286,12 +313,34 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::FwdWatchdog => {
             let mut sys = RealSys;
             let report = commands::fwd_watchdog::run(&mut sys, &view)?;
+            for r in &report.restored {
+                eprintln!("cfab fwd-watchdog: restored: {r}");
+            }
+            for d in &report.downed {
+                eprintln!("cfab fwd-watchdog: ACTUATED: {d}");
+            }
+            for u in &report.unrestored {
+                eprintln!("cfab fwd-watchdog: COULD NOT RESTORE: {u}");
+            }
+            if let Some(e) = &report.transit_cost_error {
+                eprintln!("cfab fwd-watchdog: COULD NOT RE-ADVERTISE: {e}");
+            }
+            if let Some(rule) = &report.resolved {
+                eprintln!("cfab fwd-watchdog: installed foreign-stack accept: {rule}");
+            }
+            for b in &report.blocked {
+                eprintln!("cfab fwd-watchdog: BLOCKED by a foreign ruleset: {b}");
+            }
             match report.failed {
-                None => Ok(ExitCode::SUCCESS),
                 Some(reason) => {
                     eprintln!("cfab fwd-watchdog: FAIL-CLOSED: {reason}");
                     Ok(ExitCode::FAILURE)
                 }
+                None if !report.downed.is_empty() || !report.unrestored.is_empty() => {
+                    Ok(ExitCode::FAILURE)
+                }
+                None if !report.blocked.is_empty() => Ok(ExitCode::FAILURE),
+                None => Ok(ExitCode::SUCCESS),
             }
         }
         Command::ConfSync => {
@@ -317,6 +366,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             println!("{summary}");
             Ok(ExitCode::SUCCESS)
         }
+        Command::Engine { unsafe_no_prefsrc } => {
+            cfab::engine::run(&fabric, &view, unsafe_no_prefsrc)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::PolicyTeeth => {
             let mut sys = RealSys;
             let conf_text = std::fs::read_to_string(&path)
@@ -330,6 +383,37 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             })
         }
     }
+}
+
+/// The two lines `cfab check` prints: the fabric as declared, then what THIS member gets.
+/// The second line is the last thing an operator sees before `up` creates the netdevs, so it
+/// names every leg `up` will build — the fallback legs included: their slaves fan out per wire,
+/// so their count is member-dependent and not derivable from the fabric-wide line.
+fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
+    let kind = match view.kind() {
+        MemberKind::Host => "host",
+        MemberKind::Leaf => "leaf",
+    };
+    let fallback_legs = fabric
+        .class_table
+        .iter()
+        .filter(|r| r.role == Role::Fallback)
+        .count();
+    format!(
+        "fabric.conf OK: {} zones, {} segments, {} fallback legs, {} members\n\
+         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
+         {} ingress leg(s)\n",
+        fabric.zones.len(),
+        fabric.class_table.len() - fallback_legs,
+        fallback_legs,
+        fabric.members.len(),
+        view.member.name,
+        view.node(),
+        view.class_rows().len(),
+        view.wires().join(" "),
+        view.fallback_rows().len(),
+        view.gw_rows().len(),
+    )
 }
 
 /// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
@@ -360,4 +444,76 @@ fn shape_for<'a>(
         }
     };
     emit::shape::derive(view, dev, measured, &up)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfab::config::RawConfig;
+    use cfab::model::Fabric;
+
+    fn fabric_from(text: &str) -> Fabric {
+        Fabric::from_raw(&RawConfig::parse(text).unwrap()).unwrap()
+    }
+
+    fn example() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            .unwrap()
+    }
+
+    /// The per-member line is the only output that says what THIS host will get, and `up`
+    /// builds one bond per fallback leg with one slave per wire under it. It must say so.
+    #[test]
+    fn check_names_this_members_fallback_legs() {
+        let f = fabric_from(&example());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            check_report(&f, &view),
+            "fabric.conf OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
+             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 1 ingress leg(s)\n"
+        );
+    }
+
+    /// A host that never joined has no declaration anywhere: DOWN, and the line names the
+    /// place a declaration belongs — not `config_path`'s bare relative last resort, which
+    /// would leave an operator hunting for a file that was never there.
+    #[test]
+    fn the_no_config_down_line_names_the_installed_path() {
+        assert_eq!(
+            no_config_line(&None, &PathBuf::from("fabric.conf")),
+            "DOWN (no /etc/cfab/fabric.conf)"
+        );
+        // An explicitly asked-for path is quoted back exactly, wherever it is.
+        assert_eq!(
+            no_config_line(
+                &Some(PathBuf::from("/srv/x.conf")),
+                &PathBuf::from("/srv/x.conf")
+            ),
+            "DOWN (no /srv/x.conf)"
+        );
+        // So is a resolved absolute path with no --config (the beside-binary / /etc arms).
+        assert_eq!(
+            no_config_line(&None, &PathBuf::from("/etc/cfab/fabric.conf")),
+            "DOWN (no /etc/cfab/fabric.conf)"
+        );
+    }
+
+    /// A fabric declaring no fallback row: one spelling, counted zero, never absent.
+    #[test]
+    fn check_on_a_fallback_free_fabric_counts_zero() {
+        let text = example()
+            .lines()
+            .filter(|l| !l.contains(" fallback "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = fabric_from(&text);
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            check_report(&f, &view),
+            "fabric.conf OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
+             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             0 fallback leg(s), 1 ingress leg(s)\n"
+        );
+    }
 }

@@ -3,10 +3,10 @@
 //! netdevs. Prove-ownership: only deletes cfab-* netdevs of the expected kind.
 
 use crate::commands::common::{
-    FRR_CONF, FRR_CONF_BACKUP, FRR_DAEMONS, FRR_DAEMONS_SNAPSHOT, conf_interfaces, drop_rules,
-    frr_ctl_stop_ignore, link_exists, link_kind_is,
+    conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
 };
-use crate::derive::View;
+use crate::commands::engine_ctl;
+use crate::derive::{Slave, View};
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
@@ -42,6 +42,9 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
         }
+        // custody: the accept `up` put in a foreign user hook is ours to remove, and only the
+        // rule carrying our tag is touched
+        remove_foreign_transit_accept(sys)?;
     } else {
         // a leaf owns nothing global: its own rules (prove ownership by pref + our block)
         for z in &f.zones {
@@ -60,9 +63,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             )?;
         }
     }
-    frr_ctl_stop_ignore(sys)?;
-    // return-path rules (both kinds); the zone tables hold only FRR's static, which FRR
-    // withdraws on stop — anything left there is not ours and is left alone (said so).
+    // The engine stops (and its routes are swept) before any interface goes away, so it never
+    // acts on vanished links. The zone tables hold only the engine's static, gone with it —
+    // anything left there is not ours and is left alone (said so).
+    engine_ctl::stop_and_sweep(sys, f)?;
+    // return-path rules (both kinds)
     for z in &f.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -95,28 +100,58 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         )?;
     }
     sys.remove(&f.run_dir)?;
-    if sys.exists(FRR_CONF_BACKUP) {
-        sys.rename(FRR_CONF_BACKUP, FRR_CONF)?;
-    }
-    restore_daemons(sys)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
-    if link_exists(sys, &f.vrrp_if)? {
-        if !link_kind_is(sys, &f.vrrp_if, " macvlan ")? {
-            return Err(Error::fatal(format!(
-                "REFUSING: {} exists but is not a macvlan",
-                f.vrrp_if
-            )));
+    // Fallback legs, bonds before slaves: `ip link del <bond>` RELEASES its slaves, it does not
+    // delete them, which is why the second loop exists. The engine is already stopped and its
+    // routes swept above, so this order is ownership-proof clarity, nothing more.
+    let fallback_rows = view.fallback_rows();
+    let gw_rows = view.gw_rows();
+    // An ingress leg on gw island `any` is the same bond and is torn down the same way.
+    let bond_legs: Vec<(&str, &[Slave])> = fallback_rows
+        .iter()
+        .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
+        .chain(
+            gw_rows
+                .iter()
+                .filter(|r| r.migrates())
+                .map(|r| (r.ifname.as_str(), r.slaves.as_slice())),
+        )
+        .collect();
+    for (ifname, _) in &bond_legs {
+        if link_exists(sys, ifname)? {
+            if !link_kind_is(sys, ifname, " bond ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {ifname} exists but is not a bond"
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", ifname])?;
         }
-        run_ok(sys, &["ip", "link", "del", &f.vrrp_if])?;
+    }
+    for s in bond_legs.iter().flat_map(|(_, slaves)| *slaves) {
+        if link_exists(sys, &s.ifname)? {
+            if !link_kind_is(sys, &s.ifname, " vlan ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {} exists but is not a vlan",
+                    s.ifname
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", &s.ifname])?;
+        }
     }
     let mut ifnames: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
-    ifnames.extend(view.gw_rows().into_iter().map(|r| r.ifname));
+    // A migrating leg was deleted above as a bond; the rest are plain sub-interfaces.
+    ifnames.extend(
+        gw_rows
+            .iter()
+            .filter(|r| !r.migrates())
+            .map(|r| r.ifname.clone()),
+    );
     for dev in &ifnames {
         if link_exists(sys, dev)? {
-            if !link_kind_is(sys, dev, " macvlan ")? && !link_kind_is(sys, dev, " vlan ")? {
+            if !link_kind_is(sys, dev, " vlan ")? {
                 return Err(Error::fatal(format!(
-                    "REFUSING: {dev} exists but is neither macvlan nor vlan"
+                    "REFUSING: {dev} exists but is not a vlan"
                 )));
             }
             run_ok(sys, &["ip", "link", "del", dev])?;
@@ -169,115 +204,185 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     Ok(msg)
 }
 
-/// The daemons keys `up` manages. One spelling, shared by edit and restore.
-const MANAGED_DAEMON_KEYS: [&str; 5] = ["ospfd", "bfdd", "vrrpd", "bgpd", "ospfd_instances"];
-
-/// Put the managed daemons keys back to their pre-cfab values (recorded by `up` at its first
-/// edit), then drop the record. Key-wise, not whole-file: unrelated daemons edits made while
-/// the fabric was up are not ours to destroy. Without a snapshot (an install first upped by an
-/// older cfab) fall back to the historical guess — vrrpd/bgpd off, ospfd/bfdd left enabled.
-fn restore_daemons(sys: &mut dyn Sys) -> Result<()> {
-    if !sys.exists(FRR_DAEMONS) {
-        return Ok(());
-    }
-    let cur = sys.read(FRR_DAEMONS)?;
-    if !sys.exists(FRR_DAEMONS_SNAPSHOT) {
-        let restored: String = cur
-            .lines()
-            .map(|l| match l {
-                "vrrpd=yes" => "vrrpd=no".to_string(),
-                "bgpd=yes" => "bgpd=no".to_string(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        return sys.write(FRR_DAEMONS, &restored);
-    }
-    let snap = sys.read(FRR_DAEMONS_SNAPSHOT)?;
-    fn managed(line: &str) -> Option<&str> {
-        let (key, _) = line.split_once('=')?;
-        MANAGED_DAEMON_KEYS.contains(&key).then_some(key)
-    }
-    let orig: std::collections::BTreeMap<&str, &str> = snap
-        .lines()
-        .filter_map(|l| managed(l).map(|k| (k, l)))
-        .collect();
-    let mut out: Vec<&str> = Vec::new();
-    for line in cur.lines() {
-        match managed(line) {
-            None => out.push(line),
-            // A managed line the snapshot never had (e.g. the appended ospfd_instances) is
-            // dropped; otherwise the original line replaces ours.
-            Some(key) => {
-                if let Some(o) = orig.get(key) {
-                    out.push(o);
-                }
-            }
-        }
-    }
-    sys.write(FRR_DAEMONS, &(out.join("\n") + "\n"))?;
-    sys.remove(FRR_DAEMONS_SNAPSHOT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RawConfig;
+    use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
-    #[test]
-    fn restore_daemons_puts_managed_keys_back_from_snapshot() {
-        let mut sys = MockSys::default()
-            .file(
-                FRR_DAEMONS,
-                "zebra=yes\nospfd=yes\nbfdd=yes\nvrrpd=yes\nbgpd=no\nstaticd=no\n\
-                 ospfd_instances=\"100,200,250\"\n",
+    fn fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
+    fn sys_with_a_storage_fallback_leg() -> MockSys {
+        MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
+            .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: bond \n",
             )
-            .file(
-                FRR_DAEMONS_SNAPSHOT,
-                "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=yes\nstaticd=no\n",
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st@eth9: vlan protocol 802.1Q id 300 \n",
+            )
+    }
+
+    /// `ip link del <bond>` RELEASES its slaves, it does not delete them — so the slaves get
+    /// their own deletes, and the bond goes first (ownership-proof clarity: the engine is
+    /// already stopped and swept before any netdev is touched).
+    #[test]
+    fn down_deletes_a_fallback_bond_before_its_slaves() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg();
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            ["ip link del cfab-st-fb", "ip link del cfab-st-fb-st"]
+        );
+    }
+
+    /// The same declaration with the ingress leg on island `any`.
+    fn fabric_with_a_migrating_gw() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("mg:249:", "any:249:");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
+    /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
+    /// ("not a vlan") and strand the leg on a `cfab down`.
+    #[test]
+    fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg@eth0: vlan protocol 802.1Q id 249 \n",
             );
-        restore_daemons(&mut sys).unwrap();
-        let got = sys.files.get(FRR_DAEMONS).unwrap();
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
         assert_eq!(
-            got, "zebra=yes\nospfd=no\nbfdd=no\nvrrpd=no\nbgpd=yes\nstaticd=no\n",
-            "managed keys back to pre-cfab values (bgpd back ON), appended instances line \
-             dropped, unmanaged lines untouched"
+            dels,
+            [
+                "ip link del cfab-st-fb",
+                "ip link del cfab-gw249",
+                "ip link del cfab-st-fb-st",
+                "ip link del cfab-gw249-mg",
+            ]
         );
+    }
+
+    /// Prove ownership before destroy: a stranger wearing the bond's name is refused, and a
+    /// slave name carrying something that is not a vlan is refused too.
+    #[test]
+    fn down_refuses_a_fallback_netdev_of_the_wrong_kind() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+
+        let mut sys = sys_with_a_storage_fallback_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-fb"],
+            "9: cfab-st-fb: bridge \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
         assert!(
-            !sys.files.contains_key(FRR_DAEMONS_SNAPSHOT),
-            "snapshot consumed"
+            e.contains("REFUSING: cfab-st-fb exists but is not a bond"),
+            "{e}"
         );
+        assert!(!sys.ran("ip link del cfab-st-fb"));
+
+        let mut sys = sys_with_a_storage_fallback_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+            "10: cfab-st-fb-st: macvlan \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-fb-st exists but is not a vlan"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-st-fb-st"));
     }
 
+    /// Routes the engine left behind (a crash) are swept by `down`, one delete per route,
+    /// before the first interface is deleted.
     #[test]
-    fn restore_daemons_keeps_operator_edits_to_unmanaged_keys() {
+    fn down_sweeps_private_proto_routes() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // No netdevs left but one identity veth, so exactly one `ip link del` follows the sweep.
         let mut sys = MockSys::default()
-            .file(FRR_DAEMONS, "ospfd=yes\nripd=yes\n")
-            .file(FRR_DAEMONS_SNAPSHOT, "ospfd=no\nripd=no\n");
-        restore_daemons(&mut sys).unwrap();
+            .on_stdout(
+                &["ip", "-4", "route", "show", "table", "all", "proto", "201"],
+                "10.99.0.1 via 10.99.1.1 dev cfab-st proto 201 metric 20\n\
+                 10.199.0.1 via 10.199.1.1 dev cfab-cl proto 201 metric 20\n",
+            )
+            .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
+            .on_stdout(
+                &["ip", "link", "show", "cfab-id99"],
+                "5: cfab-id99@cfab-id99-peer\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-id99"],
+                "5: cfab-id99: veth \n",
+            );
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.contains("proto 201"))
+            .filter(|c| c.starts_with("ip route del"))
+            .collect();
         assert_eq!(
-            sys.files.get(FRR_DAEMONS).unwrap(),
-            "ospfd=no\nripd=yes\n",
-            "ripd is not cfab's — the operator's mid-lifecycle edit survives"
+            dels,
+            [
+                "ip route del 10.99.0.1 metric 20 proto 201",
+                "ip route del 10.199.0.1 metric 20 proto 201"
+            ]
         );
-    }
-
-    #[test]
-    fn restore_daemons_without_snapshot_uses_historical_fallback() {
-        let mut sys =
-            MockSys::default().file(FRR_DAEMONS, "ospfd=yes\nbfdd=yes\nvrrpd=yes\nbgpd=yes\n");
-        restore_daemons(&mut sys).unwrap();
-        assert_eq!(
-            sys.files.get(FRR_DAEMONS).unwrap(),
-            "ospfd=yes\nbfdd=yes\nvrrpd=no\nbgpd=no\n"
+        let last_del = sys
+            .calls
+            .iter()
+            .rposition(|c| c.starts_with("ip route del") && c.contains("proto 201"))
+            .unwrap();
+        let first_link_del = sys
+            .calls
+            .iter()
+            .position(|c| c.starts_with("ip link del"))
+            .unwrap();
+        assert!(
+            last_del < first_link_del,
+            "sweep precedes interface deletion"
         );
-    }
-
-    #[test]
-    fn restore_daemons_no_file_is_a_noop() {
-        let mut sys = MockSys::default();
-        restore_daemons(&mut sys).unwrap();
-        assert!(sys.files.is_empty());
     }
 }

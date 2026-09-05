@@ -29,11 +29,12 @@ depend on.
 ```
 cfab check                      # parse + validate fabric.conf, print this member's resolved view
 cfab schema                     # the fabric.conf data model as JSON Schema
-cfab gen policy|mark|frr        # pure generators: print the derived artifacts
+cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
 cfab up                         # apply the fabric on this member (idempotent, root)
 cfab down                       # remove everything `up` created, restore pre-fabric FRR
-cfab verify [--timeout N]       # exit 0 OK / 2 degraded / 1 failed
+cfab status [--wait N] [--permissive]
+                                # UP 0 / UP-DEGRADED 1 / FAILED 2 / DOWN 3
 cfab measure-cap <dev> <peer>   # measure a wire's real capacity; feeds the shape derivation
 cfab policy-teeth               # prove the forward policy in throwaway netnses — and prove the proof bites
 cfab cluster status             # Proxmox (pmxcfs) coordination state; clean "not clustered" when absent
@@ -44,6 +45,32 @@ cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands starte
 `--config` defaults to `fabric.conf` beside the binary; `--host` to `$CFAB_HOST`, else the
 kernel hostname.
 
+## Running it as a service
+
+The Debian package ships `cfab-fabric.service`, **installed disabled and not started** —
+installing cfab never changes the network. Write `/etc/cfab/fabric.conf`, then:
+
+```
+systemctl enable --now cfab-fabric
+```
+
+The unit is `Type=oneshot` + `RemainAfterExit=yes`; `ExecStart`/`ExecReload` are `cfab up`,
+`ExecStop` is `cfab down`. `ConditionPathExists=/etc/cfab/fabric.conf` means a host with the
+package but no declaration is skipped at boot rather than failed. Set `CFAB_HOST` in
+`/etc/default/cfab` only when this member's row is not named by the kernel hostname.
+
+A package upgrade neither stops nor restarts the unit: stopping it runs `cfab down`, an outage
+for every identity on the host. The engine already running keeps the old binary's inode, so the
+new binary takes effect at the next `systemctl reload cfab-fabric` — which is `cfab up` again,
+and `up` always stops and restarts the routing engine, so this member's adjacencies drop and
+re-form. `apt remove` stops the unit (`cfab down`, correct: the binary is going away) and
+disables it; `apt purge` also removes `/etc/default/cfab`.
+
+The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the engine's private
+kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other`
+204) so `ip route` prints them instead of bare numbers — cosmetic only; cfab's own sweep
+matches the numeric ids.
+
 ## Cluster coordination (optional, never required)
 
 On a Proxmox cluster, `cfab` additionally coordinates through pmxcfs (`/etc/pve`) — probed at
@@ -52,7 +79,7 @@ the point of use, with identical single-host behavior when absent:
 - `conf publish` distributes one validated `fabric.conf` cluster-wide (atomic rename publish,
   generation counter, stale-lock reclaim).
 - `conf-sync` applies published configurations under a **peer-witness protocol**: validate →
-  apply → verify → ack, then commit only once at least one fresh peer ack proves the new
+  apply → status → ack, then commit only once at least one fresh peer ack proves the new
   fabric actually carries traffic — otherwise revert to the previous configuration. A
   cluster-wide bad config (one the switches cannot forward) self-heals: every member reverts.
 - `measure-cap` serializes floods behind a cluster lease and publishes measured capacities so
@@ -65,9 +92,14 @@ the point of use, with identical single-host behavior when absent:
   argv vectors, no shell, fully mockable — every imperative branch is unit-tested.
 - **Fail loud, never degrade silently.** A missing capability, absent interface, or unmet
   precondition is a clear, actionable error, never a partial apply.
-- **Verify is a first-class citizen.** `verify` checks the fabric end to end (BFD sessions,
-  identities, source pinning, forward posture) and its exit code is the contract every other
-  mechanism builds on.
+- **Detectors actuate, `status` reports.** A condition that makes a link unsafe is brought down
+  by the watchdog, and the state follows from the adjacency counts; everything else is a reason
+  line that never moves the state. `status` itself is read-only, with a test that proves it —
+  a false FAILED costs an exit code, a false actuation costs packets.
+- **`status` is a first-class citizen.** It reads the fabric end to end (BFD sessions, fallback
+  neighbors, identities, source pinning, forward posture) and reports one of four states with
+  three counts, `(<peers> | <links> | <fallbacks>)`. Its exit code — 0 UP, 1 UP-DEGRADED,
+  2 FAILED, 3 DOWN — is the contract every other mechanism builds on.
 
 ## Building
 
