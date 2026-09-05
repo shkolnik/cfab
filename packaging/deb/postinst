@@ -5,8 +5,21 @@ set -e
 
 # cargo-deb emits a daemon-reload only from its start/restart snippets, and this package
 # deliberately has neither (installing cfab must not touch the network, and an upgrade must
-# not stop the fabric). Without this, an upgrade that changes cfab-fabric.service leaves
+# not stop the fabric). Without this, an upgrade that changes cfab.service leaves
 # systemd running the old unit definition until something else reloads it.
 if [ -d /run/systemd/system ]; then
 	systemctl --system daemon-reload >/dev/null || true
+fi
+
+# 0.2.0 shipped cfab-fabric.service (a oneshot `cfab up`) plus transient units this release
+# replaces. Only the testbed ever ran 0.2.0; there is no compatibility beyond it. Installing
+# cfab must still not change the network, so nothing is stopped or started here — the
+# migration is one operator command, printed below.
+if [ -d /run/systemd/system ] && systemctl is-enabled cfab-fabric.service >/dev/null 2>&1; then
+	systemctl disable cfab-fabric.service >/dev/null 2>&1 || true
+	systemctl enable cfab.service >/dev/null 2>&1 || true
+	echo "cfab: cfab-fabric.service disabled, cfab.service enabled. The 0.2.0 daemons are"
+	echo "cfab: still running. Complete the migration with:"
+	echo "cfab:   systemctl stop cfab-fabric.service cfab-engine cfab-shape cfab-conf-sync cfab-fwd-watchdog.timer"
+	echo "cfab:   systemctl start cfab.service"
 fi

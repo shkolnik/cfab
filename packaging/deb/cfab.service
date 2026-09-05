@@ -1,0 +1,39 @@
+[Unit]
+Description=cfab fabric member
+Documentation=man:cfab(8)
+# The wires must exist and be named before the apply configures them; ifupdown2/PVE boot
+# ordering beyond this is unverified, and no ordering against frr.service is declared.
+After=network-online.target networking.service
+Wants=network-online.target
+# Installed but unconfigured is a clean boot, not a failure: with no declaration there is
+# nothing to apply, so the unit is skipped rather than started and failed.
+ConditionPathExists=/etc/cfab/fabric.conf
+# Never give up on a member whose absence is "no fabric" on an unattended host. Measured
+# 2026-09-05 on pve1-tb: the default 5-starts-in-10-s limit turned a crash loop into a
+# permanent silent outage.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+# CFAB_HOST only, and only when this member's row is not named by the kernel hostname.
+EnvironmentFile=-/etc/default/cfab
+ExecStart=/usr/bin/cfab run
+# Re-apply in place: no teardown, no netdev churn. The engine and the shape daemon restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+# 3 = the declaration or this host refused the apply; 4 = another supervisor holds the lock.
+# Neither is fixed by trying again.
+RestartPreventExitStatus=3 4
+# The apply may take START_WAIT (30 s) + SETTLE (3 s) before READY=1.
+TimeoutStartSec=120
+# The stop sequence signals all children at once and gives each 10 s before SIGKILL, then
+# tears the fabric down.
+TimeoutStopSec=60
+WatchdogSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

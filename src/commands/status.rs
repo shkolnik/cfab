@@ -20,11 +20,20 @@ use crate::commands::engine_ctl;
 use crate::derive::{View, segments_of};
 use crate::emit;
 use crate::error::Result;
-use crate::model::MemberKind;
+use crate::model::{Fabric, MemberKind};
+use crate::supervisor::child::State as CompState;
+use crate::supervisor::report::{Components, render_line};
 use crate::sys::{Sys, run_optional};
 
 /// The re-read cadence of `--wait`.
 const POLL_SECS: u64 = 2;
+
+/// The forwarding watchdog ticks every 3 s (spec §5). `status` treats it as not ticking once
+/// the last tick is older than this — comfortably past three missed ticks, so a scheduling
+/// hiccup on a busy single-vCPU host does not raise a false alarm. This is a reason line, never
+/// actuation, so a generous bar is right: a false positive costs an operator a look, a packet
+/// never. Chosen, not derived — the tick cadence is a supervisor constant, not a declaration.
+const WATCHDOG_STALE_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -114,21 +123,26 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
     // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not desired,
     // and there is nothing to wait for.
     if !sys.exists(&f.run_dir) {
+        // No fabric applied: there is nothing to describe and no supervisor to ask, so the
+        // always-printed components line is suppressed here alone.
         return Ok(finish(
             view,
             State::Down,
             "fabric not applied".to_string(),
             &Ctx::default(),
             permissive,
+            None,
+            false,
         ));
     }
 
     let expected = expected_links(view)?;
     let mut t = 0u64;
-    let (mut counts, mut c);
+    let (mut counts, mut c, mut comps);
     loop {
         c = Ctx::default();
-        counts = read(sys, view, &expected, &mut c)?;
+        comps = read_components(sys, f);
+        counts = read(sys, view, &expected, &mut c, comps.as_ref())?;
         // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
         // A degraded or failed member waits the full deadline and then reports what it reached.
         if counts.state() == State::Up || t >= wait_s {
@@ -143,10 +157,55 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
         counts.fields(),
         &c,
         permissive,
+        comps.as_ref(),
+        true,
     ))
 }
 
-fn finish(view: &View, state: State, fields: String, c: &Ctx, permissive: bool) -> StatusReport {
+/// The `components` document over `<run_dir>/cfab.sock` (spec §9). A read, never a write; the
+/// supervisor being absent, slow or unparseable is not a crash — it degrades to `None`, which
+/// the engine row and the components line render as "no supervisor answering".
+fn read_components(sys: &mut dyn Sys, f: &Fabric) -> Option<Components> {
+    let reply = sys
+        .unix_request(&format!("{}/cfab.sock", f.run_dir), "components\n")
+        .ok()?;
+    serde_json::from_str(&reply).ok()
+}
+
+/// The engine's socket is silent: say why, in the one spelling the condition earns. With a
+/// supervisor answering, quote the child it reports; without one, name the socket and the
+/// remedy. The engine is a supervised child now, never its own unit.
+fn engine_down_reason(f: &Fabric, comps: Option<&Components>) -> String {
+    match comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) {
+        Some(e) => {
+            let mut s = format!(
+                "engine not running: the supervisor reports it {}, {} restart(s)",
+                e.state.as_str(),
+                e.restarts
+            );
+            if let Some(x) = &e.last_exit {
+                s.push_str(&format!(", last exit {}", x.cause));
+            }
+            s
+        }
+        None => format!(
+            "engine not running: no supervisor answering on {}/cfab.sock — start it \
+             (systemctl start cfab)",
+            f.run_dir
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    view: &View,
+    state: State,
+    fields: String,
+    c: &Ctx,
+    permissive: bool,
+    comps: Option<&Components>,
+    with_components: bool,
+) -> StatusReport {
     let kind_s = match view.kind() {
         MemberKind::Host => "host",
         MemberKind::Leaf => "leaf",
@@ -158,6 +217,21 @@ fn finish(view: &View, state: State, fields: String, c: &Ctx, permissive: bool) 
     );
     for r in once_each(&c.reasons) {
         let _ = writeln!(out, "  {r}");
+    }
+    // The one always-printed line (spec §9): last, so the reasons read as a block above it.
+    if with_components {
+        match comps {
+            Some(cc) => {
+                let _ = writeln!(out, "  {}", render_line(cc));
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  components: no supervisor answering on {}/cfab.sock",
+                    view.fabric.run_dir
+                );
+            }
+        }
     }
     let code = if permissive && matches!(state, State::Up | State::UpDegraded) {
         0
@@ -205,20 +279,24 @@ fn read(
     view: &View,
     expected: &[(u8, String, u8, String)],
     c: &mut Ctx,
+    comps: Option<&Components>,
 ) -> Result<Counts> {
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
     // below needs the engine. Diagnose that before reporting its symptoms.
-    let port_taken = bfd_port(sys, view, c)?;
+    bfd_port(sys, view, c, comps)?;
     let doc = engine_ctl::state(sys, f).ok();
-    if doc.is_none() && !port_taken {
-        c.note("engine not running: cfab-engine.service is not answering — re-run cfab up");
+    if doc.is_none() {
+        // The engine's socket is silent. The supervisor (spec §9) is the authority on why:
+        // if it answers, quote the child's state; if it does not, the fault is upstream of
+        // the engine and the remedy is to start the service — one spelling each.
+        c.note(engine_down_reason(f, comps));
     }
-    posture(sys, view, doc.as_ref(), c)?;
+    posture(sys, view, doc.as_ref(), comps, c)?;
     return_path_and_ingress(sys, view, doc.as_ref(), c)?;
     mark_drift(sys, view, c)?;
     ceiling_counters(sys, view, c)?;
-    shape_posture(sys, view, c)?;
+    shape_posture(sys, view, comps, c)?;
     link_speeds(sys, view, c)?;
 
     let mut counts = Counts::default();
@@ -273,11 +351,11 @@ fn read(
 
 /// BFD port custody, and the one diagnosis that must run before anything else: the engine binds
 /// udp/BFD_PORT exclusively (no SO_REUSEADDR), so a daemon holding the port makes the engine exit
-/// at the first session instead of stealing our packets. Returns true when that is why there is
-/// no engine to talk to. A second BFD daemon that is merely present is a reason line: it takes
-/// the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on both sides FRR's bfdd
-/// and holo both bound 0.0.0.0:3784 and the last binder silently took every packet, either order.
-fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
+/// at the first session instead of stealing our packets. A second BFD daemon that is present is a
+/// reason line: it takes the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on
+/// both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder silently took every
+/// packet, either order.
+fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Components>) -> Result<()> {
     let f = view.fabric;
     let port = f.bfd_port;
     let mut found: Vec<String> = Vec::new();
@@ -313,27 +391,52 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
             found.join(", ")
         ));
     }
-    // A bind failure in the log is only news while the engine is gone: the engine that answers
-    // holds the port (nothing else can), and a line from a start it has since survived is history.
-    if engine_ctl::state(sys, f).is_ok() {
-        return Ok(false);
-    }
-    let systemd = sys.exists("/run/systemd/system");
-    let log = engine_ctl::engine_log(sys, f, systemd);
-    let Some(line) = engine_ctl::bfd_bind_error_line(&log, port) else {
-        return Ok(false);
+    // A bind failure in the ring buffer is only news while the engine is gone. The supervisor is
+    // the authority on that: no engine component (no supervisor answering — the frr/bfdd probe
+    // above already ran and we cannot read the ring) means no scan, and a `running` engine holds
+    // the port (nothing else can), so any bind line it left is history. Only an engine the
+    // supervisor reports down earns the diagnosis, read from its child ring buffer over cfab.sock
+    // (spec §3/§9) — best effort, a silent or unparseable socket just leaves the generic reason.
+    let Some(engine) = comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) else {
+        return Ok(());
     };
-    c.note(format!(
-        "bfd udp/{port}: the engine is not running and could not bind it — {line}"
-    ));
-    c.note(format!(
-        "remedy: {}",
-        engine_ctl::bfd_bind_remedy(line, port)
-    ));
-    Ok(true)
+    if engine.state == CompState::Running {
+        return Ok(());
+    }
+    let reply = match sys.unix_request(&format!("{}/cfab.sock", f.run_dir), "log engine 200\n") {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let Ok(doc) = serde_json::from_str::<LogReply>(&reply) else {
+        return Ok(());
+    };
+    let joined = doc.lines.join("\n");
+    if let Some(line) = engine_ctl::bfd_bind_error_line(&joined, port) {
+        c.note(format!(
+            "bfd udp/{port}: the engine is not running and could not bind it — {line}"
+        ));
+        c.note(format!(
+            "remedy: {}",
+            engine_ctl::bfd_bind_remedy(line, port)
+        ));
+    }
+    Ok(())
 }
 
-fn posture(sys: &mut dyn Sys, view: &View, doc: Option<&Value>, c: &mut Ctx) -> Result<()> {
+/// The `log <name> [n]` reply over `cfab.sock` (spec §9): the child ring buffer's tail. A parse
+/// failure degrades the BFD diagnosis to silence — it is never load-bearing enough to crash.
+#[derive(serde::Deserialize)]
+struct LogReply {
+    lines: Vec<String>,
+}
+
+fn posture(
+    sys: &mut dyn Sys,
+    view: &View,
+    doc: Option<&Value>,
+    comps: Option<&Components>,
+    c: &mut Ctx,
+) -> Result<()> {
     let f = view.fabric;
     // The fallback bond is a segment here: it carries L3 and takes the same loose rp_filter.
     // Its slaves never appear — they are L2 only.
@@ -508,11 +611,16 @@ fn posture(sys: &mut dyn Sys, view: &View, doc: Option<&Value>, c: &mut Ctx) -> 
                     ));
                 }
             }
-            if !sys
-                .run(&["systemctl", "is-active", "-q", "cfab-fwd-watchdog.timer"])?
-                .ok()
+            // The watchdog is a task in the supervisor now (spec §5): read its last tick from
+            // the components document instead of probing a systemd timer. No supervisor answering
+            // is already said once on the components line, so this row stays silent then.
+            if let Some(cc) = comps
+                && let Some(ago) = cc.watchdog.last_tick_s_ago
+                && ago > WATCHDOG_STALE_SECS
             {
-                c.note("cfab-fwd-watchdog.timer not active (the actuator is down)");
+                c.note(format!(
+                    "forwarding watchdog not ticking (last tick {ago}s ago) — the actuator is down"
+                ));
             }
         }
         MemberKind::Host => {
@@ -889,15 +997,27 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
 /// The daemon must be alive, and every wire with carrier must carry exactly the tree the shape
 /// derivation gives for the current up-set. A wire without carrier may hold a stale tree
 /// (left alone).
-fn shape_posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+fn shape_posture(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<&Components>,
+    c: &mut Ctx,
+) -> Result<()> {
     if view.kind() != MemberKind::Host {
         return Ok(());
     }
-    if !sys
-        .run(&["systemctl", "is-active", "-q", "cfab-shape.service"])?
-        .ok()
+    // shape-daemon is a supervised child now (spec §9): its liveness is the state the supervisor
+    // reports, not a systemd unit. Anything other than `running` is shaping down; no supervisor
+    // answering is already said once on the components line, so this row stays silent then.
+    if let Some(cc) = comps
+        && let Some(sd) = cc.components.iter().find(|k| k.name == "shape-daemon")
+        && sd.state != CompState::Running
     {
-        c.note("shaping down: cfab-shape.service not active");
+        c.note(format!(
+            "shaping down: shape-daemon is {}, {} restart(s)",
+            sd.state.as_str(),
+            sd.restarts
+        ));
     }
     let wires = view.wires();
     let carrier_up: Vec<bool> = wires
@@ -948,6 +1068,14 @@ fn shape_posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
 
 fn link_speeds(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     for wire in view.wires() {
+        // Task 5b (RULED, James 2026-09-05): an absent wire gets its own spelling, distinct
+        // from a present-but-carrierless one — an operator must tell "unplugged" from "gone".
+        if !sys.exists(&format!("/sys/class/net/{wire}")) {
+            c.note(format!(
+                "wire {wire} absent (no such netdev) — its segments are not configured"
+            ));
+            continue;
+        }
         let decl = view.link_speed(&wire)?.to_string();
         let obs = sys
             .read(&format!("/sys/class/net/{wire}/speed"))
@@ -1139,6 +1267,9 @@ mod tests {
                     "0\n",
                 );
         }
+        for w in view.wires() {
+            sys = sys.file(&format!("/sys/class/net/{w}"), "");
+        }
         sys = mark_env(fallback_sysfs(sys, view, "0\n"), view);
         sys
             .on_stdout(&["ip", "rule", "show", "pref", "1000"],
@@ -1194,11 +1325,40 @@ mod tests {
         sys
     }
 
-    /// The healthy leaf, ready to run: every posture file, every route, every session up.
+    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
+    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
+    /// (this testbed is not clustered), and the forwarding watchdog ticking. Uptimes are 3600 s
+    /// so the line renders `1h00m`.
+    fn healthy_components(view: &View) -> String {
+        let shape = if view.kind() == MemberKind::Host {
+            serde_json::json!({"name": "shape-daemon", "state": "running", "pid": 1250,
+                "uptime_s": 3600, "restarts": 0, "last_exit": null})
+        } else {
+            serde_json::json!({"name": "shape-daemon", "state": "stopped", "pid": null,
+                "uptime_s": null, "restarts": 0, "last_exit": null, "why": "host only"})
+        };
+        serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                shape,
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string()
+    }
+
+    /// The healthy leaf, ready to run: every posture file, every route, every session up, and a
+    /// supervisor answering the `components` query.
     fn healthy_leaf(view: &View) -> MockSys {
         let f = view.fabric;
         primary_routes(leaf_env(view), view)
             .socket("/run/cfab/engine.sock", &engine_doc(view, &all_bfd_up(f)))
+            .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
     /// `table inet cfab` as `up` leaves it: the generated file, the `-s` readback it stores and
@@ -1304,6 +1464,7 @@ mod tests {
         }
         for w in view.wires() {
             sys = sys
+                .file(&format!("/sys/class/net/{w}"), "")
                 .file(&format!("/sys/class/net/{w}/carrier"), "1\n")
                 .file(
                     &format!("/sys/class/net/{w}/speed"),
@@ -1364,8 +1525,15 @@ mod tests {
             "tc class show dev ",
             "ethtool -i ",
         ];
-        (call.starts_with("unix_request ") && call.trim_end().ends_with(" state"))
-            || ALLOWED.iter().any(|p| call.starts_with(p))
+        if let Some(rest) = call.strip_prefix("unix_request ") {
+            // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
+            // `components` / `log` (spec §9). Every other request would be a write.
+            return matches!(
+                rest.split_whitespace().nth(1),
+                Some("state" | "components" | "log")
+            );
+        }
+        ALLOWED.iter().any(|p| call.starts_with(p))
     }
 
     /// One `status` run over one fixture: nothing in `MockSys.files` may change, and every
@@ -1404,15 +1572,6 @@ mod tests {
         assert_never_writes("healthy leaf", &mut healthy_leaf(&leaf), &leaf, 0);
         assert_never_writes("engine absent (FAILED)", &mut leaf_env(&leaf), &leaf, 0);
         assert_never_writes("no run dir (DOWN)", &mut MockSys::default(), &leaf, 0);
-        assert_never_writes(
-            "bfd port taken (FAILED)",
-            &mut leaf_env(&leaf).file(
-                "/run/cfab/engine.log",
-                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use\n",
-            ),
-            &leaf,
-            0,
-        );
 
         let mut bfd = all_bfd_up(&f);
         bfd[0].1 = "down";
@@ -1623,6 +1782,7 @@ mod tests {
             }
         }
         sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
+            .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
     #[test]
@@ -1788,7 +1948,10 @@ mod tests {
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert_eq!(
-            report.output, "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n",
+            report.output,
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  components: engine running 1h00m \
+             (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
+             | watchdog ok 2s ago\n",
             "{}",
             report.output
         );
@@ -1822,50 +1985,6 @@ mod tests {
         );
     }
 
-    /// The engine is gone because the port is taken: zero adjacencies is FAILED, and the
-    /// doctor's diagnosis rides along as the reason so a dead-because-stolen-port engine is
-    /// explained rather than reported as a bare FAILED.
-    #[test]
-    fn a_lost_bfd_port_is_failed_with_the_diagnosis() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = leaf_env(&view).file(
-            "/run/cfab/engine.log",
-            "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n",
-        );
-        let report = run(&mut sys, &view, 0, false).unwrap();
-        assert_eq!(report.state, State::Failed, "output:\n{}", report.output);
-        assert_eq!(report.code, 2);
-        assert_eq!(
-            headline(&report),
-            "FAILED (0/2 | 0/18 | 0/6) on pve3-tb (leaf)"
-        );
-        assert!(
-            report.output.contains(
-                "  bfd udp/3784: the engine is not running and could not bind it — bfd: \
-                 cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n"
-            ),
-            "{}",
-            report.output
-        );
-        assert!(
-            report.output.contains(
-                "  remedy: stop FRR, which owns bfdd: systemctl disable --now frr; or declare a \
-                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
-                 session must use the same port\n"
-            ),
-            "{}",
-            report.output
-        );
-        // The generic "engine not running" line must NOT also appear: one spelling per
-        // condition, and the doctor's is the one that names the cause.
-        assert!(
-            !report.output.contains("engine not running:"),
-            "{}",
-            report.output
-        );
-    }
-
     /// The engine is simply absent (no port thief): still zero adjacencies, still FAILED, and
     /// the reason names the engine rather than eighteen symptoms of it.
     #[test]
@@ -1880,11 +1999,19 @@ mod tests {
             headline(&report),
             "FAILED (0/2 | 0/18 | 0/6) on pve3-tb (leaf)"
         );
+        // No supervisor answering on cfab.sock (leaf_env registers none): the fault is upstream
+        // of the engine, and the row names the socket and the remedy — never the old unit.
         assert!(
             report.output.contains(
-                "  engine not running: cfab-engine.service is not answering — re-run cfab up\n"
+                "  engine not running: no supervisor answering on /run/cfab/cfab.sock — start it \
+                 (systemctl start cfab)\n"
             ),
             "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("cfab-engine.service"),
+            "the old spelling must be gone: {}",
             report.output
         );
     }
@@ -2042,12 +2169,9 @@ mod tests {
         bfd[0].1 = "down";
         let degraded = engine_doc(&view, &bfd);
         let up = engine_doc(&view, &all_bfd_up(&f));
-        // The doctor and the count each read the socket once per pass, so a pass consumes two
-        // replies; the last reply repeats forever.
-        let mut sys = primary_routes(leaf_env(&view), &view).socket_seq(
-            "/run/cfab/engine.sock",
-            &[degraded.clone(), degraded, up.clone(), up],
-        );
+        // The count reads the engine socket once per pass; the last reply repeats forever.
+        let mut sys = primary_routes(leaf_env(&view), &view)
+            .socket_seq("/run/cfab/engine.sock", &[degraded, up]);
         let report = run(&mut sys, &view, 30, false).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
@@ -2311,6 +2435,77 @@ mod tests {
                 .output
                 .contains("  rp_filter cfab-mg-fb=1 (want 2 = loose)\n"),
             "{}",
+            report.output
+        );
+    }
+
+    /// Task 5b (RULED, James 2026-09-05): a declared wire with no netdev gets its own reason
+    /// line — distinct from the existing "no carrier" wording — and grades UP-DEGRADED by
+    /// adjacency exactly as a carrier-less wire does, never a refusal.
+    #[test]
+    fn status_names_an_absent_wire_in_its_own_words() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // eth9 carries storage seg1 (primary), cluster seg2 (backup) and mgmt seg3 (backup):
+        // an absent eth9 kills adjacency on exactly those three (zone, seg) pairs, for both
+        // peers.
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    let dark = (z.name == "storage" && seg == 1)
+                        || (z.name == "cluster" && seg == 2)
+                        || (z.name == "mgmt" && seg == 3);
+                    bfd.push((
+                        format!("{}.{seg}.{p}", z.block()),
+                        if dark { "down" } else { "up" },
+                    ));
+                }
+            }
+        }
+        let mut sys = host_env(&view);
+        // Review finding 7 (2026-09-05): a real absent netdev has no children either — drop
+        // every "/sys/class/net/eth9"-prefixed entry, not just the bare directory marker, so
+        // this test would fail (not pass by ordering alone) if any later check started
+        // reading a file under an absent wire.
+        sys.files
+            .retain(|k, _| !k.starts_with("/sys/class/net/eth9"));
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                let prim = view
+                    .class_rows()
+                    .into_iter()
+                    .filter(|r| r.zone == z.name)
+                    .min_by_key(|r| r.ospf_cost)
+                    .unwrap()
+                    .ifname;
+                sys = sys.on_stdout(
+                    &["ip", "route", "get", &format!("{}.0.{p}", z.block())],
+                    &format!(
+                        "{}.0.{p} dev {prim} src {}.0.1 uid 0\n",
+                        z.block(),
+                        z.block()
+                    ),
+                );
+            }
+        }
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  wire eth9 absent (no such netdev) — its segments are not configured\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("no carrier"),
+            "not the carrier row: {}",
+            report.output
+        );
+        assert_eq!(
+            report.code, 1,
+            "UP-DEGRADED: graded by adjacency, as today: {}",
             report.output
         );
     }
@@ -2669,5 +2864,190 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    // ---- Task 11: the components block and the reworded rows (spec §9) ------------------
+
+    /// A `components:` line is always printed, and last — after every reason line.
+    #[test]
+    fn the_components_line_is_always_printed_last() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        let last = report.output.lines().last().unwrap();
+        assert_eq!(
+            last,
+            "  components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago"
+        );
+    }
+
+    /// No supervisor answering: stated once on the components line and once in the engine row,
+    /// both naming the run-dir socket, and the old `cfab-engine.service` spelling gone.
+    #[test]
+    fn no_supervisor_is_stated_once_on_the_components_line_and_in_the_engine_row() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The fabric is applied (leaf_env creates the run dir) but no cfab.sock answers, and the
+        // engine's own socket is silent too.
+        let mut sys = leaf_env(&view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  engine not running: no supervisor answering on /run/cfab/cfab.sock — start it \
+                 (systemctl start cfab)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("  components: no supervisor answering on /run/cfab/cfab.sock\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("cfab-engine.service"),
+            "the old spelling must be gone: {}",
+            report.output
+        );
+    }
+
+    /// The watchdog and shaping rows are read from the components document, not a local probe:
+    /// a stale tick is "not ticking", a shape-daemon that is not `running` is "shaping down".
+    #[test]
+    fn the_watchdog_and_shaping_rows_read_the_components_document() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "shape-daemon", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 3, "last_exit": {"cause": "signal SIGKILL", "s_ago": 1}},
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 47, "result": "error", "detail": "no tick"}
+        })
+        .to_string();
+        let mut sys = healthy_host(&f, &view).socket("/run/cfab/cfab.sock", &comps);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        let out = &report.output;
+        assert!(
+            out.contains(
+                "  forwarding watchdog not ticking (last tick 47s ago) — the actuator is down\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  shaping down: shape-daemon is restarting, 3 restart(s)\n"),
+            "{out}"
+        );
+    }
+
+    /// A BFD bind failure the engine could not recover from, diagnosed from the child ring
+    /// buffer over cfab.sock — the exact gap this change closes: no frr enabled and no bfdd
+    /// process (the host probe above finds nothing), yet the engine is down because *something*
+    /// holds udp/3784, and the ring buffer carries holo's line. The supervisor reports the engine
+    /// down; status reads `log engine` and turns the line into the named remedy.
+    #[test]
+    fn a_bind_failure_in_the_ring_buffer_is_diagnosed_when_the_engine_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 60, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 4, "last_exit": {"cause": "exit 1", "s_ago": 1}}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string();
+        let log = serde_json::json!({
+            "lines": [
+                "engine starting",
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)"
+            ]
+        })
+        .to_string();
+        // No engine.sock: `state` fails, the engine is down. cfab.sock answers both verbs.
+        let mut sys = leaf_env(&view)
+            .socket_verb("/run/cfab/cfab.sock", "components", &comps)
+            .socket_verb("/run/cfab/cfab.sock", "log", &log);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  bfd udp/3784: the engine is not running and could not bind it — bfd: cannot \
+                 bind udp 0.0.0.0:3784: address in use (holder unknown)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
+                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
+                 session must use the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Teeth for the running-engine gate: the engine that answers holds the port, so a bind line
+    /// still sitting in its ring buffer is stale history and must be suppressed. Invariant: the
+    /// diagnosis fires only for an engine the supervisor reports NOT running. Regressing the gate
+    /// (deleting the `CompState::Running` early return in `bfd_port`) makes this test fail —
+    /// verified during development, then the gate was restored.
+    #[test]
+    fn a_stale_bind_line_is_suppressed_while_the_engine_runs() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let log = serde_json::json!({
+            "lines": [
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)"
+            ]
+        })
+        .to_string();
+        // Healthy host: the engine is up and the supervisor reports it `running`; the ring buffer
+        // still carries a bind line from an earlier start it has since survived.
+        let mut sys = healthy_host(&f, &view)
+            .socket_verb(
+                "/run/cfab/cfab.sock",
+                "components",
+                &healthy_components(&view),
+            )
+            .socket_verb("/run/cfab/cfab.sock", "log", &log);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report
+                .output
+                .contains("the engine is not running and could not bind it"),
+            "a stale bind line must not be diagnosed while the engine runs:\n{}",
+            report.output
+        );
+    }
+
+    /// `status` still never writes with the new socket reads: the same snapshot-and-allowlist
+    /// test, whose read-only allowlist now covers `unix_request <run_dir>/cfab.sock components`.
+    /// A healthy supervisor answering cfab.sock is exercised through every fixture in
+    /// `status_never_writes`; this asserts the allowlist accepts the new verb and rejects a
+    /// hypothetical write on the same socket.
+    #[test]
+    fn status_still_never_writes_with_the_new_socket_reads() {
+        assert!(is_read_only("unix_request /run/cfab/cfab.sock components"));
+        assert!(is_read_only(
+            "unix_request /run/cfab/cfab.sock log engine 2"
+        ));
+        assert!(is_read_only("unix_request /run/cfab/engine.sock state"));
+        assert!(!is_read_only("unix_request /run/cfab/cfab.sock reapply"));
+        assert!(!is_read_only("write /run/cfab/cfab.sock"));
     }
 }

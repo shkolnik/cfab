@@ -20,6 +20,5 @@ RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends /tmp/cfab.deb \
  && rm -rf /var/lib/apt/lists/* /tmp/cfab.deb
 
-COPY entrypoint.sh /usr/local/bin/cfab-entrypoint.sh
-RUN chmod +x /usr/local/bin/cfab-entrypoint.sh
-ENTRYPOINT ["/usr/local/bin/cfab-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/cfab"]
+CMD ["run"]

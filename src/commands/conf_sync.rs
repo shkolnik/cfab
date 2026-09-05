@@ -1,8 +1,8 @@
-//! `cfab conf-sync` — the cluster config-sync daemon (runs as cfab-conf-sync.service on every
-//! clustered member; started by `up` only when the pmxcfs probe reports clustered). Watches
+//! `cfab conf-sync` — the cluster config-sync daemon (a supervised child of `cfab run`, spawned
+//! only when the pmxcfs probe reports clustered). Watches
 //! `/etc/pve/cfab/gen` on a 1 s stat-poll; on a new generation it validates the published
-//! fabric.conf with the full typed gate, applies it by re-execing this binary's own `up`
-//! (one source of truth — the daemon never reimplements bringup), verifies, then runs the
+//! fabric.conf with the full typed gate, applies it by asking its supervisor to re-apply over
+//! `cfab.sock` (one source of truth — the daemon never applies anything itself), verifies, then runs the
 //! peer-witness protocol: write an ack file, wait for at least one ack from a DIFFERENT
 //! member, and REVERT to the previous conf when no witness appears. The pmxcfs channel's own
 //! failure is the revert signal: a severed member cannot write or see acks, so it cannot keep
@@ -20,6 +20,55 @@ use std::time::{Duration, SystemTime};
 use crate::cluster::{Pmxcfs, format_gen, parse_gen};
 use crate::error::{Error, Result};
 use crate::sys::Sys;
+
+/// How conf-sync asks for the declaration on disk to be applied. The daemon never applies
+/// anything itself — one source of truth, as when it re-exec'd `up`. Injected so the whole
+/// tick, including every revert decision, is unit-testable without a supervisor.
+pub trait Applier {
+    fn reapply(&mut self) -> Result<()>;
+}
+
+/// The real applier: one `reapply` line on the supervisor's `cfab.sock`. The supervisor answers
+/// only after the apply has finished (spec §9), so "apply then check" needs no sleep and no poll.
+pub struct SocketApplier {
+    sock: String,
+}
+
+impl SocketApplier {
+    pub fn new(run_dir: &str) -> Self {
+        SocketApplier {
+            sock: format!("{}/cfab.sock", run_dir.trim_end_matches('/')),
+        }
+    }
+}
+
+impl Applier for SocketApplier {
+    fn reapply(&mut self) -> Result<()> {
+        // A missing or unanswering socket means no supervisor is there to apply anything:
+        // that is a refusal, never a silent success.
+        let reply = crate::sys::RealSys.unix_request(&self.sock, "reapply\n")?;
+        let doc: serde_json::Value = serde_json::from_str(&reply).map_err(|e| {
+            Error::fatal(format!(
+                "{}: unreadable reply to reapply ({e}): {}",
+                self.sock,
+                reply.trim()
+            ))
+        })?;
+        if doc.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        // `{"ok": false, "error": …}` from the applier, or `{"error": …}` from the frame when
+        // the verb itself was rejected; anything else is reported verbatim rather than guessed at.
+        Err(Error::fatal(
+            match doc.get("error").and_then(serde_json::Value::as_str) {
+                // Already a rendered cfab error: re-wrapping it whole would print
+                // `FATAL: FATAL: …`, so its own prefix is consumed here.
+                Some(e) => e.strip_prefix("FATAL: ").unwrap_or(e).to_string(),
+                None => reply.trim().to_string(),
+            },
+        ))
+    }
+}
 
 /// Poll interval for the gen counter and for ack files.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -107,7 +156,7 @@ impl ConfSync {
     /// One loop iteration. Cheap checks first (quorum, gen); the expensive path only on a new
     /// generation. Errors are transient faults (pmxcfs unreadable mid-restart …): the caller
     /// logs and keeps ticking.
-    pub fn tick(&mut self, sys: &mut dyn Sys) -> Result<Tick> {
+    pub fn tick(&mut self, sys: &mut dyn Sys, applier: &mut dyn Applier) -> Result<Tick> {
         if !self.pmx.quorate()? {
             return Ok(Tick::NotQuorate);
         }
@@ -124,10 +173,15 @@ impl ConfSync {
         if generation == self.attempted {
             return Ok(Tick::AlreadyAttempted(generation));
         }
-        self.handle_new_generation(sys, generation)
+        self.handle_new_generation(sys, applier, generation)
     }
 
-    fn handle_new_generation(&mut self, sys: &mut dyn Sys, generation: u64) -> Result<Tick> {
+    fn handle_new_generation(
+        &mut self,
+        sys: &mut dyn Sys,
+        applier: &mut dyn Applier,
+        generation: u64,
+    ) -> Result<Tick> {
         // Crash-safe ordering: record the attempt BEFORE any apply, so a crash mid-apply can
         // never loop on this generation.
         self.set_attempted(generation)?;
@@ -167,7 +221,8 @@ impl ConfSync {
             });
         }
 
-        // Apply: cache the revert target, install the published text, re-exec our own `up`.
+        // Apply: cache the revert target, install the published text, ask the supervisor to
+        // re-apply it.
         if let Some(current) = &local {
             std::fs::write(self.prev_path(), current).map_err(|e| {
                 Error::fatal(format!("cannot write {}: {e}", self.prev_path().display()))
@@ -177,9 +232,8 @@ impl ConfSync {
             Error::fatal(format!("cannot write {}: {e}", self.local_conf.display()))
         })?;
         let local_conf = self.local_conf.display().to_string();
-        let up = sys.run(&[&self.exe, "--config", &local_conf, "up"])?;
-        if !up.ok() {
-            return self.revert(sys, generation, format!("up exited {}", up.status));
+        if let Err(e) = applier.reapply() {
+            return self.revert(applier, generation, format!("reapply refused: {e}"));
         }
         let wait = STATUS_WAIT_SECS.to_string();
         let status = sys.run(&[
@@ -192,7 +246,11 @@ impl ConfSync {
         ])?;
         // 0 = UP, 1 = UP-DEGRADED: both carry traffic. 2 = FAILED and 3 = DOWN do not.
         if status.status > 1 {
-            return self.revert(sys, generation, format!("status exited {}", status.status));
+            return self.revert(
+                applier,
+                generation,
+                format!("status exited {}", status.status),
+            );
         }
 
         // Witness. The ack write is retried across the whole window, not treated as terminal
@@ -236,12 +294,17 @@ impl ConfSync {
                  non-quorate"
             )
         };
-        self.revert(sys, generation, reason)
+        self.revert(applier, generation, reason)
     }
 
-    /// Restore the previous conf and re-exec `up` on it. `attempted` stays at this
+    /// Restore the previous conf and have it re-applied. `attempted` stays at this
     /// generation, so it is never retried; `committed` is unchanged.
-    fn revert(&mut self, sys: &mut dyn Sys, generation: u64, reason: String) -> Result<Tick> {
+    fn revert(
+        &mut self,
+        applier: &mut dyn Applier,
+        generation: u64,
+        reason: String,
+    ) -> Result<Tick> {
         // Retract our ack first: an ack must not outlive the decision it advertises (a late
         // reader could otherwise commit on our word after we reverted). Best-effort — in the
         // severed case the ack was never written, and the retraction cannot land either.
@@ -259,13 +322,10 @@ impl ConfSync {
                 std::fs::write(&self.local_conf, text).map_err(|e| {
                     Error::fatal(format!("cannot write {}: {e}", self.local_conf.display()))
                 })?;
-                let local_conf = self.local_conf.display().to_string();
-                let up = sys.run(&[&self.exe, "--config", &local_conf, "up"])?;
-                if !up.ok() {
+                if let Err(e) = applier.reapply() {
                     eprintln!(
-                        "conf-sync: REVERT of gen {generation}: up on the previous conf \
-                         exited {} — fabric state needs hands",
-                        up.status
+                        "conf-sync: REVERT of gen {generation}: re-applying the previous conf \
+                         was refused ({e}) — fabric state needs hands"
                     );
                 }
             }
@@ -385,6 +445,7 @@ fn write_state(path: &Path, generation: u64) -> Result<()> {
 /// The real daemon: tick every second until SIGTERM/SIGINT, log outcomes, exit cleanly.
 pub fn run(sys: &mut dyn Sys, member: &str, run_dir: &str, exe: &str) -> Result<()> {
     let mut cs = ConfSync::new(Pmxcfs::new(), exe, member, "/etc/cfab/fabric.conf", run_dir)?;
+    let mut applier = SocketApplier::new(run_dir);
     println!(
         "conf-sync: start member={member} attempted={} committed={}",
         cs.attempted, cs.committed
@@ -396,7 +457,7 @@ pub fn run(sys: &mut dyn Sys, member: &str, run_dir: &str, exe: &str) -> Result<
             .map_err(|e| Error::fatal(format!("cannot install signal handler: {e}")))?;
     }
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        match cs.tick(sys) {
+        match cs.tick(sys, &mut applier) {
             Ok(t) => cs.report(&t),
             Err(e) => eprintln!("conf-sync: tick failed: {e}"),
         }
@@ -469,9 +530,9 @@ mod tests {
         }
     }
 
-    fn up_argv(f: &Fixture) -> String {
-        format!("{EXE} --config {} up", f.local_conf.display())
-    }
+    /// What the applier records for one apply. It replaces the pinned `up` argv: the apply is
+    /// now the supervisor's, so the ordering is pinned on the applier's calls instead.
+    const REAPPLY: &str = "reapply";
 
     fn status_argv(f: &Fixture) -> String {
         format!("{EXE} --config {} status --wait 30", f.local_conf.display())
@@ -483,6 +544,156 @@ mod tests {
             .map(|s| s.trim().to_string())
     }
 
+    #[derive(Default)]
+    struct MockApplier {
+        calls: Vec<String>,
+        /// Refusal reasons, one per call, front first; an exhausted queue succeeds.
+        refuse: std::collections::VecDeque<String>,
+    }
+
+    impl MockApplier {
+        /// The next `reapply` is refused; every later one succeeds — so a test can watch the
+        /// revert go through the applier as well.
+        fn refusing_once(reason: &str) -> Self {
+            MockApplier {
+                calls: Vec::new(),
+                refuse: std::collections::VecDeque::from(vec![reason.to_string()]),
+            }
+        }
+    }
+
+    impl Applier for MockApplier {
+        fn reapply(&mut self) -> Result<()> {
+            self.calls.push("reapply".to_string());
+            match self.refuse.pop_front() {
+                Some(reason) => Err(Error::fatal(reason)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// A stand-in supervisor: answers one `reapply` line with `reply`, then closes. Returns the
+    /// run_dir the socket lives in, so the applier is built exactly as production builds it.
+    fn fake_supervisor(
+        reply: &'static str,
+    ) -> (tempfile::TempDir, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("cfab.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(reply.as_bytes()).unwrap();
+            line
+        });
+        (dir, server)
+    }
+
+    #[test]
+    fn the_socket_applier_asks_for_reapply_and_reads_ok_true_as_applied() {
+        let (dir, server) = fake_supervisor("{\"ok\":true}\n");
+        SocketApplier::new(dir.path().to_str().unwrap())
+            .reapply()
+            .unwrap();
+        assert_eq!(server.join().unwrap(), "reapply\n");
+    }
+
+    #[test]
+    fn the_socket_applier_turns_a_refusal_into_an_error_carrying_the_reason() {
+        let (dir, server) =
+            fake_supervisor("{\"ok\":false,\"error\":\"FATAL: wire eno9 absent\"}\n");
+        let e = SocketApplier::new(dir.path().to_str().unwrap())
+            .reapply()
+            .unwrap_err();
+        assert_eq!(e.to_string(), "FATAL: wire eno9 absent");
+        server.join().unwrap();
+    }
+
+    /// A reply that is not the contract (no `ok`, no `error`) is an error too, quoted verbatim:
+    /// never read as success.
+    #[test]
+    fn the_socket_applier_refuses_an_off_contract_reply() {
+        let (dir, server) = fake_supervisor("{\"lines\":[]}\n");
+        let e = SocketApplier::new(dir.path().to_str().unwrap())
+            .reapply()
+            .unwrap_err();
+        assert!(e.to_string().contains("{\"lines\":[]}"), "{e}");
+        server.join().unwrap();
+    }
+
+    /// No supervisor at all is a refusal, not a silent apply.
+    #[test]
+    fn the_socket_applier_refuses_when_nothing_is_listening() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = SocketApplier::new(dir.path().to_str().unwrap())
+            .reapply()
+            .unwrap_err();
+        assert!(e.to_string().contains("cannot connect to"), "{e}");
+        assert!(e.to_string().contains("cfab.sock"), "{e}");
+    }
+
+    #[test]
+    fn a_new_generation_asks_the_supervisor_to_reapply_and_never_runs_up() {
+        let conf = valid_conf();
+        let mut f = fixture(MEMBERS_1, Some(&conf), 7, "OLD\n");
+        let mut sys = MockSys::default();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
+        assert!(
+            matches!(
+                t,
+                Tick::Committed {
+                    generation: 7,
+                    applied: true,
+                    ..
+                }
+            ),
+            "{t:?}"
+        );
+        assert_eq!(ap.calls, vec!["reapply"]);
+        // `cfab up` no longer exists: any surviving re-exec of it is a bug, not a fallback.
+        // The bounded `status` read is the only thing left out-of-process.
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
+        assert!(
+            !sys.calls.iter().any(|c| c.ends_with(" up")),
+            "no `up` re-exec survives: {:?}",
+            sys.calls
+        );
+    }
+
+    #[test]
+    fn a_refused_reapply_reverts_exactly_as_a_failed_up_did() {
+        let conf = valid_conf();
+        let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
+        let mut sys = MockSys::default();
+        let mut ap = MockApplier::refusing_once("wire eno9 absent");
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
+        assert_eq!(
+            t,
+            Tick::Reverted {
+                generation: 1,
+                reason: "reapply refused: FATAL: wire eno9 absent".to_string()
+            }
+        );
+        // The revert re-applies the previous conf through the applier too.
+        assert_eq!(ap.calls, vec!["reapply", "reapply"]);
+        // A refused apply never reaches the status check, and never re-execs anything.
+        assert!(sys.calls.is_empty(), "{:?}", sys.calls);
+        assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
+        // No ack outlives the decision it would have advertised.
+        assert!(!Pmxcfs::at(&f.pmx_root).ack_path(1, MEMBER).exists());
+        assert_eq!(state(&f, "conf-sync-attempted").as_deref(), Some("1"));
+        assert_eq!(state(&f, "conf-sync-committed"), None);
+        assert_eq!(
+            f.cs.tick(&mut sys, &mut ap).unwrap(),
+            Tick::AlreadyAttempted(1)
+        );
+    }
+
     #[test]
     fn new_gen_applies_and_commits_on_peer_ack() {
         let conf = valid_conf();
@@ -492,7 +703,8 @@ mod tests {
         std::fs::create_dir_all(pmx.acks_dir(1)).unwrap();
         std::fs::write(pmx.ack_path(1, "pve2-tb"), "pve2-tb 0\n").unwrap();
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Committed {
@@ -501,8 +713,9 @@ mod tests {
                 witness: "witnessed by pve2-tb".to_string()
             }
         );
-        // Exact re-exec argv, in order: up then status.
-        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f)]);
+        // Exact calls, in order: one apply through the supervisor, then the status re-exec.
+        assert_eq!(ap.calls, vec![REAPPLY]);
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
         assert!(sys.slept.is_empty(), "peer ack present: no witness wait");
         // Local cache chain updated; state files persisted.
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), conf);
@@ -516,7 +729,7 @@ mod tests {
             "pve1-tb 0\n"
         );
         // Next tick is quiet.
-        assert_eq!(f.cs.tick(&mut sys).unwrap(), Tick::Idle);
+        assert_eq!(f.cs.tick(&mut sys, &mut ap).unwrap(), Tick::Idle);
     }
 
     #[test]
@@ -524,7 +737,8 @@ mod tests {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Reverted {
@@ -533,14 +747,18 @@ mod tests {
             }
         );
         assert_eq!(sys.slept.len(), 60, "full witness window polled");
-        // up (apply), status, up (revert) — exactly.
-        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
+        // apply, status, revert-apply — exactly; only the status stays a re-exec.
+        assert_eq!(ap.calls, vec![REAPPLY, REAPPLY]);
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
         // Previous conf back in place; attempted recorded, committed not.
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
         assert_eq!(state(&f, "conf-sync-attempted").as_deref(), Some("1"));
         assert_eq!(state(&f, "conf-sync-committed"), None);
         // The reverted generation is never re-attempted.
-        assert_eq!(f.cs.tick(&mut sys).unwrap(), Tick::AlreadyAttempted(1));
+        assert_eq!(
+            f.cs.tick(&mut sys, &mut ap).unwrap(),
+            Tick::AlreadyAttempted(1)
+        );
         // The revert retracted our own ack: it must not outlive the decision.
         assert!(!Pmxcfs::at(&f.pmx_root).ack_path(1, MEMBER).exists());
     }
@@ -565,7 +783,8 @@ mod tests {
                 .success()
         );
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Reverted {
@@ -592,7 +811,8 @@ mod tests {
             2,
             "no adjacency available",
         );
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Reverted {
@@ -600,7 +820,8 @@ mod tests {
                 reason: "status exited 2".to_string()
             }
         );
-        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
+        assert_eq!(ap.calls, vec![REAPPLY, REAPPLY]);
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
         // No ack for a conf the member could not carry.
         assert!(!Pmxcfs::at(&f.pmx_root).ack_path(1, MEMBER).exists());
@@ -621,7 +842,8 @@ mod tests {
             3,
             "fabric not applied",
         );
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Reverted {
@@ -651,7 +873,8 @@ mod tests {
             1,
             "",
         );
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert!(
             matches!(
                 t,
@@ -674,15 +897,21 @@ mod tests {
     fn invalid_published_conf_refused_and_not_retried() {
         let mut f = fixture(MEMBERS_3, Some("NOT_A_KEY==\n"), 1, "OLD\n");
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert!(matches!(t, Tick::Refused { generation: 1, .. }), "{t:?}");
         // Nothing applied, nothing run, local cache untouched.
         assert!(sys.calls.is_empty());
+        assert!(ap.calls.is_empty());
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
         assert_eq!(state(&f, "conf-sync-attempted").as_deref(), Some("1"));
         // The attempted gate holds: no retry loop on a bad publish.
-        assert_eq!(f.cs.tick(&mut sys).unwrap(), Tick::AlreadyAttempted(1));
+        assert_eq!(
+            f.cs.tick(&mut sys, &mut ap).unwrap(),
+            Tick::AlreadyAttempted(1)
+        );
         assert!(sys.calls.is_empty());
+        assert!(ap.calls.is_empty());
     }
 
     #[test]
@@ -692,9 +921,11 @@ mod tests {
         let conf = valid_conf().replace("pve1-tb", "pve9-tb");
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert!(matches!(t, Tick::Refused { generation: 1, .. }), "{t:?}");
         assert!(sys.calls.is_empty());
+        assert!(ap.calls.is_empty());
     }
 
     #[test]
@@ -702,7 +933,8 @@ mod tests {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 3, &conf);
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Committed {
@@ -711,11 +943,8 @@ mod tests {
                 witness: "identical, ack written".to_string()
             }
         );
-        assert!(
-            sys.calls.is_empty(),
-            "no up/status re-exec: {:?}",
-            sys.calls
-        );
+        assert!(ap.calls.is_empty(), "no apply asked for: {:?}", ap.calls);
+        assert!(sys.calls.is_empty(), "no status re-exec: {:?}", sys.calls);
         assert!(sys.slept.is_empty(), "no witness wait for a no-op");
         let pmx = Pmxcfs::at(&f.pmx_root);
         assert_eq!(
@@ -733,10 +962,12 @@ mod tests {
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         std::fs::set_permissions(&f.pmx_root, std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys);
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap);
         std::fs::set_permissions(&f.pmx_root, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(t.unwrap(), Tick::NotQuorate);
         assert!(sys.calls.is_empty());
+        assert!(ap.calls.is_empty());
         assert_eq!(state(&f, "conf-sync-attempted"), None, "gen not even read");
     }
 
@@ -745,7 +976,8 @@ mod tests {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_1, Some(&conf), 1, "OLD\n");
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::Committed {
@@ -755,7 +987,8 @@ mod tests {
             }
         );
         assert!(sys.slept.is_empty(), "no witness polling");
-        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f)]);
+        assert_eq!(ap.calls, vec![REAPPLY]);
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
         // The lone member still writes its ack (a joining peer can read history).
         let pmx = Pmxcfs::at(&f.pmx_root);
         assert_eq!(
@@ -782,7 +1015,8 @@ mod tests {
             "the obstruction must be the uid-independent one"
         );
         let mut sys = MockSys::default();
-        let t = f.cs.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         if let Tick::Reverted {
             generation: 1,
             reason,
@@ -793,7 +1027,8 @@ mod tests {
             panic!("expected Reverted, got {t:?}");
         }
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
-        assert_eq!(sys.calls, vec![up_argv(&f), status_argv(&f), up_argv(&f)]);
+        assert_eq!(ap.calls, vec![REAPPLY, REAPPLY]);
+        assert_eq!(sys.calls, vec![status_argv(&f)]);
         // The whole window was spent retrying, one poll per tick.
         assert_eq!(sys.slept.len(), 60);
     }
@@ -808,6 +1043,7 @@ mod tests {
         let pmx = Pmxcfs::at(&f.pmx_root);
         std::fs::write(pmx.cfab_dir().join("acks"), "squatter").unwrap();
         let mut sys = MockSys::default();
+        let mut ap = MockApplier::default();
         let pmx_root = f.pmx_root.clone();
         sys.on_sleep = Some(Box::new(move |n| {
             if n == 2 {
@@ -817,7 +1053,7 @@ mod tests {
                 std::fs::write(pmx.ack_path(1, "pve2-tb"), "pve2-tb 0\n").unwrap();
             }
         }));
-        let t = f.cs.tick(&mut sys).unwrap();
+        let t = f.cs.tick(&mut sys, &mut ap).unwrap();
         if let Tick::Committed {
             generation: 1,
             applied: true,
@@ -846,7 +1082,8 @@ mod tests {
         )
         .unwrap();
         let mut sys = MockSys::default();
-        let t = f2.tick(&mut sys).unwrap();
+        let mut ap = MockApplier::default();
+        let t = f2.tick(&mut sys, &mut ap).unwrap();
         assert_eq!(
             t,
             Tick::GenRegression {
@@ -855,6 +1092,7 @@ mod tests {
             }
         );
         assert!(sys.calls.is_empty());
+        assert!(ap.calls.is_empty());
         assert_eq!(std::fs::read_to_string(&f.local_conf).unwrap(), "OLD\n");
         drop(f2);
         let _ = &mut f;
@@ -865,9 +1103,10 @@ mod tests {
         let conf = valid_conf();
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");
         let mut sys = MockSys::default();
+        let mut ap = MockApplier::default();
         // Revert path leaves attempted=1 persisted; a restarted daemon must not retry.
         assert!(matches!(
-            f.cs.tick(&mut sys).unwrap(),
+            f.cs.tick(&mut sys, &mut ap).unwrap(),
             Tick::Reverted { generation: 1, .. }
         ));
         let mut restarted = ConfSync::new(
@@ -879,10 +1118,12 @@ mod tests {
         )
         .unwrap();
         let mut sys2 = MockSys::default();
+        let mut ap2 = MockApplier::default();
         assert_eq!(
-            restarted.tick(&mut sys2).unwrap(),
+            restarted.tick(&mut sys2, &mut ap2).unwrap(),
             Tick::AlreadyAttempted(1)
         );
         assert!(sys2.calls.is_empty());
+        assert!(ap2.calls.is_empty());
     }
 }

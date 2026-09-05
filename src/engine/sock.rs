@@ -4,12 +4,10 @@
 //! transit links at the leaf offset, or at the declared cost — spec §12 (b)).
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::emit::engine::TransitCost;
@@ -37,71 +35,34 @@ pub fn parse_request(line: &str) -> Option<Request> {
     }
 }
 
-/// Refuse to start when another engine owns this run_dir. Two independent liveness
-/// signals, either one refuses: something answers `state\n` on the socket, or the pid in
-/// `engine.pid` is a running `cfab engine` (a busy engine that misses the answer window
-/// is still alive). Called BEFORE the providers start: they purge the private-proto routes
-/// and open the BFD/OSPF sockets, so a late check would damage the surviving engine.
-pub fn refuse_if_live(sock_path: &Path, pid_path: &Path) -> Result<()> {
-    let pid = std::fs::read_to_string(pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    if sock_path.exists() && answers(sock_path) {
-        let pid = pid.map_or("unknown".to_string(), |p| p.to_string());
+/// Refuse to start when another engine already answers on this socket. The exclusivity
+/// guarantee itself is `supervisor::lock::hold` on `engine.lock`, held for the process's
+/// whole lifetime BEFORE the providers start (they purge the private-proto routes and open
+/// the BFD/OSPF sockets, so a late check would damage a surviving engine); this is the
+/// cheap belt-and-suspenders re-check at bind time, for a stale socket path left by a
+/// process that died without a lock (a lock is held only from `hold()` onward — nothing
+/// answers this socket if that process's flock is free).
+pub fn refuse_if_live(sock_path: &Path) -> Result<()> {
+    if answers(sock_path) {
         return Err(Error::fatal(format!(
-            "another engine is running (pid {pid} per {}, answering on {}); stop it first (cfab down)",
-            pid_path.display(),
+            "another engine is running (answering on {}); stop it first (cfab down)",
             sock_path.display()
-        )));
-    }
-    if let Some(pid) = pid
-        && pid != std::process::id()
-        && is_cfab_engine(pid)
-    {
-        return Err(Error::fatal(format!(
-            "another engine is running (pid {pid} per {}); stop it first (cfab down), or \
-             remove that file if pid {pid} is not a cfab engine",
-            pid_path.display()
         )));
     }
     Ok(())
 }
 
-/// Is `pid` alive and running `cfab engine`? Read from /proc so a recycled pid belonging
-/// to some other program does not count (cmdline = NUL-separated argv).
-fn is_cfab_engine(pid: u32) -> bool {
-    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    is_engine_cmdline(&cmdline)
-}
-
-/// Does a `/proc/<pid>/cmdline` (NUL-separated argv) name a `cfab … engine` process? The one
-/// ownership test for every signal cfab ever sends an engine pid (here, and `up`/`down`
-/// through `engine_ctl`): an argument whose file name is `cfab` and the `engine` subcommand.
-pub fn is_engine_cmdline(cmdline: &[u8]) -> bool {
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    let named_cfab = args
-        .iter()
-        .any(|a| a.rsplit(|b| *b == b'/').next() == Some(b"cfab"));
-    named_cfab && args.iter().any(|a| *a == b"engine")
-}
-
 /// Bind the socket. A leftover path is unlinked ONLY when nothing answers on it; a live
 /// answer means another engine owns this run_dir — fatal, never a silent takeover. The
-/// real guard is `refuse_if_live` before the providers start; this one is the cheap
-/// re-check at readiness time.
-pub fn bind(path: &Path, pid_path: &Path) -> Result<UnixListener> {
+/// real guard is the `engine.lock` flock, taken before this is ever called; this is the
+/// cheap re-check at readiness time.
+pub fn bind(path: &Path) -> Result<UnixListener> {
     if path.exists() {
-        refuse_if_live(path, pid_path)?;
+        refuse_if_live(path)?;
         std::fs::remove_file(path)
             .map_err(|e| Error::fatal(format!("cannot remove stale {}: {e}", path.display())))?;
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|e| Error::fatal(format!("cannot bind {}: {e}", path.display())))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::fatal(format!("cannot chmod {}: {e}", path.display())))?;
-    Ok(listener)
+    crate::sock_frame::bind(path)
 }
 
 /// Does a process answer `state\n` on this socket?
@@ -121,35 +82,24 @@ fn answers(path: &Path) -> bool {
 /// Serve one accepted connection: read the request line, reply with `respond`'s JSON.
 /// A client that sends nothing within the timeout is dropped without a reply. Reading the
 /// request and answering it are separate so the engine loop can hand `respond` a `&mut`
-/// borrow of the northbound (`transit-cost` re-commits; `state` only reads).
+/// borrow of the northbound (`transit-cost` re-commits; `state` only reads). Framing itself
+/// (read one line, write one JSON object, close) lives in `sock_frame`, shared with
+/// `cfab.sock`; only the engine's own two-verb vocabulary lives here.
 pub async fn serve_one<F>(stream: UnixStream, respond: F)
 where
     F: AsyncFnOnce(Request) -> Result<serde_json::Value>,
 {
-    let (rd, mut wr) = stream.into_split();
-    let mut line = String::new();
-    let read = tokio::time::timeout(CLIENT_IO, BufReader::new(rd).read_line(&mut line)).await;
-    let reply = match read {
-        Ok(Ok(_)) => match parse_request(&line) {
-            Some(req) => match respond(req).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(%e, ?req, "request failed");
-                    serde_json::json!({ "error": e.to_string() })
-                }
-            },
-            None => serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) }),
-        },
-        Ok(Err(_)) | Err(_) => return,
-    };
-    let mut text = reply.to_string();
-    text.push('\n');
-    let _ = tokio::time::timeout(CLIENT_IO, wr.write_all(text.as_bytes())).await;
-    let _ = wr.shutdown().await;
+    crate::sock_frame::serve_one(stream, async |line: &str| match parse_request(line) {
+        Some(req) => respond(req).await,
+        None => Ok(serde_json::json!({ "error": format!("unknown request {:?}", line.trim()) })),
+    })
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -160,13 +110,11 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("engine.sock");
-        let pid = dir.path().join("engine.pid");
-        std::fs::write(&pid, "4242\n").unwrap();
         rt.block_on(async {
             // Stale: a bound-then-dropped path nobody listens on.
             drop(UnixListener::bind(&sock).unwrap());
             assert!(sock.exists());
-            let listener = bind(&sock, &pid).unwrap();
+            let listener = bind(&sock).unwrap();
             assert_eq!(
                 std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -178,55 +126,24 @@ mod tests {
             });
             let err = tokio::task::spawn_blocking({
                 let sock = sock.clone();
-                let pid = pid.clone();
-                move || bind(&sock, &pid).err().map(|e| e.to_string())
+                move || bind(&sock).err().map(|e| e.to_string())
             })
             .await
             .unwrap()
             .unwrap();
-            assert!(err.contains("another engine is running (pid 4242"), "{err}");
+            assert!(err.contains("another engine is running"), "{err}");
             server.await.unwrap();
         });
     }
 
+    /// No socket at all: `refuse_if_live` finds nothing to be suspicious of. The exclusivity
+    /// guarantee itself moved to `supervisor::lock` (Task 9) — this function's only remaining
+    /// job is the stale-vs-live distinction at bind time.
     #[test]
-    fn pid_file_naming_a_live_engine_refuses_dead_or_foreign_pid_does_not() {
+    fn no_socket_is_not_suspicious() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("engine.sock");
-        let pid = dir.path().join("engine.pid");
-        // No files at all: fine.
-        refuse_if_live(&sock, &pid).unwrap();
-        // A pid that cannot be alive (beyond pid_max).
-        std::fs::write(&pid, "4194305\n").unwrap();
-        refuse_if_live(&sock, &pid).unwrap();
-        // Our own live pid, but its cmdline carries no `cfab … engine`: foreign, not ours.
-        std::fs::write(&pid, format!("{}\n", std::process::id())).unwrap();
-        assert!(!is_cfab_engine(std::process::id()));
-        refuse_if_live(&sock, &pid).unwrap();
-        // A live process whose argv contains `engine`: refused without any socket. The
-        // shell's builtin `read` blocks on the piped stdin, so sh itself stays alive with
-        // its argv intact (no exec) until it is killed.
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "read _", "cfab", "engine"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::fs::write(&pid, format!("{}\n", child.id())).unwrap();
-        // Until the forked child execs sh, /proc shows OUR argv; once it has, the argv
-        // stays `sh -c … cfab engine` for good, so waiting for it is race-free.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !is_cfab_engine(child.id()) && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(is_cfab_engine(child.id()));
-        let err = refuse_if_live(&sock, &pid).unwrap_err().to_string();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(
-            err.contains(&format!("another engine is running (pid {}", child.id())),
-            "{err}"
-        );
-        assert!(err.contains("not a cfab engine"), "{err}");
+        refuse_if_live(&sock).unwrap();
     }
 
     /// The whole protocol, in one place: two verbs, and everything else refused rather
@@ -261,9 +178,8 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("engine.sock");
-        let pid = dir.path().join("engine.pid");
         rt.block_on(async {
-            let listener = bind(&sock, &pid).unwrap();
+            let listener = bind(&sock).unwrap();
             let server = tokio::spawn(async move {
                 for _ in 0..3 {
                     let (s, _) = listener.accept().await.unwrap();

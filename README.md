@@ -31,15 +31,15 @@ cfab check                      # parse + validate fabric.conf, print this membe
 cfab schema                     # the fabric.conf data model as JSON Schema
 cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
-cfab up                         # apply the fabric on this member (idempotent, root)
-cfab down                       # remove everything `up` created, restore pre-fabric FRR
+cfab run                        # apply the fabric and supervise its daemons (systemd notify, root)
+cfab down                       # remove everything cfab applied, restore pre-fabric FRR
 cfab status [--wait N] [--permissive]
                                 # UP 0 / UP-DEGRADED 1 / FAILED 2 / DOWN 3
 cfab measure-cap <dev> <peer>   # measure a wire's real capacity; feeds the shape derivation
 cfab policy-teeth               # prove the forward policy in throwaway netnses — and prove the proof bites
 cfab cluster status             # Proxmox (pmxcfs) coordination state; clean "not clustered" when absent
 cfab conf publish               # validate the local fabric.conf, publish it cluster-wide
-cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands started by `up`; not for hands
+cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands started by `run`; not for hands
 ```
 
 `--config` defaults to `fabric.conf` beside the binary; `--host` to `$CFAB_HOST`, else the
@@ -57,24 +57,26 @@ applies a thing. The Debian package's `Depends` covers all of it.
 
 ## Running it as a service
 
-The Debian package ships `cfab-fabric.service`, **installed disabled and not started** —
+The Debian package ships `cfab.service`, **installed disabled and not started** —
 installing cfab never changes the network. Write `/etc/cfab/fabric.conf`, then:
 
 ```
-systemctl enable --now cfab-fabric
+systemctl enable --now cfab
 ```
 
-The unit is `Type=oneshot` + `RemainAfterExit=yes`; `ExecStart`/`ExecReload` are `cfab up`,
-`ExecStop` is `cfab down`. `ConditionPathExists=/etc/cfab/fabric.conf` means a host with the
-package but no declaration is skipped at boot rather than failed. Set `CFAB_HOST` in
-`/etc/default/cfab` only when this member's row is not named by the kernel hostname.
+The unit is `Type=notify`; `ExecStart` is `cfab run`, the long-lived supervisor that applies the
+fabric and keeps the engine, shape daemon, and conf-sync alive. `ExecReload` is
+`kill -HUP $MAINPID`, which re-applies the declaration in place — no teardown, no netdev churn.
+`ConditionPathExists=/etc/cfab/fabric.conf` means a host with the package but no declaration is
+skipped at boot rather than failed. Set `CFAB_HOST` in `/etc/default/cfab` only when this
+member's row is not named by the kernel hostname.
 
-A package upgrade neither stops nor restarts the unit: stopping it runs `cfab down`, an outage
-for every identity on the host. The engine already running keeps the old binary's inode, so the
-new binary takes effect at the next `systemctl reload cfab-fabric` — which is `cfab up` again,
-and `up` always stops and restarts the routing engine, so this member's adjacencies drop and
-re-form. `apt remove` stops the unit (`cfab down`, correct: the binary is going away) and
-disables it; `apt purge` also removes `/etc/default/cfab`.
+A package upgrade neither stops nor restarts the unit: stopping it tears the fabric down, an
+outage for every identity on the host. The supervisor already running keeps the old binary's
+inode, so the new binary takes effect at the next `systemctl restart cfab`. `systemctl reload
+cfab` re-applies the declaration in place without restarting the daemons. `apt remove` stops the
+unit (correct: the binary is going away) and disables it; `apt purge` also removes
+`/etc/default/cfab`.
 
 The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the engine's private
 kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other`

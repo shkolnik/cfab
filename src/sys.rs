@@ -19,6 +19,24 @@ impl Output {
     }
 }
 
+/// The outcome of probing a Unix socket for a listener (`Sys::unix_probe`). The point of the
+/// three-way split is a safety one: a caller deciding whether it is safe to act as if nobody
+/// owns the socket must be able to tell "provably nothing is listening" from "connected, but no
+/// usable reply". A post-connect failure (a slow peer, a read timeout) is NOT absence — a
+/// successful `connect(2)` already proves a listener owns the socket.
+#[derive(Debug)]
+pub enum UnixProbe {
+    /// `connect(2)` failed with `ENOENT` (no socket file) or `ECONNREFUSED` (a socket file with
+    /// nothing accepting): provably nobody is listening.
+    NotListening,
+    /// Connected and read a reply to EOF.
+    Answered(String),
+    /// A listener may own the socket — connected but the exchange did not yield a usable reply
+    /// (a write/read error or the 5 s read timeout), or a connect error that does not prove
+    /// absence (e.g. `EACCES`). Carries a diagnostic. Callers must treat this as "occupied".
+    Unreachable(String),
+}
+
 pub trait Sys {
     /// Run argv, capture everything; a nonzero exit is a normal `Output`, not an `Err` (callers
     /// decide — `run_ok` when failure is fatal).
@@ -35,12 +53,17 @@ pub trait Sys {
     /// One request, one reply over a Unix stream socket: connect to `path`, write `line`, read
     /// until the peer closes. The engine's state socket speaks exactly this shape.
     fn unix_request(&mut self, path: &str, line: &str) -> Result<String>;
-    /// Start a long-lived process in its own session, stdin from /dev/null, stdout+stderr
-    /// appended to `log`, and return as soon as it is launched — never waiting on it. This
-    /// is the only way to start a daemon from here: `run` captures the child's output
-    /// through pipes and reads them to EOF, so a detached child that keeps its stderr open
-    /// (the engine logs there for life) would block `run` forever.
-    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()>;
+    /// Like `unix_request`, but reports whether a listener owns the socket (`UnixProbe`). The
+    /// default cannot see the connect errno, so it maps any error to `Unreachable` — the safe
+    /// side, since a caller must never read a post-connect failure as "nobody home". `RealSys`
+    /// overrides it to read the connect errno; `MockSys` overrides it to model an unregistered
+    /// socket as `NotListening`.
+    fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+        match self.unix_request(path, line) {
+            Ok(reply) => UnixProbe::Answered(reply),
+            Err(e) => UnixProbe::Unreachable(e.to_string()),
+        }
+    }
 }
 
 /// Run and require exit 0.
@@ -137,35 +160,6 @@ impl Sys for RealSys {
         std::thread::sleep(d);
     }
 
-    fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .map_err(|e| Error::fatal(format!("cannot open {log}: {e}")))?;
-        let err_file = log_file
-            .try_clone()
-            .map_err(|e| Error::fatal(format!("cannot dup {log}: {e}")))?;
-        // `setsid -f` forks the child into a new session and exits at once; the child keeps
-        // only the log fds, so `status()` returns as soon as the fork is done.
-        let status = std::process::Command::new("setsid")
-            .arg("-f")
-            .args(argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(log_file)
-            .stderr(err_file)
-            .status()
-            .map_err(|e| Error::fatal(format!("cannot exec setsid: {e}")))?;
-        if !status.success() {
-            return Err(Error::Cmd {
-                cmd: format!("setsid -f {}", argv.join(" ")),
-                status: status.code().unwrap_or(-1),
-                stderr: format!("see {log}"),
-            });
-        }
-        Ok(())
-    }
-
     fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
         use std::io::{Read, Write};
         let timeout = Some(Duration::from_secs(5));
@@ -180,6 +174,35 @@ impl Sys for RealSys {
             .map_err(|e| Error::fatal(format!("cannot read from {path}: {e}")))?;
         Ok(reply)
     }
+
+    fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+        use std::io::{ErrorKind, Read, Write};
+        let timeout = Some(Duration::from_secs(5));
+        let mut s = match std::os::unix::net::UnixStream::connect(path) {
+            Ok(s) => s,
+            // The only two outcomes that prove nobody is listening.
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return UnixProbe::NotListening;
+            }
+            // Any other connect error (EACCES, EADDRINUSE-races, …) does not prove absence.
+            Err(e) => return UnixProbe::Unreachable(format!("cannot connect to {path}: {e}")),
+        };
+        // From a successful connect on, every failure is "occupied", never "absent".
+        if let Err(e) = s
+            .set_read_timeout(timeout)
+            .and_then(|()| s.set_write_timeout(timeout))
+        {
+            return UnixProbe::Unreachable(format!("{path}: {e}"));
+        }
+        if let Err(e) = s.write_all(line.as_bytes()) {
+            return UnixProbe::Unreachable(format!("cannot write to {path}: {e}"));
+        }
+        let mut reply = String::new();
+        match s.read_to_string(&mut reply) {
+            Ok(_) => UnixProbe::Answered(reply),
+            Err(e) => UnixProbe::Unreachable(format!("cannot read from {path}: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +213,7 @@ pub mod mock {
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::Duration;
 
-    use super::{Output, Sys};
+    use super::{Output, Sys, UnixProbe};
     use crate::error::{Error, Result};
 
     #[derive(Default)]
@@ -206,8 +229,17 @@ pub mod mock {
         pub calls: Vec<String>,
         pub slept: Vec<Duration>,
         /// socket path → the replies `unix_request` hands back in order; the last one
-        /// repeats forever. Unknown path → Err.
+        /// repeats forever. Unknown path → Err. Serves every verb on the path the same reply;
+        /// use `socket_verb` when one path must answer different verbs differently.
         pub sockets: HashMap<String, VecDeque<String>>,
+        /// (path, verb) → replies, checked before `sockets` so one socket answers `components`
+        /// and `log engine` independently and order-free (both are read in one status run). The
+        /// verb is the first whitespace-delimited word of the request line.
+        pub socket_verbs: HashMap<(String, String), VecDeque<String>>,
+        /// Socket paths that `unix_probe` reports as `Unreachable`: a listener that accepts the
+        /// connection but yields no usable reply (a slow supervisor, a read timeout). Distinct
+        /// from an unregistered path, which probes as `NotListening`.
+        pub unreachable_sockets: Vec<String>,
         /// Test hook run on each sleep with the 1-based sleep count — lets a test mutate
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
@@ -230,6 +262,25 @@ pub mod mock {
         pub fn socket_seq(mut self, path: &str, replies: &[String]) -> Self {
             self.sockets
                 .insert(path.to_string(), replies.iter().cloned().collect());
+            self
+        }
+
+        /// A reply keyed by the request verb (first word of the line), so one socket path can
+        /// answer `components` and `log engine` independently of call order. Matched ahead of the
+        /// path-level `socket`/`socket_seq` reply; successive calls with the same verb queue,
+        /// last repeating.
+        pub fn socket_verb(mut self, path: &str, verb: &str, reply: &str) -> Self {
+            self.socket_verbs
+                .entry((path.to_string(), verb.to_string()))
+                .or_default()
+                .push_back(reply.to_string());
+            self
+        }
+
+        /// A socket that `unix_probe` reports as `Unreachable` — connected, no usable reply:
+        /// the live-but-slow supervisor a `cfab down` must refuse rather than tear down under.
+        pub fn socket_unreachable(mut self, path: &str) -> Self {
+            self.unreachable_sockets.push(path.to_string());
             self
         }
 
@@ -358,23 +409,44 @@ pub mod mock {
             }
         }
 
-        fn spawn_detached(&mut self, argv: &[&str], log: &str) -> Result<()> {
-            self.calls
-                .push(format!("spawn_detached {} >> {log}", argv.join(" ")));
-            Ok(())
-        }
-
         fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
             self.calls
                 .push(format!("unix_request {path} {}", line.trim_end()));
-            let q = self
-                .sockets
-                .get_mut(path)
-                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))?;
+            let verb = line.split_whitespace().next().unwrap_or("");
+            self.socket_reply(path, verb)
+                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))
+        }
+
+        fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
+            self.calls
+                .push(format!("unix_probe {path} {}", line.trim_end()));
+            if self.unreachable_sockets.iter().any(|p| p == path) {
+                return UnixProbe::Unreachable(format!("{path}: connected, no reply (mock)"));
+            }
+            let verb = line.split_whitespace().next().unwrap_or("");
+            // A registered socket (verb-keyed or path-level) answers; an unregistered one models
+            // ENOENT/ECONNREFUSED.
+            match self.socket_reply(path, verb) {
+                Some(reply) => UnixProbe::Answered(reply),
+                None => UnixProbe::NotListening,
+            }
+        }
+    }
+
+    impl MockSys {
+        /// The next reply for `(path, verb)`: a verb-keyed queue if one is registered, else the
+        /// path-level queue. Either pops when more than one remains, so the last reply repeats.
+        /// `None` means the path is not registered at all.
+        fn socket_reply(&mut self, path: &str, verb: &str) -> Option<String> {
+            let key = (path.to_string(), verb.to_string());
+            let q = match self.socket_verbs.get_mut(&key) {
+                Some(q) => q,
+                None => self.sockets.get_mut(path)?,
+            };
             if q.len() > 1 {
-                Ok(q.pop_front().expect("len > 1"))
+                Some(q.pop_front().expect("len > 1"))
             } else {
-                Ok(q.front().cloned().unwrap_or_default())
+                Some(q.front().cloned().unwrap_or_default())
             }
         }
     }
@@ -384,7 +456,6 @@ pub mod mock {
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::time::Duration;
 
     use super::mock::MockSys;
     use super::{RealSys, Sys};
@@ -428,51 +499,6 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(reply, "got state\n");
-    }
-
-    /// The launcher must return while the child lives and keeps the log open: a child that
-    /// sleeps 30 s and holds stderr must not hold `spawn_detached` (the `run`-through-pipes
-    /// hang this method exists to avoid).
-    #[test]
-    fn real_spawn_detached_returns_while_the_child_lives_and_logs_to_the_file() {
-        let dir = std::env::temp_dir().join(format!("cfab-spawn-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("engine.log");
-        let pid_file = dir.join("child.pid");
-        let script = "echo $$ >\"$1\"; echo hello-from-stderr >&2; exec sleep 30";
-        let started = std::time::Instant::now();
-        RealSys
-            .spawn_detached(
-                &["sh", "-c", script, "sh", pid_file.to_str().unwrap()],
-                log.to_str().unwrap(),
-            )
-            .unwrap();
-        let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_secs(5), "blocked for {elapsed:?}");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut pid = String::new();
-        while pid.trim().is_empty() && std::time::Instant::now() < deadline {
-            pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
-            std::thread::yield_now();
-        }
-        let pid = pid.trim().to_string();
-        assert!(!pid.is_empty(), "child never wrote its pid");
-        // Still alive after the launcher returned, and its stderr landed in the log. The child
-        // writes the pid before the stderr line, so the log is polled under the same deadline
-        // rather than read once (a single read raced the child and failed ~1 run in 4).
-        assert!(std::path::Path::new(&format!("/proc/{pid}/status")).exists());
-        let mut logged = String::new();
-        while !logged.contains("hello-from-stderr") && std::time::Instant::now() < deadline {
-            logged = std::fs::read_to_string(&log).unwrap_or_default();
-            std::thread::yield_now();
-        }
-        assert!(logged.contains("hello-from-stderr"), "{logged:?}");
-        let killed = std::process::Command::new("sh")
-            .args(["-c", "kill \"$1\"", "sh", &pid])
-            .status()
-            .unwrap();
-        assert!(killed.success());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

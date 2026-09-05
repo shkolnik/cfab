@@ -40,9 +40,11 @@ enum Command {
         #[command(subcommand)]
         artifact: GenArtifact,
     },
-    /// Apply the fabric on this member (idempotent; root)
-    Up,
-    /// Remove everything `up` created: stop the routing engine, sweep its routes, tear down (root)
+    /// Apply the fabric on this member and supervise its components (the systemd/container
+    /// entry point; root). Applies, keeps `cfab engine`, `cfab shape-daemon` and `cfab
+    /// conf-sync` running, re-applies on SIGHUP, and tears the fabric down on SIGTERM.
+    Run,
+    /// Remove everything `run` created: stop the routing engine, sweep its routes, tear down (root)
     Down,
     /// This member's fabric state, from its adjacency counts: UP (exit 0), UP-DEGRADED (1),
     /// FAILED (2), DOWN (3). The headline carries three fixed counts, (peers | links |
@@ -57,15 +59,15 @@ enum Command {
         #[arg(long)]
         permissive: bool,
     },
-    /// Membership-reactive shaping daemon (started by `up` as cfab-shape.service)
+    /// Membership-reactive shaping daemon (a supervised child of `cfab run`)
     ShapeDaemon {
         /// Quiet-gap debounce after a link event burst, in seconds
         #[arg(long, default_value_t = 0.5)]
         debounce: f64,
     },
-    /// One fail-closed forwarding-posture check (run by the cfab-fwd-watchdog timer)
+    /// One fail-closed forwarding-posture check (run periodically by the `cfab run` supervisor)
     FwdWatchdog,
-    /// Cluster config-sync daemon (started by `up` as cfab-conf-sync.service when clustered)
+    /// Cluster config-sync daemon (a supervised child of `cfab run` when clustered)
     ConfSync,
     /// Flood a fabric peer on one NIC and record the wire's measured capacity
     MeasureCap {
@@ -89,11 +91,17 @@ enum Command {
         #[command(subcommand)]
         action: ConfAction,
     },
-    /// The resident routing engine (started by `up` as cfab-engine.service; root)
+    /// The resident routing engine (a supervised child of `cfab run`; root)
     Engine {
         /// Gate-0 teeth: install routes without preferred sources (the oracle must go RED)
         #[arg(long, hide = true)]
         unsafe_no_prefsrc: bool,
+    },
+    /// Arm parent-death like a supervised child, then block forever (test fixture)
+    #[command(name = "__pdeath-selftest", hide = true)]
+    PdeathSelftest {
+        /// Write this process's pid here once armed
+        pidfile: Option<PathBuf>,
     },
 }
 
@@ -192,7 +200,59 @@ fn member_name(cli_host: &Option<String>) -> Result<String, Error> {
         .to_string())
 }
 
+/// The three verbs the supervisor spawns, plus the self-test fixture: each arms its own
+/// parent-death signal before anything else, iff `CFAB_SUPERVISOR_PID` says it is supervised
+/// (spec §7). A failed check is exit **5** — the supervisor vanished inside the fork window —
+/// never 4, which is the supervisor's own "instance lock already held".
+fn arm_supervised_child(command: &Command) -> Option<ExitCode> {
+    match command {
+        Command::Engine { .. }
+        | Command::ShapeDaemon { .. }
+        | Command::ConfSync
+        | Command::PdeathSelftest { .. } => {
+            let expected = std::env::var("CFAB_SUPERVISOR_PID")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            match cfab::supervisor::child::arm_parent_death(expected) {
+                Ok(()) => None,
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(ExitCode::from(5))
+                }
+            }
+        }
+        Command::Check
+        | Command::Schema
+        | Command::Gen { .. }
+        | Command::Run
+        | Command::Down
+        | Command::Status { .. }
+        | Command::FwdWatchdog
+        | Command::MeasureCap { .. }
+        | Command::PolicyTeeth
+        | Command::Cluster { .. }
+        | Command::Conf { .. } => None,
+    }
+}
+
 fn run(cli: Cli) -> Result<ExitCode, Error> {
+    if let Some(code) = arm_supervised_child(&cli.command) {
+        return Ok(code);
+    }
+    if let Command::PdeathSelftest { pidfile } = &cli.command {
+        // Armed above; now block forever so a test can watch what happens to us. The pid
+        // lands via a rename so a watcher never reads a half-written file.
+        if let Some(p) = pidfile {
+            let tmp = p.with_extension("tmp");
+            std::fs::write(&tmp, std::process::id().to_string())
+                .map_err(|e| Error::fatal(format!("cannot write {}: {e}", tmp.display())))?;
+            std::fs::rename(&tmp, p)
+                .map_err(|e| Error::fatal(format!("cannot rename to {}: {e}", p.display())))?;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
     let path = config_path(&cli.config);
     if let Command::Schema = cli.command {
         // Schema needs no config file at all.
@@ -228,7 +288,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     let view = View::new(&fabric, &member)?;
 
     match cli.command {
-        Command::Schema | Command::Cluster { .. } => unreachable!("handled above"),
+        Command::Schema | Command::Cluster { .. } | Command::PdeathSelftest { .. } => {
+            unreachable!("handled above")
+        }
         Command::Conf {
             action: ConfAction::Publish,
         } => {
@@ -274,25 +336,22 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Up => {
-            let mut sys = RealSys;
-            let opts = commands::up::UpOpts {
-                exe: std::env::current_exe()
-                    .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
-                    .to_string_lossy()
-                    .into_owned(),
-                config: std::fs::canonicalize(&path)
-                    .map_err(|e| Error::fatal(format!("cannot resolve {}: {e}", path.display())))?
-                    .to_string_lossy()
-                    .into_owned(),
-                pmxcfs_root: "/etc/pve".to_string(),
-            };
-            print!("{}", commands::up::run(&mut sys, &view, &opts)?);
-            Ok(ExitCode::SUCCESS)
+        Command::Run => {
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
+                .to_string_lossy()
+                .into_owned();
+            let config = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned();
+            let code = cfab::supervisor::run(&fabric, &view, &exe, &config)?;
+            Ok(ExitCode::from(code))
         }
         Command::Down => {
             let mut sys = RealSys;
-            print!("{}", commands::down::run(&mut sys, &view)?);
+            print!("{}", commands::teardown::run_cli(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { wait, permissive } => {

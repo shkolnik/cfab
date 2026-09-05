@@ -74,27 +74,25 @@ prints the "classid effective-rate" lines
 .B status
 diffs against the live qdisc tree.
 .TP
-.B up
-Apply the fabric on this member: segment sub-interfaces, policy, marking,
-shaping, FRR config, and the transient systemd units
-.RB ( cfab\-shape.service ,
-the
-.B cfab\-fwd\-watchdog
-timer, and \(em only when pmxcfs reports a cluster \(em
-.BR cfab\-conf\-sync.service ).
-Idempotent; safe to re-run over a live fabric. An already-running
-.B cfab\-conf\-sync.service
-is left alone (the daemon re-execs
-.B up
-itself; restarting it here would kill it mid-protocol) \(em to pick up a new
-binary, stop the unit and re-run
-.BR up .
+.B run
+Apply the fabric on this member \(em segment sub-interfaces, policy, marking,
+shaping, and routing-engine config \(em then stay in the foreground and
+supervise the engine, the shape daemon, and (only when pmxcfs reports a
+cluster) conf-sync as direct child processes. This is the long-lived
+.B "systemd Type=notify"
+service and the container PID 1; it is not run by hand. The apply is
+idempotent.
+.B SIGHUP
+re-applies the declaration in place \(em no teardown, no netdev churn \(em while
+.B SIGTERM
+runs the stop sequence: forwarding off first, then each child is signalled and
+given 10 s before SIGKILL, then the fabric is torn down. Only one supervisor
+runs at a time, guarded by a lock on the run dir.
 .TP
 .B down
-Remove everything
-.B up
-created and restore FRR to its pre-fabric state. Never touches interfaces or
-firewall state the fabric does not own.
+Remove everything cfab applied and restore FRR to its pre-fabric state. Never
+touches interfaces or firewall state the fabric does not own. Refuses while a
+supervisor is still running.
 .TP
 .BR status " [\fB\-\-wait\fR \fIN\fR] [\fB\-\-permissive\fR]"
 What this member's fabric is doing right now, in one of four states:
@@ -175,11 +173,9 @@ where the shape derivation finds it again should the local (tmpfs) cap file be
 lost; a publication failure is a warning, never a measurement failure. Refuses
 to run while the fabric's shaper holds
 .IR DEV 's
-egress (stop
-.B cfab\-shape.service
-first, re-apply with
-.B cfab up
-after).
+egress qdisc \(em the shape-daemon child of
+.B cfab run
+holds it while the fabric is up, and the measurement needs the qdisc free.
 .TP
 .B policy\-teeth
 Prove the forward policy in throwaway network namespaces \(em every zone pair
@@ -188,16 +184,16 @@ bites, by regressing the policy in memory and requiring the matrix to go red.
 Cleans up its namespaces even on failure.
 .TP
 .B shape\-daemon
-Membership-reactive shaping loop; started by
-.B up
-as
-.BR cfab\-shape.service .
-Not intended for interactive use.
+Membership-reactive shaping loop; a supervised child of
+.B cfab run
+on host members. Not intended for interactive use.
 .TP
 .B fwd\-watchdog
-One fail-closed forwarding-posture check; run by the
-.B cfab\-fwd\-watchdog
-timer. If the forward policy is not loaded with a drop default, it disables
+One fail-closed forwarding-posture check. Inside
+.B cfab run
+this runs as an in-process task on a few-second tick (it replaces a systemd
+timer); the subcommand runs a single check by hand.
+If the forward policy is not loaded with a drop default, it disables
 forwarding on every cfab interface and exits nonzero. A cfab interface whose
 forwarding flag drifted from the declared value (a foreign stack writing
 .I ip_forward=1
@@ -230,10 +226,8 @@ and release the lock. Ack directories older than the previous generation are
 then removed (best effort).
 .TP
 .B conf\-sync
-Cluster config-sync daemon; started by
-.B up
-as
-.B cfab\-conf\-sync.service
+Cluster config-sync daemon; a supervised child of
+.B cfab run
 on every clustered member (publisher included \(em it is not special). Not
 intended for interactive use. Every second it checks quorum (non-quorate:
 do nothing, reads may be stale) and the published generation. On a new
@@ -243,9 +237,9 @@ retried), caches the current
 .I /etc/cfab/fabric.conf
 to
 .IR fabric.conf.prev ,
-installs the published text, and re-execs its own binary's
-.B up
-and
+installs the published text, asks the supervisor to re-apply it over
+.BR cfab.sock ,
+and runs
 .B status
 (exit 0 or 1 \(em UP or UP\-DEGRADED \(em counts as carrying traffic). It then
 writes its ack file and
@@ -255,8 +249,7 @@ member. No peer ack, a
 .B status
 of FAILED or DOWN, or a failed ack write (the severed\-node
 signal: a member that cannot write acks cannot see them either) \(em all
-REVERT to the previous conf and re-run
-.BR up .
+REVERT to the previous conf and re-apply it.
 A byte-identical publish acks and commits without applying. A single-member
 cluster skips the witness wait.
 .IP
@@ -286,13 +279,22 @@ else the kernel hostname.
 Standard help and version output.
 .SH EXIT STATUS
 .B status
-maps its state to the exit code, Nagios\-style. Every other subcommand uses 0
-for success and 1 for failure.
+maps its state to the exit code, Nagios\-style (0/1/2/3).
+.B run
+uses 0/1/3/4: 0 on a clean stop, 1 on a runtime failure, 3 when the apply is
+refused, 4 when another supervisor already holds the lock. 3 and 4 are the
+unit's
+.BR RestartPreventExitStatus ,
+neither fixed by trying again. Every other subcommand uses 0 for success and 1
+for failure.
 .TP
 .B 0
 .B status
 .BR UP :
-every expected adjacency available. For every other subcommand, success.
+every expected adjacency available. For
+.BR run ,
+a clean stop \(em the SIGTERM teardown completed. For every other subcommand,
+success.
 .TP
 .B 1
 .B status
@@ -300,6 +302,10 @@ every expected adjacency available. For every other subcommand, success.
 up and carrying traffic, but some expected adjacency is down (a wire pulled, a
 session not yet established) \(em 0 under
 .BR \-\-permissive .
+For
+.BR run ,
+a runtime failure that systemd retries after
+.BR RestartSec .
 For every other subcommand, failure: a validation error, a failed apply, a
 bitten watchdog, or
 .B policy\-teeth
@@ -315,6 +321,8 @@ included \(em we cannot know what was desired.
 no adjacency is available at all while up is desired.
 .B \-\-permissive
 does not mask it.
+.B run
+does not use this code.
 .TP
 .B 3
 .B status
@@ -322,12 +330,19 @@ does not mask it.
 up is not desired: there is no run dir \(em
 .B cfab down
 was run, or
-.B cfab up
+.B cfab run
 never was \(em or there is no
 .B fabric.conf
 on this host at all.
 .B \-\-permissive
-does not mask it.
+does not mask it. For
+.BR run ,
+the declaration or this host refused the apply; retrying will not help.
+.TP
+.B 4
+.B run
+only: another supervisor already holds the lock on the run dir. Retrying will
+not help.
 .SH ENVIRONMENT
 .TP
 .B CFAB_HOST
@@ -393,7 +408,7 @@ to it on first use).
 The publish cluster lock and the measurement lease (mkdir locks; pmxcfs
 expires a crashed holder's lock after 120\ s).
 .TP
-.I /usr/lib/systemd/system/cfab\-fabric.service
+.I /usr/lib/systemd/system/cfab.service
 The packaged systemd unit (see
 .BR SYSTEMD ).
 .TP
@@ -403,46 +418,39 @@ Optional environment file for that unit (a conffile): where to set
 when this member's row is not named by the kernel hostname.
 .SH SYSTEMD
 The Debian package ships
-.BR cfab\-fabric.service ,
+.BR cfab.service ,
 installed
 .B disabled and not started
 \(em installing cfab never changes the network. Write
 .I /etc/cfab/fabric.conf
 first, then
-.BR "systemctl enable \-\-now cfab\-fabric" .
+.BR "systemctl enable \-\-now cfab" .
 .PP
 The unit is
-.B Type=oneshot
-with
-.BR RemainAfterExit=yes .
+.BR Type=notify .
 .B ExecStart
-and
-.B ExecReload
-are
-.BR "cfab up" ;
-.B ExecStop
 is
-.BR "cfab down" .
+.BR "cfab run" ,
+the long-lived supervisor.
+.B ExecReload
+is
+.BR "kill \-HUP $MAINPID" ,
+which re\-applies the declaration in place \(em no teardown, no netdev churn.
 .B ConditionPathExists=/etc/cfab/fabric.conf
 skips it on a host that has the package but no declaration, so that host boots clean
 instead of failing.
+.B RestartPreventExitStatus=3\ 4
+stops systemd from retrying a refused apply or a lost lock.
 .PP
-A package upgrade neither stops nor restarts the unit: stopping it would run
-.B down
-and take every identity on the host with it. The engine that is already running keeps
-the old binary's inode. The new binary takes effect at the next
-.RB ( "systemctl reload cfab\-fabric" ),
-which is
-.B up
-again \(em and
-.B up
-always stops and restarts the routing engine, so this member's adjacencies drop and
-re\-form.
+A package upgrade neither stops nor restarts the unit: stopping it tears the fabric
+down and takes every identity on the host with it. The supervisor that is already
+running keeps the old binary's inode, so the new binary takes effect at the next
+.RB ( "systemctl restart cfab" ).
+.RB ( "systemctl reload cfab" )
+re\-applies the declaration in place without restarting the daemons.
 .PP
 .B "apt remove"
-stops the unit (that is
-.BR down ,
-which is correct: the binary is going away) and disables it;
+stops the unit (correct: the binary is going away) and disables it;
 .B "apt purge"
 also removes
 .IR /etc/default/cfab .
