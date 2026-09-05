@@ -13,11 +13,12 @@ use holo_northbound::error::Error as NbError;
 use holo_northbound::{NbDaemonSender, NbProviderReceiver};
 use holo_protocol::InstanceShared;
 use holo_utils::bfd::BfdSocketPolicy;
+use holo_utils::bgp::BgpListenPolicy;
 use holo_utils::ibus;
 use holo_utils::southbound::FibPolicy;
 use holo_utils::yang::{ContextExt, SchemaNodeExt};
 use holo_yang::YANG_CTX;
-use holo_yang::implemented_modules::{BFD, INTERFACE, OSPF, ROUTING};
+use holo_yang::implemented_modules::{BFD, BGP, INTERFACE, OSPF, POLICY, ROUTING};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use yang5::context::Context;
@@ -34,7 +35,9 @@ pub fn yang_ctx() -> &'static Arc<Context> {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let mut ctx = holo_yang::new_context();
-        let modules: Vec<&str> = [INTERFACE, ROUTING, OSPF, BFD].concat();
+        // POLICY carries BOTH `ietf-routing-policy` and `ietf-bgp-policy`; the BGP tree
+        // references policies by name, so neither module set is optional.
+        let modules: Vec<&str> = [INTERFACE, ROUTING, OSPF, BFD, BGP, POLICY].concat();
         holo_yang::load_modules(&mut ctx, &modules);
         ctx.cache_data_paths();
         // Set-if-unset: the engine binary sets it exactly once; a test process shares one.
@@ -44,6 +47,12 @@ pub fn yang_ctx() -> &'static Arc<Context> {
 }
 
 /// Parse + validate a candidate configuration tree (leafrefs enforced, state excluded).
+///
+/// `STRICT`, not `DataParserFlags::empty()`. Measured: under `empty()` libyang ACCEPTS a node
+/// holo's deviations mark `not-supported` (e.g. `bgp/global/route-selection-options/enable-aigp`,
+/// `holo-yang/modules/deviations/holo-ietf-bgp-deviations.yang`) and SILENTLY DROPS it from the
+/// tree — cfab would ship a configuration the engine never sees, with no error anywhere. Under
+/// `STRICT` the same node is refused with the node name and the parent path.
 pub fn parse_candidate(tree: &Value) -> Result<DataTree<'static>> {
     let ctx = yang_ctx();
     let text = serde_json::to_string(tree).map_err(Error::fatal)?;
@@ -51,7 +60,7 @@ pub fn parse_candidate(tree: &Value) -> Result<DataTree<'static>> {
         ctx,
         text,
         DataFormat::JSON,
-        DataParserFlags::empty(),
+        DataParserFlags::STRICT,
         DataValidationFlags::NO_STATE,
     )
     .map_err(|e| {
@@ -131,12 +140,13 @@ pub struct Northbound {
 }
 
 impl Northbound {
-    /// Start holo-interface + holo-routing (which spawns the OSPF instances and the BFD
-    /// instance itself). Must run inside the tokio runtime: the providers spawn tasks.
+    /// Start holo-interface, holo-policy and holo-routing (which spawns the OSPF, BFD and
+    /// BGP instances itself). Must run inside the tokio runtime: the providers spawn tasks.
     pub fn start(
         hostname: &str,
         fib_policy: FibPolicy,
         bfd_socket_policy: BfdSocketPolicy,
+        bgp_listen_policy: BgpListenPolicy,
     ) -> Northbound {
         let ctx = yang_ctx();
         let running = Arc::new(DataTree::new(ctx));
@@ -148,6 +158,7 @@ impl Northbound {
             hostname: Some(hostname.to_string()),
             fib_policy: Arc::new(fib_policy),
             bfd_socket_policy,
+            bgp_listen_policy,
             ..Default::default()
         };
 
@@ -162,6 +173,19 @@ impl Northbound {
             shared.clone(),
         );
         register_provider::<holo_interface::Master>(
+            providers.len(),
+            &mut registered_paths,
+            &mut validation_fns,
+        );
+        providers.push(daemon_tx);
+
+        // Between holo-interface and holo-routing, which is holod's own order
+        // (holo-daemon/src/northbound/core.rs). Load-bearing: commits run per provider in
+        // registration order, and holo-bgp resolves a neighbor's policy names with
+        // `shared.policies.get(name).unwrap()` — a policy named before it is defined panics
+        // the engine.
+        let daemon_tx = holo_policy::start(provider_tx.clone(), &ibus_tx, ibus_rx.policy);
+        register_provider::<holo_policy::Master>(
             providers.len(),
             &mut registered_paths,
             &mut validation_fns,
@@ -346,7 +370,8 @@ mod tests {
         let mut registered = HashMap::new();
         let mut fns = Vec::new();
         register_provider::<holo_interface::Master>(0, &mut registered, &mut fns);
-        register_provider::<holo_routing::Master>(1, &mut registered, &mut fns);
+        register_provider::<holo_policy::Master>(1, &mut registered, &mut fns);
+        register_provider::<holo_routing::Master>(2, &mut registered, &mut fns);
         resolve_provider_paths(yang_ctx(), &registered)
     }
 
@@ -357,21 +382,84 @@ mod tests {
         assert_eq!(a, b);
         assert!(yang_ctx().get_module_latest("ietf-ospf").is_some());
         assert!(yang_ctx().get_module_latest("ietf-bfd-ip-sh").is_some());
+        assert!(yang_ctx().get_module_latest("ietf-bgp").is_some());
+        // Both halves of POLICY: the BGP tree names policies that live in
+        // `ietf-routing-policy`, and their actions in `ietf-bgp-policy`.
+        assert!(
+            yang_ctx()
+                .get_module_latest("ietf-routing-policy")
+                .is_some()
+        );
+        assert!(yang_ctx().get_module_latest("ietf-bgp-policy").is_some());
         assert!(
             yang_ctx().get_module_latest("ietf-vrrp").is_none(),
             "vrrp was deleted (NAS is a leaf)"
         );
     }
 
+    /// The BGP + routing-policy material the emitter produces survives the round trip into a
+    /// libyang tree under STRICT — the proof that the module set the engine loads is the one
+    /// the emitter writes against. `pve1-tb` carries an ingress leg and must show the BGP
+    /// instance and the policy definitions; the leaf `pve3-tb` never peers and must show
+    /// neither, so the assertion cannot pass vacuously.
     #[test]
     fn generated_tree_parses_and_validates_no_state() {
         let f = fabric();
-        for member in ["pve1-tb", "pve3-tb"] {
+        for (member, want_bgp) in [("pve1-tb", true), ("pve3-tb", false)] {
             let v = View::new(&f, member).unwrap();
             let tree = crate::emit::engine::generate(&v).unwrap();
             let dtree = parse_candidate(&tree).unwrap_or_else(|e| panic!("{member}: {e}"));
             assert!(dtree.traverse().count() > 10);
+            let printed = dtree
+                .print_string(DataFormat::JSON, DataPrinterFlags::WITH_SIBLINGS)
+                .unwrap();
+            let parsed: Value = serde_json::from_str(&printed).unwrap();
+            let protos = &parsed["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"];
+            let bgp = protos
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|p| p["type"] == "ietf-bgp:bgp");
+            assert_eq!(bgp, want_bgp, "{member}: bgp instance in the parsed tree");
+            assert_eq!(
+                parsed.get("ietf-routing-policy:routing-policy").is_some(),
+                want_bgp,
+                "{member}: routing-policy in the parsed tree"
+            );
+            if want_bgp {
+                assert!(
+                    printed.contains("-import"),
+                    "{member}: import policy lost in the parse"
+                );
+            }
         }
+    }
+
+    /// STRICT's teeth: holo deviates `enable-aigp` to `not-supported`, so no provider would
+    /// ever see it. Under `DataParserFlags::empty()` libyang accepts the node and drops it
+    /// silently — cfab would ship a configuration the engine never gets. The refusal must
+    /// name the node and the path the caller needs to find it.
+    #[test]
+    fn a_node_holo_deviates_away_is_refused_with_its_path() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut tree = crate::emit::engine::generate(&v).unwrap();
+        let protos =
+            tree["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array_mut()
+                .unwrap();
+        let bgp = protos
+            .iter_mut()
+            .find(|p| p["type"] == "ietf-bgp:bgp")
+            .expect("pve1-tb emits a bgp instance");
+        bgp["ietf-bgp:bgp"]["global"]["route-selection-options"] =
+            serde_json::json!({ "enable-aigp": true });
+        let err = parse_candidate(&tree).unwrap_err().to_string();
+        assert!(err.contains("enable-aigp"), "{err}");
+        assert!(err.contains("route-selection-options"), "{err}");
+        // `yang_err` appends libyang's path; without it the operator gets a bare node name and
+        // no idea which instance carries it.
+        assert!(err.contains("(path "), "{err}");
     }
 
     /// F2: the OSPF interface leafrefs point at ietf-interfaces entries; without them the
@@ -399,9 +487,14 @@ mod tests {
             .into_iter()
             .flat_map(|(i, it)| it.map(move |p| (i, p)))
             .chain(
-                holo_routing::Master::YANG_OPS_CONFIG
+                holo_policy::Master::YANG_OPS_CONFIG
                     .paths()
                     .map(|p| (1usize, p)),
+            )
+            .chain(
+                holo_routing::Master::YANG_OPS_CONFIG
+                    .paths()
+                    .map(|p| (2usize, p)),
             )
         {
             assert_eq!(paths.get(p), Some(&want), "{p}");
@@ -421,6 +514,77 @@ mod tests {
         let changes = changes_from_diff(&diff);
         assert!(changes.len() > 20, "{}", changes.len());
         assert_eq!(first_unmapped(&changes, &provider_paths()), None);
+    }
+
+    /// The real providers accept the real tree: `Northbound::start` brings up holo-interface,
+    /// holo-policy and holo-routing (which spawns OSPF, BFD and BGP), and the emitted
+    /// configuration commits through all three phases. Stronger than parse+validate — it is
+    /// the only desk proof that holo-policy is registered where the BGP paths need it and that
+    /// no policy name is resolved before it is defined. The live proof on real interfaces is
+    /// still the testbed's.
+    ///
+    /// `proto_base` is set, NOT `FibPolicy::default()`: with no base holo-routing's startup
+    /// purge deletes every route the kernel attributes to `static`/`ospf`/`bgp` — running
+    /// `cargo test` as root would take out the host's default route. It is deliberately
+    /// `TEST_PROTO_BASE`, DISJOINT from the production `PROTO_BASE` (201..=204): the purge
+    /// deletes any route in `base..=base+3` regardless of owner and this test has none of the
+    /// real engine's `sock::refuse_if_live` guard, so a shared base would let a root test run
+    /// delete a live `cfab engine`'s routes.
+    #[tokio::test]
+    async fn the_emitted_tree_commits_through_the_real_providers() {
+        // Free range 250..=253 (FibPolicy asserts base <= 252): well clear of production and of
+        // every well-known rt_proto id, so the startup purge can touch no real engine's routes.
+        const TEST_PROTO_BASE: u8 = 250;
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let candidate = parse_candidate(&crate::emit::engine::generate(&v).unwrap()).unwrap();
+        let mut nb = Northbound::start(
+            "pve1-tb",
+            FibPolicy {
+                proto_base: Some(TEST_PROTO_BASE),
+                prefsrc: Vec::new(),
+            },
+            BfdSocketPolicy::default(),
+            BgpListenPolicy::NoListener,
+        );
+        assert!(
+            nb.commit(candidate).await.unwrap(),
+            "commit applied nothing"
+        );
+        // The commit returning Ok is NOT enough. holo-bgp resolves its policy names on its own
+        // task, after the commit response has already been sent, and a name it cannot find is
+        // an unwrap panic on that task — invisible to the caller, and the instance still shows
+        // up in the state list. What disappears is the instance's own state: with the policy
+        // provider registered AFTER holo-routing this reads back as a bare `{type, name}`
+        // (measured), so the neighbor assertion below is what actually holds the order down.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let st = nb
+            .get_state()
+            .await
+            .expect("a provider died after the commit");
+        let bgp = st["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|p| p["type"] == "ietf-bgp:bgp")
+            .expect("no bgp instance in the operational tree");
+        let want = &v
+            .fabric
+            .zone(&v.gw_rows()[0].zone)
+            .unwrap()
+            .gw
+            .as_ref()
+            .unwrap()
+            .router;
+        let nbrs = &bgp["ietf-bgp:bgp"]["neighbors"]["neighbor"];
+        assert!(
+            nbrs.as_array()
+                .into_iter()
+                .flatten()
+                .any(|n| n["remote-address"] == want.as_str()),
+            "bgp instance reports no neighbor {want}: {bgp}"
+        );
+        nb.shutdown().await;
     }
 
     #[test]

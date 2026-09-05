@@ -1,0 +1,133 @@
+{
+  "ietf-routing-policy:routing-policy": {
+    "defined-sets": {
+      "prefix-sets": {
+        "prefix-set": [
+          {
+            "name": "cfab-mgmt-id",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "10.249.0.0/24",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "policy-definitions": {
+      "policy-definition": [
+        {
+          "name": "cfab-mgmt-import",
+          "statements": {
+            "statement": [
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-med": "igp"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "cfab-mgmt-export",
+          "statements": {
+            "statement": [
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-next-hop": "self"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "bgp-instance": {
+    "type": "ietf-bgp:bgp",
+    "name": "cfab",
+    "ietf-bgp:bgp": {
+      "global": {
+        "as": 65000,
+        "identifier": "10.249.0.1",
+        "afi-safis": {
+          "afi-safi": [
+            {
+              "name": "iana-bgp-types:ipv4-unicast",
+              "apply-policy": {
+                "import-policy": [
+                  "cfab-mgmt-import"
+                ]
+              },
+              "ipv4-unicast": {
+                "holo-bgp:redistribution": [
+                  {
+                    "type": "ietf-routing:direct"
+                  },
+                  {
+                    "type": "ietf-ospf:ospfv2"
+                  }
+                ],
+                "holo-bgp:network": [
+                  "10.249.0.1/32"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "neighbors": {
+        "neighbor": [
+          {
+            "remote-address": "192.168.249.254",
+            "peer-as": 65000,
+            "timers": {
+              "connect-retry-interval": 3,
+              "hold-time": 3,
+              "keepalive": 1
+            },
+            "transport": {
+              "local-address": "192.168.249.1"
+            },
+            "afi-safis": {
+              "afi-safi": [
+                {
+                  "name": "iana-bgp-types:ipv4-unicast",
+                  "enabled": true,
+                  "apply-policy": {
+                    "export-policy": [
+                      "cfab-mgmt-export"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

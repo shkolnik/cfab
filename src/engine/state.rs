@@ -6,12 +6,14 @@ use serde_json::{Map, Value, json};
 
 const OSPFV2: &str = "ietf-ospf:ospfv2";
 const BFDV1: &str = "ietf-bfd-types:bfdv1";
+const BGP: &str = "ietf-bgp:bgp";
 
 /// Build the document. `cfg` is `emit::engine::generate`'s tree (cost/passive per OSPF
 /// interface); `state_trees` are the providers' operational trees as libyang printed them.
 pub fn document(ready: bool, cfg: &Value, state_trees: &[Value]) -> Value {
     let mut ospf = Map::new();
     let mut bfd = Vec::new();
+    let mut bgp = Vec::new();
     for tree in state_trees {
         for proto in protocols(tree) {
             match proto["type"].as_str() {
@@ -24,6 +26,7 @@ pub fn document(ready: bool, cfg: &Value, state_trees: &[Value]) -> Value {
                     }
                 }
                 Some(BFDV1) => bfd.extend(bfd_sessions(proto)),
+                Some(BGP) => bgp.extend(bgp_neighbors(proto)),
                 Some(_) | None => {}
             }
         }
@@ -32,7 +35,7 @@ pub fn document(ready: bool, cfg: &Value, state_trees: &[Value]) -> Value {
         "ready": ready,
         "ospf": Value::Object(ospf),
         "bfd": bfd,
-        "bgp": [],
+        "bgp": bgp,
     })
 }
 
@@ -148,6 +151,43 @@ fn bfd_sessions(proto: &Value) -> Vec<Value> {
         })
     })
     .collect()
+}
+
+/// One entry per `ietf-bgp:bgp` neighbor: the remote address, the FRR-worded session state, and
+/// the ipv4-unicast sent-prefix count `cfab status` reads to judge ingress (a session Established
+/// but advertising nothing is the signature of a missing neighbor afi-safi export policy).
+fn bgp_neighbors(proto: &Value) -> Vec<Value> {
+    list(&proto[BGP], "neighbors", "neighbor")
+        .map(|n| {
+            // ipv4-unicast prefix counters live under this neighbor's afi-safi list. A neighbor
+            // that has not negotiated the AFI has no entry — count it as zero, not absent.
+            let v4 = list(n, "afi-safis", "afi-safi")
+                .find(|a| local_name(&a["name"]) == Some("ipv4-unicast"));
+            let prefixes = v4.map(|a| &a["prefixes"]);
+            let pfx_snt = prefixes.and_then(|p| p["sent"].as_u64()).unwrap_or(0);
+            json!({
+                "peer": n["remote-address"],
+                "state": bgp_state(local_name(&n["session-state"])),
+                "pfx_snt": pfx_snt,
+            })
+        })
+        .collect()
+}
+
+/// The ietf-bgp `session-state` enum (lowercase) → FRR's mixed-case words, by an explicit table:
+/// `opensent` must become `OpenSent`, never `Opensent`. An unknown value passes through unchanged
+/// so a caller's `== "Established"` comparison fails loudly rather than on an invented word.
+fn bgp_state(state: Option<&str>) -> Value {
+    match state {
+        Some("idle") => "Idle".into(),
+        Some("connect") => "Connect".into(),
+        Some("active") => "Active".into(),
+        Some("opensent") => "OpenSent".into(),
+        Some("openconfirm") => "OpenConfirm".into(),
+        Some("established") => "Established".into(),
+        Some(other) => other.into(),
+        None => Value::Null,
+    }
 }
 
 #[cfg(test)]
@@ -271,7 +311,74 @@ mod tests {
         );
         assert_eq!(bfd[1]["state"], "admin-down");
         assert_eq!(bfd[1]["peer"], "10.99.1.2");
+    }
+
+    /// A control-plane-protocol of type `ietf-bgp:bgp` with one established neighbor: the three
+    /// fields, with `pfx_snt` taken from `sent`. The fixture also carries `received`/`installed`
+    /// (realistic FRR/holo shape) even though only `sent` is read.
+    fn bgp_state_tree(session_state: &str, sent: u64) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{
+            "ietf-routing:routing": {{ "control-plane-protocols": {{ "control-plane-protocol": [
+                {{ "type": "ietf-bgp:bgp", "name": "main", "ietf-bgp:bgp": {{
+                    "neighbors": {{ "neighbor": [
+                        {{ "remote-address": "192.168.249.254", "session-state": "{session_state}",
+                           "afi-safis": {{ "afi-safi": [
+                               {{ "name": "iana-bgp-types:ipv4-unicast", "prefixes": {{
+                                   "received": 99, "installed": 12, "sent": {sent} }} }},
+                               {{ "name": "iana-bgp-types:ipv6-unicast", "prefixes": {{
+                                   "received": 7, "installed": 7, "sent": 7 }} }}
+                           ] }} }}
+                    ] }}
+                }} }}
+            ] }} }}
+        }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn no_bgp_protocol_yields_an_empty_array() {
+        // The OSPF/BFD-only fixture carries no BGP control-plane-protocol.
+        let d = document(true, &cfg(), &[state()]);
         assert_eq!(d["bgp"], json!([]));
+    }
+
+    #[test]
+    fn an_established_neighbor_distills_the_three_fields() {
+        let d = document(true, &cfg(), &[bgp_state_tree("established", 34)]);
+        assert_eq!(
+            d["bgp"],
+            json!([{
+                "peer": "192.168.249.254",
+                "state": "Established",
+                "pfx_snt": 34,
+            }])
+        );
+    }
+
+    #[test]
+    fn session_state_maps_through_the_frr_table_not_capitalize_first() {
+        for (yang, frr) in [
+            ("idle", "Idle"),
+            ("connect", "Connect"),
+            ("active", "Active"),
+            ("opensent", "OpenSent"),
+            ("openconfirm", "OpenConfirm"),
+            ("established", "Established"),
+        ] {
+            let d = document(true, &cfg(), &[bgp_state_tree(yang, 0)]);
+            assert_eq!(d["bgp"][0]["state"], frr, "{yang}");
+        }
+        // Specifically: opensent must not become the capitalize-first "Opensent".
+        let d = document(true, &cfg(), &[bgp_state_tree("opensent", 0)]);
+        assert_ne!(d["bgp"][0]["state"], "Opensent");
+    }
+
+    #[test]
+    fn an_unknown_session_state_passes_through_unchanged() {
+        let d = document(true, &cfg(), &[bgp_state_tree("clearing", 0)]);
+        assert_eq!(d["bgp"][0]["state"], "clearing");
     }
 
     #[test]

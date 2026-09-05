@@ -19,7 +19,8 @@ holo-northbound = { path = "../holo/holo-northbound" }
 holo-protocol = { path = "../holo/holo-protocol" }
 holo-utils = { path = "../holo/holo-utils" }
 holo-interface = { path = "../holo/holo-interface" }
-holo-routing = { path = "../holo/holo-routing", features = ["ospf", "bfd"] }
+holo-routing = { path = "../holo/holo-routing", features = ["ospf", "bfd", "bgp"] }
+holo-policy = { path = "../holo/holo-policy" }
 yang5 = { version = "0.3", features = ["bundled"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "process"] }
 nix = { version = "0.31", features = ["process", "signal", "fs"] }

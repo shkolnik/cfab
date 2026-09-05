@@ -318,6 +318,30 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             mk_vlan(sys, &r.ifname, &r.home, r.vid, Some(&cidr), true, &qos_map)?;
             class_sysctls(sys, &r.ifname, Role::Backup)?;
         }
+        // cfab's own return-path default: a reply sourced from an identity address must leave
+        // through the ingress leg (proto 205, this member's own id), never untagged out of the
+        // main default. The FRR build got this from `ip route 0.0.0.0/0 <router> table <id>`;
+        // the embedded engine's static path cannot — holo installs a static only when its
+        // nexthop names an interface, and the fork has no `table` augment — so cfab owns it,
+        // torn down by exact key in `down`. proto 205 is outside the engine's swept 201..204
+        // range, so neither the startup purge nor `down`'s engine sweep removes it.
+        run_ok(
+            sys,
+            &[
+                "ip",
+                "route",
+                "replace",
+                "default",
+                "via",
+                &gw.router,
+                "dev",
+                &r.ifname,
+                "table",
+                &z.id.to_string(),
+                "proto",
+                &emit::engine::CFAB_PROTO.to_string(),
+            ],
+        )?;
     }
     // The fallback leg: one active-backup bond per zone over a tagged sub-interface of every
     // wire, so the member keeps a path in the zone when the physical islands are disjointly
@@ -1323,8 +1347,29 @@ mod tests {
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/send_redirects",
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding",
                 "ip link set cfab-gw249 up",
+                // The per-zone return-path default lands as part of building the leg (E2.2).
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205",
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding",
             ]
+        );
+    }
+
+    /// The per-zone return-path default (task E2.2): after the ingress leg is addressed, `up`
+    /// installs cfab's own default in the zone's table, via the router, through the leg, under
+    /// proto 205 (cfab's own id, outside the engine's swept range). Exact argv.
+    #[test]
+    fn up_installs_the_return_path_default_through_the_ingress_leg() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view);
+        let o = opts();
+        run(&mut sys, &view, &o).unwrap();
+        assert!(
+            sys.ran(
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205"
+            ),
+            "{:?}",
+            calls_for(&sys, "route replace default")
         );
     }
 
@@ -1405,6 +1450,8 @@ mod tests {
                 "ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6",
                 "ip addr replace 192.168.249.1/24 dev cfab-gw249",
                 "ip link set cfab-gw249 up",
+                // The per-zone return-path default lands as part of building the leg (E2.2).
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205",
             ]
         );
     }
