@@ -588,15 +588,18 @@ fn mk_vlan(
 /// packets lost at every value, and it buys a 10x reduction in migrations on a bouncing wire —
 /// 2 versus 20 active-slave switches over ten 250 ms flaps, each avoided switch an avoided GARP
 /// burst and MAC move on every switch in the path. `updelay` never delays the failover AWAY from
-/// a dead wire (0.026-0.042 s at every value), so it cannot lengthen an outage. Note it takes
-/// effect on an EXISTING member only after a `down`/`up`: `mk_rescue` skips `ip link add` when the
-/// bond is already there and does not re-assert the bond parameters.
+/// a dead wire (0.026-0.042 s at every value), so it cannot lengthen an outage. It takes effect on
+/// an EXISTING member only after a `down`/`up` — `mk_bond_leg` never rewrites a live bond; it
+/// refuses when the running value diverges from this one and names that remedy.
 const RESCUE_UPDELAY_MS: &str = "500";
 /// `fail_over_mac`. **`none` is the build default** — measured nil difference against `active`
 /// on veth, and it keeps one MAC across a migration. A real NIC must accept the bond MAC in its
 /// unicast filter (INFERRED); Task 7's hardware step measures that and flips this to `active`
 /// if it does not. One line, deliberately not a config knob.
 const RESCUE_FAIL_OVER_MAC: &str = "none";
+/// Bonding mode. Active-backup is the whole point of the leg: one wire carries it at a time, and
+/// a migration is invisible above L2. Not writable on a live bond — only `ip link add` sets it.
+const RESCUE_BOND_MODE: &str = "active-backup";
 /// Carrier poll, ms: measured switch at +0.014…0.059 s after carrier loss through the VLAN.
 const RESCUE_MIIMON_MS: &str = "100";
 /// Gratuitous ARPs per migration: measured exactly 3, at +0.050/+0.050/+0.152 s.
@@ -619,6 +622,53 @@ struct BondLeg<'a> {
     role: Role,
 }
 
+/// Every bond parameter this build creates a leg with, in `bonding/` sysfs spelling: the file
+/// name and the value `ip link add` was given. Read back on an existing bond so a changed
+/// constant cannot silently miss a member that already has the leg.
+const RESCUE_BOND_PARAMS: [(&str, &str); 5] = [
+    ("mode", RESCUE_BOND_MODE),
+    ("miimon", RESCUE_MIIMON_MS),
+    ("updelay", RESCUE_UPDELAY_MS),
+    ("num_grat_arp", RESCUE_NUM_GRAT_ARP),
+    ("fail_over_mac", RESCUE_FAIL_OVER_MAC),
+];
+
+/// An existing bond keeps whatever `ip link add` gave it: nothing in `up` re-asserts the
+/// parameters, so a changed constant would reach a fresh member and silently miss every member
+/// that already has the leg. Refuse on divergence rather than rewrite — `mode` and
+/// `fail_over_mac` are not writable on a live bond at all, and a partial rewrite is a degraded
+/// leg nobody asked for. `cfab down` deletes the bond before its slaves, so down/up is a proven
+/// rebuild.
+///
+/// sysfs spells the enumerated parameters `<name> <index>` ("active-backup 1", "none 0") and the
+/// numeric ones as a bare integer; compare on the first whitespace-separated token. An
+/// unreadable file is not health — it is an unproven bond — so it refuses too.
+fn bond_params_match(sys: &dyn Sys, ifname: &str) -> Result<()> {
+    let mut diverged: Vec<String> = Vec::new();
+    for (param, want) in RESCUE_BOND_PARAMS {
+        let path = format!("/sys/class/net/{ifname}/bonding/{param}");
+        let Ok(raw) = sys.read(&path) else {
+            return Err(Error::fatal(format!(
+                "REFUSING: {ifname} exists but {path} cannot be read, so its bond parameters \
+                 cannot be proven; run `cfab down` then `cfab up` to rebuild the leg"
+            )));
+        };
+        let got = raw.split_whitespace().next().unwrap_or("");
+        if got != want {
+            diverged.push(format!("{param} want {want} got {got}"));
+        }
+    }
+    if !diverged.is_empty() {
+        return Err(Error::fatal(format!(
+            "REFUSING: {ifname} exists with bond parameters this build did not create it with \
+             ({}); cfab never rewrites a live bond (mode and fail_over_mac are not writable on \
+             one), so run `cfab down` then `cfab up` to rebuild the leg",
+            diverged.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// One migrating leg: an active-backup bond over a tagged sub-interface of every wire this
 /// member has, addressed like a segment. Idempotent, and refuse-unless-ours on every netdev
 /// it touches.
@@ -632,6 +682,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
                 r.ifname
             )));
         }
+        bond_params_match(sys, r.ifname)?;
     } else {
         run_ok(
             sys,
@@ -643,7 +694,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
                 "type",
                 "bond",
                 "mode",
-                "active-backup",
+                RESCUE_BOND_MODE,
                 "miimon",
                 RESCUE_MIIMON_MS,
                 "num_grat_arp",
@@ -991,7 +1042,10 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let (_tmp, o) = opts();
-        let mut sys = up_sys(&view)
+        // An existing bond must also present its bonding/ sysfs: `up` proves the parameters
+        // before it touches a bond it did not just create.
+        let sys = bond_sysfs(up_sys(&view), "cfab-st-rs", &healthy_bond_params());
+        let mut sys = sys
             .file("/sys/class/net/cfab-st-rs-st/master", "")
             .on_stdout(&["ip", "link", "show", "cfab-st-rs"], "9: cfab-st-rs\n")
             .on_stdout(
@@ -1067,6 +1121,129 @@ mod tests {
             !sys.ran("ip link del cfab-st-rs"),
             "never deletes a stranger"
         );
+    }
+
+    /// An existing rescue bond, correctly typed, with every bonding parameter as this build
+    /// wants it — the steady state a second `up` meets.
+    fn existing_rescue_bond(sys: MockSys, params: &[(&str, &str)]) -> MockSys {
+        let sys = sys
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-rs"],
+                "9: cfab-st-rs: <UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs"],
+                "9: cfab-st-rs: bond mode active-backup \n",
+            );
+        bond_sysfs(sys, "cfab-st-rs", params)
+    }
+
+    /// A bond's `bonding/` sysfs as the kernel spells it, parameter by parameter.
+    fn bond_sysfs(mut sys: MockSys, ifname: &str, params: &[(&str, &str)]) -> MockSys {
+        for (name, value) in params {
+            sys = sys.file(&format!("/sys/class/net/{ifname}/bonding/{name}"), value);
+        }
+        sys
+    }
+
+    /// Exactly what this build creates a bond with, in sysfs spelling.
+    fn healthy_bond_params() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("mode", "active-backup 1\n"),
+            ("miimon", "100\n"),
+            ("updelay", "500\n"),
+            ("num_grat_arp", "3\n"),
+            ("fail_over_mac", "none 0\n"),
+        ]
+    }
+
+    /// Bond parameters are only set at `ip link add`, so an existing bond keeps whatever it
+    /// was created with — this branch's own `updelay` 0 -> 500 would never reach a member
+    /// that already has the leg. `up` refuses instead of rewriting a live bond (`mode` and
+    /// `fail_over_mac` are not writable on one at all) and names the remedy.
+    #[test]
+    fn up_refuses_an_existing_rescue_bond_whose_parameters_diverge() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut params = healthy_bond_params();
+        params[2] = ("updelay", "0\n");
+        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let e = run(&mut sys, &view, &o).unwrap_err().to_string();
+        assert!(e.contains("cfab-st-rs"), "{e}");
+        assert!(e.contains("updelay want 500 got 0"), "{e}");
+        assert!(e.contains("cfab down"), "{e}");
+        assert!(
+            !sys.ran("ip link set cfab-st-rs type bond updelay"),
+            "never rewrites a live bond: {:?}",
+            sys.calls
+        );
+    }
+
+    /// Every diverging parameter is named in one message, not just the first.
+    #[test]
+    fn a_diverging_bond_names_every_parameter_with_want_and_got() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let params = [
+            ("mode", "balance-rr 0\n"),
+            ("miimon", "100\n"),
+            ("updelay", "0\n"),
+            ("num_grat_arp", "1\n"),
+            ("fail_over_mac", "active 1\n"),
+        ];
+        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let e = run(&mut sys, &view, &o).unwrap_err().to_string();
+        for want in [
+            "mode want active-backup got balance-rr",
+            "updelay want 500 got 0",
+            "num_grat_arp want 3 got 1",
+            "fail_over_mac want none got active",
+        ] {
+            assert!(e.contains(want), "{want} missing from: {e}");
+        }
+        assert!(
+            !e.contains("miimon want"),
+            "the matching one is not named: {e}"
+        );
+    }
+
+    /// The steady state: a bond that is already exactly right is accepted, `ip link add` is
+    /// not re-issued, and `up` goes on to the slaves.
+    #[test]
+    fn an_existing_rescue_bond_with_matching_parameters_is_accepted() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = existing_rescue_bond(up_sys(&view), &healthy_bond_params());
+        run(&mut sys, &view, &o).unwrap();
+        assert!(
+            !sys.ran("ip link add cfab-st-rs type bond"),
+            "an existing bond is never recreated"
+        );
+        assert!(sys.ran("ip link set cfab-st-rs-st master cfab-st-rs"));
+        assert!(sys.ran("ip link set cfab-st-rs up"));
+    }
+
+    /// An unreadable bonding file is not health: it is an unproven bond. Refuse, and say
+    /// which file could not be read.
+    #[test]
+    fn an_unreadable_bonding_file_is_refused_by_name() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let params: Vec<_> = healthy_bond_params()
+            .into_iter()
+            .filter(|(n, _)| *n != "num_grat_arp")
+            .collect();
+        let mut sys = existing_rescue_bond(up_sys(&view), &params);
+        let e = run(&mut sys, &view, &o).unwrap_err().to_string();
+        assert!(
+            e.contains("/sys/class/net/cfab-st-rs/bonding/num_grat_arp"),
+            "{e}"
+        );
+        assert!(e.contains("cfab down"), "{e}");
     }
 
     /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a rescue bond left

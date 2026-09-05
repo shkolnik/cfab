@@ -255,10 +255,21 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
             // addresses, at least the offset for any other
             let doc = engine_ctl::state(sys, f)?;
             for z in &f.zones {
-                let rows: Vec<_> = view
+                // Segments AND the rescue bond as `(seg, cost)`: the bond addresses and
+                // advertises exactly like a segment (`10.<id>.<seg>.<node>`), so a
+                // class-rows-only list leaves its transit link owned by nobody and the
+                // check silently weakens to "at least the offset" for it.
+                let rows: Vec<(u8, u32)> = view
                     .class_rows()
                     .into_iter()
                     .filter(|r| r.zone == z.name)
+                    .map(|r| (r.seg, r.ospf_cost))
+                    .chain(
+                        view.rescue_rows()
+                            .into_iter()
+                            .filter(|r| r.zone == z.name)
+                            .map(|r| (r.seg, r.ospf_cost)),
+                    )
                     .collect();
                 let mut below = false;
                 for link in doc["ospf"][&z.name]["self_lsa_links"]
@@ -271,8 +282,8 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                     let addr = link["if"].as_str().unwrap_or("");
                     let want = rows
                         .iter()
-                        .find(|r| view.segment_addr(z, r.seg) == addr)
-                        .map(|r| u64::from(r.ospf_cost + f.leaf_cost_offset));
+                        .find(|(seg, _)| view.segment_addr(z, *seg) == addr)
+                        .map(|(_, cost)| u64::from(cost + f.leaf_cost_offset));
                     if metric < u64::from(f.leaf_cost_offset) || want.is_some_and(|w| metric != w) {
                         below = true;
                     }
@@ -481,7 +492,19 @@ fn rescue(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
         }
 
         // ---- adjacency: every peer carrying this zone's rescue row, at least 2-Way ----
-        let nbrs = &doc["ospf"][zone]["interfaces"][&r.ifname]["neighbors"];
+        // An interface the engine does not carry indexes to Null here, and Null reads as an
+        // empty neighbor list — every declared peer would be reported absent, which names
+        // the wrong fault. The missing interface IS the fault; say that instead.
+        let nbrs = doc["ospf"][zone]["interfaces"].get(r.ifname.as_str());
+        let Some(nbrs) = nbrs.map(|i| &i["neighbors"]) else {
+            c.bad(&format!(
+                "rescue {zone}: {} is missing from the engine's ospf state (its neighbors \
+                 cannot be read) — re-run cfab up",
+                r.ifname
+            ));
+            c.rescue.push(format!("{zone}:rescue-nbr"));
+            continue;
+        };
         let peers: Vec<&crate::model::Member> = f
             .members
             .iter()
@@ -1617,6 +1640,72 @@ mod tests {
             report
                 .output
                 .contains("  FAIL: cfab-st-rs forwarding!=0 (a leaf never transits)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// An interface the engine does not carry yields `Null` where its neighbors should be,
+    /// and `Null` reads as an empty list — every declared peer would be reported absent,
+    /// naming the wrong fault. Name the real one instead.
+    #[test]
+    fn a_rescue_interface_absent_from_the_engine_state_is_named() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        doc["ospf"]["storage"]["interfaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cfab-st-rs");
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  FAIL: rescue storage: cfab-st-rs is missing from the engine's ospf state \
+                 (its neighbors cannot be read) — re-run cfab up\n"
+            ),
+            "{}",
+            report.output
+        );
+        // and NOT the misleading per-peer verdict it used to print
+        assert!(
+            !report.output.contains("rescue storage neighbor"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The never-a-transit check must hold the rescue bond to the EXACT offset too: the bond
+    /// advertises from `10.<id>.9.<node>`, which no class row owns, so a rescue-blind check
+    /// silently falls back to the weaker "at least the offset" arm and lets a wrong metric
+    /// through. 5000 + 30000 = 35000 is the only acceptable value.
+    #[test]
+    fn a_leafs_rescue_transit_link_is_held_to_the_exact_offset() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        let rescue_addr = view.segment_addr(f.zone("storage").unwrap(), 9);
+        let links = doc["ospf"]["storage"]["self_lsa_links"]
+            .as_array_mut()
+            .unwrap();
+        let link = links
+            .iter_mut()
+            .find(|l| l["if"] == rescue_addr.as_str())
+            .expect("the rescue bond advertises a transit link");
+        // Above LEAF_COST_OFFSET, so the weak arm accepts it; not cost + offset, so the
+        // exact arm must not.
+        link["metric"] = serde_json::json!(31000);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  FAIL: ospf 99: a transit link in our router LSA is advertised below \
+                 LEAF_COST_OFFSET=30000"
+            ),
             "{}",
             report.output
         );

@@ -305,6 +305,11 @@ pub fn rescue_rows_of(fabric: &Fabric, member: &Member) -> Vec<RescueRow> {
         .iter()
         .filter(|r| r.role == Role::Rescue)
         .filter_map(|r| {
+            // A zone with a rescue row but no class row on this member has no cheapest wire,
+            // and the row is DROPPED — deliberately, and the opposite of what `gw_rows_of`
+            // does with the same condition (it falls back to the member's first wire rather
+            // than take the outside away silently). Whether a home-less rescue leg should
+            // exist at all is an open question; the two sides are not reconciled yet.
             let home = home_wire(fabric, member, &r.zone)?;
             let slaves = slaves_of(member, &r.ifname);
             Some(RescueRow {
@@ -390,6 +395,33 @@ mod tests {
         assert_eq!(rows[1].ifname, "cfab-st-bk");
         assert_eq!(rows[1].wire, "eth1");
         assert_eq!(rows[2].wire, "eth0");
+    }
+
+    /// The tie rule is load-bearing, not incidental: `home_wire`'s strict `<` keeps the
+    /// FIRST CLASS_TABLE row of the zone when two segments cost the same, and that choice
+    /// decides which slave the rescue bond takes as `primary`. Storage's two cheapest rows
+    /// sit on different wires (st = eth9 first, cl = eth1 second); tie them and eth9 must
+    /// still win. A `<=` would silently hand `primary` to the last row instead.
+    #[test]
+    fn a_cost_tie_keeps_the_first_class_table_row() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace(
+                    "cfab-st-bk  cl storage 2 101 backup  100",
+                    "cfab-st-bk  cl storage 2 101 backup  10",
+                );
+        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let m = f.members.iter().find(|m| m.name == "pve1-tb").unwrap();
+        let rows = class_rows_of(&f, m);
+        let storage: Vec<_> = rows
+            .iter()
+            .filter(|r| r.zone == "storage")
+            .map(|r| (r.ifname.as_str(), r.wire.as_str(), r.ospf_cost))
+            .collect();
+        assert_eq!(storage[0], ("cfab-st", "eth9", 10));
+        assert_eq!(storage[1], ("cfab-st-bk", "eth1", 10), "the tie is real");
+        assert_eq!(home_wire(&f, m, "storage"), Some("eth9".to_string()));
     }
 
     #[test]
