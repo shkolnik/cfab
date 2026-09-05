@@ -237,19 +237,23 @@ fn read(
                 .collect()
         })
         .unwrap_or_default();
+    // The BFD-up legs are the runtime half of the expectation rule below: which segment can
+    // actually carry this peer's traffic right now, as opposed to which one we declared.
+    let mut up_legs: BTreeSet<(u8, String, u8)> = BTreeSet::new();
     for (p, z, seg, addr) in expected {
         peers.insert(*p);
         counts.links += 1;
         if up_addrs.contains(addr) {
             counts.links_up += 1;
             peers_up.insert(*p);
+            up_legs.insert((*p, z.clone(), *seg));
         } else {
             c.note(format!("down {z}:{seg}:.{p}"));
         }
     }
 
     // ---- fallbacks: one expected OSPF neighbor per peer carrying the zone's row ----
-    fallback(
+    let two_way = fallback(
         sys,
         view,
         doc.as_ref(),
@@ -262,7 +266,7 @@ fn read(
     counts.peers = peers.len();
     counts.peers_up = peers_up.len();
 
-    reachability(sys, view, c)?;
+    reachability(sys, view, c, &up_legs, &two_way)?;
     Ok(counts)
 }
 
@@ -553,13 +557,13 @@ fn fallback(
     counts: &mut Counts,
     peers: &mut BTreeSet<u8>,
     peers_up: &mut BTreeSet<u8>,
-) -> Result<()> {
+) -> Result<BTreeSet<(u8, String)>> {
     let f = view.fabric;
+    let mut two_way: BTreeSet<(u8, String)> = BTreeSet::new();
     let rows = view.fallback_rows();
     if rows.is_empty() {
-        return Ok(());
+        return Ok(two_way);
     }
-    let ours = segments_of(f, view.member);
     for r in &rows {
         let z = f.zone(&r.zone)?;
         let zone = &r.zone;
@@ -661,83 +665,74 @@ fn fallback(
             if at_least_two_way(state) {
                 counts.fallbacks_up += 1;
                 peers_up.insert(m.node);
+                two_way.insert((m.node, zone.clone()));
             } else {
                 c.note(format!("down {zone}:fallback:.{}", m.node));
             }
         }
-
-        // ---- island-disjoint peers: reached over the bond, and that is health ---------
-        for m in &f.members {
-            if m.name == view.member.name {
-                continue;
-            }
-            let theirs = segments_of(f, m);
-            if ours
-                .intersection(&theirs)
-                .any(|s| s.starts_with(&format!("{zone}:")))
-            {
-                continue;
-            }
-            let target = format!("{}.0.{}", z.block(), m.node);
-            let (dev, _) = route_dev(sys, &target)?;
-            if dev == r.ifname {
-                c.note(format!("{zone} to {} via fallback", m.name));
-            }
-        }
     }
-    Ok(())
+    Ok(two_way)
 }
 
 /// Each peer's identity, in each zone, must be reached over the interface we expect and with a
-/// pinned source address.
-fn reachability(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+/// pinned source address — and the expectation is read from RUNTIME state, never the declaration:
+/// `expected_dev` = the cheapest of (the segment legs whose BFD to this peer is up) together with
+/// (the zone's fallback bond, if this peer is at least 2-Way on it).
+///
+/// This is the D3 class. Both former sites keyed on `segments_of()`, so a cable pull never made
+/// two members disjoint in the model, and the fabric's own safety net read as a fault while it
+/// was doing its job. The declaration still sources the DENOMINATOR (`expected_links`) — that
+/// number is meant to ignore a cable pull — but no expectation comes from it any more.
+///
+/// A peer with nothing up in a zone gets no expectation at all: those adjacencies are already
+/// counted down, and "no BFD-up segment to a peer" is not a second, louder verdict.
+fn reachability(
+    sys: &mut dyn Sys,
+    view: &View,
+    c: &mut Ctx,
+    up_legs: &BTreeSet<(u8, String, u8)>,
+    two_way: &BTreeSet<(u8, String)>,
+) -> Result<()> {
     let f = view.fabric;
     let host = &view.member.name;
-    let ours = segments_of(f, view.member);
     for m in &f.members {
         if m.name == *host {
             continue;
         }
         let p = m.node;
-        let theirs = segments_of(f, m);
         for z in &f.zones {
-            let target = format!("{}.0.{p}", z.block());
-            // the peer must be reached over the cheapest segment we SHARE with it (the NAS
-            // shape: a leaf with no wire on the zone's primary island)
-            let shared: BTreeSet<u8> = ours
-                .intersection(&theirs)
-                .filter_map(|s| {
-                    let (sz, seg) = s.split_once(':')?;
-                    (sz == z.name).then(|| seg.parse().ok()).flatten()
-                })
-                .collect();
-            let mut candidates: Vec<(u32, String)> = view
+            // (cost, ifname, is_fallback). The fallback row's cost is validated to sit above
+            // every host path in its zone, so the bond sorts last and is chosen only when no
+            // segment leg to this peer is up.
+            let mut candidates: Vec<(u32, String, bool)> = view
                 .class_rows()
                 .into_iter()
-                .filter(|r| r.zone == z.name && shared.contains(&r.seg))
-                .map(|r| (r.ospf_cost, r.ifname))
+                .filter(|r| r.zone == z.name && up_legs.contains(&(p, z.name.clone(), r.seg)))
+                .map(|r| (r.ospf_cost, r.ifname, false))
                 .collect();
+            if two_way.contains(&(p, z.name.clone())) {
+                candidates.extend(
+                    view.fallback_rows()
+                        .into_iter()
+                        .filter(|r| r.zone == z.name)
+                        .map(|r| (r.ospf_cost, r.ifname, true)),
+                );
+            }
             candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            let bond = view
-                .fallback_rows()
-                .into_iter()
-                .find(|r| r.zone == z.name)
-                .map(|r| r.ifname);
-            // No shared segment = island-disjoint from this peer in this zone: the fallback
-            // bond is the expected path, and reaching the peer over it is health.
-            let Some(expect) = candidates
-                .first()
-                .map(|(_, i)| i.clone())
-                .or_else(|| bond.clone())
-            else {
+            let Some((_, expect, is_fallback)) = candidates.first() else {
                 continue;
             };
+            let target = format!("{}.0.{p}", z.block());
             let (dev, route_line) = route_dev(sys, &target)?;
-            if dev != expect {
+            if dev != *expect {
                 c.note(format!(
                     "{} to {} via {dev}, expected {expect}",
                     z.name, m.name
                 ));
+            } else if *is_fallback {
+                // Health, whichever branch supplied the expectation — but worth a line: this
+                // peer is reachable, and not over a declared segment.
+                c.note(format!("{} to {} via fallback", z.name, m.name));
             }
             if !route_line.contains(&format!("src {}.0.{}", z.block(), view.node())) {
                 c.note(format!(
@@ -1751,6 +1746,25 @@ mod tests {
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
+    /// Every declared BFD leg up, as the runtime half of the expectation rule.
+    fn all_legs_up(view: &View) -> BTreeSet<(u8, String, u8)> {
+        expected_links(view)
+            .unwrap()
+            .into_iter()
+            .map(|(p, z, seg, _)| (p, z, seg))
+            .collect()
+    }
+
+    /// Every peer adjacent on every zone's fallback bond.
+    fn all_two_way(view: &View) -> BTreeSet<(u8, String)> {
+        let f = view.fabric;
+        f.members
+            .iter()
+            .filter(|m| m.name != view.member.name)
+            .flat_map(|m| f.zones.iter().map(move |z| (m.node, z.name.clone())))
+            .collect()
+    }
+
     fn disjoint_routes(devs: [&str; 6]) -> MockSys {
         let mut sys = MockSys::default();
         for (target, dev) in [
@@ -1796,8 +1810,22 @@ mod tests {
             "cfab-mg-b2",
         ]);
         let mut c = Ctx::default();
-        reachability(&mut sys, &view, &mut c).unwrap();
-        assert!(c.reasons.is_empty(), "{:?}", c.reasons);
+        reachability(
+            &mut sys,
+            &view,
+            &mut c,
+            &all_legs_up(&view),
+            &all_two_way(&view),
+        )
+        .unwrap();
+        assert_eq!(
+            once_each(&c.reasons),
+            vec![
+                "cluster to pve2-tb via fallback".to_string(),
+                "mgmt to pve2-tb via fallback".to_string(),
+                "storage to pve2-tb via fallback".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1814,10 +1842,19 @@ mod tests {
             "cfab-mg-b2",
         ]);
         let mut c = Ctx::default();
-        reachability(&mut sys, &view, &mut c).unwrap();
-        assert_eq!(
-            c.reasons,
-            vec!["storage to pve2-tb via cfab-st, expected cfab-st-fb".to_string()]
+        reachability(
+            &mut sys,
+            &view,
+            &mut c,
+            &all_legs_up(&view),
+            &all_two_way(&view),
+        )
+        .unwrap();
+        assert!(
+            c.reasons
+                .contains(&"storage to pve2-tb via cfab-st, expected cfab-st-fb".to_string()),
+            "{:?}",
+            c.reasons
         );
     }
 
@@ -1842,6 +1879,84 @@ mod tests {
                 )
                 .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// D3, closed. A cable pull makes two members disjoint at RUNTIME while the declaration
+    /// still says they share two storage segments. The old rule keyed the expectation on
+    /// `segments_of()`, so it expected a segment that no longer carries anything and graded the
+    /// fabric's own safety net as a fault. The runtime rule expects the bond, because the bond
+    /// is what is up.
+    #[test]
+    fn a_runtime_disjoint_peer_is_expected_over_the_bond_not_the_declared_segment() {
+        let f = half_disjoint_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The declaration still says pve3-tb shares two storage segments with pve1-tb.
+        assert_eq!(
+            expected_links(&view)
+                .unwrap()
+                .iter()
+                .filter(|(p, z, _, _)| *p == 1 && z == "storage")
+                .count(),
+            2
+        );
+        // At runtime both are dark; every other session is up.
+        let bfd: Vec<(String, &str)> = [
+            ("10.99.1.1", "down"),
+            ("10.99.3.1", "down"),
+            ("10.199.2.1", "up"),
+            ("10.199.3.1", "up"),
+            ("10.249.1.1", "up"),
+            ("10.249.3.1", "up"),
+        ]
+        .iter()
+        .map(|(a, s)| (a.to_string(), *s))
+        .collect();
+        let mut sys = leaf_env(&view).socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        for (target, dev) in [
+            // storage to pve1-tb now rides the fallback bond; the rest are unchanged
+            ("10.99.0.1", "cfab-st-fb"),
+            ("10.199.0.1", "cfab-cl-bk"),
+            ("10.249.0.1", "cfab-mg"),
+            ("10.99.0.2", "cfab-st-fb"),
+            ("10.199.0.2", "cfab-cl-fb"),
+            ("10.249.0.2", "cfab-mg-fb"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.3 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(
+            report.state,
+            State::UpDegraded,
+            "output:\n{}",
+            report.output
+        );
+        assert_eq!(report.code, 1);
+        assert_eq!(
+            headline(&report),
+            "UP-DEGRADED (2/2 | 4/6 | 6/6) on pve3-tb (leaf)"
+        );
+        assert!(
+            report
+                .output
+                .contains("  storage to pve1-tb via fallback\n"),
+            "{}",
+            report.output
+        );
+        // The companion assertion: the declaration-keyed rule would have expected a storage
+        // segment here and called the working fallback path a fault. Nothing may say that.
+        assert!(
+            !report
+                .output
+                .contains("storage to pve1-tb via cfab-st-fb, expected"),
+            "the declaration-keyed expectation is back: {}",
+            report.output
+        );
     }
 
     /// A leaf that is island-disjoint from one peer: the bond is that peer's expected path in
