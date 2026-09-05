@@ -60,12 +60,23 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         fallback: Vec::new(),
     };
 
+    // First: the engine may be gone because another BFD daemon took our port, and every
+    // check below needs the engine. Diagnose that before failing on its symptoms.
+    if bfd_port(sys, view, &mut c)? {
+        c.say(&format!(
+            "verify FAILED on {host}: the engine is not running (bfd udp/{} is taken)",
+            f.bfd_port
+        ));
+        return Ok(VerifyReport {
+            code: 1,
+            output: c.out,
+        });
+    }
     posture(sys, view, &mut c)?;
     return_path_and_ingress(sys, view, &mut c)?;
     mark_drift(sys, view, &mut c)?;
     shape_posture(sys, view, &mut c)?;
     link_speeds(sys, view, &mut c)?;
-    bfd_port(sys, view, &mut c)?;
 
     // ---- convergence (waits) -----------------------------------------------------
     // One BFD session per (zone, segment) shared with each peer, keyed by the peer's segment
@@ -197,21 +208,15 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
     })
 }
 
-/// BFD port custody. The engine binds udp/BFD_PORT exclusively (no SO_REUSEADDR), so a second
-/// BFD daemon on this host cannot steal our packets while we hold it — but it takes the port the
-/// moment we restart, and then the engine refuses to start at all. Measured 2026-09-05: with
-/// SO_REUSEADDR on both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder
-/// silently took every packet. Present-but-stopped is therefore a warning, not health.
-fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+/// BFD port custody, and the one diagnosis that must run before anything else: the engine binds
+/// udp/BFD_PORT exclusively (no SO_REUSEADDR), so a daemon holding the port makes the engine exit
+/// at the first session instead of stealing our packets. Returns true when that is why there is
+/// no engine to talk to. A second BFD daemon that is merely present is a warning: it takes the
+/// port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on both sides FRR's bfdd and
+/// holo both bound 0.0.0.0:3784 and the last binder silently took every packet, either order.
+fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<bool> {
     let f = view.fabric;
     let port = f.bfd_port;
-    let systemd = sys.exists("/run/systemd/system");
-    let log = engine_ctl::engine_log(sys, f, systemd);
-    if let Some(line) = engine_ctl::bfd_bind_error_line(&log, port) {
-        c.bad(&format!(
-            "bfd udp/{port}: the engine could not bind it — {line}"
-        ));
-    }
     let mut found: Vec<String> = Vec::new();
     for unit in ["frr", "bfdd"] {
         let unit = format!("{unit}.service");
@@ -225,8 +230,14 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
         if !pid.chars().all(|ch| ch.is_ascii_digit()) {
             continue;
         }
+        // A reaped-but-not-waited bfdd keeps its /proc entry and its name (seen in the
+        // container fixture, whose init reaps nothing): a zombie holds no socket.
         if let Ok(comm) = sys.read(&format!("/proc/{pid}/comm"))
             && comm.trim() == "bfdd"
+            && !sys
+                .read(&format!("/proc/{pid}/status"))
+                .unwrap_or_default()
+                .contains("State:\tZ")
         {
             found.push(format!("bfdd running (pid {pid})"));
         }
@@ -234,12 +245,29 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     if !found.is_empty() {
         c.warn(&format!(
             "bfd udp/{port}: another BFD daemon is on this host ({}) — it takes the port at our \
-             next engine restart; systemctl disable --now frr, or declare a free BFD_PORT on \
-             EVERY member",
+             next engine restart; stop it (systemctl disable --now frr), or declare a free \
+             BFD_PORT on EVERY member",
             found.join(", ")
         ));
     }
-    Ok(())
+    // A bind failure in the log is only news while the engine is gone: the engine that answers
+    // holds the port (nothing else can), and a line from a start it has since survived is history.
+    if engine_ctl::state(sys, f).is_ok() {
+        return Ok(false);
+    }
+    let systemd = sys.exists("/run/systemd/system");
+    let log = engine_ctl::engine_log(sys, f, systemd);
+    let Some(line) = engine_ctl::bfd_bind_error_line(&log, port) else {
+        return Ok(false);
+    };
+    c.bad(&format!(
+        "bfd udp/{port}: the engine is not running and could not bind it — {line}"
+    ));
+    c.say(&format!(
+        "  remedy: {}",
+        engine_ctl::bfd_bind_remedy(line, port)
+    ));
+    Ok(true)
 }
 
 fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
@@ -1202,38 +1230,50 @@ mod tests {
         let sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
             .on_stdout(&["systemctl", "is-enabled", "frr.service"], "enabled\n")
-            .file("/proc/812/comm", "bfdd\n");
+            .file("/proc/812/comm", "bfdd\n")
+            .file("/proc/812/status", "Name:\tbfdd\nState:\tS (sleeping)\n")
+            // A zombie of the same name holds nothing and must not be reported.
+            .file("/proc/813/comm", "bfdd\n")
+            .file("/proc/813/status", "Name:\tbfdd\nState:\tZ (zombie)\n");
         let mut sys = sys;
         let report = run(&mut sys, &view, 10).unwrap();
         assert_eq!(report.code, 0, "a warning does not change the grade");
         assert!(
             report.output.contains(
                 "  warn: bfd udp/3784: another BFD daemon is on this host (frr.service enabled, \
-                 bfdd running (pid 812)) — it takes the port at our next engine restart; \
-                 systemctl disable --now frr, or declare a free BFD_PORT on EVERY member\n"
+                 bfdd running (pid 812)) — it takes the port at our next engine restart; stop it \
+                 (systemctl disable --now frr), or declare a free BFD_PORT on EVERY member\n"
             ),
             "{}",
             report.output
         );
     }
 
-    /// The engine could not bind the port at all: a posture FAIL, with holo's own line.
+    /// The engine is gone because the port is taken: `verify` must say that, not "no engine".
     #[test]
-    fn a_lost_bfd_port_is_a_posture_failure() {
+    fn a_lost_bfd_port_is_the_verdict_not_a_missing_engine() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = primary_routes(leaf_env(&view), &view)
-            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
-            .file(
-                "/run/cfab/engine.log",
-                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n",
-            );
+        let mut sys = leaf_env(&view).file(
+            "/run/cfab/engine.log",
+            "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n",
+        );
         let report = run(&mut sys, &view, 10).unwrap();
         assert_eq!(report.code, 1, "output:\n{}", report.output);
         assert!(
             report.output.contains(
-                "  FAIL: bfd udp/3784: the engine could not bind it — bfd: cannot bind udp \
-                 0.0.0.0:3784: address in use (held by bfdd pid 812)\n"
+                "  FAIL: bfd udp/3784: the engine is not running and could not bind it — bfd: \
+                 cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)\n  remedy: \
+                 stop FRR, which owns bfdd: systemctl disable --now frr; or declare a free \
+                 BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a session \
+                 must use the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "verify FAILED on pve3-tb: the engine is not running (bfd udp/3784 is taken)"
             ),
             "{}",
             report.output
