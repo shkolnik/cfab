@@ -42,6 +42,7 @@ assets = [
     ["doc/cfab.8", "usr/share/man/man8/", "644"],
     ["examples/fabric.conf", "usr/share/doc/cfab/examples/fabric.conf.example", "644"],
     ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
+    ["packaging/deb/rt_protos.d/cfab.conf", "etc/iproute2/rt_protos.d/cfab.conf", "644"],
 ]
 # No hand-written maintainer scripts: the directory is named only because cargo-deb
 # generates no systemd maintainer-script fragments at all unless this key is set
