@@ -40,7 +40,6 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
         if have_tool(sys, "nft")? {
             run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
-            run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
         }
         // custody: the accept `up` put in a foreign user hook is ours to remove, and only the
         // rule carrying our tag is touched
@@ -62,6 +61,12 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
                 &["to", &blk, "unreachable"],
             )?;
         }
+    }
+    // The mark table (marking + the fallback control-egress ceiling) is installed on every
+    // kind, so it comes off on every kind. Guarded like the policy table above: `have_tool`
+    // keeps teardown working on a member where `nft` has since been removed.
+    if have_tool(sys, "nft")? {
+        run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
     }
     // The engine stops (and its routes are swept) before any interface goes away, so it never
     // acts on vanished links. The zone tables hold only the engine's static, gone with it —
@@ -384,5 +389,34 @@ mod tests {
             last_del < first_link_del,
             "sweep precedes interface deletion"
         );
+    }
+
+    /// `up` installs `table inet cfab` on every kind, so `down` removes it on every kind — a
+    /// leaf that tore the fabric down must not be left dropping its own OSPF at a ceiling
+    /// derived for a fabric that is gone. The forward policy stays host-only (a leaf never
+    /// installs `cfab-fwd`).
+    #[test]
+    fn down_removes_the_mark_table_on_a_leaf_and_never_the_forward_policy() {
+        let f = fabric();
+        for (host, kind) in [("pve1-tb", "host"), ("pve3-tb", "leaf")] {
+            let view = View::new(&f, host).unwrap();
+            let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+            run(&mut sys, &view).unwrap();
+            assert_eq!(
+                sys.calls
+                    .iter()
+                    .filter(|c| c.as_str() == "nft delete table inet cfab")
+                    .count(),
+                1,
+                "{kind}: {:?}",
+                sys.calls
+            );
+            let fwd = sys
+                .calls
+                .iter()
+                .filter(|c| c.as_str() == "nft delete table inet cfab-fwd")
+                .count();
+            assert_eq!(fwd, usize::from(kind == "host"), "{kind}: {:?}", sys.calls);
+        }
     }
 }
