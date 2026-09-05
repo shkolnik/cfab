@@ -38,7 +38,8 @@ WORK=${ORACLE_WORK:-/run/cfab-oracle}
 RUN=$WORK/run
 CONF=$WORK/fabric.conf
 SOCK=$RUN/engine.sock
-PIDFILE=$RUN/engine.pid
+LOCKFILE=$RUN/engine.lock         # Task 9: replaces engine.pid (flock, spec §14); the engine
+                                   # writes its own pid into it AFTER taking the lock
 LOG=$RUN/engine.log
 FRR_PS=oracle                      # FRR pathspace (-N): /etc/frr/$FRR_PS, /var/run/frr/$FRR_PS
 FRR_BIN=/usr/lib/frr
@@ -324,10 +325,14 @@ engine_alive() { [ -n "$ENGINE_PID" ] && [ -e "/proc/$ENGINE_PID/stat" ] && [ "$
 # Custody: $ENGINE_PID is the engine itself because `set +m` (top of the script) keeps the
 # background job in this shell's process group, so `setsid` is not a group leader and execs
 # in place — measured both ways: with job control ON setsid forks and $! is already gone one
-# iteration later. No pid can be recovered in that case (the engine writes engine.pid only
-# after its commit, engine/mod.rs), so the mismatch is fatal rather than adopted.
+# iteration later. No pid can be recovered in that case, so the mismatch is fatal rather than
+# adopted. Task 9 (Gate A review finding, B5): engine.pid is gone (flock replaces it, spec
+# §14); the same "did setsid fork away from me" check is re-expressed against engine.lock's
+# content instead — the engine writes its own pid into the lock file right after taking it
+# (src/supervisor/lock.rs::hold), earlier than the old pidfile write (which waited for
+# commit), so it is available at least as early as this check needs it.
 wait_ready() {
-    local i doc pidfile
+    local i doc lockpid
     for i in $(seq 1 60); do
         if ! engine_alive; then
             say "engine pid $ENGINE_PID exited before ready; log tail: $(tail -3 "$1" 2>/dev/null | tr '\n' ';')"
@@ -335,9 +340,9 @@ wait_ready() {
         fi
         doc=$(state_doc || true)
         if [ -n "$doc" ] && [ "$(printf '%s' "$doc" | jq -r '.ready' 2>/dev/null)" = true ]; then
-            pidfile=$(cat "$PIDFILE" 2>/dev/null || echo none)
-            say "engine ready after $(awk -v a="$(date +%s.%N)" -v b="$T_SPAWN" 'BEGIN{printf "%.2f", a - b}') s; pidfile=$pidfile spawn=$ENGINE_PID"
-            [ "$pidfile" = "$ENGINE_PID" ] || die "engine.pid ($pidfile) is not the spawned pid ($ENGINE_PID): setsid forked (job control on?) and this run cannot stop the engine it started"
+            lockpid=$(cat "$LOCKFILE" 2>/dev/null || echo none)
+            say "engine ready after $(awk -v a="$(date +%s.%N)" -v b="$T_SPAWN" 'BEGIN{printf "%.2f", a - b}') s; lockpid=$lockpid spawn=$ENGINE_PID"
+            [ "$lockpid" = "$ENGINE_PID" ] || die "engine.lock ($lockpid) is not the spawned pid ($ENGINE_PID): setsid forked (job control on?) and this run cannot stop the engine it started"
             return 0
         fi
         sleep 0.5
