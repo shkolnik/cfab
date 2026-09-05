@@ -55,6 +55,12 @@ const POLL_MS: u64 = 500;
 /// (spec §13 step 4). `TimeoutStopSec=60` in the unit carries the worst case with margin.
 const CHILD_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// How the supervisor pokes the systemd watchdog. One injectable seam for EVERY feed — the
+/// select-loop `feed` arm and the in-reapply feeds — so a test can observe them; production
+/// sends `WATCHDOG=1`. It carries no data because the decision of *whether* to feed is made by
+/// `should_feed` at each call site, never inside the closure.
+type FeedFn = Arc<dyn Fn() + Send + Sync>;
+
 /// A command reaching the main loop: a `reapply` request from the socket (with a reply
 /// channel), a SIGHUP re-apply, or a SIGTERM/SIGINT stop. Real Unix signals are forwarded onto
 /// this channel by `run`, and the socket server posts `Reapply`, so the loop has exactly one
@@ -225,6 +231,9 @@ pub(crate) struct Hooks {
     /// `CHILD_STOP_GRACE` (10 s); a test shrinks it so the SIGKILL path is exercised without a
     /// real 10 s wait.
     pub stop_grace: Duration,
+    /// The watchdog feed seam (see `FeedFn`). Production sends `WATCHDOG=1`; a test installs a
+    /// recorder so the in-reapply feeds are observable.
+    pub feed: FeedFn,
 }
 
 impl Hooks {
@@ -236,7 +245,30 @@ impl Hooks {
             shared: None,
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
+            feed: Arc::new(|| {
+                let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+            }),
         }
+    }
+}
+
+/// Feed the watchdog from inside a reapply, at a safe point, iff the apply is still within
+/// `should_feed`'s `Applying` tolerance. The select! loop cannot poll its own `feed` arm while
+/// `do_reapply` runs — `do_reapply` holds `&mut sys` and runs the handler to completion — so
+/// without this the watchdog starves for the whole reapply (apply + up to two ~10 s child
+/// restarts), long enough to blow `WatchdogSec=30` and have systemd kill a healthy supervisor.
+/// Past the bound we STOP feeding, so a reapply that has itself hung beyond ~63 s still trips
+/// `WatchdogSec` — the A3 gap survives (spec §8).
+fn feed_during_reapply(feed: &FeedFn, apply_started: Instant) {
+    let since_s = apply_started.elapsed().as_secs();
+    // The `Applying` arm of `should_feed` ignores the engine state and the read, so the two
+    // placeholders below never affect the decision — the one source of truth for the bound.
+    if should_feed(
+        ApplyState::Applying { since_s },
+        child::State::Starting,
+        StateRead::Failed,
+    ) {
+        feed();
     }
 }
 
@@ -317,9 +349,10 @@ pub(crate) async fn run_with(
     let pid = std::process::id();
     let run_dir = view.fabric.run_dir.clone();
     let sock_path = format!("{run_dir}/{}", crate::engine::SOCK_NAME);
-    // Captured before `hooks` is partially moved below; both are used only in the stop sequence.
+    // Captured before `hooks` is partially moved below.
     let trace = hooks.trace.clone();
     let stop_grace = hooks.stop_grace;
+    let feed_fn = hooks.feed.clone();
 
     // 1. The instance lock, before anything (spec §14). The run dir must exist to hold a lock
     // file in it; `apply` creates it too, but the lock is taken first and no stub stands in.
@@ -559,20 +592,25 @@ pub(crate) async fn run_with(
                     Cmd::Hangup => {
                         let _ = do_reapply(
                             sys, view, &opts, &shared, spawner, exe, config, pid,
-                            &exit_tx, &mut exit_rx, &mut pending,
+                            &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
                         )
                         .await;
                     }
                     Cmd::Reapply(reply) => {
                         let r = do_reapply(
                             sys, view, &opts, &shared, spawner, exe, config, pid,
-                            &exit_tx, &mut exit_rx, &mut pending,
+                            &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
                         )
                         .await;
                         let _ = reply.send(r);
                     }
                 }
             }
+            // Same select!-arm coupling as the reapply above: `watchdog_tick` holds `&mut sys`
+            // and runs to completion before the `feed` arm can be polled again. It is NOT fed
+            // through here because the forwarding check is short and bounded (a handful of sysctl
+            // reads and `ip rule` shows, sub-second) — nowhere near `WatchdogSec` — unlike a
+            // reapply, which is why only the reapply gets interior feeds.
             _ = fwd_tick.tick(), if hooks.run_watchdog => {
                 watchdog_tick(sys, view, &shared);
             }
@@ -601,7 +639,7 @@ pub(crate) async fn run_with(
                     StateRead::Failed
                 };
                 if should_feed(apply, engine_state, read) {
-                    let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+                    feed_fn();
                 }
             }
         }
@@ -769,11 +807,13 @@ async fn do_reapply(
     exit_tx: &mpsc::UnboundedSender<ChildExit>,
     exit_rx: &mut mpsc::UnboundedReceiver<ChildExit>,
     pending: &mut Vec<(&'static str, Instant)>,
+    feed: &FeedFn,
 ) -> crate::error::Result<()> {
+    let apply_started = Instant::now();
     {
         let mut st = shared.lock().unwrap();
         st.applying = true;
-        st.apply_started_at = Some(Instant::now());
+        st.apply_started_at = Some(apply_started);
     }
     // `block_in_place` as at the initial apply (spec §3): a re-apply is where the starvation
     // actually bites — it runs inside the live supervise loop, so a bare ~35 s apply on a
@@ -793,10 +833,15 @@ async fn do_reapply(
             return Err(e);
         }
     }
+    // Feed at each safe point — the select! loop's `feed` arm cannot run while we hold `&mut
+    // sys` here, so these interior feeds are the only thing keeping systemd fed across the
+    // reapply. Bounded by the same `Applying` tolerance, so a hung reapply still trips WatchdogSec.
+    feed_during_reapply(feed, apply_started);
     restart_child(
         "engine", true, view, shared, spawner, exe, config, pid, exit_tx, exit_rx, pending,
     )
     .await;
+    feed_during_reapply(feed, apply_started);
     if view.kind() == MemberKind::Host {
         restart_child(
             "shape-daemon",
@@ -812,6 +857,7 @@ async fn do_reapply(
             pending,
         )
         .await;
+        feed_during_reapply(feed, apply_started);
     }
     {
         let mut st = shared.lock().unwrap();
@@ -1233,6 +1279,7 @@ mod tests {
             shared: Some(shared),
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
+            feed: Arc::new(|| {}),
         }
     }
 
@@ -1264,6 +1311,7 @@ mod tests {
                 shared: None,
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
+                feed: Arc::new(|| {}),
             },
         )
         .await;
@@ -1717,6 +1765,7 @@ mod tests {
             shared: Some(shared),
             trace: Some(calls.clone()),
             stop_grace: grace,
+            feed: Arc::new(|| {}),
         };
         let code = run_with(
             &mut sys,
@@ -1801,6 +1850,75 @@ mod tests {
         assert!(
             calls.iter().any(|c| c == "signal shape-daemon SIGKILL"),
             "the child that ignored SIGTERM is SIGKILLed: {calls:?}"
+        );
+    }
+
+    /// Spec §8 + the select!-arm coupling: while `do_reapply` runs it holds `&mut sys` and the
+    /// loop's `feed` arm cannot be polled, so the reapply must feed the watchdog itself at each
+    /// safe point or systemd starves and kills a healthy supervisor mid-reapply. With the feed
+    /// routed through the injectable seam and no other feed active in the test (run_watchdog off,
+    /// no `WATCHDOG_USEC`), every recorded feed is an interior reapply feed: none before it, one
+    /// per safe point during it (after the apply, after each child restart).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watchdog_is_fed_at_each_safe_point_during_a_reapply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap(); // a host: engine + shape both restart
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let feeds = Arc::new(Mutex::new(0usize));
+        let feeds_in = feeds.clone();
+        let feed: FeedFn = Arc::new(move || *feeds_in.lock().unwrap() += 1);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let feeds_probe = feeds.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let before = *feeds_probe.lock().unwrap();
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            driver_tx.send(Cmd::Reapply(rtx)).ok();
+            let res = tokio::task::spawn_blocking(move || rrx.recv().unwrap())
+                .await
+                .unwrap();
+            let after = *feeds_probe.lock().unwrap();
+            driver_tx.send(Cmd::Terminate).ok();
+            (before, after, res)
+        });
+        let hooks = Hooks {
+            on_ready: Some(ready_tx),
+            run_watchdog: false,
+            serve_socket: false,
+            shared: Some(shared.clone()),
+            trace: None,
+            stop_grace: CHILD_STOP_GRACE,
+            feed,
+        };
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        let (before, after, res) = driver.await.unwrap();
+        assert_eq!(code, 0);
+        assert!(res.is_ok(), "the reapply must succeed: {res:?}");
+        assert_eq!(
+            before, 0,
+            "nothing feeds this seam before the reapply — the initial bringup is pre-READY"
+        );
+        // After the apply, after the engine restart, after the shape restart: three safe points.
+        assert!(
+            after >= 3,
+            "the watchdog must be fed at each safe point DURING the reapply, not only around it: \
+             got {after} feeds"
         );
     }
 
