@@ -18,6 +18,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Prefix for the musl C dependencies; runner-writable, so no sudo.
+  MUSL_PREFIX: ${{ github.workspace }}/../musl-deps
 
 jobs:
   release:
@@ -31,15 +33,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-      - name: Install libyang build dependencies
+      - name: Install musl build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake build-essential libpcre2-dev
+          sudo apt-get install -y --no-install-recommends cmake build-essential musl-tools
+      - name: Build the C dependencies musl has no distro packages for
+        # Appends the target-scoped CMAKE_PREFIX_PATH / PKG_CONFIG_* the
+        # libyang build needs to $GITHUB_ENV, for every step below.
+        run: scripts/musl-deps.sh
       - name: Holo pin and feature guard
         run: bash scripts/holo-check.sh
       - name: Test
         # A tag can point at a commit CI never checked; never publish untested.
-        run: cargo test --locked
+        # Tested on the target that ships: the static musl binaries run on the
+        # runner, and no glibc build of libyang is then needed at all.
+        run: cargo test --locked --target x86_64-unknown-linux-musl
       - name: Install cargo-deb
         run: cargo install cargo-deb
       - name: Resolve channel and version
