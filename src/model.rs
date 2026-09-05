@@ -92,6 +92,16 @@ pub struct Wire {
     pub speed_mbit: u32,
 }
 
+/// The widest ifname a bond leg (a rescue segment, or a migrating ingress leg) may carry.
+/// Its slaves are named `<ifname>-<island>`: three characters of suffix inside IFNAMSIZ 15.
+pub const MAX_BOND_IFNAME: usize = 12;
+
+/// Does this bond-leg name leave room for the `-<island>` suffix its slaves need? One
+/// predicate for both legs, so the rule cannot drift between them.
+fn bond_ifname_too_long(ifname: &str) -> bool {
+    ifname.len() > MAX_BOND_IFNAME
+}
+
 /// One MEMBER_TABLE row.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Member {
@@ -456,10 +466,10 @@ impl Fabric {
             }
         }
         for r in ct.iter().filter(|r| r.role == Role::Rescue) {
-            if r.ifname.len() > 12 {
+            if bond_ifname_too_long(&r.ifname) {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: rescue ifname must be 12 characters or fewer (slaves are \
-                     named <ifname>-<island>, IFNAMSIZ 15)",
+                    "CLASS_TABLE {}: rescue ifname must be {MAX_BOND_IFNAME} characters or \
+                     fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
                     r.ifname
                 )));
             }
@@ -526,11 +536,14 @@ impl Fabric {
         }
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
-            if gw.island == Island::Any {
+            // island `any` = a migrating ingress leg: a bond over one tagged sub-interface
+            // per wire, named like a rescue leg's slaves, so the derived bond name must
+            // leave room for the `-<island>` suffix.
+            if gw.island == Island::Any && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {} gw island 'any' is not supported yet (the ingress leg does \
-                     not migrate); use st|cl|mg",
-                    z.name
+                    "ZONE_TABLE {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
+                     characters or fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
+                    z.name, z.id
                 )));
             }
             if ct.iter().any(|r| r.vid == gw.vid) {
@@ -961,16 +974,37 @@ mod tests {
         );
     }
 
+    /// Task 9: the ingress leg migrates, so `any` is a legal gw island. (Task 1 shipped a
+    /// temporary refusal here because `gw_rows_of` had no fan-out; this replaces it.)
     #[test]
-    fn gw_island_any_fails() {
-        let err = parse_fabric(|t| *t = t.replace("mg:249:", "any:249:")).unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "gw island 'any' is not supported yet (the ingress leg does not migrate); \
-                 use st|cl|mg"
-            ),
-            "{err}"
+    fn gw_island_any_is_accepted() {
+        let f = parse_fabric(|t| *t = t.replace("mg:249:", "any:249:")).unwrap();
+        assert_eq!(
+            f.zone("mgmt").unwrap().gw.as_ref().unwrap().island,
+            Island::Any
         );
+    }
+
+    /// The slave-name guard, at the predicate: a bond leg's slaves are `<ifname>-<island>`,
+    /// so 12 characters fit IFNAMSIZ and 13 do not.
+    #[test]
+    fn bond_ifname_longer_than_twelve_is_refused() {
+        assert!(!bond_ifname_too_long("cfab-st-rs"));
+        assert!(!bond_ifname_too_long("123456789012"));
+        assert!(bond_ifname_too_long("1234567890123"));
+    }
+
+    /// ...and no ZONE_TABLE declaration can reach it today: a zone id is a u8, so the widest
+    /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-mg` (13).
+    /// The check guards the name SCHEME, not the declaration; this test is what would go red
+    /// if the scheme ever grew.
+    #[test]
+    fn every_zone_id_yields_an_ingress_bond_name_that_fits() {
+        for id in u8::MIN..=u8::MAX {
+            let ifname = format!("cfab-gw{id}");
+            assert!(!bond_ifname_too_long(&ifname), "{ifname}");
+            assert!(format!("{ifname}-mg").len() <= 15, "{ifname}");
+        }
     }
 
     #[test]

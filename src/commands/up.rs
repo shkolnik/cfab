@@ -8,7 +8,7 @@ use crate::commands::common::{
     proc_sysctl,
 };
 use crate::commands::engine_ctl;
-use crate::derive::{RescueRow, View};
+use crate::derive::{GwRow, Slave, View};
 use crate::emit;
 use crate::error::{Error, Result};
 use crate::model::{MemberKind, Role};
@@ -207,24 +207,36 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         )?;
         class_sysctls(sys, &r.ifname, r.role)?;
     }
-    // The ingress leg: the router's VLAN on this wire, this node's address in the router's /24.
-    // Same sysctls as a backup segment; nothing else about it is a segment.
+    // The ingress leg: the router's VLAN, this node's address in the router's /24. Same
+    // sysctls as a backup segment; nothing else about it is a segment. On a gw island of
+    // `any` the leg is the same bond a rescue segment is, so it migrates between wires
+    // instead of dying with its island — one leg, one BGP session (James 2026-09-04).
     for r in &gw_rows {
         let z = f.zone(&r.zone)?;
         let gw = z.gw.as_ref().expect("gw_rows lists gw zones");
-        mk_vlan(
-            sys,
-            &r.ifname,
-            &r.wire,
-            r.vid,
-            Some(&gw.leg_cidr(n)),
-            true,
-            &[
-                &format!("0:{}", z.pcp),
-                &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
-            ],
-        )?;
-        class_sysctls(sys, &r.ifname, Role::Backup)?;
+        let cidr = gw.leg_cidr(n);
+        let qos_map = [
+            format!("0:{}", z.pcp),
+            format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
+        ];
+        let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
+        if r.migrates() {
+            mk_bond_leg(
+                sys,
+                &BondLeg {
+                    ifname: &r.ifname,
+                    vid: r.vid,
+                    home: &r.home,
+                    slaves: &r.slaves,
+                    cidr: &cidr,
+                    role: Role::Backup,
+                },
+                &qos_map,
+            )?;
+        } else {
+            mk_vlan(sys, &r.ifname, &r.home, r.vid, Some(&cidr), true, &qos_map)?;
+            class_sysctls(sys, &r.ifname, Role::Backup)?;
+        }
     }
     // The rescue leg: one active-backup bond per zone over a tagged sub-interface of every
     // wire, so the member keeps a path in the zone when the physical islands are disjointly
@@ -232,10 +244,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     // shaper, the qdisc sweep, verify's link-speed checks) ever sees it.
     for r in &view.rescue_rows() {
         let z = f.zone(&r.zone)?;
-        mk_rescue(
+        mk_bond_leg(
             sys,
-            r,
-            &format!("{}/24", view.segment_addr(z, r.seg)),
+            &BondLeg {
+                ifname: &r.ifname,
+                vid: r.vid,
+                home: &r.home,
+                slaves: &r.slaves,
+                cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
+                role: Role::Rescue,
+            },
             &[
                 &format!("0:{}", z.pcp),
                 &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
@@ -583,13 +601,28 @@ const RESCUE_NUM_GRAT_ARP: &str = "3";
 /// expect. The return migration is lossless (measured), so it costs nothing.
 const RESCUE_PRIMARY_RESELECT: &str = "always";
 
-/// One rescue leg: an active-backup bond over a tagged sub-interface of every wire this member
-/// has, addressed like a segment. Idempotent, and refuse-unless-ours on every netdev it touches.
-fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> Result<()> {
+/// A migrating leg to build: a rescue segment, or an ingress leg on gw island `any`. The two
+/// are the same netdev shape, so they are the same code — only the address and the (unused)
+/// role differ.
+struct BondLeg<'a> {
+    ifname: &'a str,
+    vid: u16,
+    /// The wire whose slave the bond takes as `primary`.
+    home: &'a str,
+    slaves: &'a [Slave],
+    /// The bond is the L3 interface; its slaves carry no address.
+    cidr: &'a str,
+    role: Role,
+}
+
+/// One migrating leg: an active-backup bond over a tagged sub-interface of every wire this
+/// member has, addressed like a segment. Idempotent, and refuse-unless-ours on every netdev
+/// it touches.
+fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
     // (1) the bond. Unlike a vlan of the wrong id, a same-named foreign netdev here is not
     // ours to delete — refuse and say so.
-    if link_exists(sys, &r.ifname)? {
-        if !link_kind_is(sys, &r.ifname, " bond ")? {
+    if link_exists(sys, r.ifname)? {
+        if !link_kind_is(sys, r.ifname, " bond ")? {
             return Err(Error::fatal(format!(
                 "REFUSING: {} exists but is not a bond",
                 r.ifname
@@ -602,7 +635,7 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
                 "ip",
                 "link",
                 "add",
-                &r.ifname,
+                r.ifname,
                 "type",
                 "bond",
                 "mode",
@@ -622,7 +655,7 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
     // a link the kernel is bringing up is a race. The egress-qos map lives HERE: the tag is
     // applied on the slave, and PCP is per frame, so control on the rescue path is queued like
     // control anywhere.
-    for s in &r.slaves {
+    for s in r.slaves {
         mk_vlan(sys, &s.ifname, &s.wire, r.vid, None, false, qos_map)?;
         // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
         // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
@@ -639,7 +672,7 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
             )));
         }
         if !enslaved_here {
-            run_ok(sys, &["ip", "link", "set", &s.ifname, "master", &r.ifname])?;
+            run_ok(sys, &["ip", "link", "set", &s.ifname, "master", r.ifname])?;
         }
         run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
         // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
@@ -662,7 +695,7 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
             "ip",
             "link",
             "set",
-            &r.ifname,
+            r.ifname,
             "type",
             "bond",
             "primary",
@@ -672,9 +705,9 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
         ],
     )?;
     // (5) the bond is the segment: address, segment sysctls, up.
-    run_ok(sys, &["ip", "addr", "replace", cidr, "dev", &r.ifname])?;
-    class_sysctls(sys, &r.ifname, Role::Rescue)?;
-    run_ok(sys, &["ip", "link", "set", &r.ifname, "up"])?;
+    run_ok(sys, &["ip", "addr", "replace", r.cidr, "dev", r.ifname])?;
+    class_sysctls(sys, r.ifname, r.role)?;
+    run_ok(sys, &["ip", "link", "set", r.ifname, "up"])?;
     Ok(())
 }
 
@@ -682,7 +715,17 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
 /// wire: it is `down` exactly when not one of its slaves has carrier, so the warning must name
 /// that condition — "ip -br link show cfab-st-rs" would only show an interface that is UP.
 fn describe_down(view: &View, down: &[String]) -> Vec<String> {
-    let rescue: Vec<String> = view.rescue_rows().into_iter().map(|r| r.ifname).collect();
+    let rescue: Vec<String> = view
+        .rescue_rows()
+        .into_iter()
+        .map(|r| r.ifname)
+        .chain(
+            view.gw_rows()
+                .into_iter()
+                .filter(GwRow::migrates)
+                .map(|r| r.ifname),
+        )
+        .collect();
     down.iter()
         .map(|entry| {
             let ifname = entry.rsplit('/').next().unwrap_or(entry);
@@ -1048,6 +1091,97 @@ mod tests {
                 "{slave} is L2 only"
             );
         }
+    }
+
+    /// The same declaration with the ingress leg on island `any`.
+    fn fabric_with_a_migrating_gw() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("mg:249:", "any:249:");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Task 9: a gw island of `any` builds the ingress leg as the very same bond a rescue
+    /// leg is — same parameters, same slave-then-enslave order, same `primary`-after-slaves
+    /// rule — addressed with the router's /24 leg address, not a segment address. mgmt's
+    /// cheapest segment is on the mg island, so `primary` names the mg SLAVE.
+    #[test]
+    fn a_migrating_gw_leg_is_built_as_a_bond() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view);
+        let (_tmp, o) = opts();
+        run(&mut sys, &view, &o).unwrap();
+        assert_eq!(
+            calls_for(&sys, "cfab-gw249"),
+            [
+                "ip link show cfab-gw249",
+                "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 0 fail_over_mac none",
+                "ip link show cfab-gw249-st",
+                // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
+                "ip link show cfab-gw249-st",
+                "ip link add link eth9 name cfab-gw249-st type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-st master cfab-gw249",
+                "ip link set cfab-gw249-st up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-st/forwarding",
+                "ip link show cfab-gw249-cl",
+                "ip link show cfab-gw249-cl",
+                "ip link add link eth1 name cfab-gw249-cl type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-cl master cfab-gw249",
+                "ip link set cfab-gw249-cl up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-cl/forwarding",
+                "ip link show cfab-gw249-mg",
+                "ip link show cfab-gw249-mg",
+                "ip link add link eth0 name cfab-gw249-mg type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-mg master cfab-gw249",
+                "ip link set cfab-gw249-mg up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-mg/forwarding",
+                "ip link set cfab-gw249 type bond primary cfab-gw249-mg primary_reselect always",
+                "ip addr replace 192.168.249.1/24 dev cfab-gw249",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249/arp_ignore",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249/rp_filter",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249/send_redirects",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding",
+                "ip link set cfab-gw249 up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding",
+            ]
+        );
+    }
+
+    /// The bond forwards (it is the L3 leg); its slaves never do, and `up` writes that
+    /// explicitly rather than inheriting conf/default.
+    #[test]
+    fn a_migrating_gw_bond_forwards_and_its_slaves_never_do() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view);
+        let (_tmp, o) = opts();
+        run(&mut sys, &view, &o).unwrap();
+        assert_eq!(
+            sys.writes_to("/proc/sys/net/ipv4/conf/cfab-gw249/forwarding"),
+            Some("1")
+        );
+        for slave in ["cfab-gw249-st", "cfab-gw249-cl", "cfab-gw249-mg"] {
+            assert_eq!(
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
+                Some("0"),
+                "{slave} is L2 only"
+            );
+        }
+    }
+
+    /// A migrating ingress leg is a bond too, so the settle warning must name the real
+    /// condition for it as well.
+    #[test]
+    fn a_down_migrating_gw_bond_is_reported_as_no_wire_with_carrier() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let got = describe_down(&view, &["mgmt/cfab-gw249".to_string()]);
+        assert_eq!(
+            got,
+            ["mgmt/cfab-gw249 (no wire with carrier under it)".to_string()]
+        );
     }
 
     /// The rescue leg extended `mk_vlan` with `addr`/`bring_up`. A class row and an ingress
