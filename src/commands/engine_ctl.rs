@@ -115,6 +115,35 @@ fn parse_state(reply: &str) -> Result<Value> {
     Ok(doc)
 }
 
+/// What holo-bfd prints before exiting 1 when its Rx socket cannot be bound.
+const BFD_BIND_ERROR: &str = "bfd: cannot bind udp ";
+
+/// The engine's BFD bind failure for this port, if the log holds one (the tracing prefix — level,
+/// timestamp, target — is cut, so the message reads the same however the ring buffer captured it).
+pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
+    log.lines()
+        .filter_map(|l| l.find(BFD_BIND_ERROR).map(|i| l[i..].trim_end()))
+        .find(|l| l.contains(&format!(":{port}:")))
+}
+
+/// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
+/// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
+/// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
+/// One spelling, shared by `up` (which hits this at start) and `status` (which diagnoses it).
+pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
+    let stop = if line.contains("bfdd") || line.contains("frr") {
+        "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
+    } else if line.contains("holder unknown") {
+        format!("find the holder (ss -ulpn | grep ':{port}') and stop it")
+    } else {
+        "stop the daemon named in the line above".to_string()
+    };
+    format!(
+        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.conf on EVERY member — \
+         every peer of a session must use the same port"
+    )
+}
+
 /// The OSPF interfaces cfab configures per zone, in the order `emit::engine` writes them:
 /// segments, the fallback bond, the identity, the ingress leg.
 fn configured_ifs(view: &View, zone: &crate::model::Zone) -> Vec<String> {
@@ -768,5 +797,57 @@ pub(crate) mod tests {
         let mut sys = MockSys::default().socket("/run/cfab/engine.sock", "{\"error\":\"boom\"}\n");
         let e = state(&mut sys, &f).unwrap_err().to_string();
         assert!(e.contains("engine state request failed: boom"), "{e}");
+    }
+
+    /// The pure diagnosis helpers, independent of where the log came from (a file, once; the
+    /// child ring buffer now): the line is picked only for our port, and the remedy branches on
+    /// what holo could name — the frr/bfdd holder, an unknown holder, and the generic fallback.
+    #[test]
+    fn bfd_bind_error_line_matches_only_our_port() {
+        let ours = "bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)";
+        let other = "bfd: cannot bind udp 0.0.0.0:4784: address in use (held by bfdd pid 1)";
+        // The right port matches, the trailing prefix is trimmed, and a different port is ignored.
+        assert_eq!(bfd_bind_error_line(ours, 3784), Some(ours));
+        assert_eq!(bfd_bind_error_line(other, 3784), None);
+        // A tracing prefix is cut to the message.
+        assert_eq!(
+            bfd_bind_error_line(&format!("2026-09-05T00:00:00Z ERROR {ours}\n"), 3784),
+            Some(ours)
+        );
+        // No bind line at all is None, not a panic.
+        assert_eq!(bfd_bind_error_line("engine starting\n", 3784), None);
+    }
+
+    #[test]
+    fn bfd_bind_remedy_branches_on_the_named_holder() {
+        // frr/bfdd holder → stop FRR.
+        let frr = "bfd: cannot bind udp 0.0.0.0:3784: address in use (held by bfdd pid 812)";
+        let r = bfd_bind_remedy(frr, 3784);
+        assert!(
+            r.starts_with("stop FRR, which owns bfdd: systemctl disable --now frr;"),
+            "{r}"
+        );
+        // Unknown holder → point at ss for the port.
+        let unknown = "bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)";
+        let r = bfd_bind_remedy(unknown, 3784);
+        assert!(
+            r.starts_with("find the holder (ss -ulpn | grep ':3784') and stop it;"),
+            "{r}"
+        );
+        // Neither named → the generic fallback.
+        let generic = "bfd: cannot bind udp 0.0.0.0:3784: permission denied";
+        let r = bfd_bind_remedy(generic, 3784);
+        assert!(
+            r.starts_with("stop the daemon named in the line above;"),
+            "{r}"
+        );
+        // Every branch carries the fabric-wide-port caveat.
+        assert!(
+            r.contains(
+                "or declare a free BFD_PORT (now 3784) in fabric.conf on EVERY member — \
+                 every peer of a session must use the same port"
+            ),
+            "{r}"
+        );
     }
 }

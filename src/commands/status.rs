@@ -284,7 +284,7 @@ fn read(
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
     // below needs the engine. Diagnose that before reporting its symptoms.
-    bfd_port(sys, view, c)?;
+    bfd_port(sys, view, c, comps)?;
     let doc = engine_ctl::state(sys, f).ok();
     if doc.is_none() {
         // The engine's socket is silent. The supervisor (spec §9) is the authority on why:
@@ -355,7 +355,7 @@ fn read(
 /// reason line: it takes the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on
 /// both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder silently took every
 /// packet, either order.
-fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Components>) -> Result<()> {
     let f = view.fabric;
     let port = f.bfd_port;
     let mut found: Vec<String> = Vec::new();
@@ -391,7 +391,43 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
             found.join(", ")
         ));
     }
+    // A bind failure in the ring buffer is only news while the engine is gone. The supervisor is
+    // the authority on that: no engine component (no supervisor answering — the frr/bfdd probe
+    // above already ran and we cannot read the ring) means no scan, and a `running` engine holds
+    // the port (nothing else can), so any bind line it left is history. Only an engine the
+    // supervisor reports down earns the diagnosis, read from its child ring buffer over cfab.sock
+    // (spec §3/§9) — best effort, a silent or unparseable socket just leaves the generic reason.
+    let Some(engine) = comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) else {
+        return Ok(());
+    };
+    if engine.state == CompState::Running {
+        return Ok(());
+    }
+    let reply = match sys.unix_request(&format!("{}/cfab.sock", f.run_dir), "log engine 200\n") {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let Ok(doc) = serde_json::from_str::<LogReply>(&reply) else {
+        return Ok(());
+    };
+    let joined = doc.lines.join("\n");
+    if let Some(line) = engine_ctl::bfd_bind_error_line(&joined, port) {
+        c.note(format!(
+            "bfd udp/{port}: the engine is not running and could not bind it — {line}"
+        ));
+        c.note(format!(
+            "remedy: {}",
+            engine_ctl::bfd_bind_remedy(line, port)
+        ));
+    }
     Ok(())
+}
+
+/// The `log <name> [n]` reply over `cfab.sock` (spec §9): the child ring buffer's tail. A parse
+/// failure degrades the BFD diagnosis to silence — it is never load-bearing enough to crash.
+#[derive(serde::Deserialize)]
+struct LogReply {
+    lines: Vec<String>,
 }
 
 fn posture(
@@ -2911,6 +2947,91 @@ mod tests {
         assert!(
             out.contains("  shaping down: shape-daemon is restarting, 3 restart(s)\n"),
             "{out}"
+        );
+    }
+
+    /// A BFD bind failure the engine could not recover from, diagnosed from the child ring
+    /// buffer over cfab.sock — the exact gap this change closes: no frr enabled and no bfdd
+    /// process (the host probe above finds nothing), yet the engine is down because *something*
+    /// holds udp/3784, and the ring buffer carries holo's line. The supervisor reports the engine
+    /// down; status reads `log engine` and turns the line into the named remedy.
+    #[test]
+    fn a_bind_failure_in_the_ring_buffer_is_diagnosed_when_the_engine_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 60, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 4, "last_exit": {"cause": "exit 1", "s_ago": 1}}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string();
+        let log = serde_json::json!({
+            "lines": [
+                "engine starting",
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)"
+            ]
+        })
+        .to_string();
+        // No engine.sock: `state` fails, the engine is down. cfab.sock answers both verbs.
+        let mut sys = leaf_env(&view)
+            .socket_verb("/run/cfab/cfab.sock", "components", &comps)
+            .socket_verb("/run/cfab/cfab.sock", "log", &log);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  bfd udp/3784: the engine is not running and could not bind it — bfd: cannot \
+                 bind udp 0.0.0.0:3784: address in use (holder unknown)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
+                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
+                 session must use the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Teeth for the running-engine gate: the engine that answers holds the port, so a bind line
+    /// still sitting in its ring buffer is stale history and must be suppressed. Invariant: the
+    /// diagnosis fires only for an engine the supervisor reports NOT running. Regressing the gate
+    /// (deleting the `CompState::Running` early return in `bfd_port`) makes this test fail —
+    /// verified during development, then the gate was restored.
+    #[test]
+    fn a_stale_bind_line_is_suppressed_while_the_engine_runs() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let log = serde_json::json!({
+            "lines": [
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)"
+            ]
+        })
+        .to_string();
+        // Healthy host: the engine is up and the supervisor reports it `running`; the ring buffer
+        // still carries a bind line from an earlier start it has since survived.
+        let mut sys = healthy_host(&f, &view)
+            .socket_verb(
+                "/run/cfab/cfab.sock",
+                "components",
+                &healthy_components(&view),
+            )
+            .socket_verb("/run/cfab/cfab.sock", "log", &log);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report
+                .output
+                .contains("the engine is not running and could not bind it"),
+            "a stale bind line must not be diagnosed while the engine runs:\n{}",
+            report.output
         );
     }
 

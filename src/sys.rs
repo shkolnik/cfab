@@ -229,8 +229,13 @@ pub mod mock {
         pub calls: Vec<String>,
         pub slept: Vec<Duration>,
         /// socket path → the replies `unix_request` hands back in order; the last one
-        /// repeats forever. Unknown path → Err.
+        /// repeats forever. Unknown path → Err. Serves every verb on the path the same reply;
+        /// use `socket_verb` when one path must answer different verbs differently.
         pub sockets: HashMap<String, VecDeque<String>>,
+        /// (path, verb) → replies, checked before `sockets` so one socket answers `components`
+        /// and `log engine` independently and order-free (both are read in one status run). The
+        /// verb is the first whitespace-delimited word of the request line.
+        pub socket_verbs: HashMap<(String, String), VecDeque<String>>,
         /// Socket paths that `unix_probe` reports as `Unreachable`: a listener that accepts the
         /// connection but yields no usable reply (a slow supervisor, a read timeout). Distinct
         /// from an unregistered path, which probes as `NotListening`.
@@ -257,6 +262,18 @@ pub mod mock {
         pub fn socket_seq(mut self, path: &str, replies: &[String]) -> Self {
             self.sockets
                 .insert(path.to_string(), replies.iter().cloned().collect());
+            self
+        }
+
+        /// A reply keyed by the request verb (first word of the line), so one socket path can
+        /// answer `components` and `log engine` independently of call order. Matched ahead of the
+        /// path-level `socket`/`socket_seq` reply; successive calls with the same verb queue,
+        /// last repeating.
+        pub fn socket_verb(mut self, path: &str, verb: &str, reply: &str) -> Self {
+            self.socket_verbs
+                .entry((path.to_string(), verb.to_string()))
+                .or_default()
+                .push_back(reply.to_string());
             self
         }
 
@@ -395,15 +412,9 @@ pub mod mock {
         fn unix_request(&mut self, path: &str, line: &str) -> Result<String> {
             self.calls
                 .push(format!("unix_request {path} {}", line.trim_end()));
-            let q = self
-                .sockets
-                .get_mut(path)
-                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))?;
-            if q.len() > 1 {
-                Ok(q.pop_front().expect("len > 1"))
-            } else {
-                Ok(q.front().cloned().unwrap_or_default())
-            }
+            let verb = line.split_whitespace().next().unwrap_or("");
+            self.socket_reply(path, verb)
+                .ok_or_else(|| Error::fatal(format!("mock: no socket {path}")))
         }
 
         fn unix_probe(&mut self, path: &str, line: &str) -> UnixProbe {
@@ -412,11 +423,30 @@ pub mod mock {
             if self.unreachable_sockets.iter().any(|p| p == path) {
                 return UnixProbe::Unreachable(format!("{path}: connected, no reply (mock)"));
             }
-            match self.sockets.get_mut(path) {
-                // A registered socket answers; an unregistered one models ENOENT/ECONNREFUSED.
-                Some(q) if q.len() > 1 => UnixProbe::Answered(q.pop_front().expect("len > 1")),
-                Some(q) => UnixProbe::Answered(q.front().cloned().unwrap_or_default()),
+            let verb = line.split_whitespace().next().unwrap_or("");
+            // A registered socket (verb-keyed or path-level) answers; an unregistered one models
+            // ENOENT/ECONNREFUSED.
+            match self.socket_reply(path, verb) {
+                Some(reply) => UnixProbe::Answered(reply),
                 None => UnixProbe::NotListening,
+            }
+        }
+    }
+
+    impl MockSys {
+        /// The next reply for `(path, verb)`: a verb-keyed queue if one is registered, else the
+        /// path-level queue. Either pops when more than one remains, so the last reply repeats.
+        /// `None` means the path is not registered at all.
+        fn socket_reply(&mut self, path: &str, verb: &str) -> Option<String> {
+            let key = (path.to_string(), verb.to_string());
+            let q = match self.socket_verbs.get_mut(&key) {
+                Some(q) => q,
+                None => self.sockets.get_mut(path)?,
+            };
+            if q.len() > 1 {
+                Some(q.pop_front().expect("len > 1"))
+            } else {
+                Some(q.front().cloned().unwrap_or_default())
             }
         }
     }
