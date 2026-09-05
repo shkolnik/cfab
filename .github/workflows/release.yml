@@ -113,8 +113,11 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
-        # --ref: without it gh first resolves the default branch over GraphQL,
-        # one more call the token must be allowed to make.
+        # --ref is load-bearing: without it gh resolves the default branch over
+        # GraphQL (repository.defaultBranchRef), which a token scoped to
+        # Actions:write + Metadata:read cannot read, and the dispatch fails with
+        # "Resource not accessible by personal access token". Verified 2026-09-05
+        # from the CLI with the real token: same error without --ref, works with it.
         run: |
           # Say which account the secret's token is and whether it can see the
           # repo before dispatching, so a failure names the token, not the job.
