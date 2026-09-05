@@ -821,7 +821,7 @@ fn return_path_and_ingress(
             .any(|l| l.contains("linkdown") || l.contains("dead"))
         {
             c.note(format!(
-                "{} gw {} unreachable (table {id} default is linkdown — the ingress leg has no \
+                "{} gw {} unreachable (table {id} default is linkdown - the ingress leg has no \
                  carrier)",
                 z.name, gw.router
             ));
@@ -853,7 +853,7 @@ fn return_path_and_ingress(
             .to_string();
         if state != "Established" {
             c.note(format!(
-                "{} ingress: bgp {} {state} (not Established — the router is not \
+                "{} ingress: bgp {} {state} (not Established - the router is not \
                  learning this zone's identities)",
                 z.name, gw.router
             ));
@@ -862,7 +862,7 @@ fn return_path_and_ingress(
             // afi-safi export policy: the session is healthy, the zone's identities never leave.
             c.note(format!(
                 "{} ingress: bgp {} Established but advertising nothing (0 sent prefixes \
-                 — the neighbor afi-safi export policy is not attached)",
+                 - the neighbor afi-safi export policy is not attached)",
                 z.name, gw.router
             ));
         }
@@ -2025,7 +2025,7 @@ mod tests {
         let report = run(&mut sys, &host, 0, false).unwrap();
         assert!(
             report.output.contains(
-                "mgmt ingress: bgp 192.168.249.254 Idle (not Established — the router is \
+                "mgmt ingress: bgp 192.168.249.254 Idle (not Established - the router is \
                  not learning this zone's identities)"
             ),
             "{}",
@@ -2049,7 +2049,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "mgmt ingress: bgp 192.168.249.254 Established but advertising nothing \
-                 (0 sent prefixes — the neighbor afi-safi export policy is not attached)"
+                 (0 sent prefixes - the neighbor afi-safi export policy is not attached)"
             ),
             "{}",
             report.output
@@ -2091,7 +2091,7 @@ mod tests {
         let report = run(&mut sys, &host, 0, false).unwrap();
         assert!(
             report.output.contains(
-                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown — the \
+                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown - the \
                  ingress leg has no carrier)"
             ),
             "{}",
@@ -2127,7 +2127,7 @@ mod tests {
         let report = run(&mut sys, &host, 0, false).unwrap();
         assert!(
             report.output.contains(
-                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown — the \
+                "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown - the \
                  ingress leg has no carrier)"
             ),
             "a dead second `default ` line must degrade the return path even though the first \
