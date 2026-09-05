@@ -212,7 +212,11 @@ fn read(
     let port_taken = bfd_port(sys, view, c)?;
     let doc = engine_ctl::state(sys, f).ok();
     if doc.is_none() && !port_taken {
-        c.note("engine not running: cfab-engine.service is not answering — re-run cfab up");
+        // Review finding 12 (2026-09-05): "re-run cfab up" is no longer true — `apply`
+        // (Task 5) starts no daemon at all. The honest remedy is the not-yet-built
+        // supervisor's job (spec §9 rewords this row properly in a later task); until then,
+        // say only what is true.
+        c.note("engine not running: cfab-engine.service is not answering");
     }
     posture(sys, view, doc.as_ref(), c)?;
     return_path_and_ingress(sys, view, doc.as_ref(), c)?;
@@ -1893,9 +1897,9 @@ mod tests {
             "FAILED (0/2 | 0/18 | 0/6) on pve3-tb (leaf)"
         );
         assert!(
-            report.output.contains(
-                "  engine not running: cfab-engine.service is not answering — re-run cfab up\n"
-            ),
+            report
+                .output
+                .contains("  engine not running: cfab-engine.service is not answering\n"),
             "{}",
             report.output
         );
@@ -2352,7 +2356,12 @@ mod tests {
             }
         }
         let mut sys = host_env(&view);
-        sys.files.remove("/sys/class/net/eth9");
+        // Review finding 7 (2026-09-05): a real absent netdev has no children either — drop
+        // every "/sys/class/net/eth9"-prefixed entry, not just the bare directory marker, so
+        // this test would fail (not pass by ordering alone) if any later check started
+        // reading a file under an absent wire.
+        sys.files
+            .retain(|k, _| !k.starts_with("/sys/class/net/eth9"));
         for p in [2u8, 3u8] {
             for z in &f.zones {
                 let prim = view
