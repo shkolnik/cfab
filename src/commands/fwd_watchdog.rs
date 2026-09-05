@@ -41,6 +41,9 @@ pub struct WatchdogReport {
     /// Restores that failed, after which the narrowest thing that removes the hazard was
     /// brought down. The name says what went down and why.
     pub downed: Vec<String>,
+    /// Restores that failed where there is nothing to actuate on — the drift stands, loudly,
+    /// and `status` keeps reporting it. Never silent, never an outage.
+    pub unrestored: Vec<String>,
 }
 
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
@@ -91,12 +94,20 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
         )?;
     }
     // ---- restore what cfab owns, and actuate only where a restore failed ----------------
+    // Narrowest hazard first, and the one that can amputate LAST: a leg-wide sysctl, then one
+    // bond's membership, then the member-wide rules. Running the rules first would down every
+    // fabric leg — the bonds included — under a bond restore that had not been tried yet.
     let mut restored: Vec<String> = Vec::new();
     let mut downed: Vec<String> = Vec::new();
-    restore_rp_filter(sys, view, &mut restored)?;
-    restore_rules(sys, view, &mut restored, &mut downed)?;
+    let mut unrestored: Vec<String> = Vec::new();
+    restore_rp_filter(sys, view, &mut restored, &mut unrestored)?;
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
-    for line in restored.iter().chain(downed.iter()) {
+    restore_rules(sys, view, &mut restored, &mut downed)?;
+    for line in restored
+        .iter()
+        .chain(downed.iter())
+        .chain(unrestored.iter())
+    {
         run_ignore(sys, &["logger", "-t", "cfab-fwd-watchdog", line])?;
     }
 
@@ -108,6 +119,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
             resolved: None,
             restored,
             downed,
+            unrestored,
         });
     }
     // Ask the foreign stack to pass cfab transit before judging it: Docker's policy stays DROP
@@ -154,6 +166,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
         resolved,
         restored,
         downed,
+        unrestored,
     })
 }
 
@@ -169,15 +182,26 @@ fn fabric_legs(view: &View) -> Vec<String> {
 /// Row 4. cfab owns the value (loose, every role — strict rp_filter black-holed control for
 /// ~5 s when all links returned at once), so drift is written back, never reported and left.
 /// Radius is a leg and the fix is one idempotent write, so there is nothing here to actuate on.
-fn restore_rp_filter(sys: &mut dyn Sys, view: &View, restored: &mut Vec<String>) -> Result<()> {
+/// A write that fails is recorded and the tick continues: one unwritable sysctl must not cost
+/// the bond and rule restores that follow it.
+fn restore_rp_filter(
+    sys: &mut dyn Sys,
+    view: &View,
+    restored: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
     for ifname in fabric_legs(view) {
         let path = format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter");
         // An absent leg is not ours to create — `cfab up` does that.
         let Ok(v) = sys.read(&path) else { continue };
         let v = v.trim().to_string();
         if v != "2" {
-            sys.write(&path, "2")?;
-            restored.push(format!("rp_filter {ifname} {v}->2 (want 2 = loose)"));
+            match sys.write(&path, "2") {
+                Ok(()) => restored.push(format!("rp_filter {ifname} {v}->2 (want 2 = loose)")),
+                Err(e) => unrestored.push(format!(
+                    "rp_filter {ifname}={v}: could not write 2 ({e}) — re-run cfab up"
+                )),
+            }
         }
     }
     Ok(())
@@ -283,6 +307,7 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
         resolved: None,
         restored: Vec::new(),
         downed: Vec::new(),
+        unrestored: Vec::new(),
     })
 }
 
@@ -617,6 +642,75 @@ mod tests {
             .remove("/proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter");
         let report = run(&mut sys, &view).unwrap();
         assert!(report.restored.is_empty(), "{:?}", report.restored);
+    }
+
+    /// Row 4, unrestorable. A read-only `/proc` (a container, a hardened host) must not cost
+    /// the restores that follow it: the drift is reported loudly and the tick carries on to the
+    /// bond and the rules. Availability-first — one stuck sysctl is not a reason to stop
+    /// repairing everything else.
+    #[test]
+    fn row4_an_unwritable_rp_filter_is_loud_and_does_not_abort_the_tick() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view)
+            .file("/proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter", "1\n")
+            .write_fail("/proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter")
+            .file(
+                "/sys/class/net/cfab-cl-fb/bonding/active_slave",
+                "someone-elses0\n",
+            );
+        let report = run(&mut sys, &view).unwrap();
+        assert_eq!(report.unrestored.len(), 1, "{:?}", report.unrestored);
+        assert!(
+            report.unrestored[0].starts_with("rp_filter cfab-st-fb=1: could not write 2"),
+            "{:?}",
+            report.unrestored
+        );
+        // The bond restore behind it still ran.
+        assert_eq!(
+            report.restored,
+            vec!["fallback cluster: released foreign slave someone-elses0".to_string()]
+        );
+        assert!(report.downed.is_empty(), "{:?}", report.downed);
+    }
+
+    /// Ordering: the member-wide amputation runs LAST. With the rules first, an unrestorable
+    /// leak guard would down every fabric leg — the bonds included — under a bond restore that
+    /// had not been tried yet, and the release would then be attempted on a dead bond.
+    #[test]
+    fn the_bond_release_is_tried_before_the_member_wide_amputation() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf_sys(&view)
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "someone-elses0\n",
+            )
+            .on_stdout(&["ip", "rule", "show", "pref", "1001"], "")
+            .on_fail(
+                &["ip", "rule", "add", "pref", "1001"],
+                2,
+                "RTNETLINK: EPERM",
+            );
+        let report = run(&mut sys, &view).unwrap();
+        assert!(
+            report
+                .restored
+                .contains(&"fallback storage: released foreign slave someone-elses0".to_string()),
+            "{:?}",
+            report.restored
+        );
+        let release = sys
+            .calls
+            .iter()
+            .position(|c| c == "ip link set someone-elses0 nomaster")
+            .expect("the release was attempted");
+        let amputation = sys
+            .calls
+            .iter()
+            .position(|c| c == "ip link set cfab-st-fb down")
+            .expect("the legs went down");
+        assert!(release < amputation, "{:?}", sys.calls);
     }
 
     /// Row 5, restore. A leaf's leak guard is re-added, and the fabric stays up.
