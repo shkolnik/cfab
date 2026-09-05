@@ -393,7 +393,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
              underneath (ip -br link show). The fabric is up on the rest; cfab verify grades \
              this degraded",
             engine_ctl::SETTLE_MS / 1000,
-            down.join(" ")
+            down.join(", ")
         );
     }
 
@@ -566,7 +566,9 @@ fn mk_vlan(
 /// Bond `updelay` in ms. **0 is the measured configuration** (the spike migrated losslessly
 /// four times per `fail_over_mac` mode at this value). 500 ms is the target James accepted, but
 /// it is INFERRED — Task 7.2(d) sweeps 0/200/500 on hardware and decides; this constant is the
-/// one line that changes.
+/// one line that changes. Note it takes effect on an EXISTING member only after a `down`/`up`:
+/// `mk_rescue` skips `ip link add` when the bond is already there and does not re-assert the
+/// bond parameters, so the sweep must tear the leg down between values.
 const RESCUE_UPDELAY_MS: &str = "0";
 /// `fail_over_mac`. **`none` is the build default** — measured nil difference against `active`
 /// on veth, and it keeps one MAC across a migration. A real NIC must accept the bond MAC in its
@@ -625,12 +627,26 @@ fn mk_rescue(sys: &mut dyn Sys, r: &RescueRow, cidr: &str, qos_map: &[&str]) -> 
         // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
         // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
         // to whom (the master link cannot be read as a file — it is a symlink to a directory).
-        let enslaved_here = sys.exists(&format!("/sys/class/net/{}/master", s.ifname))
-            && link_kind_is(sys, &s.ifname, &format!(" master {} ", r.ifname))?;
+        let enslaved_anywhere = sys.exists(&format!("/sys/class/net/{}/master", s.ifname));
+        let enslaved_here =
+            enslaved_anywhere && link_kind_is(sys, &s.ifname, &format!(" master {} ", r.ifname))?;
+        if enslaved_anywhere && !enslaved_here {
+            // Enslaved, but not to us. The kernel would answer the `master` set with a bare
+            // EBUSY; say what is actually wrong instead.
+            return Err(Error::fatal(format!(
+                "REFUSING: {} is enslaved to another bond",
+                s.ifname
+            )));
+        }
         if !enslaved_here {
             run_ok(sys, &["ip", "link", "set", &s.ifname, "master", &r.ifname])?;
         }
         run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
+        // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
+        // means forwarding=1 — the same hazard `mk_identity` guards against. `up` only zeroes
+        // conf/default on a HOST; a LEAF has rescue rows and is deliberately left alone there,
+        // so the explicit write is the only thing that holds `owned_forwarding()`'s false.
+        proc_sysctl(sys, &s.ifname, "forwarding", "0")?;
     }
     // (4) AFTER the slaves exist: `primary` names a SLAVE, and at `ip link add` time no slave
     // exists yet, so setting it there is a silent no-op.
@@ -671,7 +687,7 @@ fn describe_down(view: &View, down: &[String]) -> Vec<String> {
         .map(|entry| {
             let ifname = entry.rsplit('/').next().unwrap_or(entry);
             if rescue.iter().any(|r| r == ifname) {
-                format!("{entry} (no wire with carrier under {ifname})")
+                format!("{entry} (no wire with carrier under it)")
             } else {
                 entry.clone()
             }
@@ -893,18 +909,21 @@ mod tests {
                 "ip link add link eth9 name cfab-st-rs-st type vlan id 300 egress-qos-map 0:0 6:6",
                 "ip link set cfab-st-rs-st master cfab-st-rs",
                 "ip link set cfab-st-rs-st up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs-st/forwarding",
                 "ip link show cfab-st-rs-cl",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
                 "ip link show cfab-st-rs-cl",
                 "ip link add link eth1 name cfab-st-rs-cl type vlan id 300 egress-qos-map 0:0 6:6",
                 "ip link set cfab-st-rs-cl master cfab-st-rs",
                 "ip link set cfab-st-rs-cl up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs-cl/forwarding",
                 "ip link show cfab-st-rs-mg",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
                 "ip link show cfab-st-rs-mg",
                 "ip link add link eth0 name cfab-st-rs-mg type vlan id 300 egress-qos-map 0:0 6:6",
                 "ip link set cfab-st-rs-mg master cfab-st-rs",
                 "ip link set cfab-st-rs-mg up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-rs-mg/forwarding",
                 "ip link set cfab-st-rs type bond primary cfab-st-rs-st primary_reselect always",
                 "ip addr replace 10.99.9.1/24 dev cfab-st-rs",
                 "write /proc/sys/net/ipv4/conf/cfab-st-rs/arp_ignore",
@@ -951,6 +970,34 @@ mod tests {
         assert!(sys.ran("ip link set cfab-st-rs-cl master cfab-st-rs"));
     }
 
+    /// A slave name that is already enslaved SOMEWHERE ELSE: the kernel would answer the
+    /// `master` set with a bare "Device or resource busy". Refuse in cfab's own wording.
+    #[test]
+    fn up_refuses_a_rescue_slave_enslaved_to_a_foreign_bond() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view)
+            .file("/sys/class/net/cfab-st-rs-st/master", "")
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-rs-st"],
+                "10: cfab-st-rs-st@eth9: master br0 state UP vlan protocol 802.1Q id 300 \n",
+            );
+        let e = run(&mut sys, &view, &o).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-rs-st is enslaved to another bond"),
+            "{e}"
+        );
+        assert!(
+            !sys.ran("ip link set cfab-st-rs-st master"),
+            "never fights the kernel for it"
+        );
+    }
+
     /// A netdev already carrying a rescue bond's name but of another kind is not ours to
     /// delete (unlike a vlan of the wrong id, which cfab created and can recreate): refuse.
     #[test]
@@ -977,7 +1024,9 @@ mod tests {
 
     /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a rescue bond left
     /// out of it would leave every `up` DEGRADED and make the watchdog "correct" a flag cfab
-    /// never set. The slaves stay 0: a slave carries no L3.
+    /// never set. The slaves are written 0 EXPLICITLY: they carry no L3, and inheriting
+    /// conf/default (1 on a leaf whose external owner keeps ip_forward=1) would contradict
+    /// `owned_forwarding()` with nothing in `up` to correct it.
     #[test]
     fn rescue_bonds_forward_and_their_slaves_never_do() {
         let f = fabric();
@@ -995,7 +1044,7 @@ mod tests {
         for slave in ["cfab-st-rs-st", "cfab-st-rs-cl", "cfab-st-rs-mg"] {
             assert_eq!(
                 sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
-                None,
+                Some("0"),
                 "{slave} is L2 only"
             );
         }
@@ -1051,7 +1100,7 @@ mod tests {
             got,
             [
                 "storage/cfab-st".to_string(),
-                "storage/cfab-st-rs (no wire with carrier under cfab-st-rs)".to_string(),
+                "storage/cfab-st-rs (no wire with carrier under it)".to_string(),
             ]
         );
     }
