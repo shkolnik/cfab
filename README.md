@@ -44,6 +44,27 @@ cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands starte
 `--config` defaults to `fabric.conf` beside the binary; `--host` to `$CFAB_HOST`, else the
 kernel hostname.
 
+## Running it as a service
+
+The Debian package ships `cfab-fabric.service`, **installed disabled and not started** —
+installing cfab never changes the network. Write `/etc/cfab/fabric.conf`, then:
+
+```
+systemctl enable --now cfab-fabric
+```
+
+The unit is `Type=oneshot` + `RemainAfterExit=yes`; `ExecStart`/`ExecReload` are `cfab up`,
+`ExecStop` is `cfab down`. `ConditionPathExists=/etc/cfab/fabric.conf` means a host with the
+package but no declaration is skipped at boot rather than failed. Set `CFAB_HOST` in
+`/etc/default/cfab` only when this member's row is not named by the kernel hostname.
+
+A package upgrade neither stops nor restarts the unit: stopping it runs `cfab down`, an outage
+for every identity on the host. The engine already running keeps the old binary's inode, so the
+new binary takes effect at the next `systemctl reload cfab-fabric` — which is `cfab up` again,
+and `up` always stops and restarts the routing engine, so this member's adjacencies drop and
+re-form. `apt remove` stops the unit (`cfab down`, correct: the binary is going away) and
+disables it; `apt purge` also removes `/etc/default/cfab`.
+
 ## Cluster coordination (optional, never required)
 
 On a Proxmox cluster, `cfab` additionally coordinates through pmxcfs (`/etc/pve`) — probed at
