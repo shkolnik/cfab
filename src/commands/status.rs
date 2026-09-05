@@ -834,11 +834,9 @@ fn return_path_and_ingress(
 }
 
 fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
-    // Host only: a leaf marks nothing. The DSCP plane is a queueing switch's actual isolation
-    // mechanism, so drift is worth a line.
-    if view.kind() != MemberKind::Host {
-        return Ok(());
-    }
+    // Every kind: `up` installs `table inet cfab` on every kind. The DSCP plane is a queueing
+    // switch's actual isolation mechanism and the ceiling is the fallback segment's only
+    // containment, so drift in either is worth a line.
     let f = view.fabric;
     let want = emit::mark::generate(view)?;
     let loaded = sys
@@ -857,17 +855,14 @@ fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The fallback control-egress ceiling's drop counters. Host only, like the table that holds
-/// them. A tripped ceiling is the containment working — it protects every switch port the
+/// The fallback control-egress ceiling's drop counters, on every kind — like the table that
+/// holds them. A tripped ceiling is the containment working — it protects every switch port the
 /// fallback broadcast domain reaches — so it is a reason line and never moves the state: the
 /// links axis already reports what a lost fallback adjacency costs. A ceiling rule that is gone
 /// while up is desired is mark drift, reported by `mark_drift` above; there is no second
 /// detector here and nothing actuates on it (`cfab fwd-watchdog` restores sysctls, bond
 /// membership and `ip rule`s — never an nft table).
 fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
-    if view.kind() != MemberKind::Host {
-        return Ok(());
-    }
     let ceilings = emit::mark::ceilings(view);
     if ceilings.is_empty() {
         return Ok(());
@@ -1144,7 +1139,7 @@ mod tests {
                     "0\n",
                 );
         }
-        sys = fallback_sysfs(sys, view, "0\n");
+        sys = mark_env(fallback_sysfs(sys, view, "0\n"), view);
         sys
             .on_stdout(&["ip", "rule", "show", "pref", "1000"],
                 "1000: from all to 10.99.0.0/16 iif lo lookup main\n1000: from all to 10.199.0.0/16 iif lo lookup main\n1000: from all to 10.249.0.0/16 iif lo lookup main\n")
@@ -1204,6 +1199,26 @@ mod tests {
         let f = view.fabric;
         primary_routes(leaf_env(view), view)
             .socket("/run/cfab/engine.sock", &engine_doc(view, &all_bfd_up(f)))
+    }
+
+    /// `table inet cfab` as `up` leaves it: the generated file, the `-s` readback it stores and
+    /// the stateful listing `ceiling_counters` parses, with every ceiling at zero. Installed on
+    /// every kind, so both `leaf_env` and `host_env` build on it.
+    fn mark_env(sys: MockSys, view: &View) -> MockSys {
+        let f = view.fabric;
+        sys.file(
+            &format!("{}/mark.nft", f.run_dir),
+            &crate::emit::mark::generate(view).unwrap(),
+        )
+        .file(&format!("{}/mark.applied", f.run_dir), "table inet cfab\n")
+        .on_stdout(
+            &["nft", "-s", "list", "table", "inet", "cfab"],
+            "table inet cfab\n",
+        )
+        .on_stdout(
+            &["nft", "list", "table", "inet", "cfab"],
+            &ceiling_listing(view, 0),
+        )
     }
 
     /// `nft list table inet cfab` as nftables 1.1.3 prints the ceiling rules, with `drops`
@@ -1304,22 +1319,13 @@ mod tests {
             .file(
                 &format!("{}/policy.applied", f.run_dir),
                 "table inet cfab-fwd\n",
+            );
+        mark_env(sys, view)
+            .on_stdout(
+                &["nft", "-s", "list", "table", "inet", "cfab-fwd"],
+                "table inet cfab-fwd\n",
             )
-            .file(
-                &format!("{}/mark.nft", f.run_dir),
-                &crate::emit::mark::generate(view).unwrap(),
-            )
-            .file(&format!("{}/mark.applied", f.run_dir), "table inet cfab\n");
-        sys.on_stdout(
-            &["nft", "-s", "list", "table", "inet", "cfab-fwd"],
-            "table inet cfab-fwd\n",
-        )
-        .on_stdout(&["nft", "-s", "list", "table", "inet", "cfab"], "table inet cfab\n")
-        .on_stdout(
-            &["nft", "list", "table", "inet", "cfab"],
-            &ceiling_listing(view, 0),
-        )
-        .on_stdout(
+            .on_stdout(
             &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
             "chain forward {\n  type filter hook forward priority filter; policy drop;\n               iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n               oifname @admin counter packets 0 bytes 0 drop comment \"admin-out\"\n               counter packets 0 bytes 0 comment \"default-deny\"\n}",
         )
@@ -1678,6 +1684,51 @@ mod tests {
         }
         // Nothing else moved: the mark table still matches what was applied.
         assert!(!report.output.contains("mark drift"), "{}", report.output);
+    }
+
+    /// The same on a leaf. `up` installs the table on every kind, so `status` reads the counter
+    /// on every kind — a leaf that has stopped shouting must say so, or the containment is
+    /// invisible on exactly the member (a NAS) where the CPU cost of a storm lands hardest.
+    #[test]
+    fn a_tripped_ceiling_on_a_leaf_is_the_same_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).on_stdout(
+            &["nft", "list", "table", "inet", "cfab"],
+            &ceiling_listing(&view, 28),
+        );
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(report.code, 0);
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)"
+        );
+        for zone in ["storage", "cluster", "mgmt"] {
+            let want =
+                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+            assert!(
+                report.output.lines().filter(|l| *l == want).count() == 1,
+                "expected exactly one {want:?} in:\n{}",
+                report.output
+            );
+        }
+        assert!(!report.output.contains("mark drift"), "{}", report.output);
+    }
+
+    /// A leaf's mark table is watched for drift like a host's: the table `up` installed is the
+    /// only thing keeping the ceiling on the wire, and nothing actuates on its absence.
+    #[test]
+    fn a_leaf_with_a_stale_mark_table_reports_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).file("/run/cfab/mark.nft", "table inet cfab\n");
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains("mark drift — re-run cfab up"),
+            "{}",
+            report.output
+        );
     }
 
     /// `burst 160 packets` sits before the counter on a ceiling rule, so a parse anchored on
