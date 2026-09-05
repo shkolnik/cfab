@@ -336,23 +336,17 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::Up => {
             let mut sys = RealSys;
-            let opts = commands::up::UpOpts {
-                exe: std::env::current_exe()
-                    .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
-                    .to_string_lossy()
-                    .into_owned(),
-                config: std::fs::canonicalize(&path)
-                    .map_err(|e| Error::fatal(format!("cannot resolve {}: {e}", path.display())))?
-                    .to_string_lossy()
-                    .into_owned(),
+            let opts = commands::apply::ApplyOpts {
                 pmxcfs_root: "/etc/pve".to_string(),
             };
-            print!("{}", commands::up::run(&mut sys, &view, &opts)?);
+            for w in commands::apply::run(&mut sys, &view, &opts)? {
+                println!("{w}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Down => {
             let mut sys = RealSys;
-            print!("{}", commands::down::run(&mut sys, &view)?);
+            print!("{}", commands::teardown::run(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { wait, permissive } => {
