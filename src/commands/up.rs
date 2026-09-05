@@ -581,13 +581,17 @@ fn mk_vlan(
     Ok(())
 }
 
-/// Bond `updelay` in ms. **0 is the measured configuration** (the spike migrated losslessly
-/// four times per `fail_over_mac` mode at this value). 500 ms is the target James accepted, but
-/// it is INFERRED — Task 7.2(d) sweeps 0/200/500 on hardware and decides; this constant is the
-/// one line that changes. Note it takes effect on an EXISTING member only after a `down`/`up`:
-/// `mk_rescue` skips `ip link add` when the bond is already there and does not re-assert the
-/// bond parameters, so the sweep must tear the leg down between values.
-const RESCUE_UPDELAY_MS: &str = "0";
+/// Bond `updelay` in ms — how long a returning wire must hold carrier before it is reselected.
+/// **500 is MEASURED, not a target** (sweep of 0/200/500, n=1 per value, research repo
+/// `docs/research/2026-09-04-rescue-segment-container-evidence.md` §5): it costs a 0.574 s window
+/// after a *legitimate* return in which `verify` reads DEGRADED (0.074 s at 0), with **zero**
+/// packets lost at every value, and it buys a 10x reduction in migrations on a bouncing wire —
+/// 2 versus 20 active-slave switches over ten 250 ms flaps, each avoided switch an avoided GARP
+/// burst and MAC move on every switch in the path. `updelay` never delays the failover AWAY from
+/// a dead wire (0.026-0.042 s at every value), so it cannot lengthen an outage. Note it takes
+/// effect on an EXISTING member only after a `down`/`up`: `mk_rescue` skips `ip link add` when the
+/// bond is already there and does not re-assert the bond parameters.
+const RESCUE_UPDELAY_MS: &str = "500";
 /// `fail_over_mac`. **`none` is the build default** — measured nil difference against `active`
 /// on veth, and it keeps one MAC across a migration. A real NIC must accept the bond MAC in its
 /// unicast filter (INFERRED); Task 7's hardware step measures that and flips this to `active`
@@ -945,7 +949,7 @@ mod tests {
             calls_for(&sys, "cfab-st-rs"),
             [
                 "ip link show cfab-st-rs",
-                "ip link add cfab-st-rs type bond mode active-backup miimon 100 num_grat_arp 3 updelay 0 fail_over_mac none",
+                "ip link add cfab-st-rs type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
                 "ip link show cfab-st-rs-st",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
                 "ip link show cfab-st-rs-st",
@@ -1117,7 +1121,7 @@ mod tests {
             calls_for(&sys, "cfab-gw249"),
             [
                 "ip link show cfab-gw249",
-                "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 0 fail_over_mac none",
+                "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
                 "ip link show cfab-gw249-st",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
                 "ip link show cfab-gw249-st",
