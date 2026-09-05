@@ -26,18 +26,22 @@ pub enum Island {
     Cl,
     /// The management island; a host's wire here also carries its untagged admin path.
     Mg,
+    /// Not a physical switch domain: "every island this member has a wire on". Only a
+    /// fallback segment (`Role::Fallback`) is declared on it; `Member::wire` always returns
+    /// `None` for it (a fallback leg is a bond over every wire, resolved in the derive layer,
+    /// never a single indexed wire).
+    Any,
 }
 
 impl Island {
-    pub const ALL: [Island; 3] = [Island::St, Island::Cl, Island::Mg];
-
     pub fn parse(s: &str) -> Result<Island> {
         match s {
             "st" => Ok(Island::St),
             "cl" => Ok(Island::Cl),
             "mg" => Ok(Island::Mg),
+            "any" => Ok(Island::Any),
             other => Err(Error::config(format!(
-                "unknown island '{other}' (st|cl|mg)"
+                "unknown island '{other}' (st|cl|mg|any)"
             ))),
         }
     }
@@ -47,6 +51,7 @@ impl Island {
             Island::St => "st",
             Island::Cl => "cl",
             Island::Mg => "mg",
+            Island::Any => "any",
         }
     }
 }
@@ -87,6 +92,16 @@ pub struct Wire {
     pub speed_mbit: u32,
 }
 
+/// The widest ifname a bond leg (a fallback segment, or a migrating ingress leg) may carry.
+/// Its slaves are named `<ifname>-<island>`: three characters of suffix inside IFNAMSIZ 15.
+pub const MAX_BOND_IFNAME: usize = 12;
+
+/// Does this bond-leg name leave room for the `-<island>` suffix its slaves need? One
+/// predicate for both legs, so the rule cannot drift between them.
+fn bond_ifname_too_long(ifname: &str) -> bool {
+    ifname.len() > MAX_BOND_IFNAME
+}
+
 /// One MEMBER_TABLE row.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Member {
@@ -100,7 +115,12 @@ pub struct Member {
 
 impl Member {
     pub fn wire(&self, island: Island) -> Option<&Wire> {
-        self.wires[island as usize].as_ref()
+        match island {
+            Island::St | Island::Cl | Island::Mg => self.wires[island as usize].as_ref(),
+            // A fallback leg is a bond over every wire this member has, not one indexed
+            // wire — resolved by the derive layer, never here.
+            Island::Any => None,
+        }
     }
 }
 
@@ -223,6 +243,9 @@ impl Zone {
 pub enum Role {
     Primary,
     Backup,
+    /// A fallback segment: island `any`, one per zone, no BFD, reached only when every
+    /// island segment of its zone is gone.
+    Fallback,
 }
 
 impl Role {
@@ -230,8 +253,9 @@ impl Role {
         match s {
             "primary" => Ok(Role::Primary),
             "backup" => Ok(Role::Backup),
+            "fallback" => Ok(Role::Fallback),
             other => Err(Error::config(format!(
-                "CLASS_TABLE role '{other}' (expected primary|backup)"
+                "CLASS_TABLE role '{other}' (expected primary|backup|fallback)"
             ))),
         }
     }
@@ -263,16 +287,15 @@ pub struct Fabric {
     pub forward_allow: Vec<(String, String)>,
     pub admin_floor_mbit: u32,
     pub admin_band: u32,
-    pub vrrp_gw: bool,
-    pub vrrp_vrid: u8,
-    pub vrrp_if: String,
-    pub vrrp_advert_ms: u32,
     pub pcp_ctrl: u8,
     pub dscp_mark: bool,
     pub dscp_ctrl: Dscp,
     pub bfd_rx_ms: u32,
     pub bfd_tx_ms: u32,
     pub bfd_mult: u32,
+    /// UDP port for single-hop BFD (RFC 5881: 3784). A port is an external contract — every
+    /// member and every peer must agree — so it is a declared key, not a derived threshold.
+    pub bfd_port: u16,
     pub ospf_hello: u32,
     pub ospf_dead: u32,
     pub bgp_as: u32,
@@ -281,7 +304,7 @@ pub struct Fabric {
     pub bgp_connect_s: u32,
     /// `(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.
     pub usb_nics: Vec<(String, String)>,
-    /// Runtime state dir written by `up`, read by `verify` and the daemons (CFAB_RUN).
+    /// Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).
     pub run_dir: String,
     pub fabric_domain: String,
 }
@@ -298,16 +321,13 @@ pub const CONSUMED_KEYS: &[&str] = &[
     "ADMIN_FLOOR",
     "ADMIN_BAND",
     "FORWARD_ALLOW",
-    "VRRP_GW",
-    "VRRP_VRID",
-    "VRRP_ADVERT_MS",
-    "VRRP_IF",
     "PCP_CTRL",
     "DSCP_MARK",
     "DSCP_CTRL",
     "BFD_RX_MS",
     "BFD_TX_MS",
     "BFD_MULT",
+    "BFD_PORT",
     "OSPF_HELLO",
     "OSPF_DEAD",
     "BGP_AS",
@@ -322,6 +342,26 @@ fn parse_num<T: std::str::FromStr>(raw: &RawConfig, key: &str) -> Result<T> {
     let v = raw.require(key)?;
     v.parse()
         .map_err(|_| Error::config(format!("{key}='{v}' is not a valid number")))
+}
+
+/// RFC 5881's single-hop port: what every BFD implementation binds unless told otherwise.
+pub const BFD_PORT_DEFAULT: u16 = 3784;
+
+/// An optional port key: absent = the default, present = a registered/dynamic port. Ports below
+/// 1024 are refused (the engine drops privileges to bind nothing else there) and 0 is not a port.
+fn parse_port(raw: &RawConfig, key: &str, default: u16) -> Result<u16> {
+    let Some(v) = raw.get(key) else {
+        return Ok(default);
+    };
+    let port: u16 = v
+        .parse()
+        .map_err(|_| Error::config(format!("{key}='{v}' is not a valid port")))?;
+    if !(1024..=65535).contains(&port) {
+        return Err(Error::config(format!(
+            "{key}={port} is outside 1024..65535"
+        )));
+    }
+    Ok(port)
 }
 
 fn parse_bool01(raw: &RawConfig, key: &str) -> Result<bool> {
@@ -358,16 +398,13 @@ impl Fabric {
             forward_allow,
             admin_floor_mbit: parse_num(raw, "ADMIN_FLOOR")?,
             admin_band: parse_num(raw, "ADMIN_BAND")?,
-            vrrp_gw: parse_bool01(raw, "VRRP_GW")?,
-            vrrp_vrid: parse_num(raw, "VRRP_VRID")?,
-            vrrp_if: raw.require("VRRP_IF")?.to_string(),
-            vrrp_advert_ms: parse_num(raw, "VRRP_ADVERT_MS")?,
             pcp_ctrl: parse_num(raw, "PCP_CTRL")?,
             dscp_mark: parse_bool01(raw, "DSCP_MARK")?,
             dscp_ctrl: Dscp::parse(raw.require("DSCP_CTRL")?)?,
             bfd_rx_ms: parse_num(raw, "BFD_RX_MS")?,
             bfd_tx_ms: parse_num(raw, "BFD_TX_MS")?,
             bfd_mult: parse_num(raw, "BFD_MULT")?,
+            bfd_port: parse_port(raw, "BFD_PORT", BFD_PORT_DEFAULT)?,
             ospf_hello: parse_num(raw, "OSPF_HELLO")?,
             ospf_dead: parse_num(raw, "OSPF_DEAD")?,
             bgp_as: parse_num(raw, "BGP_AS")?,
@@ -425,6 +462,49 @@ impl Fabric {
         for r in ct {
             self.zone(&r.zone)?;
         }
+        for r in ct {
+            if r.island == Island::Any && r.role != Role::Fallback {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: island 'any' requires role 'fallback' (a fallback segment is \
+                     the only segment without an island)",
+                    r.ifname
+                )));
+            }
+            if r.role == Role::Fallback && r.island != Island::Any {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: role 'fallback' requires island 'any' (an island segment \
+                     cannot be fallback)",
+                    r.ifname
+                )));
+            }
+        }
+        for r in ct.iter().filter(|r| r.role == Role::Fallback) {
+            if bond_ifname_too_long(&r.ifname) {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: fallback ifname must be {MAX_BOND_IFNAME} characters or \
+                     fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
+                    r.ifname
+                )));
+            }
+            let longest_path: u32 = ct
+                .iter()
+                .filter(|other| other.zone == r.zone && other.role != Role::Fallback)
+                .map(|other| other.ospf_cost)
+                .sum();
+            if r.ospf_cost <= longest_path {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: fallback cost {} must exceed zone {}'s longest host path \
+                     ({longest_path}, the sum of its class-row costs)",
+                    r.ifname, r.ospf_cost, r.zone
+                )));
+            }
+            if r.ospf_cost >= self.leaf_cost_offset {
+                return Err(Error::config(format!(
+                    "CLASS_TABLE {}: fallback cost {} must be below LEAF_COST_OFFSET ({})",
+                    r.ifname, r.ospf_cost, self.leaf_cost_offset
+                )));
+            }
+        }
         if let Some(d) = dup(self.zones.iter().map(|z| z.id.to_string())) {
             return Err(Error::config(format!("ZONE_TABLE id {d} used twice")));
         }
@@ -469,6 +549,16 @@ impl Fabric {
         }
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
+            // island `any` = a migrating ingress leg: a bond over one tagged sub-interface
+            // per wire, named like a fallback leg's slaves, so the derived bond name must
+            // leave room for the `-<island>` suffix.
+            if gw.island == Island::Any && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
+                     characters or fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
+                    z.name, z.id
+                )));
+            }
             if ct.iter().any(|r| r.vid == gw.vid) {
                 return Err(Error::config(format!(
                     "ZONE_TABLE {} ingress vid {} is also a segment vid",
@@ -659,7 +749,8 @@ mod tests {
         let f = Fabric::from_raw(&raw).unwrap();
         assert_eq!(f.members.len(), 3);
         assert_eq!(f.zones.len(), 3);
-        assert_eq!(f.class_table.len(), 9);
+        // 9 class segments + 3 fallback rows (one per zone, island `any`).
+        assert_eq!(f.class_table.len(), 12);
         assert_eq!(f.zone("mgmt").unwrap().id, 249);
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
         assert_eq!(gw.router, "192.168.249.254");
@@ -667,6 +758,15 @@ mod tests {
         assert_eq!(gw.island, Island::Mg);
         assert_eq!(gw.leg_cidr(2), "192.168.249.2/24");
         assert!(f.zone("storage").unwrap().gw.is_none());
+        let fallback = f
+            .class_table
+            .iter()
+            .find(|r| r.ifname == "cfab-st-fb")
+            .unwrap();
+        assert_eq!(fallback.island, Island::Any);
+        assert_eq!(fallback.role, Role::Fallback);
+        assert_eq!(fallback.zone, "storage");
+        assert_eq!(fallback.ospf_cost, 5000);
         assert_eq!(f.member("pve3-tb").unwrap().kind, MemberKind::Leaf);
         assert_eq!(
             f.member("pve1-tb")
@@ -678,6 +778,31 @@ mod tests {
         );
         // No literal key in the real file is unknown to the model.
         assert_eq!(raw.unconsumed(CONSUMED_KEYS), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn bfd_port_defaults_and_is_range_checked() {
+        // The shipped declaration states it; a declaration that omits it gets RFC 5881's port.
+        assert_eq!(parse_fabric(|_| {}).unwrap().bfd_port, 3784);
+        let f = parse_fabric(|t| *t = t.replace("BFD_PORT=3784\n", "")).unwrap();
+        assert_eq!(f.bfd_port, BFD_PORT_DEFAULT);
+        assert_eq!(
+            parse_fabric(|t| *t = t.replace("BFD_PORT=3784", "BFD_PORT=3785"))
+                .unwrap()
+                .bfd_port,
+            3785
+        );
+        for (bad, want) in [
+            ("BFD_PORT=1023", "BFD_PORT=1023 is outside 1024..65535"),
+            ("BFD_PORT=0", "BFD_PORT=0 is outside 1024..65535"),
+            ("BFD_PORT=70000", "BFD_PORT='70000' is not a valid port"),
+            ("BFD_PORT=bfd", "BFD_PORT='bfd' is not a valid port"),
+        ] {
+            let err = parse_fabric(|t| *t = t.replace("BFD_PORT=3784", bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{bad}: {err}");
+        }
     }
 
     fn parse_fabric(mut edit: impl FnMut(&mut String)) -> Result<Fabric> {
@@ -783,5 +908,148 @@ mod tests {
             err.to_string().contains("members: pve1-tb pve2-tb pve3-tb"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn island_parses_any() {
+        assert_eq!(Island::parse("any").unwrap(), Island::Any);
+        assert_eq!(Island::Any.as_str(), "any");
+        assert_eq!(Island::Any.to_string(), "any");
+    }
+
+    #[test]
+    fn role_parses_fallback() {
+        assert_eq!(Role::parse("fallback").unwrap(), Role::Fallback);
+    }
+
+    #[test]
+    fn wire_of_island_any_is_always_none() {
+        let raw = RawConfig::parse(&real_conf()).unwrap();
+        let f = Fabric::from_raw(&raw).unwrap();
+        for m in &f.members {
+            assert!(m.wire(Island::Any).is_none(), "{}", m.name);
+        }
+    }
+
+    #[test]
+    fn island_any_without_role_fallback_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-fb  any storage 9 300 fallback 5000",
+                "cfab-st-fb  any storage 9 300 primary 5000",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("island 'any' requires role 'fallback'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn role_fallback_without_island_any_fails() {
+        // Flip an ordinary segment's role to `fallback` without changing its island — the
+        // opposite-direction check, exercised without colliding with the zone:island
+        // uniqueness check (every zone already has a row on every physical island).
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-bk  cl storage 2 101 backup  100",
+                "cfab-st-bk  cl storage 2 101 fallback  100",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role 'fallback' requires island 'any'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fallback_ifname_over_12_chars_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace("cfab-st-fb  any storage", "cfab-storage-fb any storage")
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fallback ifname must be 12 characters or fewer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fallback_cost_at_or_below_zones_longest_path_fails() {
+        // storage's other class rows sum to 10 + 100 + 300 = 410; 400 does not clear it.
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st-fb  any storage 9 300 fallback 5000",
+                "cfab-st-fb  any storage 9 300 fallback 400",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fallback cost 400 must exceed zone storage's longest host path (410"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fallback_cost_at_or_above_leaf_cost_offset_fails() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-cl-fb  any cluster 9 301 fallback 5000",
+                "cfab-cl-fb  any cluster 9 301 fallback 30000",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fallback cost 30000 must be below LEAF_COST_OFFSET (30000)"),
+            "{err}"
+        );
+    }
+
+    /// Task 9: the ingress leg migrates, so `any` is a legal gw island. (Task 1 shipped a
+    /// temporary refusal here because `gw_rows_of` had no fan-out; this replaces it.)
+    #[test]
+    fn gw_island_any_is_accepted() {
+        let f = parse_fabric(|t| *t = t.replace("mg:249:", "any:249:")).unwrap();
+        assert_eq!(
+            f.zone("mgmt").unwrap().gw.as_ref().unwrap().island,
+            Island::Any
+        );
+    }
+
+    /// The slave-name guard, at the predicate: a bond leg's slaves are `<ifname>-<island>`,
+    /// so 12 characters fit IFNAMSIZ and 13 do not.
+    #[test]
+    fn bond_ifname_longer_than_twelve_is_refused() {
+        assert!(!bond_ifname_too_long("cfab-st-fb"));
+        assert!(!bond_ifname_too_long("123456789012"));
+        assert!(bond_ifname_too_long("1234567890123"));
+    }
+
+    /// ...and no ZONE_TABLE declaration can reach it today: a zone id is a u8, so the widest
+    /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-mg` (13).
+    /// The check guards the name SCHEME, not the declaration; this test is what would go red
+    /// if the scheme ever grew.
+    #[test]
+    fn every_zone_id_yields_an_ingress_bond_name_that_fits() {
+        for id in u8::MIN..=u8::MAX {
+            let ifname = format!("cfab-gw{id}");
+            assert!(!bond_ifname_too_long(&ifname), "{ifname}");
+            assert!(format!("{ifname}-mg").len() <= 15, "{ifname}");
+        }
+    }
+
+    #[test]
+    fn schema_still_emits_with_fallback() {
+        let schema = schemars::schema_for!(Fabric);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        assert!(json.contains("\"fallback\""), "{json}");
+        assert!(json.contains("\"any\""), "{json}");
     }
 }
