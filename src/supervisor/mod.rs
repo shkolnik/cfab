@@ -447,7 +447,7 @@ pub(crate) async fn run_with(
 
     // The watchdog feed (spec §8): only when systemd set WATCHDOG_USEC, so `WatchdogSec` lives
     // in the unit file alone. Absent that, the feed never runs.
-    let feed_period = sd_notify::watchdog_enabled().map(|d| d / 3);
+    let feed_period = feed_period();
 
     if let Some(tx) = hooks.on_ready {
         let _ = tx.send(());
@@ -536,17 +536,33 @@ pub(crate) async fn run_with(
                 }
             }
             _ = fwd_tick.tick(), if hooks.run_watchdog => {
-                let (result, detail) = match fwd_watchdog::run(sys, view) {
-                    Ok(report) => summarize_watchdog(&report),
-                    Err(e) => ("error".to_string(), Some(e.to_string())),
-                };
-                let mut st = shared.lock().unwrap();
-                st.wd_last_tick = Some(Instant::now());
-                st.wd_result = result;
-                st.wd_detail = detail;
+                watchdog_tick(sys, view, &shared);
             }
             _ = feed => {
-                if should_feed(sys, &shared, &sock_path) {
+                let (apply, engine_state) = {
+                    let st = shared.lock().unwrap();
+                    let apply = if st.applying {
+                        ApplyState::Applying {
+                            since_s: st.apply_started_at.map_or(0, |t| t.elapsed().as_secs()),
+                        }
+                    } else {
+                        ApplyState::Idle
+                    };
+                    (apply, st.child("engine").state)
+                };
+                // Only a `running` engine's silence withholds the feed, so only then pay the
+                // bounded `state\n` read (5 s client timeout); otherwise the read is not consulted.
+                let read = if engine_state == child::State::Running {
+                    match sys.unix_request(&sock_path, "state\n") {
+                        Ok(r) if serde_json::from_str::<serde_json::Value>(&r).is_ok() => {
+                            StateRead::Ok
+                        }
+                        _ => StateRead::Failed,
+                    }
+                } else {
+                    StateRead::Failed
+                };
+                if should_feed(apply, engine_state, read) {
                     let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
                 }
             }
@@ -853,33 +869,67 @@ fn wait_ready(sys: &mut dyn Sys, sock: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// Whether to feed the systemd watchdog this tick (spec §8): during an apply within its time
-/// bound, or when the engine is running and answers a parseable state, or while it is
-/// starting/restarting (there is nothing to read; a crash-looping engine must not also get the
-/// supervisor killed). Only a `running` engine that will not answer, or a stopped one, withholds
-/// the feed.
-fn should_feed(sys: &mut dyn Sys, shared: &Arc<Mutex<Shared>>, sock: &str) -> bool {
-    let (applying, apply_age, engine_state) = {
-        let st = shared.lock().unwrap();
-        (
-            st.applying,
-            st.apply_started_at.map(|t| t.elapsed()),
-            st.child("engine").state,
-        )
+/// The three inputs `should_feed` decides on, kept separate so the decision is a pure function
+/// testable without systemd, a socket, or a clock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ApplyState {
+    /// An apply is in progress; `since_s` is how many seconds ago it started.
+    Applying { since_s: u64 },
+    /// No apply in progress.
+    Idle,
+}
+
+/// Whether a bounded `state\n` read on `engine.sock` returned a parseable document this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateRead {
+    Ok,
+    Failed,
+}
+
+/// Whether to feed the systemd watchdog this tick (spec §8), as a pure function of the apply
+/// state, the engine child's state, and a bounded state read. WATCHDOG=1 is fed normally; it is
+/// withheld ONLY when a `running` engine has stopped answering — an applying supervisor past its
+/// time bound (a hang systemd should catch) or a stopped engine also withholds, but a `starting`
+/// or crash-looping (`restarting`) engine still feeds, so a contained child fault never escalates
+/// into systemd killing the whole unit (A2).
+fn should_feed(apply: ApplyState, engine: child::State, read: StateRead) -> bool {
+    match apply {
+        ApplyState::Applying { since_s } => {
+            // Within the bound the apply itself vouches for liveness; past it, withhold so a
+            // supervisor hung inside the apply is caught at `WatchdogSec` (the accepted A3 gap).
+            let bound_s = (START_WAIT_MS + engine_ctl::SETTLE_MS + 30_000) / 1000;
+            since_s < bound_s
+        }
+        ApplyState::Idle => match engine {
+            child::State::Running => read == StateRead::Ok,
+            child::State::Starting | child::State::Restarting => true,
+            child::State::Stopped => false,
+        },
+    }
+}
+
+/// The watchdog feed period: `WATCHDOG_USEC` ÷ 3, or `None` when systemd set no watchdog — in
+/// which case the feed task never runs, so `WatchdogSec` lives in the unit file alone and is
+/// never duplicated as a Rust constant (spec §8). Derived live from `sd_notify`, so it is `None`
+/// on the container path with no `WATCHDOG_USEC`.
+fn feed_period() -> Option<Duration> {
+    sd_notify::watchdog_enabled().map(|d| d / 3)
+}
+
+/// One forwarding-watchdog tick (spec §5): run the synchronous check with `block_in_place` — on
+/// this same thread, never `spawn_blocking`, whose pool retires idle threads and would SIGTERM a
+/// child a future spawn forked from it (§7) — and record its outcome into `components`. Runs on
+/// every member kind: `fwd_watchdog::run` guards its own transit-only work internally, so a leaf
+/// ticks too and only reports what a leaf owns.
+fn watchdog_tick(sys: &mut dyn Sys, view: &View, shared: &Arc<Mutex<Shared>>) {
+    let (result, detail) = match tokio::task::block_in_place(|| fwd_watchdog::run(sys, view)) {
+        Ok(report) => summarize_watchdog(&report),
+        Err(e) => ("error".to_string(), Some(e.to_string())),
     };
-    if applying {
-        let bound = Duration::from_millis(START_WAIT_MS + engine_ctl::SETTLE_MS + 30_000);
-        return apply_age.is_none_or(|a| a < bound);
-    }
-    match engine_state {
-        child::State::Running => sys
-            .unix_request(sock, "state\n")
-            .ok()
-            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
-            .is_some(),
-        child::State::Starting | child::State::Restarting => true,
-        child::State::Stopped => false,
-    }
+    let mut st = shared.lock().unwrap();
+    st.wd_last_tick = Some(Instant::now());
+    st.wd_result = result;
+    st.wd_detail = detail;
 }
 
 /// The forwarding watchdog tick's outcome, for `components` (spec §5): one of `ok` | `actuated`
@@ -1421,5 +1471,119 @@ mod tests {
             "expected initial + crash-respawn + re-apply engine spawns: {:?}",
             st.spawned
         );
+    }
+
+    /// A6 + the container path: with no systemd watchdog, `feed_period` is derived from
+    /// `watchdog_enabled()` (never a duplicated constant) and is `None`, so no feed task is ever
+    /// started, and `sd_notify::notify` is a no-op that returns `Ok` with no `NOTIFY_SOCKET`.
+    /// `cargo test` is not a systemd service, so neither variable is set; we cannot `remove_var`
+    /// here because `unsafe_code = "forbid"` (edition 2024) forbids it even in tests and the crate
+    /// has no safe env-manipulation helper — so the test asserts the derivation instead.
+    #[test]
+    fn sd_notify_is_a_no_op_without_notify_socket() {
+        // `feed_period` is exactly `watchdog_enabled()/3` — proving it is derived, not a constant.
+        assert_eq!(feed_period(), sd_notify::watchdog_enabled().map(|d| d / 3));
+        assert!(
+            sd_notify::notify(&[sd_notify::NotifyState::Ready]).is_ok(),
+            "notify is a no-op returning Ok without NOTIFY_SOCKET"
+        );
+        assert!(sd_notify::watchdog_enabled().is_none());
+        assert!(feed_period().is_none());
+    }
+
+    /// Spec §8 as a pure function: WATCHDOG=1 is fed normally and withheld ONLY when a running
+    /// engine stops answering a bounded state read. A crash-looping (restarting) engine still
+    /// feeds — a contained child fault must never escalate into systemd killing the whole unit
+    /// (A2).
+    #[test]
+    fn the_feed_is_withheld_only_when_a_running_engine_stops_answering() {
+        use ApplyState::{Applying, Idle};
+        use child::State::{Restarting, Running};
+        // An apply within its bound feeds regardless of the engine (it may not answer yet).
+        assert!(should_feed(Applying { since_s: 5 }, Running, StateRead::Ok));
+        // Past the apply bound, a running engine that will not answer withholds.
+        assert!(!should_feed(
+            Applying { since_s: 100 },
+            Running,
+            StateRead::Failed
+        ));
+        // Idle: a running engine feeds iff it answers.
+        assert!(should_feed(Idle, Running, StateRead::Ok));
+        assert!(!should_feed(Idle, Running, StateRead::Failed));
+        // A crash-looping engine must NOT get the supervisor killed too (A2).
+        assert!(should_feed(Idle, Restarting, StateRead::Failed));
+    }
+
+    /// The forwarding-watchdog tick runs on a leaf too (spec §5): `fwd_watchdog::run` is called on
+    /// a leaf view and its report is recorded into `components`. A healthy leaf posture summarizes
+    /// to `ok`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watchdog_ticks_on_a_leaf_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap(); // a leaf
+        let mut sys = healthy_leaf_sys(&view);
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        watchdog_tick(&mut sys, &view, &shared);
+        let snap = shared.lock().unwrap().components(Instant::now());
+        assert_eq!(
+            snap.watchdog.result, "ok",
+            "a healthy leaf tick is ok (detail: {:?})",
+            snap.watchdog.detail
+        );
+        assert!(
+            snap.watchdog.last_tick_s_ago.is_some(),
+            "the tick was recorded into components"
+        );
+    }
+
+    /// A healthy leaf forwarding posture for `fwd_watchdog::run` (mirrors its own leaf fixture):
+    /// every L3 leg's `rp_filter` loose and `forwarding` off, every `ip rule` cfab installed
+    /// present, and each fallback bond active on a slave of ours.
+    fn healthy_leaf_sys(view: &View) -> MockSys {
+        use crate::commands::common;
+        let legs: Vec<String> = view
+            .class_rows()
+            .into_iter()
+            .map(|r| r.ifname)
+            .chain(view.fallback_rows().into_iter().map(|r| r.ifname))
+            .collect();
+        let mut sys = MockSys::default();
+        for ifname in &legs {
+            sys = sys
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter"),
+                    "2\n",
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{ifname}/forwarding"),
+                    "0\n",
+                );
+        }
+        let mut by_pref: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for r in common::leak_guard_rules(view)
+            .into_iter()
+            .chain(common::return_path_rules(view))
+        {
+            by_pref
+                .entry(r.pref.clone())
+                .or_default()
+                .push(format!("{}: from all {}\n", r.pref, r.needle));
+        }
+        for (pref, lines) in by_pref {
+            sys = sys.on_stdout(&["ip", "rule", "show", "pref", &pref], &lines.concat());
+        }
+        for r in view.fallback_rows() {
+            let home = r
+                .slaves
+                .iter()
+                .find(|s| s.wire == r.home)
+                .expect("the home wire is one of the slaves");
+            sys = sys.file(
+                &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                &format!("{}\n", home.ifname),
+            );
+        }
+        sys
     }
 }
