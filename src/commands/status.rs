@@ -580,8 +580,17 @@ fn fallback(
                 ));
             }
             (Ok(mii), Ok(active)) if mii.trim() != "up" => {
-                let _ = active;
-                c.note(format!("fallback {zone} no carrier"));
+                // A bond the watchdog had to take down because it could not evict an intruder
+                // reads exactly like a dark bond, and "no carrier" would send an operator to
+                // the wrong end of the cable. The active slave still names the intruder.
+                let active = active.trim().to_string();
+                if !active.is_empty() && !r.slaves.iter().any(|s| s.ifname == active) {
+                    c.note(format!(
+                        "fallback {zone} down: foreign slave {active} could not be released"
+                    ));
+                } else {
+                    c.note(format!("fallback {zone} no carrier"));
+                }
             }
             (Ok(_), Ok(active)) => {
                 let active = active.trim();
@@ -1584,6 +1593,34 @@ mod tests {
         let report = run(&mut sys, &view, 0, false).unwrap();
         assert!(
             report.output.contains("  fallback cluster no carrier\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Row 19's actuated end: the watchdog could not evict an intruder from a bond cfab owns,
+    /// so it downed the bond. That reads exactly like a dark bond, and "no carrier" would send
+    /// an operator to the wrong end of the cable — the active slave still names the intruder.
+    #[test]
+    fn a_bond_downed_over_a_foreign_slave_says_so_not_no_carrier() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file("/sys/class/net/cfab-st-fb/bonding/mii_status", "down\n")
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "someone-elses0\n",
+            );
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains(
+                "  fallback storage down: foreign slave someone-elses0 could not be released\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("fallback storage no carrier"),
             "{}",
             report.output
         );
