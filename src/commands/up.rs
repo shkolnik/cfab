@@ -1,5 +1,5 @@
 //! `cfab up` — apply the fabric on THIS member. Idempotent, root. The order is load-bearing:
-//! preconditions → own the NICs → sysctls → per-class netdevs → return path → VRRP netdev →
+//! preconditions → own the NICs → sysctls → per-class netdevs → return path →
 //! policy + per-interface forwarding (or the leaf leak guard) → qos + shape daemon → routing
 //! engine (restart + readback) → fail-closed watchdog.
 
@@ -295,58 +295,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         )?;
     }
 
-    // ---- floating storage gateway netdev ---------------------------------------
-    if kind == MemberKind::Host && f.vrrp_gw {
-        if !f.host_forward {
-            return Err(Error::fatal(
-                "VRRP_GW=1 needs HOST_FORWARD=1 (a gateway that does not forward)",
-            ));
-        }
-        let vmac = format!("00:00:5e:00:01:{:02x}", f.vrrp_vrid);
-        let vr_parent = class_rows
-            .iter()
-            .find(|r| r.zone == "storage" && r.role == Role::Primary)
-            .map(|r| r.ifname.clone())
-            .ok_or_else(|| {
-                Error::fatal("VRRP_GW=1 but no storage primary segment on this member")
-            })?;
-        if !link_exists(sys, &f.vrrp_if)? {
-            run_ok(
-                sys,
-                &[
-                    "ip", "link", "add", &f.vrrp_if, "link", &vr_parent, "type", "macvlan", "mode",
-                    "bridge",
-                ],
-            )?;
-        }
-        run_ok(
-            sys,
-            &["ip", "link", "set", "dev", &f.vrrp_if, "address", &vmac],
-        )?;
-        // noprefixroute: a second connected route here made the host source its own OSPF/BFD
-        // from the VIP after a link cycle (measured root cause).
-        let vip = format!("{}/24", view.vrrp_vip()?);
-        run_ok(
-            sys,
-            &[
-                "ip",
-                "addr",
-                "replace",
-                &vip,
-                "dev",
-                &f.vrrp_if,
-                "noprefixroute",
-            ],
-        )?;
-        proc_sysctl(sys, &f.vrrp_if, "arp_ignore", "1")?;
-        proc_sysctl(sys, &f.vrrp_if, "send_redirects", "0")?;
-        proc_sysctl(sys, &f.vrrp_if, "forwarding", "0")?;
-        // NAS traffic enters on this macvlan but the reverse route is via the parent sub-if, so
-        // strict rpf would drop every packet the gateway exists to carry.
-        proc_sysctl(sys, &f.vrrp_if, "rp_filter", "2")?;
-        run_ok(sys, &["ip", "link", "set", &f.vrrp_if, "up"])?; // vrrpd holds the backup's macvlan down
-    }
-
     // ---- forward policy + per-interface forwarding ------------------------------
     if kind == MemberKind::Leaf {
         leaf_guard(sys, view)?;
@@ -495,9 +443,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     }
     if kind == MemberKind::Host {
         msg.push_str(&format!(
-            "up OK on {host} (node {n}, host); forward={} vrrp={} shape={} wires; run cfab verify\n",
+            "up OK on {host} (node {n}, host); forward={} shape={} wires; run cfab verify\n",
             u8::from(f.host_forward),
-            u8::from(f.vrrp_gw),
             wires.len()
         ));
     } else {
@@ -804,7 +751,7 @@ fn class_sysctls(sys: &mut dyn Sys, ifname: &str, _role: Role) -> Result<()> {
 }
 
 /// Load the policy atomically, read it back, and only then enable forwarding — on exactly the
-/// class-table interfaces (+ the VRRP macvlan), never a wire, never the untagged admin NIC.
+/// class-table interfaces, never a wire, never the untagged admin NIC.
 fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     let f = view.fabric;
     let policy = emit::policy::generate(view)?;
@@ -833,9 +780,6 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View) -> Result<()> {
     // transit — leaving it out here would make every `up` report DEGRADED three seconds later.
     for r in view.fallback_rows() {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
-    }
-    if f.vrrp_gw {
-        proc_sysctl(sys, &f.vrrp_if, "forwarding", "1")?;
     }
     if let Some(admin) = view.admin_if() {
         proc_sysctl(sys, admin, "forwarding", "0")?; // belt (the policy's admin rules = braces)
@@ -1365,6 +1309,21 @@ mod tests {
         );
     }
 
+    /// VRRP was deleted (the NAS is a fabric leaf, James 2026-09-02): a forwarding host's
+    /// `up` must create no macvlan at all — the storage VIP netdev was the only one cfab ever
+    /// made. The example fabric declares `HOST_FORWARD=1`, the case that used to build it.
+    #[test]
+    fn a_forwarding_host_creates_no_macvlan() {
+        let f = fabric();
+        assert!(f.host_forward);
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let (_tmp, o) = opts();
+        let mut sys = up_sys(&view);
+        run(&mut sys, &view, &o).unwrap();
+        assert_eq!(calls_for(&sys, "macvlan"), Vec::<String>::new());
+        assert_eq!(calls_for(&sys, "cfab-st-vr"), Vec::<String>::new());
+    }
+
     /// The fallback leg extended `mk_vlan` with `addr`/`bring_up`. A class row and an ingress
     /// leg must still produce exactly the argv they produced before it — this pins them.
     #[test]
@@ -1382,8 +1341,6 @@ mod tests {
                 "ip link add link eth9 name cfab-st type vlan id 100 egress-qos-map 0:0 6:6",
                 "ip addr replace 10.99.1.1/24 dev cfab-st",
                 "ip link set cfab-st up",
-                // the VRRP macvlan hangs off the storage primary — not a mk_vlan call
-                "ip link add cfab-st-vr link cfab-st type macvlan mode bridge",
             ]
         );
         assert_eq!(

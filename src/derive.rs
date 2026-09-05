@@ -145,8 +145,7 @@ impl<'a> View<'a> {
     /// Every interface cfab owns on this member with the forwarding flag cfab sets on it:
     /// declared wires and the admin NIC (never), class-table segments, ingress legs, fallback
     /// bonds (transit like a segment — a fallback leg for one zone can carry another zone's
-    /// island-disjoint traffic) and the VRRP macvlan (only a forwarding host), fallback slaves
-    /// and identity veths (never: a slave is L2 only, the bond is the L3 interface). Scoped
+    /// island-disjoint traffic), fallback slaves and identity veths (never: a slave is L2 only, the bond is the L3 interface). Scoped
     /// posture: cfab's forwarding authority is exactly this set — it neither reads nor writes
     /// the flag on any other interface, so a foreign forwarder (Docker, a routed bridge, a
     /// host-level CNI) is not cfab's to police. Declared names only; `owns_if` adds the
@@ -176,9 +175,6 @@ impl<'a> View<'a> {
             for s in r.slaves {
                 out.push((s.ifname, false));
             }
-        }
-        if f.vrrp_gw {
-            out.push((f.vrrp_if.clone(), transit));
         }
         for z in &f.zones {
             let id = Self::identity_if(z);
@@ -222,25 +218,6 @@ impl<'a> View<'a> {
     /// This member's address on a zone's segment `seg`: `10.<id>.<seg>.<node>`.
     pub fn segment_addr(&self, zone: &Zone, seg: u8) -> String {
         format!("{}.{seg}.{}", zone.block(), self.node())
-    }
-
-    /// The floating storage gateway VIP: `10.<storage id>.1.254` — on the primary segment,
-    /// `.254` beside the node addresses. Derived, never declared.
-    pub fn vrrp_vip(&self) -> Result<String> {
-        Ok(format!("{}.1.254", self.fabric.zone("storage")?.block()))
-    }
-
-    /// VRRP priority by node id — a fixed table for now (a known design wart: a new member
-    /// needs an edit here; the priority should derive from the declaration).
-    pub fn vrrp_prio(&self) -> Result<u32> {
-        match self.node() {
-            3 => Ok(200),
-            1 => Ok(100),
-            2 => Ok(50),
-            n => Err(Error::config(format!(
-                "no VRRP priority for node {n} (vrrp_prio table)"
-            ))),
-        }
     }
 }
 
@@ -555,8 +532,7 @@ mod tests {
                 "cfab-st",
                 "cfab-st-b2",
                 "cfab-st-bk",
-                "cfab-st-fb",
-                "cfab-st-vr"
+                "cfab-st-fb"
             ]
         );
         assert_eq!(
@@ -604,14 +580,6 @@ mod tests {
             View::new(&f, "pve2-tb").unwrap().wires(),
             vec!["eth0", "eth1", "eth9"]
         );
-    }
-
-    #[test]
-    fn vip_and_prio() {
-        let f = fabric();
-        let v = View::new(&f, "pve3-tb").unwrap();
-        assert_eq!(v.vrrp_vip().unwrap(), "10.99.1.254");
-        assert_eq!(v.vrrp_prio().unwrap(), 200);
     }
 
     #[test]

@@ -33,7 +33,6 @@ pub fn document(ready: bool, cfg: &Value, state_trees: &[Value]) -> Value {
         "ospf": Value::Object(ospf),
         "bfd": bfd,
         "bgp": [],
-        "vrrp": [],
     })
 }
 
@@ -273,7 +272,6 @@ mod tests {
         assert_eq!(bfd[1]["state"], "admin-down");
         assert_eq!(bfd[1]["peer"], "10.99.1.2");
         assert_eq!(d["bgp"], json!([]));
-        assert_eq!(d["vrrp"], json!([]));
     }
 
     #[test]
