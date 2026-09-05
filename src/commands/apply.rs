@@ -1,31 +1,43 @@
-//! `cfab up` — apply the fabric on THIS member. Idempotent, root. The order is load-bearing:
-//! preconditions → own the NICs → sysctls → per-class netdevs → return path →
-//! policy + per-interface forwarding (or the leaf leak guard) → marking + the fallback
-//! ceiling → qos + shape daemon → routing
-//! engine (restart + readback) → fail-closed watchdog.
+//! `cfab apply` — apply the fabric on THIS member. Idempotent, root. The order is
+//! load-bearing: preconditions → own the NICs → sysctls → per-class netdevs → return
+//! path → policy + per-interface forwarding (or the leaf leak guard) → marking + the
+//! fallback ceiling → qos. Starting the routing engine, the shape daemon, conf-sync and
+//! the fail-closed watchdog is the supervisor's job (`cfab run`), not this function's.
+
+use std::collections::BTreeSet;
 
 use crate::commands::common;
 use crate::commands::common::{
     conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
-use crate::commands::engine_ctl;
 use crate::derive::{GwRow, Slave, View};
 use crate::emit;
 use crate::error::{Error, Result};
 use crate::model::{MemberKind, Role};
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 
-pub struct UpOpts {
-    /// Absolute path to this binary (re-exec'd as the shape daemon / watchdog).
-    pub exe: String,
-    /// Absolute path to fabric.conf (passed to the re-exec'd units).
-    pub config: String,
+pub struct ApplyOpts {
     /// pmxcfs mount root probed to decide whether to start conf-sync (/etc/pve in
-    /// production; a tempdir in tests).
+    /// production; a tempdir in tests). Read here only; conf-sync itself is spawned by
+    /// the supervisor.
     pub pmxcfs_root: String,
 }
 
-pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
+/// The set of declared wires with no netdev: reserved for Task 5b (James's ruling,
+/// 2026-09-05), which turns that condition from a refusal into a warning. Always empty
+/// today — `own_wires` still refuses on an absent wire, unchanged from before this refactor.
+pub type AbsentWires = BTreeSet<String>;
+
+/// Bring up every declared wire, releasing it from a manager it does not belong to. One
+/// presence check per wire: `ip link set <dev> up` fails when the netdev does not exist.
+fn own_wires(sys: &mut dyn Sys, view: &View) -> Result<AbsentWires> {
+    for dev in &view.wires() {
+        run_ok(sys, &["ip", "link", "set", dev, "up"])?;
+    }
+    Ok(AbsentWires::new())
+}
+
+pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<String>> {
     let f = view.fabric;
     let kind = view.kind();
     let n = view.node();
@@ -36,22 +48,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     let admin_if = view.admin_if();
 
     // ---- preconditions: fail loud, never degrade -------------------------------
-    for dev in &wires {
-        if !link_exists(sys, dev)? {
-            return Err(Error::fatal(format!("{dev} missing")));
-        }
-    }
-    // The engine runs as a transient unit where systemd is (probed, like the other daemons);
-    // a container leaf detaches it with setsid (`Sys::spawn_detached`) and stops it by pid.
     // `nft` is uniform: every kind installs `table inet cfab` (marking + the fallback
     // control-egress ceiling). `tc`/`ethtool` stay host-only — a leaf shapes nothing and its
     // wires' qdiscs and offloads belong to its OS.
     let mut tools: Vec<&str> = vec!["ip", "nft"];
-    if sys.exists("/run/systemd/system") {
-        tools.push("systemd-run");
-    } else {
-        tools.extend(["setsid", "kill"]);
-    }
     if kind == MemberKind::Host {
         tools.extend(["tc", "ethtool"]);
         if f.host_forward {
@@ -98,8 +98,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
     // Release the wires from their manager — leftover DHCP state on a fabric NIC is a fight
     // for its addresses. The admin NIC's UNTAGGED L3 is the admin path: only tagged sub-ifs
     // are added on it, never a flush.
+    let _absent = own_wires(sys, view)?;
     for dev in &wires {
-        run_ok(sys, &["ip", "link", "set", dev, "up"])?;
         if kind != MemberKind::Host {
             continue; // a leaf never owns a wire's L3 (DSM does)
         }
@@ -109,11 +109,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         if sys.run(&["pgrep", "-f", &format!("dhcpcd.*{dev}")])?.ok() {
             run_ignore(sys, &["dhcpcd", "-k", dev])?;
         }
-        if sys
-            .run(&["systemctl", "is-active", "-q", "NetworkManager"])?
-            .ok()
-        {
-            run_ok(sys, &["nmcli", "device", "set", dev, "managed", "no"])?;
+        if have_tool(sys, "nmcli")? {
+            run_ignore(sys, &["nmcli", "device", "set", dev, "managed", "no"])?;
         }
         let dhcp = sys.run(&["pgrep", "-af", "dhclient|udhcpc"])?;
         if dhcp
@@ -277,7 +274,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
         enable_forwarding(sys, view)?;
     } else {
         run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
-        run_ignore(sys, &["systemctl", "stop", "cfab-fwd-watchdog.timer"])?;
         sys.remove(&format!("{}/policy.nft", f.run_dir))?;
         sys.remove(&format!("{}/policy.applied", f.run_dir))?;
     }
@@ -306,139 +302,24 @@ pub fn run(sys: &mut dyn Sys, view: &View, opts: &UpOpts) -> Result<String> {
                 &["tc", "qdisc", "replace", "dev", dev, "root", "fq_codel"],
             )?;
         }
-        // Floor+borrow shaping: the daemon re-derives each up wire's HTB tree on link events.
-        run_ignore(sys, &["systemctl", "stop", "cfab-shape.service"])?;
-        run_ignore(sys, &["systemctl", "reset-failed", "cfab-shape.service"])?;
-        run_ok(
-            sys,
-            &[
-                "systemd-run",
-                "--quiet",
-                "--unit=cfab-shape",
-                "-p",
-                "KillMode=mixed",
-                &opts.exe,
-                "--config",
-                &opts.config,
-                "--host",
-                host,
-                "shape-daemon",
-            ],
-        )?;
     }
 
-    // ---- routing engine ----------------------------------------------------------
-    // A fresh start on every `up`: the engine has no config file and no state to replay, so
-    // stop → sweep its routes → start → wait for ready is the whole apply. `ready` alone is
-    // not proof the providers took the tree: the readback checks every instance.
-    engine_ctl::stop_and_sweep(sys, f)?;
-    let doc = engine_ctl::start_and_wait(sys, f, &opts.exe, &opts.config, host)?;
-    engine_ctl::readback(view, &doc)?;
-    // Operationally down is a warning, never a refusal: one wire without carrier must not
-    // cost the host the fabric it can still have on the others.
-    let down = describe_down(view, &engine_ctl::settled_down_ifs(sys, view, &doc)?);
-    if !down.is_empty() {
-        eprintln!(
-            "cfab: warn: ospf interfaces still down after {}s: {} — no adjacency forms on them \
-             and nothing routes over those wires. Usual cause is no carrier on the wire \
-             underneath (ip -br link show). The fabric is up on the rest; cfab status grades \
-             this degraded",
-            engine_ctl::SETTLE_MS / 1000,
-            down.join(", ")
-        );
-    }
-
-    // ---- fail-closed watchdog ---------------------------------------------------
-    if kind == MemberKind::Host && f.host_forward {
-        run_ignore(
-            sys,
-            &[
-                "systemctl",
-                "stop",
-                "cfab-fwd-watchdog.timer",
-                "cfab-fwd-watchdog.service",
-            ],
-        )?;
-        run_ignore(
-            sys,
-            &[
-                "systemctl",
-                "reset-failed",
-                "cfab-fwd-watchdog.timer",
-                "cfab-fwd-watchdog.service",
-            ],
-        )?;
-        run_ok(
-            sys,
-            &[
-                "systemd-run",
-                "--quiet",
-                "--unit=cfab-fwd-watchdog",
-                "--on-active=3",
-                "--on-unit-active=3",
-                "--timer-property=AccuracySec=1s",
-                &opts.exe,
-                "--config",
-                &opts.config,
-                "--host",
-                host,
-                "fwd-watchdog",
-            ],
-        )?;
-    }
-
-    // ---- cluster conf-sync daemon (additive: only when pmxcfs reports clustered) ----------
-    let clustered = crate::cluster::Pmxcfs::at(&opts.pmxcfs_root)
-        .probe()?
-        .is_some_and(|m| m.cluster.is_some());
-    if clustered {
-        // The daemon re-execs this very `up` on each cluster apply/revert; stopping the unit
-        // here would kill that daemon mid-protocol (systemd stops the whole cgroup, this
-        // process included) — a running daemon is left alone.
-        if !sys
-            .run(&["systemctl", "is-active", "-q", "cfab-conf-sync.service"])?
-            .ok()
-        {
-            run_ignore(
-                sys,
-                &["systemctl", "reset-failed", "cfab-conf-sync.service"],
-            )?;
-            run_ok(
-                sys,
-                &[
-                    "systemd-run",
-                    "--quiet",
-                    "--unit=cfab-conf-sync",
-                    "-p",
-                    "KillMode=mixed",
-                    &opts.exe,
-                    "--config",
-                    &opts.config,
-                    "--host",
-                    host,
-                    "conf-sync",
-                ],
-            )?;
-        }
-    }
-
-    let mut msg = warnings.join("\n");
-    if !msg.is_empty() {
-        msg.push('\n');
-    }
+    // Starting the routing engine (stop/sweep/start/readback/settle), the shape daemon, the
+    // fail-closed watchdog and conf-sync is the supervisor's job now (`cfab run`): a child
+    // lifecycle, not part of this idempotent apply. `describe_down` stays exported for it.
     if kind == MemberKind::Host {
-        msg.push_str(&format!(
-            "up OK on {host} (node {n}, host); forward={} shape={} wires; run cfab status\n",
+        warnings.push(format!(
+            "apply OK on {host} (node {n}, host); forward={} {} wires",
             u8::from(f.host_forward),
             wires.len()
         ));
     } else {
-        msg.push_str(&format!(
-            "up OK on {host} (node {n}, leaf); no transit (cost +{}, forwarding=0, leak guard); run cfab status\n",
+        warnings.push(format!(
+            "apply OK on {host} (node {n}, leaf); no transit (cost +{}, forwarding=0, leak guard)",
             f.leaf_cost_offset
         ));
     }
-    Ok(msg)
+    Ok(warnings)
 }
 
 /// An always-up netdev holding a /32: a veth pair (on every kernel that runs Docker; `dummy` is
@@ -701,7 +582,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
 /// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A fallback bond is not a
 /// wire: it is `down` exactly when not one of its slaves has carrier, so the warning must name
 /// that condition — "ip -br link show cfab-st-fb" would only show an interface that is UP.
-fn describe_down(view: &View, down: &[String]) -> Vec<String> {
+pub fn describe_down(view: &View, down: &[String]) -> Vec<String> {
     let fallback: Vec<String> = view
         .fallback_rows()
         .into_iter()
@@ -803,51 +684,24 @@ mod tests {
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
-    /// A leaf whose engine came up ready but took only two of the three zones: `up` must
-    /// refuse, naming the third, instead of trusting `ready`.
+    /// Task 5: the engine start, the shape daemon, the watchdog and conf-sync all moved to
+    /// the (not-yet-built) supervisor. `apply` itself must launch no daemon at all — no
+    /// `systemd-run`, no `systemctl`, no `spawn_detached` — and must name no unit.
     #[test]
-    fn up_refuses_when_readback_misses_an_instance() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
-        let mut doc = engine_ctl::tests::healthy_doc(&view);
-        doc["ospf"].as_object_mut().unwrap().remove("mgmt");
-        let mut sys = absent_fallback_netdevs(
-            MockSys::default()
-                .socket("/run/cfab/engine.sock", &doc.to_string())
-                .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
-            &view,
-        );
-        let pmxcfs = tempfile::tempdir().unwrap();
-        let opts = UpOpts {
-            exe: "/usr/bin/cfab".into(),
-            config: "/etc/cfab/fabric.conf".into(),
-            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
-        };
-        let e = run(&mut sys, &view, &opts).unwrap_err().to_string();
-        assert!(e.contains("ospf instance 'mgmt' missing"), "{e}");
-        assert!(sys.ran(
-            "spawn_detached /usr/bin/cfab --config /etc/cfab/fabric.conf --host pve3-tb engine"
-        ));
-        // Sweep before start, every id of the private range.
-        let first_sweep = sys
-            .calls
-            .iter()
-            .position(|c| c.contains("route show table all proto 201"))
-            .unwrap();
-        let start = sys
-            .calls
-            .iter()
-            .position(|c| c.starts_with("spawn_detached"))
-            .unwrap();
-        assert!(first_sweep < start);
+    fn apply_starts_no_daemon_and_names_no_unit() {
+        let (mut sys, view) = up_sys_and_view();
+        run(&mut sys, &view, &opts()).unwrap();
+        for c in &sys.calls {
+            assert!(!c.contains("systemd-run"), "{c}");
+            assert!(!c.contains("systemctl"), "{c}");
+            assert!(!c.starts_with("spawn_detached"), "{c}");
+        }
     }
 
     /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC
     /// addressed, and the forward chain readable — the shape a first bringup sees.
-    fn up_sys(view: &View) -> MockSys {
-        let doc = engine_ctl::tests::healthy_doc(view);
+    fn up_sys(_view: &View) -> MockSys {
         MockSys::default()
-            .socket("/run/cfab/engine.sock", &doc.to_string())
             .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n")
             .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
             .on_stdout(&["ip", "link", "show", "eth0"], "2: eth0: <UP>\n")
@@ -863,6 +717,16 @@ mod tests {
             )
     }
 
+    /// `fabric()` + the `pve1-tb` view + `up_sys`'s fixture, combined for the common case
+    /// (a fresh `apply` from scratch on a host). Leaks the `Fabric` (test-only, one per
+    /// call): `View` borrows it, and a helper returning both needs a `'static` owner.
+    fn up_sys_and_view() -> (MockSys, View<'static>) {
+        let f: &'static Fabric = Box::leak(Box::new(fabric()));
+        let view = View::new(f, "pve1-tb").unwrap();
+        let sys = up_sys(&view);
+        (sys, view)
+    }
+
     /// The older mocks answer every `ip link show` with success, so a fallback bond would look
     /// present and of an unknown kind — a refusal. Mark the bonds absent: a fresh member.
     fn absent_fallback_netdevs(mut sys: MockSys, view: &View) -> MockSys {
@@ -876,14 +740,10 @@ mod tests {
         sys
     }
 
-    fn opts() -> (tempfile::TempDir, UpOpts) {
-        let pmxcfs = tempfile::tempdir().unwrap();
-        let o = UpOpts {
-            exe: "/usr/bin/cfab".into(),
-            config: "/etc/cfab/fabric.conf".into(),
-            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
-        };
-        (pmxcfs, o)
+    fn opts() -> ApplyOpts {
+        ApplyOpts {
+            pmxcfs_root: "/nonexistent/pve".to_string(),
+        }
     }
 
     fn calls_for(sys: &MockSys, needle: &str) -> Vec<String> {
@@ -913,7 +773,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
-        let (_tmp, o) = opts();
+        let o = opts();
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(
             calls_for(&sys, "cfab-st-fb"),
@@ -960,7 +820,7 @@ mod tests {
     fn a_second_up_does_not_re_enslave_a_slave_already_in_the_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         // An existing bond must also present its bonding/ sysfs: `up` proves the parameters
         // before it touches a bond it did not just create.
         let sys = bond_sysfs(up_sys(&view), "cfab-st-fb", &healthy_bond_params());
@@ -996,7 +856,7 @@ mod tests {
     fn up_refuses_a_fallback_slave_enslaved_to_a_foreign_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = up_sys(&view)
             .file("/sys/class/net/cfab-st-fb-st/master", "")
             .on_stdout(
@@ -1024,7 +884,7 @@ mod tests {
     fn up_refuses_a_foreign_netdev_named_like_a_fallback_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = up_sys(&view)
             .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
             .on_stdout(
@@ -1084,7 +944,7 @@ mod tests {
     fn up_refuses_an_existing_fallback_bond_whose_parameters_diverge() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut params = healthy_bond_params();
         params[2] = ("updelay", "0\n");
         let mut sys = existing_fallback_bond(up_sys(&view), &params);
@@ -1104,7 +964,7 @@ mod tests {
     fn a_diverging_bond_names_every_parameter_with_want_and_got() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let params = [
             ("mode", "balance-rr 0\n"),
             ("miimon", "100\n"),
@@ -1134,7 +994,7 @@ mod tests {
     fn an_existing_fallback_bond_with_matching_parameters_is_accepted() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = existing_fallback_bond(up_sys(&view), &healthy_bond_params());
         run(&mut sys, &view, &o).unwrap();
         assert!(
@@ -1151,7 +1011,7 @@ mod tests {
     fn an_unreadable_bonding_file_is_refused_by_name() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let params: Vec<_> = healthy_bond_params()
             .into_iter()
             .filter(|(n, _)| *n != "num_grat_arp")
@@ -1174,7 +1034,7 @@ mod tests {
     fn fallback_bonds_forward_and_their_slaves_never_do() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = up_sys(&view);
         run(&mut sys, &view, &o).unwrap();
         for zone_if in ["cfab-st-fb", "cfab-cl-fb", "cfab-mg-fb"] {
@@ -1211,7 +1071,7 @@ mod tests {
         let f = fabric_with_a_migrating_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
-        let (_tmp, o) = opts();
+        let o = opts();
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(
             calls_for(&sys, "cfab-gw249"),
@@ -1256,7 +1116,7 @@ mod tests {
         let f = fabric_with_a_migrating_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
-        let (_tmp, o) = opts();
+        let o = opts();
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(
             sys.writes_to("/proc/sys/net/ipv4/conf/cfab-gw249/forwarding"),
@@ -1292,7 +1152,7 @@ mod tests {
         let f = fabric();
         assert!(f.host_forward);
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = up_sys(&view);
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(calls_for(&sys, "macvlan"), Vec::<String>::new());
@@ -1305,7 +1165,7 @@ mod tests {
     fn class_and_gw_sub_interfaces_are_created_exactly_as_before() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let (_tmp, o) = opts();
+        let o = opts();
         let mut sys = up_sys(&view);
         run(&mut sys, &view, &o).unwrap();
         assert_eq!(
@@ -1352,30 +1212,6 @@ mod tests {
         );
     }
 
-    /// Availability-first: a segment wire with no carrier at `up` time is a real OSPF `down`,
-    /// and must not cost the host its whole fabric. `up` completes (warning on stderr); the
-    /// loss is `status`'s to grade degraded.
-    #[test]
-    fn up_completes_when_a_segment_interface_is_down() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
-        let mut doc = engine_ctl::tests::healthy_doc(&view);
-        doc["ospf"]["storage"]["interfaces"]["cfab-st"]["state"] = serde_json::json!("down");
-        let mut sys = absent_fallback_netdevs(
-            MockSys::default()
-                .socket("/run/cfab/engine.sock", &doc.to_string())
-                .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n"),
-            &view,
-        );
-        let pmxcfs = tempfile::tempdir().unwrap();
-        let opts = UpOpts {
-            exe: "/usr/bin/cfab".into(),
-            config: "/etc/cfab/fabric.conf".into(),
-            pmxcfs_root: pmxcfs.path().to_string_lossy().into_owned(),
-        };
-        run(&mut sys, &view, &opts).unwrap();
-    }
-
     /// A leaf installs `table inet cfab` exactly as a host does: the generated file, the one
     /// `nft -f` transaction, and the `-s` readback stored for `status`'s drift check. The
     /// containment the table carries (the fallback control-egress ceiling) is worthless if the
@@ -1388,7 +1224,7 @@ mod tests {
             &["nft", "-s", "list", "table", "inet", "cfab"],
             "table inet cfab\n",
         );
-        let (_pmxcfs, opts) = opts();
+        let opts = opts();
         run(&mut sys, &view, &opts).unwrap();
 
         let want = emit::mark::generate(&view).unwrap();
@@ -1421,7 +1257,7 @@ mod tests {
             1,
             "",
         );
-        let (_pmxcfs, opts) = opts();
+        let opts = opts();
         let err = run(&mut sys, &view, &opts).unwrap_err().to_string();
         assert!(err.contains("nft not installed"), "{err}");
         assert!(

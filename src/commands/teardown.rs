@@ -11,28 +11,14 @@ use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 
-pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
+/// Stage one of the teardown, callable alone: forwarding OFF, the forward policy off, and the
+/// foreign-stack accept removed. Run before anything that can fail or block — this is what
+/// lets the supervisor's stop sequence fail closed *first* (spec §13): everything after this
+/// point can be `SIGKILL`ed by `TimeoutStopSec` without a packet transiting a half-torn-down
+/// host.
+pub fn forwarding_off(sys: &mut dyn Sys, view: &View) -> Result<()> {
     let f = view.fabric;
-    let kind = view.kind();
-    let mut notes = Vec::new();
-
-    // conf-sync goes first, so a cluster publish landing mid-teardown cannot re-apply.
-    // Guarded: a leaf's container has no systemd (and the daemon only starts where pmxcfs is).
-    if have_tool(sys, "systemctl")? {
-        run_ignore(sys, &["systemctl", "stop", "cfab-conf-sync.service"])?;
-    }
-
-    if kind == MemberKind::Host {
-        run_ignore(
-            sys,
-            &[
-                "systemctl",
-                "stop",
-                "cfab-fwd-watchdog.timer",
-                "cfab-fwd-watchdog.service",
-                "cfab-shape.service",
-            ],
-        )?;
+    if view.kind() == MemberKind::Host {
         for ifn in conf_interfaces(sys)? {
             if view.owns_if(&ifn) {
                 sys.write(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "0")?;
@@ -62,6 +48,15 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             )?;
         }
     }
+    Ok(())
+}
+
+pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
+    let f = view.fabric;
+    let mut notes = Vec::new();
+
+    forwarding_off(sys, view)?;
+
     // The mark table (marking + the fallback control-egress ceiling) is installed on every
     // kind, so it comes off on every kind. Guarded like the policy table above: `have_tool`
     // keeps teardown working on a member where `nft` has since been removed.
@@ -196,7 +191,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             ));
         }
     }
-    if kind == MemberKind::Host {
+    if view.kind() == MemberKind::Host {
         for dev in view.wires() {
             run_ignore(sys, &["tc", "qdisc", "del", "dev", &dev, "root"])?;
         }
