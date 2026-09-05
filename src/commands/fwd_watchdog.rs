@@ -307,6 +307,81 @@ mod tests {
         );
     }
 
+    /// PROVING existing behavior, not new logic: `owned_forwarding()` (Task 2) already flags
+    /// the fallback bond `transit`-eligible like a class segment (a fallback leg for one zone can
+    /// carry another zone's island-disjoint traffic on a forwarding host) — this test exercises
+    /// that through the watchdog's own correction path rather than reading `owned_forwarding`
+    /// directly, so a regression here fails where it would actually bite in production.
+    #[test]
+    fn a_fallback_bond_drifted_to_0_is_corrected_to_1_like_a_segment() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(
+            !view.fallback_rows().is_empty(),
+            "fixture must carry fallback rows"
+        );
+        let mut sys = healthy_sys(&view);
+        for r in view.fallback_rows() {
+            sys = sys.file(
+                &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                "0\n",
+            );
+        }
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_none(), "{:?}", report.failed);
+        for r in view.fallback_rows() {
+            assert!(
+                report
+                    .corrected
+                    .iter()
+                    .any(|c| c.starts_with(&format!("{} forwarding 0->1", r.ifname))),
+                "{}: not corrected to 1 like a segment: {:?}",
+                r.ifname,
+                report.corrected
+            );
+            assert_eq!(
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname)),
+                Some("1")
+            );
+        }
+    }
+
+    /// A fallback slave is L2 only (`owned_forwarding` always pairs it with `false`): even if
+    /// something turned its forwarding sysctl on, the watchdog writes it back to 0, same as
+    /// the admin NIC — it is never flagged transit-eligible the way the bond is.
+    #[test]
+    fn a_fallback_slave_drifted_to_1_is_corrected_to_0_never_flagged_transit() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let slave_ifs: Vec<String> = view
+            .fallback_rows()
+            .into_iter()
+            .flat_map(|r| r.slaves)
+            .map(|s| s.ifname)
+            .collect();
+        assert!(!slave_ifs.is_empty(), "fixture must carry fallback slaves");
+        let mut sys = healthy_sys(&view);
+        for ifn in &slave_ifs {
+            sys = sys.file(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "1\n");
+        }
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.failed.is_none(), "{:?}", report.failed);
+        for ifn in &slave_ifs {
+            assert!(
+                report
+                    .corrected
+                    .iter()
+                    .any(|c| c.starts_with(&format!("{ifn} forwarding 1->0"))),
+                "{ifn}: slave was not corrected back to 0: {:?}",
+                report.corrected
+            );
+            assert_eq!(
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding")),
+                Some("0")
+            );
+        }
+    }
+
     #[test]
     fn a_healthy_host_reports_nothing_blocked() {
         let f = view_fixture();

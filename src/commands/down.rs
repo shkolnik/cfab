@@ -6,7 +6,7 @@ use crate::commands::common::{
     conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
 };
 use crate::commands::engine_ctl;
-use crate::derive::View;
+use crate::derive::{Slave, View};
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
@@ -111,8 +111,51 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
         run_ok(sys, &["ip", "link", "del", &f.vrrp_if])?;
     }
+    // Fallback legs, bonds before slaves: `ip link del <bond>` RELEASES its slaves, it does not
+    // delete them, which is why the second loop exists. The engine is already stopped and its
+    // routes swept above, so this order is ownership-proof clarity, nothing more.
+    let fallback_rows = view.fallback_rows();
+    let gw_rows = view.gw_rows();
+    // An ingress leg on gw island `any` is the same bond and is torn down the same way.
+    let bond_legs: Vec<(&str, &[Slave])> = fallback_rows
+        .iter()
+        .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
+        .chain(
+            gw_rows
+                .iter()
+                .filter(|r| r.migrates())
+                .map(|r| (r.ifname.as_str(), r.slaves.as_slice())),
+        )
+        .collect();
+    for (ifname, _) in &bond_legs {
+        if link_exists(sys, ifname)? {
+            if !link_kind_is(sys, ifname, " bond ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {ifname} exists but is not a bond"
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", ifname])?;
+        }
+    }
+    for s in bond_legs.iter().flat_map(|(_, slaves)| *slaves) {
+        if link_exists(sys, &s.ifname)? {
+            if !link_kind_is(sys, &s.ifname, " vlan ")? {
+                return Err(Error::fatal(format!(
+                    "REFUSING: {} exists but is not a vlan",
+                    s.ifname
+                )));
+            }
+            run_ok(sys, &["ip", "link", "del", &s.ifname])?;
+        }
+    }
     let mut ifnames: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
-    ifnames.extend(view.gw_rows().into_iter().map(|r| r.ifname));
+    // A migrating leg was deleted above as a bond; the rest are plain sub-interfaces.
+    ifnames.extend(
+        gw_rows
+            .iter()
+            .filter(|r| !r.migrates())
+            .map(|r| r.ifname.clone()),
+    );
     for dev in &ifnames {
         if link_exists(sys, dev)? {
             if !link_kind_is(sys, dev, " macvlan ")? && !link_kind_is(sys, dev, " vlan ")? {
@@ -182,6 +225,122 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap();
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
+    fn sys_with_a_storage_fallback_leg() -> MockSys {
+        MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
+            .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-fb"],
+                "9: cfab-st-fb: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+                "10: cfab-st-fb-st@eth9: vlan protocol 802.1Q id 300 \n",
+            )
+    }
+
+    /// `ip link del <bond>` RELEASES its slaves, it does not delete them — so the slaves get
+    /// their own deletes, and the bond goes first (ownership-proof clarity: the engine is
+    /// already stopped and swept before any netdev is touched).
+    #[test]
+    fn down_deletes_a_fallback_bond_before_its_slaves() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg();
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            ["ip link del cfab-st-fb", "ip link del cfab-st-fb-st"]
+        );
+    }
+
+    /// The same declaration with the ingress leg on island `any`.
+    fn fabric_with_a_migrating_gw() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace("mg:249:", "any:249:");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
+    /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
+    /// ("neither macvlan nor vlan") and strand the leg on a `cfab down`.
+    #[test]
+    fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            )
+            .on_stdout(
+                &["ip", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249-mg"],
+                "21: cfab-gw249-mg@eth0: vlan protocol 802.1Q id 249 \n",
+            );
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            [
+                "ip link del cfab-st-fb",
+                "ip link del cfab-gw249",
+                "ip link del cfab-st-fb-st",
+                "ip link del cfab-gw249-mg",
+            ]
+        );
+    }
+
+    /// Prove ownership before destroy: a stranger wearing the bond's name is refused, and a
+    /// slave name carrying something that is not a vlan is refused too.
+    #[test]
+    fn down_refuses_a_fallback_netdev_of_the_wrong_kind() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+
+        let mut sys = sys_with_a_storage_fallback_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-fb"],
+            "9: cfab-st-fb: bridge \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-fb exists but is not a bond"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-st-fb"));
+
+        let mut sys = sys_with_a_storage_fallback_leg().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-st-fb-st"],
+            "10: cfab-st-fb-st: macvlan \n",
+        );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-st-fb-st exists but is not a vlan"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-st-fb-st"));
     }
 
     /// Routes the engine left behind (a crash) are swept by `down`, one delete per route,

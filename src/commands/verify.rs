@@ -24,7 +24,12 @@ pub struct VerifyReport {
 struct Ctx {
     out: String,
     fails: u32,
+    /// Zones whose ingress is unreachable — `<zone>:gw` / `<zone>:bgp`.
     degraded: Vec<String>,
+    /// Fallback-segment conditions — `<zone>:fallback-leg` / `<zone>:fallback-nbr` /
+    /// `<zone>:fallback-path`. Kept apart from `degraded` so neither headline note has to
+    /// describe the other's condition.
+    fallback: Vec<String>,
 }
 
 impl Ctx {
@@ -52,6 +57,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         out: String::new(),
         fails: 0,
         degraded: Vec::new(),
+        fallback: Vec::new(),
     };
 
     posture(sys, view, &mut c)?;
@@ -122,6 +128,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         }
         sys.sleep(Duration::from_secs(2));
     }
+    fallback(sys, view, &mut c)?;
     if kind == MemberKind::Host && f.vrrp_gw {
         let doc = engine_ctl::state(sys, f)?;
         let inst = doc["vrrp"]
@@ -151,7 +158,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
             output: c.out,
         });
     }
-    if !down.is_empty() || !c.degraded.is_empty() {
+    if !down.is_empty() || !c.degraded.is_empty() || !c.fallback.is_empty() {
         if !down.is_empty() {
             c.say(&format!(
                 "  DOWN segments (zone:seg:peer): {}",
@@ -161,13 +168,19 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
         let gw_note = if c.degraded.is_empty() {
             String::new()
         } else {
-            format!("; gw unreachable: {}", c.degraded.join(" "))
+            format!("; gw unreachable: {}", once_each(&c.degraded).join(" "))
+        };
+        let fallback_note = if c.fallback.is_empty() {
+            String::new()
+        } else {
+            format!("; fallback degraded: {}", once_each(&c.fallback).join(" "))
         };
         c.say(&format!(
-            "verify DEGRADED on {host} ({kind_s}): {}/{} BFD up; every identity reachable, src pinned; posture ok{}",
+            "verify DEGRADED on {host} ({kind_s}): {}/{} BFD up; every identity reachable, src pinned; posture ok{}{}",
             expect_bfd - down.len(),
             expect_bfd,
-            gw_note
+            gw_note,
+            fallback_note
         ));
         return Ok(VerifyReport {
             code: 2,
@@ -185,22 +198,29 @@ pub fn run(sys: &mut dyn Sys, view: &View, timeout_s: u64) -> Result<VerifyRepor
 
 fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     let f = view.fabric;
-    for r in view.class_rows() {
+    // The fallback bond is a segment here: it carries L3 and takes the same loose rp_filter.
+    // Its slaves never appear — they are L2 only.
+    let l3: Vec<String> = view
+        .class_rows()
+        .into_iter()
+        .map(|r| r.ifname)
+        .chain(view.fallback_rows().into_iter().map(|r| r.ifname))
+        .collect();
+    for ifname in &l3 {
         let got = sys
-            .read(&format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname))
+            .read(&format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "missing".to_string());
         if got != "2" {
             c.bad(&format!(
-                "{} rp_filter={got} (want 2 = loose, every role)",
-                r.ifname
+                "{ifname} rp_filter={got} (want 2 = loose, every role)"
             ));
         }
     }
 
     match view.kind() {
         MemberKind::Leaf => {
-            let mut ifs: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
+            let mut ifs: Vec<String> = l3.clone();
             for z in &f.zones {
                 let id = View::identity_if(z);
                 ifs.push(id.clone());
@@ -235,10 +255,21 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
             // addresses, at least the offset for any other
             let doc = engine_ctl::state(sys, f)?;
             for z in &f.zones {
-                let rows: Vec<_> = view
+                // Segments AND the fallback bond as `(seg, cost)`: the bond addresses and
+                // advertises exactly like a segment (`10.<id>.<seg>.<node>`), so a
+                // class-rows-only list leaves its transit link owned by nobody and the
+                // check silently weakens to "at least the offset" for it.
+                let rows: Vec<(u8, u32)> = view
                     .class_rows()
                     .into_iter()
                     .filter(|r| r.zone == z.name)
+                    .map(|r| (r.seg, r.ospf_cost))
+                    .chain(
+                        view.fallback_rows()
+                            .into_iter()
+                            .filter(|r| r.zone == z.name)
+                            .map(|r| (r.seg, r.ospf_cost)),
+                    )
                     .collect();
                 let mut below = false;
                 for link in doc["ospf"][&z.name]["self_lsa_links"]
@@ -251,8 +282,8 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                     let addr = link["if"].as_str().unwrap_or("");
                     let want = rows
                         .iter()
-                        .find(|r| view.segment_addr(z, r.seg) == addr)
-                        .map(|r| u64::from(r.ospf_cost + f.leaf_cost_offset));
+                        .find(|(seg, _)| view.segment_addr(z, *seg) == addr)
+                        .map(|(_, cost)| u64::from(cost + f.leaf_cost_offset));
                     if metric < u64::from(f.leaf_cost_offset) || want.is_some_and(|w| metric != w) {
                         below = true;
                     }
@@ -368,6 +399,177 @@ fn posture(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
                 if sys.read(&path)?.trim() != "0" {
                     c.bad(&format!("{path} = 1 with HOST_FORWARD=0"));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ietf-ospf `nbr-state-type`, in its enum order. The fallback bar is 2-Way: on a broadcast LAN
+/// two DROthers never go past it, so Full would be a bar a healthy fallback LAN cannot clear.
+const NBR_STATES: [&str; 8] = [
+    "down", "attempt", "init", "2-way", "exstart", "exchange", "loading", "full",
+];
+
+fn at_least_two_way(state: &str) -> bool {
+    NBR_STATES
+        .iter()
+        .position(|s| *s == state)
+        .is_some_and(|i| i >= 3)
+}
+
+/// The fallback segment: which wire each zone's bond is actually on, whether every peer that
+/// carries the row is adjacent on it, and — the point of the whole segment — that a peer we
+/// share no island with is reached over the bond, which is HEALTH, not degradation.
+///
+/// Runs after convergence, so the routes it reads have settled. Nothing here touches the
+/// headline: fallback carries no BFD, so `<n> BFD up` counts segments only.
+fn fallback(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+    let f = view.fabric;
+    let rows = view.fallback_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let doc = engine_ctl::state(sys, f)?;
+    let ours = segments_of(f, view.member);
+    for r in &rows {
+        let z = f.zone(&r.zone)?;
+        let zone = &r.zone;
+
+        // ---- the leg: bonding/{mii_status,active_slave} ------------------------------
+        let mii = sys.read(&format!("/sys/class/net/{}/bonding/mii_status", r.ifname));
+        let active = sys.read(&format!("/sys/class/net/{}/bonding/active_slave", r.ifname));
+        let (Ok(mii), Ok(active)) = (mii, active) else {
+            c.bad(&format!(
+                "fallback {zone}: {} is not a bond (/sys/class/net/{}/bonding unreadable) — re-run cfab up",
+                r.ifname, r.ifname
+            ));
+            continue;
+        };
+        if mii.trim() != "up" {
+            c.warn(&format!("fallback {zone} no carrier"));
+            c.fallback.push(format!("{zone}:fallback-leg"));
+        } else {
+            let active = active.trim();
+            let Some(wire) = r
+                .slaves
+                .iter()
+                .find(|s| s.ifname == active)
+                .map(|s| s.wire.clone())
+            else {
+                c.bad(&format!(
+                    "fallback {zone}: {} is up with no slave of ours active (active_slave={active:?})",
+                    r.ifname
+                ));
+                continue;
+            };
+            if wire == r.home {
+                c.say(&format!("  fallback {zone} via {wire}"));
+            } else {
+                // Off the home wire is only a fault while the home wire still has carrier:
+                // that is a stuck reselect. A dark home is the bond doing its job. An
+                // unreadable carrier is neither and is never assumed healthy — the file
+                // returns EINVAL on a down interface, so this is a field state, not a
+                // theoretical one.
+                match sys.read(&format!("/sys/class/net/{}/carrier", r.home)) {
+                    Ok(s) if s.trim() == "1" => {
+                        c.warn(&format!(
+                            "fallback {zone} via {wire} (home {} has carrier but is not active)",
+                            r.home
+                        ));
+                        c.fallback.push(format!("{zone}:fallback-leg"));
+                    }
+                    Ok(_) => c.say(&format!("  fallback {zone} via {wire}")),
+                    Err(_) => {
+                        c.warn(&format!(
+                            "fallback {zone} via {wire} (home {} carrier unreadable)",
+                            r.home
+                        ));
+                        c.fallback.push(format!("{zone}:fallback-leg"));
+                    }
+                }
+            }
+        }
+
+        // ---- adjacency: every peer carrying this zone's fallback row, at least 2-Way ----
+        // An interface the engine does not carry indexes to Null here, and Null reads as an
+        // empty neighbor list — every declared peer would be reported absent, which names
+        // the wrong fault. The missing interface IS the fault; say that instead.
+        let nbrs = doc["ospf"][zone]["interfaces"].get(r.ifname.as_str());
+        let Some(nbrs) = nbrs.map(|i| &i["neighbors"]) else {
+            c.bad(&format!(
+                "fallback {zone}: {} is missing from the engine's ospf state (its neighbors \
+                 cannot be read) — re-run cfab up",
+                r.ifname
+            ));
+            c.fallback.push(format!("{zone}:fallback-nbr"));
+            continue;
+        };
+        let peers: Vec<&crate::model::Member> = f
+            .members
+            .iter()
+            .filter(|m| m.name != view.member.name)
+            .filter(|m| {
+                crate::derive::fallback_rows_of(f, m)
+                    .iter()
+                    .any(|p| p.zone == *zone)
+            })
+            .collect();
+        let mut adjacent = 0usize;
+        for m in &peers {
+            let rid = format!("{}.0.{}", z.block(), m.node);
+            let state = nbrs
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|n| n["router_id"] == rid.as_str())
+                .and_then(|n| n["state"].as_str())
+                .map(|s| s.rsplit(':').next().unwrap_or(s))
+                .unwrap_or("absent");
+            if at_least_two_way(state) {
+                adjacent += 1;
+            } else {
+                c.warn(&format!(
+                    "fallback {zone} neighbor {} is {state} (want 2-Way or better)",
+                    m.name
+                ));
+                c.fallback.push(format!("{zone}:fallback-nbr"));
+            }
+        }
+        c.say(&format!(
+            "  fallback {zone} neighbors: {adjacent}/{} 2-Way or better",
+            peers.len()
+        ));
+
+        // ---- island-disjoint peers: reached over the bond, and that is health ---------
+        for m in &f.members {
+            if m.name == view.member.name {
+                continue;
+            }
+            let theirs = segments_of(f, m);
+            if ours
+                .intersection(&theirs)
+                .any(|s| s.starts_with(&format!("{zone}:")))
+            {
+                continue;
+            }
+            let target = format!("{}.0.{}", z.block(), m.node);
+            let (dev, route_line) = route_dev(sys, &target)?;
+            if dev == r.ifname {
+                c.say(&format!(
+                    "  {zone} id .0.{} ({}) via fallback {}",
+                    m.node, m.name, r.ifname
+                ));
+            } else {
+                // Reachable only when a segment is down: `check()` makes the same comparison
+                // and refuses to converge on it, but skips it entirely while `down` is
+                // non-empty. That is exactly when the fallback path matters most, so the
+                // degraded verdict has to come from here.
+                c.warn(&format!(
+                    "{zone} id .0.{} via {dev}, not fallback {}: [{route_line}]",
+                    m.node, r.ifname
+                ));
+                c.fallback.push(format!("{zone}:fallback-path"));
             }
         }
     }
@@ -632,19 +834,19 @@ fn check(
                 .map(|r| (r.ospf_cost, r.ifname))
                 .collect();
             candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            // No shared segment = island-disjoint from this peer in this zone: the fallback
+            // bond is the expected path, and reaching the peer over it is health.
             let prim = candidates
                 .first()
                 .map(|(_, i)| i.clone())
+                .or_else(|| {
+                    view.fallback_rows()
+                        .into_iter()
+                        .find(|r| r.zone == z.name)
+                        .map(|r| r.ifname)
+                })
                 .unwrap_or_default();
-            let route = sys.run(&["ip", "route", "get", &target])?.stdout;
-            let route_line = route.lines().next().unwrap_or("").trim().to_string();
-            let words: Vec<&str> = route_line.split_whitespace().collect();
-            let dev = words
-                .iter()
-                .position(|w| *w == "dev")
-                .and_then(|i| words.get(i + 1))
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let (dev, route_line) = route_dev(sys, &target)?;
             if !ifs.contains(&dev) {
                 return Ok((
                     1,
@@ -679,6 +881,32 @@ fn check(
     } else {
         Ok((2, String::new(), down))
     }
+}
+
+/// `ip route get <target>` → (the `dev` it leaves by, the whole first line). The line is
+/// carried back with the device because every caller quotes it in the failure it reports.
+fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(String, String)> {
+    let route = sys.run(&["ip", "route", "get", target])?.stdout;
+    let route_line = route.lines().next().unwrap_or("").trim().to_string();
+    let words: Vec<&str> = route_line.split_whitespace().collect();
+    let dev = words
+        .iter()
+        .position(|w| *w == "dev")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    Ok((dev, route_line))
+}
+
+/// The headline notes name each condition once: a zone with two down peers pushes its token
+/// per peer, and this output is machine-read.
+fn once_each(tokens: &[String]) -> Vec<String> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    tokens
+        .iter()
+        .filter(|t| seen.insert(t.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// `counter packets N bytes M … comment "<name>"` → N.
@@ -718,8 +946,10 @@ mod tests {
     }
 
     /// The engine's state document as `engine::state::document` shapes it: every instance
-    /// healthy with transit links at the leaf offset, plus one BFD session per (peer, state).
-    fn engine_doc(view: &View, bfd: &[(String, &str)]) -> String {
+    /// healthy with transit links at the leaf offset, one BFD session per (peer, state), and
+    /// every peer that carries the zone's fallback row adjacent on the fallback bond.
+    fn engine_value(view: &View, bfd: &[(String, &str)]) -> serde_json::Value {
+        let f = view.fabric;
         let mut doc = engine_ctl::tests::healthy_doc(view);
         doc["bfd"] = bfd
             .iter()
@@ -730,25 +960,72 @@ mod tests {
                 })
             })
             .collect();
-        doc.to_string()
+        for r in view.fallback_rows() {
+            let z = f.zone(&r.zone).unwrap();
+            let nbrs: Vec<serde_json::Value> = f
+                .members
+                .iter()
+                .filter(|m| m.name != view.member.name)
+                .filter(|m| {
+                    crate::derive::fallback_rows_of(f, m)
+                        .iter()
+                        .any(|p| p.zone == r.zone)
+                })
+                .map(|m| {
+                    serde_json::json!({
+                        "router_id": format!("{}.0.{}", z.block(), m.node),
+                        "addr": format!("{}.{}.{}", z.block(), r.seg, m.node),
+                        "state": "full",
+                    })
+                })
+                .collect();
+            doc["ospf"][&r.zone]["interfaces"][&r.ifname]["neighbors"] =
+                serde_json::Value::Array(nbrs);
+        }
+        doc
     }
 
-    #[test]
-    fn counter_parse() {
-        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
-                     counter packets 42 bytes 999 comment \"default-deny\"";
-        assert_eq!(counter_packets(chain, "admin-in"), Some(0));
-        assert_eq!(counter_packets(chain, "default-deny"), Some(42));
-        assert_eq!(counter_packets(chain, "nope"), None);
+    fn engine_doc(view: &View, bfd: &[(String, &str)]) -> String {
+        engine_value(view, bfd).to_string()
     }
 
-    /// A leaf whose whole environment is healthy reports OK with the right session count.
-    #[test]
-    fn leaf_verify_ok_end_to_end_mocked() {
-        let f = fabric();
-        let view = View::new(&f, "pve3-tb").unwrap();
+    /// The `bonding/` sysfs a live active-backup bond exposes, captured from the spike
+    /// container (`cat /sys/class/net/cfab-st-fb/bonding/{mii_status,active_slave}` →
+    /// `up` / `cfab-st-fb-st`), plus the L3 posture `up` sets on the bond itself.
+    fn fallback_sysfs(mut sys: MockSys, view: &View, forwarding: &str) -> MockSys {
+        for r in view.fallback_rows() {
+            let home = r
+                .slaves
+                .iter()
+                .find(|s| s.wire == r.home)
+                .expect("the home wire is one of the slaves");
+            sys = sys
+                .file(
+                    &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
+                    "up\n",
+                )
+                .file(
+                    &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                    &format!("{}\n", home.ifname),
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
+                    "2\n",
+                )
+                .file(
+                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
+                    forwarding,
+                );
+        }
+        sys
+    }
+
+    /// A leaf's healthy environment: posture sysctls on every segment, the fallback bonds and
+    /// the identity veths, the leak-guard and return-path rules, and the gw zone's learned
+    /// default. Each test adds the engine state and the routes it wants to prove.
+    fn leaf_env(view: &View) -> MockSys {
+        let f = view.fabric;
         let mut sys = MockSys::default();
-        // sysctls all correct
         for r in view.class_rows() {
             sys = sys
                 .file(
@@ -769,8 +1046,8 @@ mod tests {
                     "0\n",
                 );
         }
-        // leak guard + return path rules
-        sys = sys
+        sys = fallback_sysfs(sys, view, "0\n");
+        sys
             .on_stdout(&["ip", "rule", "show", "pref", "1000"],
                 "1000: from all to 10.99.0.0/16 iif lo lookup main\n1000: from all to 10.199.0.0/16 iif lo lookup main\n1000: from all to 10.249.0.0/16 iif lo lookup main\n")
             .on_stdout(&["ip", "rule", "show", "pref", "1001"],
@@ -783,9 +1060,11 @@ mod tests {
                 "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
             // gw zone (mgmt): the leaf learns the ingress default via OSPF from the hosts
             .on_stdout(&["ip", "route", "show", "table", "249"],
-                "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
-        // Engine state: transit links at offset cost, every expected BFD session up (peer
-        // segment addresses for nodes 1 and 2)
+                "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+    }
+
+    /// Every expected BFD session, up.
+    fn all_bfd_up(f: &Fabric) -> Vec<(String, &'static str)> {
         let mut bfd = Vec::new();
         for p in [1u8, 2u8] {
             for z in &f.zones {
@@ -794,10 +1073,13 @@ mod tests {
                 }
             }
         }
-        sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        // routes: each identity via the zone's primary with pinned src
+        bfd
+    }
+
+    /// Each peer identity reached over the zone's primary segment with a pinned src.
+    fn primary_routes(mut sys: MockSys, view: &View) -> MockSys {
         for p in [1u8, 2u8] {
-            for z in &f.zones {
+            for z in &view.fabric.zones {
                 let prim = view
                     .class_rows()
                     .into_iter()
@@ -816,6 +1098,26 @@ mod tests {
                 );
             }
         }
+        sys
+    }
+
+    #[test]
+    fn counter_parse() {
+        let chain = "    iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n\
+                     counter packets 42 bytes 999 comment \"default-deny\"";
+        assert_eq!(counter_packets(chain, "admin-in"), Some(0));
+        assert_eq!(counter_packets(chain, "default-deny"), Some(42));
+        assert_eq!(counter_packets(chain, "nope"), None);
+    }
+
+    /// A leaf whose whole environment is healthy reports OK with the right session count.
+    #[test]
+    fn leaf_verify_ok_end_to_end_mocked() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)));
         let report = run(&mut sys, &view, 10).unwrap();
         assert_eq!(report.code, 0, "output:\n{}", report.output);
         assert!(
@@ -825,6 +1127,24 @@ mod tests {
             "{}",
             report.output
         );
+        // The fallback clause: each bond active on the wire carrying that zone's cheapest
+        // segment, and every peer that carries the row adjacent on it.
+        for (zone, wire) in [("storage", "eth9"), ("cluster", "eth1"), ("mgmt", "eth0")] {
+            assert!(
+                report
+                    .output
+                    .contains(&format!("  fallback {zone} via {wire}\n")),
+                "{}",
+                report.output
+            );
+            assert!(
+                report.output.contains(&format!(
+                    "  fallback {zone} neighbors: 2/2 2-Way or better\n"
+                )),
+                "{}",
+                report.output
+            );
+        }
     }
 
     /// Pull one segment (dark) → DEGRADED with the session named.
@@ -832,38 +1152,7 @@ mod tests {
     fn leaf_verify_degraded_names_the_down_segment() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = MockSys::default();
-        for r in view.class_rows() {
-            sys = sys
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
-                    "2\n",
-                )
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
-                    "0\n",
-                );
-        }
-        for z in &f.zones {
-            let id = View::identity_if(z);
-            sys = sys
-                .file(&format!("/proc/sys/net/ipv4/conf/{id}/forwarding"), "0\n")
-                .file(
-                    &format!("/proc/sys/net/ipv4/conf/{id}-peer/forwarding"),
-                    "0\n",
-                );
-        }
-        sys = sys
-            .on_stdout(&["ip", "rule", "show", "pref", "1000"],
-                "to 10.99.0.0/16 iif lo lookup main\nto 10.199.0.0/16 iif lo lookup main\nto 10.249.0.0/16 iif lo lookup main\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "1001"],
-                "to 10.99.0.0/16 unreachable\nto 10.199.0.0/16 unreachable\nto 10.249.0.0/16 unreachable\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2000"],
-                "from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\nfrom 10.199.0.0/16 to 10.199.0.0/16 lookup main suppress_prefixlength 0\nfrom 10.249.0.0/16 to 10.249.0.0/16 lookup main suppress_prefixlength 0\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2001"],
-                "from 10.99.0.0/16 lookup 99\nfrom 10.199.0.0/16 lookup 199\nfrom 10.249.0.0/16 lookup 249\n")
-            .on_stdout(&["ip", "rule", "show", "pref", "2002"],
-                "from 10.99.0.0/16 unreachable\nfrom 10.199.0.0/16 unreachable\nfrom 10.249.0.0/16 unreachable\n");
+        let mut sys = leaf_env(&view);
         // BFD: all up EXCEPT storage seg 1 to node 1 (10.99.1.1), which the engine still
         // lists, down
         let mut bfd = Vec::new();
@@ -921,5 +1210,514 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    /// The bond is active on a wire that is not the home while the home still has carrier —
+    /// a stuck reselect. DEGRADED, and the line names both wires.
+    #[test]
+    fn fallback_leg_degraded_when_the_home_has_carrier_but_is_not_active() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            // storage homes on eth9 (cfab-st, cost 10); the bond sits on the mg slave
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-mg\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: fallback storage via eth0 (home eth9 has carrier but is not active)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: storage:fallback-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The same reselect, but the home wire is dark: the bond did exactly its job, so the
+    /// line is the plain OK spelling and the report stays OK.
+    #[test]
+    fn fallback_leg_on_a_backup_wire_is_ok_when_the_home_is_dark() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-mg\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "0\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 0, "output:\n{}", report.output);
+        assert!(
+            report.output.contains("  fallback storage via eth0\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The same reselect, but the home wire's carrier cannot be read at all (the file
+    /// returns EINVAL on a down interface). Unreadable is never healthy: its own spelling,
+    /// and DEGRADED.
+    #[test]
+    fn fallback_leg_home_carrier_unreadable_is_degraded() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        // no /sys/class/net/eth9/carrier at all — the read fails
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-mg\n",
+            );
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  warn: fallback storage via eth0 (home eth9 carrier unreadable)\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: storage:fallback-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Two peers down in the SAME zone push the same token twice; the headline note names
+    /// each condition once, because it is machine-read.
+    #[test]
+    fn a_zone_with_two_down_peers_names_its_token_once() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        // both peers gone from the storage fallback LAN
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["neighbors"] = serde_json::json!([]);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        for m in ["pve1-tb", "pve2-tb"] {
+            assert!(
+                report.output.contains(&format!(
+                    "  warn: fallback storage neighbor {m} is absent (want 2-Way or better)\n"
+                )),
+                "{}",
+                report.output
+            );
+        }
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: storage:fallback-nbr\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Every slave dark: one spelling, `no carrier`, and DEGRADED.
+    #[test]
+    fn fallback_leg_no_carrier_is_degraded() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/sys/class/net/cfab-cl-fb/bonding/mii_status", "down\n")
+            .file("/sys/class/net/cfab-cl-fb/bonding/active_slave", "\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  warn: fallback cluster no carrier\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: cluster:fallback-leg"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// "Which member is down": a peer that carries the zone's fallback row but is not adjacent
+    /// on the bond is named, and the report is DEGRADED.
+    #[test]
+    fn fallback_neighbor_below_two_way_is_named() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        // pve1-tb (10.99.0.1) drops out of the storage fallback LAN entirely; pve2-tb is stuck
+        // in init on the mgmt one.
+        doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["neighbors"] = serde_json::json!([
+            { "router_id": "10.99.0.2", "addr": "10.99.9.2", "state": "2-way" }
+        ]);
+        doc["ospf"]["mgmt"]["interfaces"]["cfab-mg-fb"]["neighbors"] = serde_json::json!([
+            { "router_id": "10.249.0.1", "addr": "10.249.9.1", "state": "full" },
+            { "router_id": "10.249.0.2", "addr": "10.249.9.2", "state": "ietf-ospf:init" }
+        ]);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: fallback storage neighbor pve1-tb is absent (want 2-Way or better)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "  warn: fallback mgmt neighbor pve2-tb is init (want 2-Way or better)\n"
+            ),
+            "{}",
+            report.output
+        );
+        // 2-way itself clears the bar, and cluster is untouched.
+        assert!(
+            report
+                .output
+                .contains("  fallback cluster neighbors: 2/2 2-Way or better\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: storage:fallback-nbr mgmt:fallback-nbr"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Two members with no island in common: pve1-tb has only its st wire, pve2-tb only its
+    /// cl wire, so they share no segment in any zone. The fallback bond is the only path
+    /// between them — and that is HEALTH, not degradation.
+    fn disjoint_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace(
+                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve1-tb 1 host eth9:5000 - -",
+                )
+                .replace(
+                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve2-tb 2 host - eth1:1000 -",
+                )
+                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_island_disjoint_peer_is_expected_over_the_fallback_bond() {
+        let f = disjoint_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // pve1-tb and pve2-tb share nothing; pve3-tb has every wire, so it still shares the
+        // st segments with pve1-tb.
+        assert!(
+            segments_of(&f, f.member("pve1-tb").unwrap())
+                .intersection(&segments_of(&f, f.member("pve2-tb").unwrap()))
+                .next()
+                .is_none()
+        );
+        let mut sys = MockSys::default();
+        for (target, dev) in [
+            // the island-disjoint peer: over the storage fallback bond
+            ("10.99.0.2", "cfab-st-fb"),
+            ("10.199.0.2", "cfab-cl-fb"),
+            ("10.249.0.2", "cfab-mg-fb"),
+            // the peer we do share segments with: over the cheapest shared segment
+            ("10.99.0.3", "cfab-st"),
+            ("10.199.0.3", "cfab-cl-bk"),
+            ("10.249.0.3", "cfab-mg-b2"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.1 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let mut bfd: Vec<(String, &str)> = Vec::new();
+        for (z, seg) in [("storage", 1u8), ("cluster", 2), ("mgmt", 3)] {
+            let block = f.zone(z).unwrap().block();
+            bfd.push((format!("{block}.{seg}.3"), "up"));
+        }
+        let expected: Vec<(u8, String, u8, String)> = bfd
+            .iter()
+            .zip([("storage", 1u8), ("cluster", 2), ("mgmt", 3)])
+            .map(|((addr, _), (z, seg))| (3u8, z.to_string(), seg, addr.clone()))
+            .collect();
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        let (rc, why, down) = check(&mut sys, &view, &expected).unwrap();
+        assert_eq!(rc, 0, "why: {why}");
+        assert!(down.is_empty(), "{down:?}");
+    }
+
+    #[test]
+    fn an_island_disjoint_peer_off_the_fallback_bond_does_not_converge() {
+        let f = disjoint_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        for (target, dev) in [
+            // storage to the disjoint peer leaves over a class segment, not the bond
+            ("10.99.0.2", "cfab-st"),
+            ("10.199.0.2", "cfab-cl-fb"),
+            ("10.249.0.2", "cfab-mg-fb"),
+            ("10.99.0.3", "cfab-st"),
+            ("10.199.0.3", "cfab-cl-bk"),
+            ("10.249.0.3", "cfab-mg-b2"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.1 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &[]));
+        let (rc, why, _) = check(&mut sys, &view, &[]).unwrap();
+        assert_eq!(rc, 1, "why: {why}");
+        assert!(
+            why.contains("storage id .0.2 via cfab-st, not primary cfab-st-fb"),
+            "{why}"
+        );
+    }
+
+    /// pve1-tb and pve3-tb sit on the st and mg islands, pve2-tb only on cl: pve2-tb shares
+    /// no segment with pve3-tb in any zone, while pve1-tb shares two per zone (so one of
+    /// them can go dark without the zone losing its only session).
+    fn half_disjoint_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap()
+                .replace(
+                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve1-tb 1 host eth9:5000 - eth0:1000",
+                )
+                .replace(
+                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
+                    "pve2-tb 2 host - eth1:1000 -",
+                )
+                .replace(
+                    "pve3-tb 3 leaf eth9:10000 eth1:1000 eth0:1000",
+                    "pve3-tb 3 leaf eth9:10000 - eth0:1000",
+                )
+                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+    }
+
+    /// The `<zone>:fallback-path` branch through the only path that reaches it: a down segment
+    /// makes `check()` skip its primary comparison, so the fallback clause is the only thing
+    /// left watching the island-disjoint peer — and it is exactly then that the fallback
+    /// segment is load-bearing.
+    #[test]
+    fn an_island_disjoint_peer_off_the_bond_is_degraded_while_a_segment_is_down() {
+        let f = half_disjoint_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        assert!(
+            segments_of(&f, view.member)
+                .intersection(&segments_of(&f, f.member("pve2-tb").unwrap()))
+                .next()
+                .is_none(),
+            "pve2-tb must be island-disjoint from pve3-tb in every zone"
+        );
+        let sys = leaf_env(&view);
+        // pve1-tb shares two segments per zone; storage seg 1 is dark, the rest up.
+        let bfd: Vec<(String, &str)> = [
+            ("10.99.1.1", "down"),
+            ("10.99.3.1", "up"),
+            ("10.199.2.1", "up"),
+            ("10.199.3.1", "up"),
+            ("10.249.1.1", "up"),
+            ("10.249.3.1", "up"),
+        ]
+        .iter()
+        .map(|(a, s)| (a.to_string(), *s))
+        .collect();
+        let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
+        for (target, dev) in [
+            // the peer we share segments with
+            ("10.99.0.1", "cfab-st"),
+            ("10.199.0.1", "cfab-cl-bk"),
+            ("10.249.0.1", "cfab-mg"),
+            // the island-disjoint peer: cluster and mgmt over the bond, storage NOT
+            ("10.99.0.2", "cfab-st-b2"),
+            ("10.199.0.2", "cfab-cl-fb"),
+            ("10.249.0.2", "cfab-mg-fb"),
+        ] {
+            sys = sys.on_stdout(
+                &["ip", "route", "get", target],
+                &format!(
+                    "{target} dev {dev} src {}.0.3 uid 0\n",
+                    &target[..target.len() - 4]
+                ),
+            );
+        }
+        let report = run(&mut sys, &view, 60).unwrap();
+        assert_eq!(report.code, 2, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  warn: storage id .0.2 via cfab-st-b2, not fallback cfab-st-fb: \
+                 [10.99.0.2 dev cfab-st-b2 src 10.99.0.3 uid 0]\n"
+            ),
+            "{}",
+            report.output
+        );
+        // the other direction, over the same live run
+        assert!(
+            report
+                .output
+                .contains("  cluster id .0.2 (pve2-tb) via fallback cfab-cl-fb\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("; fallback degraded: storage:fallback-path\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// 5.4: the bond carries L3 and must have the loose rp_filter every cfab interface has.
+    #[test]
+    fn fallback_bond_rp_filter_is_a_posture_check() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  FAIL: cfab-mg-fb rp_filter=1 (want 2 = loose, every role)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// 5.4: a leaf never transits — on the bond either.
+    #[test]
+    fn fallback_bond_forwarding_is_a_leaf_posture_check() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view)
+            .socket("/run/cfab/engine.sock", &engine_doc(&view, &all_bfd_up(&f)))
+            .file("/proc/sys/net/ipv4/conf/cfab-st-fb/forwarding", "1\n");
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("  FAIL: cfab-st-fb forwarding!=0 (a leaf never transits)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// An interface the engine does not carry yields `Null` where its neighbors should be,
+    /// and `Null` reads as an empty list — every declared peer would be reported absent,
+    /// naming the wrong fault. Name the real one instead.
+    #[test]
+    fn a_fallback_interface_absent_from_the_engine_state_is_named() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        doc["ospf"]["storage"]["interfaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cfab-st-fb");
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  FAIL: fallback storage: cfab-st-fb is missing from the engine's ospf state \
+                 (its neighbors cannot be read) — re-run cfab up\n"
+            ),
+            "{}",
+            report.output
+        );
+        // and NOT the misleading per-peer verdict it used to print
+        assert!(
+            !report.output.contains("fallback storage neighbor"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The never-a-transit check must hold the fallback bond to the EXACT offset too: the bond
+    /// advertises from `10.<id>.9.<node>`, which no class row owns, so a fallback-blind check
+    /// silently falls back to the weaker "at least the offset" arm and lets a wrong metric
+    /// through. 5000 + 30000 = 35000 is the only acceptable value.
+    #[test]
+    fn a_leafs_fallback_transit_link_is_held_to_the_exact_offset() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut doc = engine_value(&view, &all_bfd_up(&f));
+        let fallback_addr = view.segment_addr(f.zone("storage").unwrap(), 9);
+        let links = doc["ospf"]["storage"]["self_lsa_links"]
+            .as_array_mut()
+            .unwrap();
+        let link = links
+            .iter_mut()
+            .find(|l| l["if"] == fallback_addr.as_str())
+            .expect("the fallback bond advertises a transit link");
+        // Above LEAF_COST_OFFSET, so the weak arm accepts it; not cost + offset, so the
+        // exact arm must not.
+        link["metric"] = serde_json::json!(31000);
+        let sys = leaf_env(&view);
+        let mut sys = primary_routes(sys, &view).socket("/run/cfab/engine.sock", &doc.to_string());
+        let report = run(&mut sys, &view, 10).unwrap();
+        assert_eq!(report.code, 1, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "  FAIL: ospf 99: a transit link in our router LSA is advertised below \
+                 LEAF_COST_OFFSET=30000"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    #[test]
+    fn two_way_is_the_adjacency_bar() {
+        for s in ["2-way", "exstart", "exchange", "loading", "full"] {
+            assert!(at_least_two_way(s), "{s}");
+        }
+        for s in ["down", "attempt", "init", "absent", ""] {
+            assert!(!at_least_two_way(s), "{s}");
+        }
     }
 }
