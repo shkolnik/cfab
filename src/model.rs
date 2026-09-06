@@ -526,9 +526,7 @@ impl Fabric {
             }
             // Refused, not merely unbuilt: a domain has exactly one segment per zone, addressed
             // 10.<id>.<seg>.<node>/24, so two wires in one broadcast domain would hold two
-            // addresses of one /24 on one node — ARP-ambiguous. The coherent realizations are a
-            // bond over the two wires (cfab does not build one yet) or a SECOND segment declared
-            // on the same domain; neither is expressible by repeating a domain here.
+            // addresses of one /24 on one node — ARP-ambiguous.
             let mut seen: BTreeSet<&DomainId> = BTreeSet::new();
             for w in &m.wires {
                 if !seen.insert(&w.domain) {
@@ -536,9 +534,9 @@ impl Fabric {
                         "MEMBER_TABLE {}: two wires on domain {} ({}). The model cannot express \
                          it: a domain has one segment per zone, addressed 10.<id>.<seg>.<node>/24, \
                          so two wires in one broadcast domain would hold two addresses of one /24 \
-                         on one node — ARP-ambiguous. Bond the two NICs and declare the bond as \
-                         one wire (cfab does not build that bond yet), or declare a SECOND segment \
-                         on domain {} and put the wires in different domains",
+                         on one node — ARP-ambiguous. Put the wires in different domains. The \
+                         other coherent shape is one bond over both NICs declared as a single \
+                         wire, which cfab does not build yet",
                         m.name,
                         w.domain,
                         m.wires
@@ -547,7 +545,6 @@ impl Fabric {
                             .map(|x| x.name.as_str())
                             .collect::<Vec<_>>()
                             .join(" "),
-                        w.domain,
                     )));
                 }
             }
@@ -1474,8 +1471,18 @@ mod tests {
         .to_string();
         assert!(err.contains("two wires on domain a (eth9 eth8)"), "{err}");
         assert!(err.contains("ARP-ambiguous"), "{err}");
-        assert!(err.contains("Bond the two NICs"), "{err}");
-        assert!(err.contains("declare a SECOND segment"), "{err}");
+        assert!(err.contains("Put the wires in different domains"), "{err}");
+        assert!(
+            err.contains(
+                "one bond over both NICs declared as a single wire, which cfab does not \
+                          build yet"
+            ),
+            "the second remedy is a separate sentence, and says it is not built: {err}"
+        );
+        assert!(
+            !err.contains("SECOND segment"),
+            "the second-segment clause was wrong (it does not fix this row): {err}"
+        );
     }
 
     #[test]
@@ -1504,38 +1511,27 @@ mod tests {
 
     #[test]
     fn a_zone_primary_domain_without_a_segment_is_refused() {
-        // Move storage's `a` segment to a domain the zone has no other row on.
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st     a   storage 1 100",
-                "cfab-st     b   storage 1 100",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        // The zone:domain uniqueness check fires first (storage already has a `b` segment), so
-        // use a zone with a free domain instead.
-        assert!(!err.is_empty());
+        // Trips ONLY this check: domain d is declared and wired (so the two-directional domain
+        // check is satisfied) but carries no segment, and storage names it as its primary.
         let err = parse_fabric(|t| {
             *t = t
+                .replace("DOMAINS=\"a b c\"", "DOMAINS=\"a b c d\"")
                 .replace(
-                    "cfab-st     a   storage 1 100",
-                    "cfab-st     c   storage 1 100",
+                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:1000",
                 )
                 .replace(
-                    "cfab-st-b2  c   storage 3 102",
-                    "cfab-st-b2  b   storage 3 102",
-                )
-                .replace(
-                    "cfab-st-bk  b   storage 2 101",
-                    "cfab-st-bk  c   storage 2 101",
+                    "storage  99 0 cs0 2000 2 4 a -",
+                    "storage  99 0 cs0 2000 2 4 d -",
                 );
-            // now storage has segments on c, c, b — duplicate; simplify: drop the `a` row.
-            *t = t.replace("cfab-st-bk  c   storage 2 101\n", "");
         })
         .unwrap_err()
         .to_string();
-        assert!(!err.is_empty(), "{err}");
+        assert!(
+            err.contains("ZONE_TABLE storage") && err.contains("primary domain d"),
+            "the error must name the zone and its primary domain: {err}"
+        );
+        assert!(err.contains("no segment in SEGMENT_TABLE"), "{err}");
     }
 
     // ---- WIRE_PREF --------------------------------------------------------------------------

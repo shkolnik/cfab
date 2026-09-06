@@ -215,36 +215,53 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
         out,
         "== 3. teeth: strip the admin drop rules from the ruleset -> the admin negative must go RED"
     );
-    let admin = *view
+    let admins: Vec<String> = view
         .admin_ifs()
-        .first()
-        .ok_or_else(|| Error::fatal("policy-teeth: no admin NIC on this member (host only)"))?;
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect();
+    if admins.is_empty() {
+        return Err(Error::fatal(
+            "policy-teeth: no admin NIC on this member (host only)",
+        ));
+    }
     let noadmin: String = prod
         .lines()
         .filter(|l| !l.contains("comment \"admin-"))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    // Simulate the worst case: a hand-edit that adds the admin NIC to the storage zone set.
+    // Simulate the worst case: a hand-edit that adds EVERY admin NIC to the storage zone set.
+    // Every wire of a host is the admin plane, so proving the teeth on the first wire alone
+    // would leave wires 2..N covered by nothing but the rule text.
     let noadmin = noadmin.replace(
         "set storage { type ifname; elements = { ",
-        &format!("set storage {{ type ifname; elements = {{ \"{admin}\", "),
+        &format!(
+            "set storage {{ type ifname; elements = {{ {}, ",
+            admins
+                .iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     );
     load(sys, &noadmin)?;
-    let got = reach(sys, &fx, admin, first_if(view, "storage")?)?;
-    let r3 = if got == 0 {
-        let _ = writeln!(
-            out,
-            "  NO TEETH: admin test did not notice the missing admin rules"
-        );
-        false
-    } else {
-        let _ = writeln!(
-            out,
-            "  RED  mutated: {admin} -> storage = {got}/3 (want 0) — the wanted outcome"
-        );
-        true
-    };
+    let mut r3 = true;
+    for admin in &admins {
+        let got = reach(sys, &fx, admin, first_if(view, "storage")?)?;
+        if got == 0 {
+            let _ = writeln!(
+                out,
+                "  NO TEETH: admin test did not notice the missing admin rules for {admin}"
+            );
+            r3 = false;
+        } else {
+            let _ = writeln!(
+                out,
+                "  RED  mutated: {admin} -> storage = {got}/3 (want 0) — the wanted outcome"
+            );
+        }
+    }
 
     let _ = writeln!(
         out,

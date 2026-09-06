@@ -329,12 +329,30 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
         .filter_map(|r| {
             let domain = r.scope.domain()?;
             let w = member.wire_on(domain)?;
+            // Not a `?`: every zone has a pref row (prefs_of maps over fabric.zones) and the
+            // order always contains this wire (candidate_wires is exactly the wires whose
+            // domain has a segment in the zone, and this row IS such a segment). A bad
+            // declaration cannot reach here — only a refactor that breaks the invariant
+            // across model.rs and derive.rs can, and it must not degrade to a missing row.
             let rank = prefs
                 .iter()
-                .find(|p| p.zone == r.zone)?
+                .find(|p| p.zone == r.zone)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: no wire preference for zone {} (segment {})",
+                        member.name, r.zone, r.ifname
+                    )
+                })
                 .order
                 .iter()
-                .position(|n| *n == w.name)?;
+                .position(|n| *n == w.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: zone {} preference order does not contain wire {} (segment {} on \
+                         domain {})",
+                        member.name, r.zone, w.name, r.ifname, domain
+                    )
+                });
             Some(ClassRow {
                 ifname: r.ifname.clone(),
                 wire: w.name.clone(),
@@ -610,14 +628,15 @@ fn check_no_equal_cost_paths(fabric: &Fabric, zone: &str) -> Result<()> {
             }
             // A universal segment is one broadcast domain over every wire, so any two members
             // that both have one in this zone are adjacent on it.
-            if !other.wires.is_empty() {
-                for r in &universal {
-                    edges.entry(&m.name).or_default().push((
-                        &other.name,
-                        r.ospf_cost + offset,
-                        r.ifname.clone(),
-                    ));
-                }
+            // No "does the peer have wires?" guard: a member with no wires is unrepresentable
+            // (the parser requires at least one), so every member with a universal segment in
+            // this zone is adjacent on it.
+            for r in &universal {
+                edges.entry(&m.name).or_default().push((
+                    &other.name,
+                    r.ospf_cost + offset,
+                    r.ifname.clone(),
+                ));
             }
         }
     }
