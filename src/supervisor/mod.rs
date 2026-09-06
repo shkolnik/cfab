@@ -537,6 +537,16 @@ pub(crate) async fn run_with(
             p.max(Duration::from_millis(1)),
         )
     });
+    // Reconcile the engine's readiness on every tick. The initial `wait_ready` above runs once,
+    // before this loop; every *respawn* — the crash backoff here and the reapply's
+    // `restart_child` alike — puts the engine back into `starting` (spec §4), and nothing else
+    // moves it to `running`. Without this a healthy engine the supervisor restarted in place
+    // stays labeled `starting` forever (pid stable, fabric converged), which `status` then
+    // misreports as a stuck start. Same query and cadence as `wait_ready`.
+    let mut ready_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_millis(POLL_MS),
+        Duration::from_millis(POLL_MS),
+    );
 
     loop {
         let next_respawn = pending.iter().map(|(_, d)| *d).min();
@@ -640,6 +650,21 @@ pub(crate) async fn run_with(
                 };
                 if should_feed(apply, engine_state, read) {
                     feed_fn();
+                }
+            }
+            // Move a restarted engine out of `starting` once its socket answers ready. Only the
+            // `starting` state pays the bounded `state\n` read; a `running`/`stopped`/`restarting`
+            // engine is a cheap lock check. `became_ready` is a no-op unless still `starting`, so
+            // a late answer never resurrects a child that has since died.
+            _ = ready_tick.tick() => {
+                let starting =
+                    shared.lock().unwrap().child("engine").state == child::State::Starting;
+                if starting
+                    && let Ok(reply) = sys.unix_request(&sock_path, "state\n")
+                    && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&reply)
+                    && doc["ready"] == true
+                {
+                    shared.lock().unwrap().child_mut("engine").became_ready();
                 }
             }
         }
@@ -1587,6 +1612,70 @@ mod tests {
             st.spawned.iter().filter(|n| *n == "engine").count() >= 3,
             "expected initial + crash-respawn + re-apply engine spawns: {:?}",
             st.spawned
+        );
+    }
+
+    /// Finding B: an engine restarted in place must return to `running`, not stay `starting`.
+    /// The first engine crashes (`engine_first_quick`); the backoff respawn puts it back into
+    /// `starting`; the readiness-reconcile tick must then observe the socket ready and move it to
+    /// `running`. Without that tick the respawned engine is stuck `starting` forever even though
+    /// the fabric is up — this test times out waiting for `running` (its teeth).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_place_engine_restart_returns_to_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let inner = Arc::new(Mutex::new(RecState {
+            engine_first_quick: true,
+            ..RecState::default()
+        }));
+        let mut spawner = Rec {
+            inner: inner.clone(),
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            // Wait for the crash-respawn (restarts >= 1) AND the reconcile back to running,
+            // bounded well past the 2 s backoff + one poll interval.
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            let ok = loop {
+                {
+                    let st = sh.lock().unwrap();
+                    let e = st.child("engine");
+                    if e.restarts >= 1 && e.state == child::State::Running {
+                        break true;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            driver_tx.send(Cmd::Terminate).ok();
+            ok
+        });
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            quiet_hooks(shared, ready_tx),
+        )
+        .await;
+        let ok = driver.await.unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            ok,
+            "a restarted engine must return to running, not stay starting"
         );
     }
 
