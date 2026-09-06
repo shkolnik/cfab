@@ -5,10 +5,18 @@
 //! subcommand that reads the declaration. `examples/fabric.toml` must reproduce it byte for
 //! byte, stdout and stderr.
 //!
-//! ONE transform is applied, and it is the whole of the allowed difference: the summary line
-//! of `check` (and every error) names the declaration file, which is now `fabric.toml`
-//! (§11.2 rule 5). The fixture is left verbatim because it is a CAPTURE — evidence of what
-//! the old binary printed, not a file to keep in sync.
+//! TWO transforms are applied, and they are the whole of the allowed difference:
+//!   1. The summary line of `check` (and every error) names the declaration file, which is now
+//!      `fabric.toml` (§11.2 rule 5).
+//!   2. `gen engine` now filters LEAF identities out of every gw zone's BGP policy — the
+//!      `cfab-<zone>-leaf` prefix set and the `reject-route` statement naming it. A leaf carries
+//!      no ingress leg and cannot answer a packet sent to its fabric identity, so its identity
+//!      is never offered to the router (James 2026-09-06: unsupported by design). The capture
+//!      predates that, so the filter is SUBTRACTED from the new output and everything else in
+//!      the tree stays compared. Its own shape is pinned by `emit::engine`'s tests.
+//!
+//! The fixture is left verbatim because it is a CAPTURE — evidence of what the old binary
+//! printed, not a file to keep in sync.
 //!
 //! `schema.json` is deliberately not compared: `cfab schema` now emits the DECLARATION
 //! schema instead of the internal model's (§11.2 rule 6), which is a wanted change, not a
@@ -19,6 +27,7 @@ use std::process::Command;
 
 use cfab::decl::Declaration;
 use cfab::model::Fabric;
+use serde_json::Value;
 
 const MEMBERS: [&str; 3] = ["pve1-tb", "pve2-tb", "pve3-tb"];
 const WIRES: [&str; 3] = ["eth9", "eth1", "eth0"];
@@ -101,9 +110,41 @@ fn fixture_err(member: &str, file: &str) -> String {
     std::fs::read_to_string(p).unwrap_or_default()
 }
 
-/// The one enumerated transform: the declaration's name.
+/// Enumerated transform 1: the declaration's name.
 fn renamed(fixture: &str) -> String {
     fixture.replace("fabric.conf", "fabric.toml")
+}
+
+/// Enumerated transform 2: subtract the leaf-identity filter from `gen engine`'s output, so
+/// every other node of the tree stays under byte comparison. A no-op on any other artifact,
+/// and a no-op on a member that emits no policy tree.
+fn without_leaf_filter(file: &str, stdout: &str) -> String {
+    if file != "gen-engine.json" {
+        return stdout.to_string();
+    }
+    let mut t: Value = serde_json::from_str(stdout).expect("gen engine emits JSON");
+    let Some(pol) = t.get_mut("ietf-routing-policy:routing-policy") else {
+        return stdout.to_string();
+    };
+    if let Some(sets) = pol["defined-sets"]["prefix-sets"]["prefix-set"].as_array_mut() {
+        sets.retain(|s| !s["name"].as_str().unwrap().ends_with("-leaf"));
+    }
+    for p in pol["policy-definitions"]["policy-definition"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(stmts) = p["statements"]["statement"].as_array_mut() {
+            stmts.retain(|s| {
+                !(s["conditions"]["match-prefix-set"]["prefix-set"]
+                    .as_str()
+                    .is_some_and(|n| n.ends_with("-leaf"))
+                    && s["actions"]["policy-result"] == "reject-route")
+            });
+        }
+    }
+    let trailing = &stdout[stdout.trim_end().len()..];
+    format!("{}{trailing}", serde_json::to_string_pretty(&t).unwrap())
 }
 
 fn diff(label: &str, want: &str, got: &str) -> Option<String> {
@@ -134,7 +175,7 @@ fn every_artifact_matches_the_shell_format_capture() {
             if let Some(d) = diff(
                 &format!("{member} {file} (stdout)"),
                 &renamed(&fixture(member, &file)),
-                &stdout,
+                &without_leaf_filter(&file, &stdout),
             ) {
                 panic!("{d}");
             }

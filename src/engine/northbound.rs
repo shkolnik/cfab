@@ -451,6 +451,16 @@ mod tests {
                     printed.contains("-import"),
                     "{member}: import policy lost in the parse"
                 );
+                // The leaf-identity filter: a `reject-route` statement is as much a part of the
+                // shipped policy as the accept, and STRICT must take it.
+                assert!(
+                    printed.contains("reject-route"),
+                    "{member}: leaf reject statement lost in the parse"
+                );
+                assert!(
+                    printed.contains("-leaf"),
+                    "{member}: leaf prefix set lost in the parse"
+                );
             }
         }
     }

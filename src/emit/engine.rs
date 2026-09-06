@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::derive::{GwRow, View};
+use crate::derive::{GwRow, View, identity_addr_of};
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 
@@ -172,6 +172,13 @@ fn id_set(zone: &str) -> String {
     format!("cfab-{zone}-id")
 }
 
+/// The leaf-identity prefix set of a gw zone: the identity /32 of every leaf member. Emitted
+/// only when the fabric declares a leaf, so a fabric of hosts alone carries neither the set nor
+/// the statements that name it.
+fn leaf_set(zone: &str) -> String {
+    format!("cfab-{zone}-leaf")
+}
+
 fn import_policy(zone: &str) -> String {
     format!("cfab-{zone}-import")
 }
@@ -220,33 +227,78 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
                 "mask-length-upper": 32,
             } ] },
         }));
+        // A leaf is reached from outside the fabric at its OWN addresses, never at a fabric
+        // identity: it carries no ingress leg, so a packet the router sent to its identity /32
+        // would arrive with no return path. That shape is unsupported by design (James
+        // 2026-09-06), so a leaf identity is never offered to the router — the set below names
+        // every leaf identity in this zone, and the first statement of both policies rejects it.
+        //
+        // Both policies, because they are two different gates and either alone leaves a way
+        // through: the import policy runs on REDISTRIBUTION (this host learns the leaf's /32 by
+        // OSPF and would otherwise inject it into BGP), the export policy runs on what is
+        // offered to the neighbor (a leaf /32 that reaches the Adj-RIB-Out by any other route —
+        // origination, a future neighbor import policy — still never leaves the host).
+        // holo evaluates a policy's statements in the BTreeMap order of their names and an
+        // `accept-route` terminates the chain (`holo-bgp/src/policy.rs::process_policies`), so
+        // the reject is named "0" to sort before the "1" that accepts.
+        let leaf_prefixes: Vec<Value> = f
+            .members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Leaf)
+            .map(|m| {
+                json!({
+                    "ip-prefix": format!("{}/32", identity_addr_of(z, m)),
+                    "mask-length-lower": 32,
+                    "mask-length-upper": 32,
+                })
+            })
+            .collect();
+        let reject_leaves: Vec<Value> = if leaf_prefixes.is_empty() {
+            Vec::new()
+        } else {
+            prefix_sets.push(json!({
+                "name": leaf_set(&z.name),
+                "mode": "ipv4",
+                "prefixes": { "prefix-list": leaf_prefixes },
+            }));
+            vec![json!({
+                "name": "0",
+                "conditions": { "match-prefix-set": { "prefix-set": leaf_set(&z.name) } },
+                "actions": { "policy-result": "reject-route" },
+            })]
+        };
+
         // Import: `set-med igp` carries the OSPF cost of a redistributed identity into MED, so
         // the router prefers the identity's owner (MED 0) over a transit. It works only here —
         // the export stage sees the interned attributes alone.
+        let mut import_stmts = reject_leaves.clone();
+        import_stmts.push(json!({
+            "name": "1",
+            "conditions": { "match-prefix-set": { "prefix-set": id_set(&z.name) } },
+            "actions": {
+                "policy-result": "accept-route",
+                "ietf-bgp-policy:bgp-actions": { "set-med": "igp" },
+            },
+        }));
         policies.push(json!({
             "name": import_policy(&z.name),
-            "statements": { "statement": [ {
-                "name": "1",
-                "conditions": { "match-prefix-set": { "prefix-set": id_set(&z.name) } },
-                "actions": {
-                    "policy-result": "accept-route",
-                    "ietf-bgp-policy:bgp-actions": { "set-med": "igp" },
-                },
-            } ] },
+            "statements": { "statement": import_stmts },
         }));
         // Export: the OSPF next hop of a redistributed identity is a segment address the
         // router cannot resolve, so the leg address replaces it. The prefix set repeats the
         // import filter as defense in depth.
+        let mut export_stmts = reject_leaves;
+        export_stmts.push(json!({
+            "name": "1",
+            "conditions": { "match-prefix-set": { "prefix-set": id_set(&z.name) } },
+            "actions": {
+                "policy-result": "accept-route",
+                "ietf-bgp-policy:bgp-actions": { "set-next-hop": "self" },
+            },
+        }));
         policies.push(json!({
             "name": export_policy(&z.name),
-            "statements": { "statement": [ {
-                "name": "1",
-                "conditions": { "match-prefix-set": { "prefix-set": id_set(&z.name) } },
-                "actions": {
-                    "policy-result": "accept-route",
-                    "ietf-bgp-policy:bgp-actions": { "set-next-hop": "self" },
-                },
-            } ] },
+            "statements": { "statement": export_stmts },
         }));
         import_policies.push(Value::String(import_policy(&z.name)));
         // The owner's own identity /32 has no connected DIRECT route (holo marks a
@@ -702,6 +754,16 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    /// The same fabric with every member a host, so the leaf-identity filter has nothing to
+    /// name and must disappear entirely rather than emit an empty set.
+    fn fabric_without_a_leaf() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+                .unwrap()
+                .replace("kind = \"leaf\"", "kind = \"host\"");
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
     /// The same fabric with no ingress at all.
     fn fabric_without_a_gw() -> Fabric {
         let text =
@@ -868,6 +930,108 @@ mod tests {
         }
     }
 
+    /// A leaf carries no ingress leg, so a packet the router sent to its fabric identity would
+    /// have no return path: the identity of every leaf is rejected — FIRST, before the accept
+    /// that would otherwise carry it — in both policies of every gw zone.
+    #[test]
+    fn a_gw_zones_policies_reject_every_leaf_identity_before_they_accept() {
+        for f in [fabric(), fabric_with_two_gw_zones()] {
+            for member in ["pve1-tb", "pve2-tb"] {
+                let v = View::new(&f, member).unwrap();
+                let t = generate(&v).unwrap();
+                let pol = &t["ietf-routing-policy:routing-policy"];
+                for r in v.gw_rows() {
+                    let z = f.zone(&r.zone).unwrap();
+                    let want: Vec<String> = f
+                        .members
+                        .iter()
+                        .filter(|m| m.kind == MemberKind::Leaf)
+                        .map(|m| format!("{}/32", identity_addr_of(z, m)))
+                        .collect();
+                    assert!(!want.is_empty(), "the example fabric declares a leaf");
+
+                    let set = pol["defined-sets"]["prefix-sets"]["prefix-set"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|p| p["name"] == leaf_set(&z.name))
+                        .unwrap_or_else(|| panic!("{member} {}: no leaf set", z.name));
+                    let got: Vec<String> = set["prefixes"]["prefix-list"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| {
+                            assert_eq!(p["mask-length-lower"], 32);
+                            assert_eq!(p["mask-length-upper"], 32);
+                            p["ip-prefix"].as_str().unwrap().to_string()
+                        })
+                        .collect();
+                    assert_eq!(got, want, "{member} {}", z.name);
+
+                    // Both policies, and the reject sorts first: holo evaluates statements in
+                    // the order of their names and an accept-route ends the chain.
+                    for policy in [import_policy(&z.name), export_policy(&z.name)] {
+                        let p = pol["policy-definitions"]["policy-definition"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|p| p["name"] == policy)
+                            .unwrap();
+                        let stmts = p["statements"]["statement"].as_array().unwrap();
+                        assert_eq!(stmts.len(), 2, "{member} {policy}");
+                        assert_eq!(stmts[0]["name"], "0", "{member} {policy}");
+                        assert_eq!(
+                            stmts[0]["conditions"]["match-prefix-set"]["prefix-set"],
+                            json!(leaf_set(&z.name)),
+                            "{member} {policy}"
+                        );
+                        assert_eq!(
+                            stmts[0]["actions"],
+                            json!({ "policy-result": "reject-route" }),
+                            "{member} {policy}"
+                        );
+                        assert_eq!(stmts[1]["name"], "1", "{member} {policy}");
+                        assert_eq!(
+                            stmts[1]["conditions"]["match-prefix-set"]["prefix-set"],
+                            json!(id_set(&z.name)),
+                            "{member} {policy}"
+                        );
+                        assert_eq!(
+                            stmts[1]["actions"]["policy-result"], "accept-route",
+                            "{member} {policy}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fabric of hosts alone emits no leaf set and no reject statement at all — the policy
+    /// tree is byte-identical to the one before leaf identities were filtered.
+    #[test]
+    fn a_fabric_without_a_leaf_emits_no_leaf_set_and_no_reject() {
+        let f = fabric_without_a_leaf();
+        for member in ["pve1-tb", "pve2-tb", "pve3-tb"] {
+            let v = View::new(&f, member).unwrap();
+            let t = generate(&v).unwrap();
+            let pol = &t["ietf-routing-policy:routing-policy"];
+            let sets = names_at(&t, &["defined-sets", "prefix-sets", "prefix-set"]);
+            assert_eq!(sets, ["cfab-mgmt-id"], "{member}");
+            for p in pol["policy-definitions"]["policy-definition"]
+                .as_array()
+                .unwrap()
+            {
+                let stmts = p["statements"]["statement"].as_array().unwrap();
+                assert_eq!(stmts.len(), 1, "{member} {}", p["name"]);
+                assert_eq!(stmts[0]["name"], "1", "{member} {}", p["name"]);
+            }
+            assert!(
+                !serde_json::to_string(pol).unwrap().contains("reject-route"),
+                "{member}"
+            );
+        }
+    }
+
     /// One prefix set per gw zone, and no zone's identity block reaches another zone's policies:
     /// a leak here would advertise cluster identities to the mgmt router.
     #[test]
@@ -878,7 +1042,12 @@ mod tests {
         let pol = &t["ietf-routing-policy:routing-policy"];
         assert_eq!(
             names_at(&t, &["defined-sets", "prefix-sets", "prefix-set"]),
-            ["cfab-cluster-id", "cfab-mgmt-id"]
+            [
+                "cfab-cluster-id",
+                "cfab-cluster-leaf",
+                "cfab-mgmt-id",
+                "cfab-mgmt-leaf"
+            ]
         );
         assert_eq!(
             names_at(&t, &["policy-definitions", "policy-definition"]),
@@ -913,7 +1082,11 @@ mod tests {
             let zone = name.split('-').nth(1).unwrap();
             let mut sets = Vec::new();
             collect(p, "prefix-set", &mut sets);
-            assert_eq!(sets, [format!("cfab-{zone}-id")], "{name}");
+            assert_eq!(
+                sets,
+                [format!("cfab-{zone}-leaf"), format!("cfab-{zone}-id")],
+                "{name}"
+            );
         }
         // Each neighbor exports only its own zone's policy.
         for (zone, router) in [("cluster", "192.168.199.254"), ("mgmt", "192.168.249.254")] {

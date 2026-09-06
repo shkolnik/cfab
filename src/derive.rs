@@ -272,13 +272,20 @@ impl<'a> View<'a> {
 
     /// The identity address for this member in a zone: `10.<id>.0.<node>`.
     pub fn identity_addr(&self, zone: &Zone) -> String {
-        format!("{}.0.{}", zone.block(), self.node())
+        identity_addr_of(zone, self.member)
     }
 
     /// This member's address on a zone's segment `seg`: `10.<id>.<seg>.<node>`.
     pub fn segment_addr(&self, zone: &Zone, seg: u8) -> String {
         format!("{}.{seg}.{}", zone.block(), self.node())
     }
+}
+
+/// Any member's identity address in a zone: `10.<id>.0.<node>`. The member-agnostic form of
+/// `View::identity_addr`, for the places that reason about members other than the one whose
+/// view is being generated.
+pub fn identity_addr_of(zone: &Zone, member: &Member) -> String {
+    format!("{}.0.{}", zone.block(), member.node)
 }
 
 /// The default producer (spec §4, option (c)): rank 0 is the wire on the zone's DECLARED
