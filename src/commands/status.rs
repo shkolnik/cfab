@@ -2060,6 +2060,34 @@ mod tests {
         }
     }
 
+    /// The jump `-A OUTPUT -j cfab-out` is what puts the ceiling on the wire at all: without
+    /// it the chains are resident and unreachable. On nft the hook lives inside the covered
+    /// table, so this failure mode does not exist there; here it must be watched explicitly,
+    /// or a member reads clean while policing nothing.
+    #[test]
+    fn a_readback_missing_the_output_jump_is_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // Same live table with the one jump deleted — everything else identical.
+        let mut unhooked = ipt_leaf(&view, 0);
+        let save = unhooked
+            .cmd_rules
+            .iter()
+            .rev()
+            .find(|(p, _)| p == &["iptables-legacy-save", "-t", "mangle"])
+            .map(|(_, o)| o.stdout.clone())
+            .unwrap();
+        assert!(save.contains("-A OUTPUT -j cfab-out\n"), "{save}");
+        let unhooked_save = save.replace("-A OUTPUT -j cfab-out\n", "");
+        unhooked = unhooked.on_stdout(&["iptables-legacy-save", "-t", "mangle"], &unhooked_save);
+        let report = run(&mut unhooked, &view, 0, false).unwrap();
+        assert!(
+            report.output.contains("mark drift — re-run cfab up"),
+            "an unhooked ceiling read clean:\n{}",
+            report.output
+        );
+    }
+
     /// Drift on this backend has the same two halves as on nft: what `up` rendered against
     /// what it wrote, and the live ruleset against the readback it stored.
     #[test]

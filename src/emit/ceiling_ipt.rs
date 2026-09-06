@@ -122,13 +122,21 @@ pub fn generate(view: &View) -> Result<String> {
     Ok(out)
 }
 
-/// The `cfab-` lines of an `iptables-legacy-save -t mangle` dump: the live half of the drift
-/// check, and the only lines teardown enumerates chain names from. Foreign chains and the
-/// table's built-in policy lines are not ours and are not read.
+/// The lines of an `iptables-legacy-save -t mangle` dump that belong to cfab: the live half of
+/// the drift check, and the only lines teardown enumerates chain names from. Foreign chains and
+/// the table's built-in policy lines are not ours and are not read.
+///
+/// Three shapes, one predicate: our chain declarations, our rules, AND the rule in a chain that
+/// is not ours which jumps INTO ours (`-A OUTPUT -j cfab-out`). The last one is not decoration —
+/// deleting that jump unhooks the whole ceiling, and unlike nft, where the hook lives inside the
+/// covered table, nothing else here would notice.
 pub fn ours(save_output: &str) -> String {
     let mut out = String::new();
     for l in save_output.lines() {
-        if l.starts_with(":cfab-") || l.starts_with("-A cfab-") {
+        if l.starts_with(":cfab-")
+            || l.starts_with("-A cfab-")
+            || l.ends_with(&format!(" -j {OUT_CHAIN}"))
+        {
             out.push_str(l);
             out.push('\n');
         }
@@ -302,9 +310,11 @@ mod tests {
                     :DOCKER-USER - [0:0]\n:cfab-out - [0:0]\n:cfab-ceil-storage - [0:0]\n\
                     -A OUTPUT -j cfab-out\n-A DOCKER-USER -j RETURN\n\
                     -A cfab-out -j cfab-ceil-storage\n-A cfab-ceil-storage -j DROP\nCOMMIT\n";
+        // The OUTPUT jump is ours to watch even though the chain holding it is not: without
+        // it the ceiling is unhooked, and nothing else in the readback would show that.
         assert_eq!(
             ours(save),
-            ":cfab-out - [0:0]\n:cfab-ceil-storage - [0:0]\n\
+            ":cfab-out - [0:0]\n:cfab-ceil-storage - [0:0]\n-A OUTPUT -j cfab-out\n\
              -A cfab-out -j cfab-ceil-storage\n-A cfab-ceil-storage -j DROP\n"
         );
         assert_eq!(chains_in(save), vec!["cfab-out", "cfab-ceil-storage"]);

@@ -47,9 +47,15 @@ kernel hostname.
 
 ## Runtime requirements
 
-Both member kinds need `ip` (iproute2) and `nft` (nftables): every member installs
+Both member kinds need `ip` (iproute2). A **host** needs `nft` (nftables): it installs
 `table inet cfab`, the per-zone bulk DSCP clamp plus one derived control-egress ceiling per
-fallback bond — a leaf sources a fallback-segment control storm exactly as a host does, so a
+fallback bond, and a kernel without nf_tables is a hard refusal for that kind. A **leaf**
+takes `nft` too where the kernel has it; where it does not (a Synology NAS on Linux 4.4, say)
+it falls back to `iptables-legacy`, `iptables-legacy-save` and `iptables-legacy-restore` and
+installs the **ceiling only** — that kernel has no DSCP target, so the per-zone bulk clamp is
+skipped and `cfab status` names the backend and says so. The choice is made at `up` on the
+kernel's own refusal, never on a knob, and recorded in the run dir. A leaf gets the ceiling
+either way because it sources a fallback-segment control storm exactly as a host does, so a
 containment it escaped would be half a containment. (This member's OWN control marking is not
 in that table: the engine sets DSCP CS6 and skb-priority PCP_CTRL on its OSPF and BFD
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.

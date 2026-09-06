@@ -102,10 +102,11 @@ fn mark_backend_for_leaf(sys: &mut dyn Sys) -> Result<MarkBackend> {
     Ok(MarkBackend::IptablesLegacy)
 }
 
-/// Remove whatever the OTHER backend left behind, before this one installs. A leaf that gains
-/// nf_tables (a DSM upgrade) or loses it must never end up policed by both, or by neither with
-/// stale chains still resident. Each half is `have_tool`-guarded, so a member that no longer
-/// has the other backend's binaries still applies.
+/// Remove whatever the OTHER backend left behind, before this one installs. A member that gains
+/// nf_tables (a DSM upgrade), loses it, or is redeclared from `leaf` to `host` must never end up
+/// policed by both, or by neither with stale chains still resident — so this runs on EVERY kind,
+/// not only the one that can choose. Each half is `have_tool`-guarded, so a host that has never
+/// had the legacy binaries runs no extra command at all.
 fn remove_other_mark_backend(
     sys: &mut dyn Sys,
     f: &crate::model::Fabric,
@@ -552,9 +553,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         &emit::ceiling_ipt::record_path(&f.run_dir),
         &format!("{}\n", mark_backend.as_str()),
     )?;
-    if kind == MemberKind::Leaf {
-        remove_other_mark_backend(sys, f, mark_backend)?;
-    }
+    remove_other_mark_backend(sys, f, mark_backend)?;
     match mark_backend {
         MarkBackend::Nft => {
             let mark = emit::mark::generate(view)?;
@@ -564,9 +563,13 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab"])?;
             sys.write(&format!("{}/mark.applied", f.run_dir), &applied.stdout)?;
         }
-        MarkBackend::IptablesLegacy => install_mark_ipt(sys, view)?,
+        MarkBackend::IptablesLegacy => {
+            install_mark_ipt(sys, view)?;
+            // Only the degraded backend is worth a line here: it is a real, named loss of the
+            // bulk clamp. `mark: nft` is the ordinary case and belongs to `status` alone.
+            warnings.push(mark_backend.status_line().to_string());
+        }
     }
-    warnings.push(mark_backend.status_line().to_string());
 
     // ---- qos (host only: a leaf shapes nothing; its wires' qdiscs belong to its OS) ----------
     if kind == MemberKind::Host {
@@ -1819,25 +1822,32 @@ mod tests {
         assert!(!sys.files.contains_key("/run/cfab/mark.ipt"));
     }
 
-    /// A host never probes and never touches iptables: its mark path is nft, byte for byte
-    /// what it was before the leaf backend existed — the probe, the legacy binaries and the
-    /// other-backend sweep are all leaf-only. (`mark.backend` is a file, not a command; the
-    /// commands a host runs are unchanged.)
+    /// A host never probes, and on a host that has never had the legacy binaries the mark
+    /// path is nft byte for byte — no probe, no iptables, no extra command. The two things
+    /// that are new on every kind are file operations, not commands: the `mark.backend`
+    /// record and the removal of any stale `mark.ipt`.
     #[test]
-    fn a_host_never_probes_and_its_nft_mark_path_is_unchanged() {
+    fn a_host_without_iptables_runs_the_nft_mark_path_and_nothing_else() {
         let (mut sys, view) = up_sys_and_view();
-        sys = sys.on_stdout(
-            &["nft", "-s", "list", "table", "inet", "cfab"],
-            "table inet cfab\n",
-        );
+        sys = sys
+            .on_stdout(
+                &["nft", "-s", "list", "table", "inet", "cfab"],
+                "table inet cfab\n",
+            )
+            .on_fail(
+                &["/usr/bin/env", "sh", "-c", "command -v iptables-legacy"],
+                1,
+                "",
+            );
         run(&mut sys, &view, &opts()).unwrap();
         assert!(!sys.ran("cfabprobe"), "{:?}", sys.calls);
-        assert!(!sys.ran("iptables-legacy"), "{:?}", sys.calls);
-        // The precondition list, in its old order and with nothing added: `iptables-legacy`
-        // is never even looked for on a host. (The trailing `nmcli` probes are the wire
-        // release, one per wire, unchanged.)
+        assert!(!sys.ran("iptables-legacy -"), "{:?}", sys.calls);
+        assert!(!sys.ran("iptables-legacy-save"), "{:?}", sys.calls);
+        // The precondition list, in its old order: `iptables-legacy` is looked for only by
+        // the guarded sweep, never as a host precondition. (The trailing `nmcli` probes are
+        // the per-wire release, unchanged.)
         let mut probes = calls_for(&sys, "command -v");
-        probes.retain(|c| !c.ends_with("nmcli"));
+        probes.retain(|c| !c.ends_with("nmcli") && !c.contains("iptables"));
         assert_eq!(
             probes,
             vec![
@@ -1850,8 +1860,6 @@ mod tests {
             "{:?}",
             sys.calls
         );
-        // The mark install itself, argv by argv: exactly the commands it always ran. In
-        // particular no `nft delete table inet cfab` — the other-backend sweep is leaf-only.
         assert!(!sys.ran("nft delete table inet cfab"), "{:?}", sys.calls);
         assert_eq!(
             sys.calls
@@ -1861,6 +1869,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "write /run/cfab/mark.backend",
+                "rm /run/cfab/mark.ipt",
                 "write /run/cfab/mark.nft",
                 "nft -f /run/cfab/mark.nft",
                 "write /run/cfab/mark.applied",
@@ -1880,6 +1889,36 @@ mod tests {
             sys.files.get("/run/cfab/mark.backend"),
             Some(&"nft\n".to_string())
         );
+    }
+
+    /// ...and a member redeclared from `leaf` to `host` while its ceiling chains are still
+    /// resident IS swept: the sweep runs on every kind, guarded on the binaries existing, so
+    /// nothing is ever policed by two mechanisms at once.
+    #[test]
+    fn a_host_with_the_legacy_binaries_still_sweeps_resident_ceiling_chains() {
+        let (mut sys, view) = up_sys_and_view();
+        let leaf_view = {
+            let f: &'static Fabric = Box::leak(Box::new(fabric()));
+            View::new(f, "pve3-tb").unwrap()
+        };
+        sys = sys
+            .on_stdout(
+                &["nft", "-s", "list", "table", "inet", "cfab"],
+                "table inet cfab\n",
+            )
+            .on_stdout(
+                &["iptables-legacy-save", "-t", "mangle"],
+                &ipt_save(&leaf_view),
+            );
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(
+            sys.ran("iptables-legacy -t mangle -X cfab-ceil-storage"),
+            "{:?}",
+            sys.calls
+        );
+        assert!(!sys.ran("DOCKER-USER -j"), "{:?}", sys.calls);
+        // ...and the nft path still ran, unchanged.
+        assert!(sys.ran("nft -f /run/cfab/mark.nft"), "{:?}", sys.calls);
     }
 
     /// `iptables-restore --noflush` does not flush an existing user chain, so a second `up`
@@ -1986,7 +2025,11 @@ mod tests {
             Some(&emit::mark::generate(&view).unwrap())
         );
         assert!(sys.ran("nft -f /run/cfab/mark.nft"), "{:?}", sys.calls);
-        assert!(warnings.iter().any(|w| w == "mark: nft"), "{warnings:?}");
+        // The ordinary backend is not worth a line at `up`: only the degraded one is.
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("mark:")),
+            "{warnings:?}"
+        );
     }
 
     /// A zone that lost its fallback row leaves an unhooked but resident chain behind. It is
