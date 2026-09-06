@@ -1,6 +1,9 @@
-//! Traffic-class marking (table inet cfab) derived from the class table. Two label planes
-//! from one model: 802.1p PCP (skb-priority → sub-interface egress-qos-map) and IP DSCP (the
-//! plane a DSCP-trusting switch queues on), plus the fallback control-egress ceiling (below).
+//! Traffic-class marking (table inet cfab) derived from the class table: the per-zone bulk DSCP
+//! clamp (the plane a DSCP-trusting switch queues on) and the fallback control-egress ceiling
+//! (below). Control marking is NOT here — the engine sets it on its own OSPF/BFD sockets
+//! (IP_TOS = DSCP_CTRL, then SO_PRIORITY = PCP_CTRL), and the VLAN sub-interface
+//! egress-qos-map turns that skb-priority into the 802.1p PCP on the wire. Because the clamp
+//! rewrites the whole zone, guard rules let control past it untouched.
 //! Pure text out.
 
 use crate::derive::{View, class_rows_of};
@@ -126,58 +129,13 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("table inet cfab {\n");
     out.push_str("  chain out {\n");
     out.push_str("    type filter hook output priority mangle;\n");
-    for z in &f.zones {
-        let ifs_list = view.zone_ifs(&z.name);
-        if ifs_list.is_empty() {
-            continue;
-        }
-        let ifs = ifs_list
-            .iter()
-            .map(|i| format!("\"{i}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        // PCP plane: lift OSPF/BFD to PCP_CTRL on zones mapped below it. OSPF is matched by
-        // number: nft resolves `ip protocol ospf` through /etc/protocols (package netbase), which
-        // a slim container image does not have, and `nft -f` then refuses the whole ruleset
-        // (verified 2026-09-05 on debian:trixie-slim + nftables 1.1.3; the 0.1.0 deb got
-        // netbase only through its frr dependency). A number assumes nothing.
-        if z.pcp != f.pcp_ctrl {
-            out.push_str(&format!(
-                "    oifname {{ {ifs} }} ip protocol 89 meta priority set 0:{} comment \"pcp-{}-ctrl\"\n",
-                f.pcp_ctrl, z.name
-            ));
-            out.push_str(&format!(
-                "    oifname {{ {ifs} }} udp dport 3784-3785 meta priority set 0:{} comment \"pcp-{}-bfd\"\n",
-                f.pcp_ctrl, z.name
-            ));
-        }
-        if !f.dscp_mark {
-            continue;
-        }
-        // DSCP plane, order matters: clamp the WHOLE zone first, then lift its control
-        // (last write wins per field) — makes bulk-in-the-control-queue unrepresentable.
-        out.push_str(&format!(
-            "    oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-bulk\"\n",
-            z.dscp, z.name
-        ));
-        if z.dscp != f.dscp_ctrl {
-            out.push_str(&format!(
-                "    oifname {{ {ifs} }} ip protocol 89 ip dscp set {} comment \"dscp-{}-ctrl\"\n",
-                f.dscp_ctrl, z.name
-            ));
-            out.push_str(&format!(
-                "    oifname {{ {ifs} }} udp dport 3784-3785 ip dscp set {} comment \"dscp-{}-bfd\"\n",
-                f.dscp_ctrl, z.name
-            ));
-        }
-    }
-    // The fallback control-egress ceiling, last so a passed packet has already been marked and
-    // a dropped one is dropped by the last word in the chain. Containment, not policing: a
-    // fallback segment is one broadcast domain spanning every island, so a control-plane loop on
-    // it reaches every switch port in the fabric. Over the derived rate the packets are dropped
-    // and counted (`cfab status` reads the counter) — a member whose control plane has gone mad
-    // stops shouting and at worst loses its own fallback adjacency, which is the cheaper half of
-    // "degraded but up".
+    // The fallback control-egress ceiling, FIRST: the guard rules below `return` on OSPF, so a
+    // ceiling placed after them would never see the packets it exists to count. Containment, not
+    // policing: a fallback segment is one broadcast domain spanning every island, so a
+    // control-plane loop on it reaches every switch port in the fabric. Over the derived rate the
+    // packets are dropped and counted (`cfab status` reads the counter) — a member whose control
+    // plane has gone mad stops shouting and at worst loses its own fallback adjacency, which is
+    // the cheaper half of "degraded but up".
     //
     // OSPF only, and only on the bond: a fallback leg carries NO BFD by construction (`emit/
     // engine.rs` gives the bond no `bfd` key at all, and `segments_of()` keeps it out of BFD
@@ -190,6 +148,43 @@ pub fn generate(view: &View) -> Result<String> {
             "    oifname {{ \"{}\" }} ip protocol 89 limit rate over {}/second burst {} packets counter drop comment \"ceiling-{}\"\n",
             ce.ifname, ce.rate_pps, ce.burst_pkts, ce.zone
         ));
+    }
+    // The bulk clamp, per zone, only when the declaration asks for the DSCP plane.
+    if f.dscp_mark {
+        for z in &f.zones {
+            let ifs_list = view.zone_ifs(&z.name);
+            if ifs_list.is_empty() {
+                continue;
+            }
+            let ifs = ifs_list
+                .iter()
+                .map(|i| format!("\"{i}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            // Order matters: control leaves the chain BEFORE the bulk clamp can rewrite the DSCP the
+            // engine's socket already set, so bulk-in-the-control-queue stays unrepresentable while
+            // the clamp itself stays unqualified. The exclusion is a `return` guard, never a negated
+            // match inside the clamp: `udp dport != 3784-3785` carries nft's implicit
+            // `meta l4proto udp` dependency and would stop clamping TCP and ICMP — the very
+            // iSCSI/NFS/migration bulk the clamp exists for.
+            //
+            // OSPF is matched by number: nft resolves `ip protocol ospf` through /etc/protocols
+            // (package netbase), which a slim container image does not have, and `nft -f` then
+            // refuses the whole ruleset (verified 2026-09-05 on debian:trixie-slim + nftables 1.1.3).
+            // A number assumes nothing.
+            out.push_str(&format!(
+                "    oifname {{ {ifs} }} ip protocol 89 return comment \"guard-{}-ospf\"\n",
+                z.name
+            ));
+            out.push_str(&format!(
+                "    oifname {{ {ifs} }} udp dport 3784-3785 return comment \"guard-{}-bfd\"\n",
+                z.name
+            ));
+            out.push_str(&format!(
+                "    oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-bulk\"\n",
+                z.dscp, z.name
+            ));
+        }
     }
     out.push_str("  }\n}\n");
     Ok(out)
@@ -308,10 +303,13 @@ mod tests {
                 assert!(!r.contains(seg), "the ceiling names an island segment: {r}");
             }
         }
-        // Last in the chain: a passed packet is already marked, a dropped one is dropped by the
-        // last word.
-        let first_ceiling = out.find("ceiling-storage").unwrap();
-        assert!(out.rfind("dscp-mgmt-bfd").unwrap() < first_ceiling);
+        // Ahead of the guard rules: they `return` on OSPF, so a ceiling behind them would never
+        // see the packets it counts.
+        let last_ceiling = out.rfind("ceiling-mgmt").unwrap();
+        assert!(
+            out.find("guard-storage-ospf").unwrap() > last_ceiling,
+            "{out}"
+        );
     }
 
     /// No fallback row, no rule — and nothing else in the table moves. A member with no wire on
