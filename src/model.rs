@@ -364,6 +364,17 @@ fn parse_port(raw: &RawConfig, key: &str, default: u16) -> Result<u16> {
     Ok(port)
 }
 
+/// An 802.1p priority: a 3-bit field. Refused loudly here rather than at the socket, where
+/// the engine sets it as SO_PRIORITY on its control sockets and a rejected value would take
+/// the engine down at start.
+fn parse_pcp(raw: &RawConfig, key: &str) -> Result<u8> {
+    let pcp: u8 = parse_num(raw, key)?;
+    if pcp > 7 {
+        return Err(Error::config(format!("{key}={pcp} is outside 0..7")));
+    }
+    Ok(pcp)
+}
+
 fn parse_bool01(raw: &RawConfig, key: &str) -> Result<bool> {
     match raw.require(key)? {
         "0" => Ok(false),
@@ -398,7 +409,7 @@ impl Fabric {
             forward_allow,
             admin_floor_mbit: parse_num(raw, "ADMIN_FLOOR")?,
             admin_band: parse_num(raw, "ADMIN_BAND")?,
-            pcp_ctrl: parse_num(raw, "PCP_CTRL")?,
+            pcp_ctrl: parse_pcp(raw, "PCP_CTRL")?,
             dscp_mark: parse_bool01(raw, "DSCP_MARK")?,
             dscp_ctrl: Dscp::parse(raw.require("DSCP_CTRL")?)?,
             bfd_rx_ms: parse_num(raw, "BFD_RX_MS")?,
@@ -799,6 +810,28 @@ mod tests {
             ("BFD_PORT=bfd", "BFD_PORT='bfd' is not a valid port"),
         ] {
             let err = parse_fabric(|t| *t = t.replace("BFD_PORT=3784", bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn pcp_ctrl_is_range_checked() {
+        assert_eq!(parse_fabric(|_| {}).unwrap().pcp_ctrl, 6);
+        assert_eq!(
+            parse_fabric(|t| *t = t.replace("PCP_CTRL=6", "PCP_CTRL=7"))
+                .unwrap()
+                .pcp_ctrl,
+            7
+        );
+        for (bad, want) in [
+            ("PCP_CTRL=8", "PCP_CTRL=8 is outside 0..7"),
+            ("PCP_CTRL=255", "PCP_CTRL=255 is outside 0..7"),
+            ("PCP_CTRL=256", "PCP_CTRL='256' is not a valid number"),
+            ("PCP_CTRL=six", "PCP_CTRL='six' is not a valid number"),
+        ] {
+            let err = parse_fabric(|t| *t = t.replace("PCP_CTRL=6", bad))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "{bad}: {err}");

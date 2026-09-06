@@ -147,6 +147,7 @@ impl Northbound {
         fib_policy: FibPolicy,
         bfd_socket_policy: BfdSocketPolicy,
         bgp_listen_policy: BgpListenPolicy,
+        control_priority: Option<u32>,
     ) -> Northbound {
         let ctx = yang_ctx();
         let running = Arc::new(DataTree::new(ctx));
@@ -159,6 +160,7 @@ impl Northbound {
             fib_policy: Arc::new(fib_policy),
             bfd_socket_policy,
             bgp_listen_policy,
+            control_priority,
             ..Default::default()
         };
 
@@ -546,6 +548,7 @@ mod tests {
             },
             BfdSocketPolicy::default(),
             BgpListenPolicy::NoListener,
+            Some(6),
         );
         assert!(
             nb.commit(candidate).await.unwrap(),

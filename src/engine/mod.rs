@@ -46,6 +46,10 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
     };
     let bfd_policy = bfd_socket_policy(fabric);
     let bgp_policy = bgp_listen_policy(fabric);
+    // The engine marks its own OSPF/BFD frames with the fabric's control priority: the VLAN
+    // sub-interface's egress-qos-map turns sk_priority into the 802.1p bits, so this needs no
+    // netfilter and works on kernels that have none.
+    let control_priority = Some(u32::from(fabric.pcp_ctrl));
     let sock_path = PathBuf::from(&fabric.run_dir).join(SOCK_NAME);
     let lock_path = PathBuf::from(&fabric.run_dir).join(LOCK_NAME);
     // Before anything destructive: starting the providers purges the private-proto routes
@@ -73,8 +77,13 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
         .map_err(|e| Error::fatal(format!("engine: cannot create async runtime: {e}")))?;
     rt.block_on(async {
         info!(member = %view.member.name, "engine starting");
-        let mut nb =
-            northbound::Northbound::start(&view.member.name, policy, bfd_policy, bgp_policy);
+        let mut nb = northbound::Northbound::start(
+            &view.member.name,
+            policy,
+            bfd_policy,
+            bgp_policy,
+            control_priority,
+        );
         let result = serve(&mut nb, view, &cfg, &sock_path).await;
         // Every exit, healthy or not, is holod's teardown: stop answering, drop the
         // providers, wait for every task (holo-routing uninstalls its routes on that path).
