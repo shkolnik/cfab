@@ -1,0 +1,245 @@
+/usr/bin/env sh -c command -v ip
+/usr/bin/env sh -c command -v nft
+/usr/bin/env LC_ALL=C nft add table inet cfabprobe
+nft delete table inet cfabprobe
+mkdir -p /run/cfab
+ip link show eth0
+ip link set eth0 up
+ip link show eth1
+ip link set eth1 up
+ip link show eth9
+ip link set eth9 up
+ip link show cfab-id99
+ip link show cfab-id99
+ip link add cfab-id99 type veth peer name cfab-id99-peer
+ip addr replace 10.99.0.3/32 dev cfab-id99
+write /proc/sys/net/ipv4/conf/cfab-id99/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id99/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-id99-peer/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id99-peer/send_redirects
+ip link set cfab-id99-peer up
+ip link set cfab-id99 up
+ip route replace unreachable 10.99.0.0/16
+ip link show cfab-id199
+ip link show cfab-id199
+ip link add cfab-id199 type veth peer name cfab-id199-peer
+ip addr replace 10.199.0.3/32 dev cfab-id199
+write /proc/sys/net/ipv4/conf/cfab-id199/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id199/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-id199-peer/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id199-peer/send_redirects
+ip link set cfab-id199-peer up
+ip link set cfab-id199 up
+ip route replace unreachable 10.199.0.0/16
+ip link show cfab-id249
+ip link show cfab-id249
+ip link add cfab-id249 type veth peer name cfab-id249-peer
+ip addr replace 10.249.0.3/32 dev cfab-id249
+write /proc/sys/net/ipv4/conf/cfab-id249/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id249/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-id249-peer/forwarding
+write /proc/sys/net/ipv4/conf/cfab-id249-peer/send_redirects
+ip link set cfab-id249-peer up
+ip link set cfab-id249 up
+ip route replace unreachable 10.249.0.0/16
+ip link show cfab-st
+ip link show cfab-st
+ip link add link eth9 name cfab-st type vlan id 100 egress-qos-map 0:0 6:6
+ip addr replace 10.99.1.3/24 dev cfab-st
+ip link set cfab-st up
+write /proc/sys/net/ipv4/conf/cfab-st/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-st/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-st/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-st/forwarding
+ip link show cfab-st-bk
+ip link show cfab-st-bk
+ip link add link eth1 name cfab-st-bk type vlan id 101 egress-qos-map 0:0 6:6
+ip addr replace 10.99.2.3/24 dev cfab-st-bk
+ip link set cfab-st-bk up
+write /proc/sys/net/ipv4/conf/cfab-st-bk/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-st-bk/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-st-bk/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-st-bk/forwarding
+ip link show cfab-st-b2
+ip link show cfab-st-b2
+ip link add link eth0 name cfab-st-b2 type vlan id 102 egress-qos-map 0:0 6:6
+ip addr replace 10.99.3.3/24 dev cfab-st-b2
+ip link set cfab-st-b2 up
+write /proc/sys/net/ipv4/conf/cfab-st-b2/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-st-b2/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-st-b2/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-st-b2/forwarding
+ip link show cfab-cl
+ip link show cfab-cl
+ip link add link eth1 name cfab-cl type vlan id 200 egress-qos-map 0:6 6:6
+ip addr replace 10.199.1.3/24 dev cfab-cl
+ip link set cfab-cl up
+write /proc/sys/net/ipv4/conf/cfab-cl/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-cl/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-cl/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-cl/forwarding
+ip link show cfab-cl-bk
+ip link show cfab-cl-bk
+ip link add link eth9 name cfab-cl-bk type vlan id 201 egress-qos-map 0:6 6:6
+ip addr replace 10.199.2.3/24 dev cfab-cl-bk
+ip link set cfab-cl-bk up
+write /proc/sys/net/ipv4/conf/cfab-cl-bk/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-cl-bk/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-cl-bk/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-cl-bk/forwarding
+ip link show cfab-cl-b2
+ip link show cfab-cl-b2
+ip link add link eth0 name cfab-cl-b2 type vlan id 202 egress-qos-map 0:6 6:6
+ip addr replace 10.199.3.3/24 dev cfab-cl-b2
+ip link set cfab-cl-b2 up
+write /proc/sys/net/ipv4/conf/cfab-cl-b2/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-cl-b2/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-cl-b2/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-cl-b2/forwarding
+ip link show cfab-mg
+ip link show cfab-mg
+ip link add link eth0 name cfab-mg type vlan id 250 egress-qos-map 0:2 6:6
+ip addr replace 10.249.1.3/24 dev cfab-mg
+ip link set cfab-mg up
+write /proc/sys/net/ipv4/conf/cfab-mg/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-mg/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-mg/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-mg/forwarding
+ip link show cfab-mg-bk
+ip link show cfab-mg-bk
+ip link add link eth1 name cfab-mg-bk type vlan id 251 egress-qos-map 0:2 6:6
+ip addr replace 10.249.2.3/24 dev cfab-mg-bk
+ip link set cfab-mg-bk up
+write /proc/sys/net/ipv4/conf/cfab-mg-bk/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-mg-bk/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-mg-bk/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-mg-bk/forwarding
+ip link show cfab-mg-b2
+ip link show cfab-mg-b2
+ip link add link eth9 name cfab-mg-b2 type vlan id 252 egress-qos-map 0:2 6:6
+ip addr replace 10.249.3.3/24 dev cfab-mg-b2
+ip link set cfab-mg-b2 up
+write /proc/sys/net/ipv4/conf/cfab-mg-b2/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-mg-b2/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-mg-b2/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-mg-b2/forwarding
+ip link show cfab-st-fb
+ip link add cfab-st-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none
+ip link show cfab-st-fb-a
+ip link show cfab-st-fb-a
+ip link add link eth9 name cfab-st-fb-a type vlan id 300 egress-qos-map 0:0 6:6
+ip link set cfab-st-fb-a master cfab-st-fb
+ip link set cfab-st-fb-a up
+write /proc/sys/net/ipv4/conf/cfab-st-fb-a/forwarding
+ip link show cfab-st-fb-b
+ip link show cfab-st-fb-b
+ip link add link eth1 name cfab-st-fb-b type vlan id 300 egress-qos-map 0:0 6:6
+ip link set cfab-st-fb-b master cfab-st-fb
+ip link set cfab-st-fb-b up
+write /proc/sys/net/ipv4/conf/cfab-st-fb-b/forwarding
+ip link show cfab-st-fb-c
+ip link show cfab-st-fb-c
+ip link add link eth0 name cfab-st-fb-c type vlan id 300 egress-qos-map 0:0 6:6
+ip link set cfab-st-fb-c master cfab-st-fb
+ip link set cfab-st-fb-c up
+write /proc/sys/net/ipv4/conf/cfab-st-fb-c/forwarding
+ip link set cfab-st-fb type bond primary cfab-st-fb-a primary_reselect always
+ip addr replace 10.99.9.3/24 dev cfab-st-fb
+write /proc/sys/net/ipv4/conf/cfab-st-fb/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-st-fb/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-st-fb/forwarding
+ip link set cfab-st-fb up
+ip link show cfab-cl-fb
+ip link add cfab-cl-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none
+ip link show cfab-cl-fb-a
+ip link show cfab-cl-fb-a
+ip link add link eth9 name cfab-cl-fb-a type vlan id 301 egress-qos-map 0:6 6:6
+ip link set cfab-cl-fb-a master cfab-cl-fb
+ip link set cfab-cl-fb-a up
+write /proc/sys/net/ipv4/conf/cfab-cl-fb-a/forwarding
+ip link show cfab-cl-fb-b
+ip link show cfab-cl-fb-b
+ip link add link eth1 name cfab-cl-fb-b type vlan id 301 egress-qos-map 0:6 6:6
+ip link set cfab-cl-fb-b master cfab-cl-fb
+ip link set cfab-cl-fb-b up
+write /proc/sys/net/ipv4/conf/cfab-cl-fb-b/forwarding
+ip link show cfab-cl-fb-c
+ip link show cfab-cl-fb-c
+ip link add link eth0 name cfab-cl-fb-c type vlan id 301 egress-qos-map 0:6 6:6
+ip link set cfab-cl-fb-c master cfab-cl-fb
+ip link set cfab-cl-fb-c up
+write /proc/sys/net/ipv4/conf/cfab-cl-fb-c/forwarding
+ip link set cfab-cl-fb type bond primary cfab-cl-fb-b primary_reselect always
+ip addr replace 10.199.9.3/24 dev cfab-cl-fb
+write /proc/sys/net/ipv4/conf/cfab-cl-fb/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-cl-fb/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-cl-fb/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-cl-fb/forwarding
+ip link set cfab-cl-fb up
+ip link show cfab-mg-fb
+ip link add cfab-mg-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none
+ip link show cfab-mg-fb-a
+ip link show cfab-mg-fb-a
+ip link add link eth9 name cfab-mg-fb-a type vlan id 302 egress-qos-map 0:2 6:6
+ip link set cfab-mg-fb-a master cfab-mg-fb
+ip link set cfab-mg-fb-a up
+write /proc/sys/net/ipv4/conf/cfab-mg-fb-a/forwarding
+ip link show cfab-mg-fb-b
+ip link show cfab-mg-fb-b
+ip link add link eth1 name cfab-mg-fb-b type vlan id 302 egress-qos-map 0:2 6:6
+ip link set cfab-mg-fb-b master cfab-mg-fb
+ip link set cfab-mg-fb-b up
+write /proc/sys/net/ipv4/conf/cfab-mg-fb-b/forwarding
+ip link show cfab-mg-fb-c
+ip link show cfab-mg-fb-c
+ip link add link eth0 name cfab-mg-fb-c type vlan id 302 egress-qos-map 0:2 6:6
+ip link set cfab-mg-fb-c master cfab-mg-fb
+ip link set cfab-mg-fb-c up
+write /proc/sys/net/ipv4/conf/cfab-mg-fb-c/forwarding
+ip link set cfab-mg-fb type bond primary cfab-mg-fb-c primary_reselect always
+ip addr replace 10.249.9.3/24 dev cfab-mg-fb
+write /proc/sys/net/ipv4/conf/cfab-mg-fb/arp_ignore
+write /proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter
+write /proc/sys/net/ipv4/conf/cfab-mg-fb/send_redirects
+write /proc/sys/net/ipv4/conf/cfab-mg-fb/forwarding
+ip link set cfab-mg-fb up
+ip rule show pref 2000
+ip rule add pref 2000 from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0
+ip rule show pref 2001
+ip rule add pref 2001 from 10.99.0.0/16 lookup 99
+ip rule show pref 2002
+ip rule add pref 2002 from 10.99.0.0/16 unreachable
+ip rule show pref 2000
+ip rule add pref 2000 from 10.199.0.0/16 to 10.199.0.0/16 lookup main suppress_prefixlength 0
+ip rule show pref 2001
+ip rule add pref 2001 from 10.199.0.0/16 lookup 199
+ip rule show pref 2002
+ip rule add pref 2002 from 10.199.0.0/16 unreachable
+ip rule show pref 2000
+ip rule add pref 2000 from 10.249.0.0/16 to 10.249.0.0/16 lookup main suppress_prefixlength 0
+ip rule show pref 2001
+ip rule add pref 2001 from 10.249.0.0/16 lookup 249
+ip rule show pref 2002
+ip rule add pref 2002 from 10.249.0.0/16 unreachable
+ip rule show pref 1000
+ip rule add pref 1000 to 10.99.0.0/16 iif lo lookup main
+ip rule show pref 1001
+ip rule add pref 1001 to 10.99.0.0/16 unreachable
+ip rule show pref 1000
+ip rule add pref 1000 to 10.199.0.0/16 iif lo lookup main
+ip rule show pref 1001
+ip rule add pref 1001 to 10.199.0.0/16 unreachable
+ip rule show pref 1000
+ip rule add pref 1000 to 10.249.0.0/16 iif lo lookup main
+ip rule show pref 1001
+ip rule add pref 1001 to 10.249.0.0/16 unreachable
+write /run/cfab/mark.backend
+/usr/bin/env sh -c command -v iptables-legacy
+/usr/bin/env sh -c command -v iptables-legacy-save
+iptables-legacy-save -t mangle
+rm /run/cfab/mark.ipt
+write /run/cfab/mark.nft
+nft -f /run/cfab/mark.nft
+nft -s list table inet cfab
+write /run/cfab/mark.applied

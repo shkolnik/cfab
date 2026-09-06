@@ -1072,12 +1072,19 @@ fn watchdog_tick(sys: &mut dyn Sys, view: &View, shared: &Arc<Mutex<Shared>>) {
 }
 
 /// The forwarding watchdog tick's outcome, for `components` (spec §5): one of `ok` | `actuated`
-/// | `failed-closed` | `blocked` | `error`, plus the first line of detail.
+/// | `rebuilt` | `failed-closed` | `blocked` | `error`, plus the first line of detail.
+///
+/// `rebuilt` ranks after the two conditions that mean something is WRONG right now (a member
+/// failed closed, or a hazard was amputated) and before the rest: putting a re-enumerated wire's
+/// legs back is a repair that leaves the member healthy, and the operator wants to see it said —
+/// `status` renders it as `watchdog rebuilt 2s ago (rebuilt storage/cfab-st on eth9)`.
 fn summarize_watchdog(report: &fwd_watchdog::WatchdogReport) -> (String, Option<String>) {
     if let Some(f) = &report.failed {
         ("failed-closed".to_string(), Some(f.clone()))
     } else if let Some(d) = report.downed.first() {
         ("actuated".to_string(), Some(d.clone()))
+    } else if let Some(r) = report.rebuilt.first() {
+        ("rebuilt".to_string(), Some(r.clone()))
     } else if let Some(b) = report.blocked.first() {
         ("blocked".to_string(), Some(b.clone()))
     } else if let Some(u) = report.unrestored.first() {
@@ -1765,6 +1772,63 @@ mod tests {
         );
     }
 
+    /// A tick that put a re-enumerated wire's legs back is neither `ok` (something happened the
+    /// operator wants to see) nor `actuated` (nothing was brought down): it is `rebuilt`, ranked
+    /// after the two conditions that mean the member is unwell, with the first leg as detail.
+    /// `status` renders it as `watchdog rebuilt 2s ago (rebuilt storage/cfab-st on eth9)`.
+    #[test]
+    fn a_rebuilt_leg_summarizes_to_rebuilt() {
+        let rebuilt = |extra: fn(&mut fwd_watchdog::WatchdogReport)| {
+            let mut r = fwd_watchdog::WatchdogReport {
+                failed: None,
+                corrected: Vec::new(),
+                blocked: Vec::new(),
+                resolved: None,
+                restored: Vec::new(),
+                downed: Vec::new(),
+                unrestored: Vec::new(),
+                rebuilt: vec![
+                    "rebuilt storage/cfab-st on eth9".to_string(),
+                    "rebuilt cluster/cfab-cl-bk on eth9".to_string(),
+                ],
+                transit_cost_error: None,
+            };
+            extra(&mut r);
+            summarize_watchdog(&r)
+        };
+        assert_eq!(
+            rebuilt(|_| {}),
+            (
+                "rebuilt".to_string(),
+                Some("rebuilt storage/cfab-st on eth9".to_string())
+            )
+        );
+        // ...but never ahead of a member that failed closed or had something amputated.
+        assert_eq!(
+            rebuilt(|r| r.downed.push("fallback storage down".to_string())).0,
+            "actuated"
+        );
+        assert_eq!(
+            rebuilt(|r| r.failed = Some("no policy".to_string())).0,
+            "failed-closed"
+        );
+        // An empty `rebuilt` is the ordinary tick and stays `ok`.
+        let mut r = fwd_watchdog::WatchdogReport {
+            failed: None,
+            corrected: Vec::new(),
+            blocked: Vec::new(),
+            resolved: None,
+            restored: Vec::new(),
+            downed: Vec::new(),
+            unrestored: Vec::new(),
+            rebuilt: Vec::new(),
+            transit_cost_error: None,
+        };
+        assert_eq!(summarize_watchdog(&r), ("ok".to_string(), None));
+        r.unrestored.push("stuck".to_string());
+        assert_eq!(summarize_watchdog(&r).0, "error");
+    }
+
     /// A healthy leaf forwarding posture for `fwd_watchdog::run` (mirrors its own leaf fixture):
     /// every L3 leg's `rp_filter` loose and `forwarding` off, every `ip rule` cfab installed
     /// present, and each fallback bond active on a slave of ours.
@@ -1812,7 +1876,9 @@ mod tests {
                 &format!("{}\n", home.ifname),
             );
         }
-        sys
+        // Every declared leg present and of cfab's own kind — the rebuild step must find
+        // nothing to do. One definition, shared with the watchdog's own fixture.
+        crate::commands::fwd_watchdog::tests::legs_present(sys, view)
     }
 
     /// A pmxcfs root whose `.members` reports a quorate cluster, so the conf-sync predicate

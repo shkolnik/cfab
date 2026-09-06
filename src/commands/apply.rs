@@ -382,20 +382,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         )?;
     }
     for r in class_rows.iter().filter(|r| !absent.contains(&r.wire)) {
-        let z = f.zone(&r.zone)?;
-        mk_vlan(
-            sys,
-            &r.ifname,
-            &r.wire,
-            r.vid,
-            Some(&format!("{}/24", view.segment_addr(z, r.seg))),
-            true,
-            &[
-                &format!("0:{}", z.pcp),
-                &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
-            ],
-        )?;
-        class_sysctls(sys, &r.ifname)?;
+        build_class_leg(sys, view, r)?;
     }
     // The ingress leg: the router's VLAN, this node's address in the router's /24. Same
     // sysctls as a backup segment; nothing else about it is a segment. On a gw domain of
@@ -405,10 +392,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         let z = f.zone(&r.zone)?;
         let gw = z.gw.as_ref().expect("gw_rows lists gw zones");
         let cidr = gw.leg_cidr(n);
-        let qos_map = [
-            format!("0:{}", z.pcp),
-            format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
-        ];
+        let qos_map = qos_map(f, z);
         let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
         if r.migrates() {
             let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
@@ -426,8 +410,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 &qos_map,
             )?;
         } else if !absent.contains(&r.home) {
-            mk_vlan(sys, &r.ifname, &r.home, r.vid, Some(&cidr), true, &qos_map)?;
-            class_sysctls(sys, &r.ifname)?;
+            build_gw_vlan_leg(sys, view, r)?;
         }
         // cfab's own return-path default: a reply sourced from an identity address must leave
         // through the ingress leg (proto 205, this member's own id), never untagged out of the
@@ -463,10 +446,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 slaves: &slaves,
                 cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
             },
-            &[
-                &format!("0:{}", z.pcp),
-                &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
-            ],
+            &qos_map(f, z).iter().map(String::as_str).collect::<Vec<_>>(),
         )?;
     }
 
@@ -581,7 +561,12 @@ fn mk_identity(sys: &mut dyn Sys, name: &str, cidr: &str) -> Result<()> {
 /// A tagged sub-interface on `lower`. `addr` is `None` for a link that carries no L3 of its
 /// own (a fallback bond's slave: the bond holds the address), and `bring_up` is false for a link
 /// something else brings up later (enslaving wants the slave down first).
-fn mk_vlan(
+/// The `ip -d link show` marker that proves a netdev is a vlan sub-interface of this vid.
+pub(crate) fn vlan_marker(vid: u16) -> String {
+    format!("vlan protocol 802.1Q id {vid} ")
+}
+
+pub(crate) fn mk_vlan(
     sys: &mut dyn Sys,
     name: &str,
     lower: &str,
@@ -591,9 +576,7 @@ fn mk_vlan(
     qos_map: &[&str],
 ) -> Result<()> {
     let vid_s = vid.to_string();
-    if link_exists(sys, name)?
-        && !link_kind_is(sys, name, &format!("vlan protocol 802.1Q id {vid} "))?
-    {
+    if link_exists(sys, name)? && !link_kind_is(sys, name, &vlan_marker(vid))? {
         run_ok(sys, &["ip", "link", "del", name])?;
     }
     if !link_exists(sys, name)? {
@@ -621,6 +604,60 @@ fn mk_vlan(
         run_ok(sys, &["ip", "link", "set", name, "up"])?;
     }
     Ok(())
+}
+
+/// The `egress-qos-map` every leg of a zone is created with: the zone's own PCP for untagged
+/// priority, and the control PCP mapped to itself. One definition — `apply` builds a leg with
+/// it and the forwarding watchdog rebuilds one with it, so the two cannot drift.
+pub(crate) fn qos_map(f: &crate::model::Fabric, z: &crate::model::Zone) -> [String; 2] {
+    [
+        format!("0:{}", z.pcp),
+        format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
+    ]
+}
+
+/// One class-segment leg, exactly as the per-class-netdevs section builds it: the tagged
+/// sub-interface with this member's segment address, then the segment sysctls (which leave
+/// `forwarding=0`; `enable_forwarding` raises it later on a transiting host).
+pub(crate) fn build_class_leg(
+    sys: &mut dyn Sys,
+    view: &View,
+    r: &crate::derive::ClassRow,
+) -> Result<()> {
+    let f = view.fabric;
+    let z = f.zone(&r.zone)?;
+    let qm = qos_map(f, z);
+    mk_vlan(
+        sys,
+        &r.ifname,
+        &r.wire,
+        r.vid,
+        Some(&format!("{}/24", view.segment_addr(z, r.seg))),
+        true,
+        &qm.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    class_sysctls(sys, &r.ifname)
+}
+
+/// One NON-migrating ingress leg (a gw on a physical domain): a plain tagged sub-interface on
+/// the leg's `home` wire, addressed in the router's /24. The return-path default is installed
+/// by the caller — `apply` does it for every gw row, the watchdog through
+/// `restore_gw_return_defaults`.
+pub(crate) fn build_gw_vlan_leg(sys: &mut dyn Sys, view: &View, r: &GwRow) -> Result<()> {
+    let f = view.fabric;
+    let z = f.zone(&r.zone)?;
+    let gw = z.gw.as_ref().expect("gw_rows lists gw zones");
+    let qm = qos_map(f, z);
+    mk_vlan(
+        sys,
+        &r.ifname,
+        &r.home,
+        r.vid,
+        Some(&gw.leg_cidr(view.node())),
+        true,
+        &qm.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    class_sysctls(sys, &r.ifname)
 }
 
 /// Bond `updelay` in ms — how long a returning wire must hold carrier before it is reselected.
@@ -652,14 +689,14 @@ const FALLBACK_PRIMARY_RESELECT: &str = "always";
 
 /// A migrating leg to build: a universal segment, or an ingress leg on gw scope `any`. The two
 /// are the same netdev shape, so they are the same code — only the address differs.
-struct BondLeg<'a> {
-    ifname: &'a str,
-    vid: u16,
+pub(crate) struct BondLeg<'a> {
+    pub(crate) ifname: &'a str,
+    pub(crate) vid: u16,
     /// The wire whose slave the bond takes as `primary`.
-    home: &'a str,
-    slaves: &'a [Slave],
+    pub(crate) home: &'a str,
+    pub(crate) slaves: &'a [Slave],
     /// The bond is the L3 interface; its slaves carry no address.
-    cidr: &'a str,
+    pub(crate) cidr: &'a str,
 }
 
 /// Every bond parameter this build creates a leg with, in `bonding/` sysfs spelling: the file
@@ -712,15 +749,12 @@ fn bond_params_match(sys: &dyn Sys, ifname: &str) -> Result<()> {
 /// One migrating leg: an active-backup bond over a tagged sub-interface of every wire this
 /// member has, addressed like a segment. Idempotent, and refuse-unless-ours on every netdev
 /// it touches.
-fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
+pub(crate) fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
     // (1) the bond. Unlike a vlan of the wrong id, a same-named foreign netdev here is not
     // ours to delete — refuse and say so.
     if link_exists(sys, r.ifname)? {
         if !link_kind_is(sys, r.ifname, " bond ")? {
-            return Err(Error::fatal(format!(
-                "REFUSING: {} exists but is not a bond",
-                r.ifname
-            )));
+            return Err(Error::fatal(not_a_bond(r.ifname)));
         }
         bond_params_match(sys, r.ifname)?;
     } else {
@@ -751,59 +785,102 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
     // applied on the slave, and PCP is per frame, so control on the fallback path is queued like
     // control anywhere.
     for s in r.slaves {
-        mk_vlan(sys, &s.ifname, &s.wire, r.vid, None, false, qos_map)?;
-        // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
-        // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
-        // to whom (the master link cannot be read as a file — it is a symlink to a directory).
-        let enslaved_anywhere = sys.exists(&format!("/sys/class/net/{}/master", s.ifname));
-        let enslaved_here =
-            enslaved_anywhere && link_kind_is(sys, &s.ifname, &format!(" master {} ", r.ifname))?;
-        if enslaved_anywhere && !enslaved_here {
-            // Enslaved, but not to us. The kernel would answer the `master` set with a bare
-            // EBUSY; say what is actually wrong instead.
-            return Err(Error::fatal(format!(
-                "REFUSING: {} is enslaved to another bond",
-                s.ifname
-            )));
-        }
-        if !enslaved_here {
-            run_ok(sys, &["ip", "link", "set", &s.ifname, "master", r.ifname])?;
-        }
-        run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
-        // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
-        // means forwarding=1 — the same hazard `mk_identity` guards against. `up` only zeroes
-        // conf/default on a HOST; a LEAF has fallback rows and is deliberately left alone there,
-        // so the explicit write is the only thing that holds `owned_forwarding()`'s false.
-        proc_sysctl(sys, &s.ifname, "forwarding", "0")?;
+        add_bond_slave(sys, r.ifname, s, r.vid, qos_map)?;
     }
     // (4) AFTER the slaves exist: `primary` names a SLAVE, and at `ip link add` time no slave
     // exists yet, so setting it there is a silent no-op.
-    let home = r.slaves.iter().find(|s| s.wire == r.home).ok_or_else(|| {
-        Error::fatal(format!(
-            "{}: home wire {} carries no slave of this bond",
-            r.ifname, r.home
-        ))
-    })?;
+    let home = home_slave(r.ifname, r.slaves, r.home)?;
+    set_bond_primary(sys, r.ifname, &home.ifname)?;
+    // (5) the bond is the segment: address, segment sysctls, up.
+    run_ok(sys, &["ip", "addr", "replace", r.cidr, "dev", r.ifname])?;
+    class_sysctls(sys, r.ifname)?;
+    run_ok(sys, &["ip", "link", "set", r.ifname, "up"])?;
+    Ok(())
+}
+
+/// One slave of a bond leg, exactly as `mk_bond_leg` builds it: the tagged sub-interface DOWN
+/// and address-less with the leg's qos map, enslaved (never re-enslaved — that is EBUSY), up,
+/// and `forwarding=0` written explicitly. Callable for ONE slave so the forwarding watchdog can
+/// put back the legs a re-enumerated wire took with it, in the same argv as `apply`.
+pub(crate) fn add_bond_slave(
+    sys: &mut dyn Sys,
+    bond: &str,
+    s: &Slave,
+    vid: u16,
+    qos_map: &[&str],
+) -> Result<()> {
+    mk_vlan(sys, &s.ifname, &s.wire, vid, None, false, qos_map)?;
+    // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
+    // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
+    // to whom (the master link cannot be read as a file — it is a symlink to a directory).
+    let enslaved_anywhere = sys.exists(&format!("/sys/class/net/{}/master", s.ifname));
+    let enslaved_here =
+        enslaved_anywhere && link_kind_is(sys, &s.ifname, &format!(" master {bond} "))?;
+    if enslaved_anywhere && !enslaved_here {
+        // Enslaved, but not to us. The kernel would answer the `master` set with a bare
+        // EBUSY; say what is actually wrong instead.
+        return Err(Error::fatal(enslaved_elsewhere(&s.ifname)));
+    }
+    if !enslaved_here {
+        run_ok(sys, &["ip", "link", "set", &s.ifname, "master", bond])?;
+    }
+    run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
+    // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
+    // means forwarding=1 — the same hazard `mk_identity` guards against. `up` only zeroes
+    // conf/default on a HOST; a LEAF has fallback rows and is deliberately left alone there,
+    // so the explicit write is the only thing that holds `owned_forwarding()`'s false.
+    proc_sysctl(sys, &s.ifname, "forwarding", "0")
+}
+
+/// Re-assert the bond's `primary` and `primary_reselect`. Idempotent, and the ONLY way to set
+/// `primary` — it names a slave, so at `ip link add` time it is a silent no-op.
+pub(crate) fn set_bond_primary(sys: &mut dyn Sys, bond: &str, home_slave: &str) -> Result<()> {
     run_ok(
         sys,
         &[
             "ip",
             "link",
             "set",
-            r.ifname,
+            bond,
             "type",
             "bond",
             "primary",
-            &home.ifname,
+            home_slave,
             "primary_reselect",
             FALLBACK_PRIMARY_RESELECT,
         ],
     )?;
-    // (5) the bond is the segment: address, segment sysctls, up.
-    run_ok(sys, &["ip", "addr", "replace", r.cidr, "dev", r.ifname])?;
-    class_sysctls(sys, r.ifname)?;
-    run_ok(sys, &["ip", "link", "set", r.ifname, "up"])?;
     Ok(())
+}
+
+/// The slave carrying a bond leg's `home` wire — the one `primary` names.
+pub(crate) fn home_slave<'a>(bond: &str, slaves: &'a [Slave], home: &str) -> Result<&'a Slave> {
+    slaves.iter().find(|s| s.wire == home).ok_or_else(|| {
+        Error::fatal(format!(
+            "{bond}: home wire {home} carries no slave of this bond"
+        ))
+    })
+}
+
+/// One spelling per condition (spec §9 string table), shared by `apply` and the forwarding
+/// watchdog's rebuild step so the operator sees the same sentence whichever found it.
+pub(crate) fn not_a_bond(ifname: &str) -> String {
+    format!("REFUSING: {ifname} exists but is not a bond")
+}
+
+pub(crate) fn enslaved_elsewhere(ifname: &str) -> String {
+    format!("REFUSING: {ifname} is enslaved to another bond")
+}
+
+/// A netdev holding a cfab VLAN leg's name but of another kind. `apply` DELETES such a netdev
+/// and re-creates it (it is cfab's by name, and an `up` is an operator-driven act); the
+/// forwarding watchdog will not delete a live netdev on a three-second tick, so it says this
+/// instead and leaves the leg unbuilt.
+pub(crate) fn not_our_vlan(ifname: &str, lower: &str, vid: u16) -> String {
+    format!(
+        "REFUSING: {ifname} exists but is not a vlan id {vid} sub-interface of {lower} — the \
+         watchdog never deletes a live netdev; re-run cfab up"
+    )
 }
 
 /// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A fallback bond is not a
@@ -835,7 +912,7 @@ pub fn describe_down(view: &View, down: &[String]) -> Vec<String> {
 
 /// Measured live: arp_ignore=1 (NOT arp_filter — it flaps BFD); rp_filter LOOSE on every
 /// segment (strict on a primary black-holed control for ~5 s when all links returned at once).
-fn class_sysctls(sys: &mut dyn Sys, ifname: &str) -> Result<()> {
+pub(crate) fn class_sysctls(sys: &mut dyn Sys, ifname: &str) -> Result<()> {
     proc_sysctl(sys, ifname, "arp_ignore", "1")?;
     proc_sysctl(sys, ifname, "rp_filter", "2")?;
     proc_sysctl(sys, ifname, "send_redirects", "0")?;
@@ -1508,6 +1585,31 @@ mod tests {
             got,
             ["mgmt/cfab-gw249 (no wire with carrier under it)".to_string()]
         );
+    }
+
+    /// The WHOLE recorded sequence of a from-scratch `apply`, argv by argv and write by write,
+    /// for a forwarding host and for a leaf. The per-leg builders below are shared with the
+    /// forwarding watchdog's rebuild step (`fwd_watchdog::restore_missing_legs`), which exists
+    /// precisely so the two spellings cannot drift — this pins the other half of that bargain:
+    /// factoring a builder out must not move one byte of what `apply` issues, in what order.
+    #[test]
+    fn the_whole_apply_sequence_is_pinned() {
+        for member in ["pve1-tb", "pve3-tb"] {
+            let f = fabric();
+            let view = View::new(&f, member).unwrap();
+            let mut sys = absent_fallback_netdevs(up_sys(&view), &view);
+            run(&mut sys, &view, &opts()).unwrap();
+            let got = format!("{}\n", sys.calls.join("\n"));
+            let path = format!(
+                "{}/tests/fixtures/apply-argv-{member}.txt",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let want = std::fs::read_to_string(&path).unwrap_or_default();
+            if got != want {
+                std::fs::write(format!("{path}.actual"), &got).unwrap();
+                panic!("the apply sequence for {member} changed; see {path}.actual");
+            }
+        }
     }
 
     /// VRRP was deleted (the NAS is a fabric leaf, James 2026-09-02): a forwarding host's
