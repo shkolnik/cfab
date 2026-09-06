@@ -3,17 +3,12 @@
 //! the operational document) and `transit-cost leaf|normal` (re-advertise this member's
 //! transit links at the leaf offset, or at the declared cost — spec §12 (b)).
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
-use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::emit::engine::TransitCost;
 use crate::error::{Error, Result};
-
-const CLIENT_IO: Duration = Duration::from_secs(2);
 
 /// One request line, already parsed. An unknown verb never reaches the handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +38,7 @@ pub fn parse_request(line: &str) -> Option<Request> {
 /// process that died without a lock (a lock is held only from `hold()` onward — nothing
 /// answers this socket if that process's flock is free).
 pub fn refuse_if_live(sock_path: &Path) -> Result<()> {
-    if answers(sock_path) {
+    if crate::sock_frame::answers(sock_path, "state") {
         return Err(Error::fatal(format!(
             "another engine is running (answering on {}); stop it first (cfab down)",
             sock_path.display()
@@ -57,26 +52,7 @@ pub fn refuse_if_live(sock_path: &Path) -> Result<()> {
 /// real guard is the `engine.lock` flock, taken before this is ever called; this is the
 /// cheap re-check at readiness time.
 pub fn bind(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        refuse_if_live(path)?;
-        std::fs::remove_file(path)
-            .map_err(|e| Error::fatal(format!("cannot remove stale {}: {e}", path.display())))?;
-    }
-    crate::sock_frame::bind(path)
-}
-
-/// Does a process answer `state\n` on this socket?
-fn answers(path: &Path) -> bool {
-    let Ok(mut s) = StdUnixStream::connect(path) else {
-        return false;
-    };
-    let _ = s.set_read_timeout(Some(CLIENT_IO));
-    let _ = s.set_write_timeout(Some(CLIENT_IO));
-    if s.write_all(b"state\n").is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 1];
-    matches!(s.read(&mut buf), Ok(n) if n > 0)
+    crate::sock_frame::bind_reclaiming(path, "state", "engine")
 }
 
 /// Serve one accepted connection: read the request line, reply with `respond`'s JSON.
@@ -98,7 +74,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream as StdUnixStream;
 
     use super::*;
 

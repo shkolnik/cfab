@@ -373,6 +373,29 @@ pub(crate) async fn run_with(
         }
     };
 
+    // 1b. The operator socket, before the apply: a supervisor nobody can talk to must not start
+    // a fabric. A path left by a SIGKILLed predecessor is reclaimed (nothing answers on it); a
+    // live answer is another supervisor — the same refusal as the lock, by name.
+    let cfab_sock = std::path::PathBuf::from(&run_dir).join("cfab.sock");
+    let sock_listener = if hooks.serve_socket {
+        if crate::sock_frame::answers(&cfab_sock, "components") {
+            eprintln!(
+                "REFUSING: another cfab supervisor answers on {}",
+                cfab_sock.display()
+            );
+            return EXIT_LOCK_HELD;
+        }
+        match sock::bind(&cfab_sock) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("cfab run: {e}");
+                return EXIT_INTERNAL;
+            }
+        }
+    } else {
+        None
+    };
+
     let shared = hooks
         .shared
         .unwrap_or_else(|| Arc::new(Mutex::new(Shared::new(pid))));
@@ -502,15 +525,14 @@ pub(crate) async fn run_with(
             .mark_stopped("conf-sync", "not clustered");
     }
 
-    // 5. The operator surface: the `cfab.sock` server.
-    if hooks.serve_socket {
+    // 5. The operator surface: the `cfab.sock` server, on the listener bound at 1b.
+    if let Some(listener) = sock_listener {
         let source = Arc::new(SockSource {
             shared: shared.clone(),
             cmd_tx: cmd_tx.clone(),
         });
-        let path = std::path::PathBuf::from(&run_dir).join("cfab.sock");
         tokio::spawn(async move {
-            if let Err(e) = sock::serve(source, &path).await {
+            if let Err(e) = sock::serve(source, listener).await {
                 tracing::warn!(%e, "cfab.sock server stopped");
             }
         });

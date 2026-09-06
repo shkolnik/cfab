@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::net::UnixListener;
+
 use super::report::Components;
 use crate::error::{Error, Result};
 
@@ -55,13 +57,19 @@ pub fn respond<S: ComponentsSource + ?Sized>(source: &S, line: &str) -> Result<s
     }
 }
 
-/// Bind `path` (mode 0600) and serve until the task is dropped. One connection per request:
-/// the client writes one line, we write one JSON object and close.
-pub async fn serve<S>(source: Arc<S>, path: &Path) -> Result<()>
+/// Bind `cfab.sock` (mode 0600), reclaiming the path a SIGKILLed predecessor left behind;
+/// a live supervisor answering `components` on it is a refusal. Separate from `serve` so the
+/// supervisor binds synchronously and a failure is its exit, not a warning in a task.
+pub fn bind(path: &Path) -> Result<UnixListener> {
+    crate::sock_frame::bind_reclaiming(path, "components", "supervisor")
+}
+
+/// Serve `listener` until the task is dropped. One connection per request: the client writes
+/// one line, we write one JSON object and close.
+pub async fn serve<S>(source: Arc<S>, listener: UnixListener) -> Result<()>
 where
     S: ComponentsSource + Send + Sync + 'static,
 {
-    let listener = crate::sock_frame::bind(path)?;
     loop {
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
@@ -123,13 +131,39 @@ mod tests {
     fn start(apply_fails: bool) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cfab.sock");
-        let p = path.clone();
+        start_in(dir, path, apply_fails)
+    }
+
+    fn start_in(
+        dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        apply_fails: bool,
+    ) -> (tempfile::TempDir, String) {
+        let listener = bind(&path).unwrap();
         tokio::spawn(async move {
-            serve(std::sync::Arc::new(Fake { apply_fails }), &p)
+            serve(std::sync::Arc::new(Fake { apply_fails }), listener)
                 .await
                 .unwrap();
         });
         (dir, path.to_string_lossy().into_owned())
+    }
+
+    /// The live 2026-09-06 defect: the leaf container was SIGKILLed, `/run/cfab/cfab.sock`
+    /// survived, and the restarted supervisor's bind failed on the leftover path — logged as a
+    /// warning nobody saw, leaving `status` with "no supervisor answering" until `down`/`up`.
+    /// A stale path must be reclaimed and the new supervisor must answer on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_cfab_sock_left_by_a_killed_supervisor_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfab.sock");
+        drop(crate::sock_frame::bind(&path).unwrap());
+        assert!(path.exists(), "the predecessor's path is still there");
+        let (_dir, p) = start_in(dir, path, false);
+        let v = ask(&p, "components").await;
+        assert_eq!(
+            v["components"][0]["name"], "engine",
+            "the new supervisor answers: {v}"
+        );
     }
 
     async fn ask(path: &str, line: &str) -> serde_json::Value {
