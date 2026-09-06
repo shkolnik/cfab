@@ -25,8 +25,11 @@ and
 .BR nft (8):
 every member installs
 .BR "table inet cfab" ,
-which carries the traffic-class marking and the fallback control-egress
-ceiling. A
+which carries the per-zone bulk DSCP clamp and the fallback control-egress
+ceiling. This member's own OSPF and BFD are marked by the engine itself
+(DSCP_CTRL, and skb-priority PCP_CTRL onto the wire through the segment
+sub-interface's egress-qos-map), not by that table, which lets them past the
+clamp untouched. A
 .B host
 additionally needs
 .BR tc (8)
@@ -61,7 +64,7 @@ Print a generated artifact: the nft forward policy (table inet cfab-fwd:
 default-deny for anything touching a cfab interface, declared pairs pass, the
 admin NIC never transits, packets touching no cfab interface are accepted as
 another stack's business), the traffic-class marking (table inet cfab: the
-PCP and DSCP planes plus one derived control-egress ceiling per fallback
+per-zone bulk DSCP clamp plus one derived control-egress ceiling per fallback
 bond), or
 this member's routing-engine configuration tree (JSON).
 .TP
