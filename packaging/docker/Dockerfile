@@ -13,9 +13,12 @@ FROM debian:trixie-slim
 ARG CFAB_DEB=cfab.deb
 COPY ${CFAB_DEB} /tmp/cfab.deb
 
-# apt pulls the deb's own Depends (nftables, iproute2, ethtool) — that is the whole runtime
-# chain; nothing extra is baked in. Add diagnostic tools (tcpdump, iputils-ping, ...) in a
-# derived image if a deployment wants them — they are not part of the generic contract.
+# apt pulls the deb's own Depends (nftables, iptables, iproute2, ethtool) — that is the whole
+# runtime chain; nothing extra is baked in. iptables is there for the ceiling-only fallback a
+# leaf takes on a kernel without nf_tables (the -legacy binaries; the image's own kernel is the
+# host's, so which one is used is decided at `cfab up`, not at build time). Add diagnostic
+# tools (tcpdump, iputils-ping, ...) in a derived image if a deployment wants them — they are
+# not part of the generic contract.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends /tmp/cfab.deb \
  && rm -rf /var/lib/apt/lists/* /tmp/cfab.deb

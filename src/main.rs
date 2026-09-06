@@ -117,12 +117,25 @@ enum ConfAction {
     Publish,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum MarkBackendArg {
+    Nft,
+    IptablesLegacy,
+}
+
 #[derive(Subcommand)]
 enum GenArtifact {
     /// The nft forward policy (table inet cfab-fwd)
     Policy,
-    /// The traffic-class marking (table inet cfab)
-    Mark,
+    /// The traffic-class marking (table inet cfab), or the leaf ceiling for a kernel
+    /// without nf_tables
+    Mark {
+        /// Which backend to render for. `iptables-legacy` is the ceiling-only fallback a
+        /// leaf takes on a kernel without nf_tables; offline rendering must be able to show
+        /// either, so this is a flag and not a probe.
+        #[arg(long, value_enum, default_value_t = MarkBackendArg::Nft)]
+        backend: MarkBackendArg,
+    },
     /// This member's routing-engine configuration tree (JSON)
     Engine,
     /// The floor+borrow HTB derivation for one physical NIC
@@ -312,7 +325,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Gen { artifact } => {
             match artifact {
                 GenArtifact::Policy => print!("{}", emit::policy::generate(&view)?),
-                GenArtifact::Mark => print!("{}", emit::mark::generate(&view)?),
+                GenArtifact::Mark { backend } => match backend {
+                    MarkBackendArg::Nft => print!("{}", emit::mark::generate(&view)?),
+                    MarkBackendArg::IptablesLegacy => {
+                        print!("{}", emit::ceiling_ipt::generate(&view)?)
+                    }
+                },
                 GenArtifact::Engine => {
                     let tree = emit::engine::generate(&view)?;
                     println!(
