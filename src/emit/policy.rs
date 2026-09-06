@@ -139,4 +139,36 @@ mod tests {
             }
         }
     }
+
+    /// Every wire of a HOST is the admin plane (its untagged path), so the admin set lists
+    /// them all and the first two rules drop anything forwarded in or out of any of them. A
+    /// leaf owns none of it: the set is present but empty, and an empty `@admin` matches
+    /// nothing, so the drop rules are inert rather than absent.
+    #[test]
+    fn the_admin_set_is_every_wire_on_a_host_and_empty_on_a_leaf() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let line = |out: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with("set admin "))
+                .unwrap()
+                .to_string()
+        };
+        let out = generate(&host).unwrap();
+        let set_line = line(&out);
+        for wire in host.wires() {
+            assert!(
+                set_line.contains(&format!("\"{wire}\"")),
+                "host admin set missing {wire}: {set_line}"
+            );
+        }
+        assert_eq!(set_line.matches('"').count() / 2, host.wires().len());
+
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let leaf_out = generate(&leaf).unwrap();
+        assert_eq!(line(&leaf_out).trim(), "set admin { type ifname; }");
+        for rule in ["iifname @admin counter drop", "oifname @admin counter drop"] {
+            assert!(leaf_out.contains(rule), "leaf lost {rule}");
+        }
+    }
 }

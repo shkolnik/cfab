@@ -1064,6 +1064,289 @@ mod tests {
         );
     }
 
+    // ---- G2: shapes the reference declaration does not have -------------------------
+
+    /// A conf built from the example by replacing whole table blocks, so these fabrics stay
+    /// readable next to the reference one and keep every unrelated key.
+    fn conf_with(blocks: &[(&str, &str)]) -> String {
+        let mut t = conf_text();
+        for (key, body) in blocks {
+            let head = format!("{key}=\"");
+            let start = t
+                .find(&head)
+                .unwrap_or_else(|| panic!("no {key} in the example conf"));
+            let end = t[start + head.len()..]
+                .find('"')
+                .expect("unterminated value")
+                + start
+                + head.len();
+            t.replace_range(start..=end, &format!("{key}=\"{body}\""));
+        }
+        t
+    }
+
+    fn from_blocks(blocks: &[(&str, &str)]) -> Result<Fabric> {
+        Fabric::from_raw(&RawConfig::parse(&conf_with(blocks)).unwrap())
+    }
+
+    fn order_of(f: &Fabric, member: &str, zone: &str) -> Vec<String> {
+        prefs_of(f, f.member(member).unwrap())
+            .into_iter()
+            .find(|p| p.zone == zone)
+            .unwrap()
+            .order
+    }
+
+    /// A member with ONE wire is not a special case: it is rank 0 in every zone (the zone's
+    /// primary domain when it happens to be there, the only candidate otherwise), so every
+    /// segment it carries costs 10 and it still gets the universal bond — over one slave.
+    #[test]
+    fn a_one_wire_member_ranks_that_wire_first_in_every_zone() {
+        let f = edited(|t| {
+            *t = t
+                .replace(
+                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                    "pve1-tb 1 host eth9@a:5000",
+                )
+                .replace(
+                    "USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"",
+                    "USB_NICS=\"pve2-tb:eth9\"",
+                );
+        });
+        let m = f.member("pve1-tb").unwrap();
+        for zone in ["storage", "cluster", "mgmt"] {
+            assert_eq!(order_of(&f, "pve1-tb", zone), vec!["eth9"], "{zone}");
+        }
+        let rows: Vec<(String, u32)> = class_rows_of(&f, m)
+            .into_iter()
+            .map(|r| (r.ifname, r.ospf_cost))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("cfab-st".to_string(), 10),
+                ("cfab-cl-bk".to_string(), 10),
+                ("cfab-mg-b2".to_string(), 10),
+            ],
+            "one wire = rank 0 everywhere, including the zones it is only a backup domain for"
+        );
+        let fb = fallback_rows_of(&f, m);
+        assert_eq!(fb.len(), 3);
+        for r in &fb {
+            assert_eq!(
+                r.slaves
+                    .iter()
+                    .map(|s| s.ifname.clone())
+                    .collect::<Vec<_>>(),
+                vec![format!("{}-a", r.ifname)],
+                "a one-wire member still gets the bond, over its single wire"
+            );
+            assert_eq!(r.home, "eth9");
+        }
+    }
+
+    /// Four wires on four domains: rank 0 is the zone's primary domain and the other three
+    /// follow by DECLARED speed descending, so the ladder runs 10/100/200/300.
+    #[test]
+    fn a_four_wire_member_ranks_primary_then_speed_across_four_domains() {
+        let f = from_blocks(&[
+            ("DOMAINS", "a b c d"),
+            (
+                "MEMBER_TABLE",
+                "
+pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500
+pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500
+pve3-tb 3 leaf eth9@a:10000 eth1@b:1000 eth0@c:1000
+",
+            ),
+            (
+                "SEGMENT_TABLE",
+                "
+cfab-st     a   storage 1 100
+cfab-st-bk  b   storage 2 101
+cfab-st-b2  c   storage 3 102
+cfab-st-b3  d   storage 4 103
+cfab-cl     b   cluster 1 200
+cfab-cl-bk  a   cluster 2 201
+cfab-cl-b2  c   cluster 3 202
+cfab-cl-b3  d   cluster 4 203
+cfab-mg     c   mgmt    1 250
+cfab-mg-bk  b   mgmt    2 251
+cfab-mg-b2  a   mgmt    3 252
+cfab-mg-b3  d   mgmt    4 253
+cfab-st-fb  any storage 9 300
+cfab-cl-fb  any cluster 9 301
+cfab-mg-fb  any mgmt    9 302
+",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            order_of(&f, "pve1-tb", "storage"),
+            vec!["eth9", "eth2", "eth1", "eth0"],
+            "primary a, then 2500, then the two 1000s in MEMBER_TABLE order"
+        );
+        assert_eq!(
+            order_of(&f, "pve1-tb", "cluster"),
+            vec!["eth1", "eth9", "eth2", "eth0"]
+        );
+        assert_eq!(
+            order_of(&f, "pve1-tb", "mgmt"),
+            vec!["eth0", "eth9", "eth2", "eth1"]
+        );
+        let costs: Vec<(String, u32)> = class_rows_of(&f, f.member("pve1-tb").unwrap())
+            .into_iter()
+            .filter(|r| r.zone == "storage")
+            .map(|r| (r.wire, r.ospf_cost))
+            .collect();
+        assert_eq!(
+            costs,
+            vec![
+                ("eth9".to_string(), 10),
+                ("eth1".to_string(), 200),
+                ("eth0".to_string(), 300),
+                ("eth2".to_string(), 100),
+            ],
+            "the ladder is rank-indexed, not table-indexed"
+        );
+        // The leaf has no wire on d, so it simply has no row there.
+        assert!(
+            class_rows_of(&f, f.member("pve3-tb").unwrap())
+                .iter()
+                .all(|r| r.ifname != "cfab-st-b3")
+        );
+    }
+
+    /// A 4-member fabric where two members share no domain: h1 and h4 reach each other only
+    /// through h2 or h3, and those two transits are indistinguishable, so the SPF would ECMP
+    /// across them. Distinct INTERFACE costs do not imply distinct PATH costs — this is the
+    /// check that catches it at validate time.
+    const DISJOINT_MEMBERS: &str = "
+h1 1 host eth0@a:1000
+h2 2 host eth0@a:1000 eth1@b:1000
+h3 3 host eth0@a:1000 eth1@b:1000
+h4 4 host eth0@b:1000
+";
+    const ONE_ZONE_SEGMENTS: &str = "
+cfab-st     a   storage 1 100
+cfab-st-bk  b   storage 2 101
+cfab-st-fb  any storage 9 300
+";
+
+    fn one_zone_blocks(domains: &str, members: &str, segments: &str) -> Vec<(String, String)> {
+        vec![
+            ("DOMAINS".to_string(), domains.to_string()),
+            ("MEMBER_TABLE".to_string(), members.to_string()),
+            (
+                "ZONE_TABLE".to_string(),
+                "\nstorage  99 0 cs0 2000 2 4 a -\n".to_string(),
+            ),
+            ("SEGMENT_TABLE".to_string(), segments.to_string()),
+            ("FORWARD_ALLOW".to_string(), "storage>storage".to_string()),
+            ("USB_NICS".to_string(), String::new()),
+        ]
+    }
+
+    fn one_zone_fabric(domains: &str, members: &str, segments: &str) -> Result<Fabric> {
+        let owned = one_zone_blocks(domains, members, segments);
+        let blocks: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        from_blocks(&blocks)
+    }
+
+    #[test]
+    fn two_equal_cost_transits_between_domain_disjoint_members_are_refused() {
+        let err = one_zone_fabric("a b", DISJOINT_MEMBERS, ONE_ZONE_SEGMENTS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("storage") && err.contains("h1") && err.contains("h4"),
+            "the error must name the zone and both ends: {err}"
+        );
+        assert!(
+            err.contains("h2") && err.contains("h3"),
+            "and the two indistinguishable transits: {err}"
+        );
+    }
+
+    /// The same fabric is fine once the two transits are distinguishable. Cost is a function
+    /// of RANK, not of speed, so the fix is the one the error names: a WIRE_PREF row that
+    /// re-ranks one transit's wires.
+    #[test]
+    fn the_same_fabric_passes_once_a_wire_pref_distinguishes_the_transits() {
+        let owned = one_zone_blocks("a b", DISJOINT_MEMBERS, ONE_ZONE_SEGMENTS);
+        let blocks: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let text = format!(
+            "{}\nWIRE_PREF=\"\nh3 storage eth1 eth0\n\"\n",
+            conf_with(&blocks)
+        );
+        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        assert_eq!(order_of(&f, "h3", "storage"), vec!["eth1", "eth0"]);
+        assert_eq!(order_of(&f, "h2", "storage"), vec!["eth0", "eth1"]);
+    }
+
+    /// The rank-0 check: a host whose cheapest wire for a zone is alone on its domain while
+    /// another of its wires does reach a peer. Every path out then costs more than the
+    /// one-hop backup, which is never what the operator meant.
+    #[test]
+    fn a_rank_zero_wire_alone_on_its_domain_is_refused_when_another_wire_reaches_a_peer() {
+        let members = "
+h1 1 host eth2@d:1000 eth0@a:1000
+h2 2 host eth0@a:1000 eth1@b:1000
+h3 3 host eth0@a:1000 eth1@b:1000
+";
+        let segments = "
+cfab-st     a   storage 1 100
+cfab-st-bk  b   storage 2 101
+cfab-st-b3  d   storage 4 103
+cfab-st-fb  any storage 9 300
+";
+        let owned = one_zone_blocks("a b d", members, segments);
+        let mut blocks: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let zone = "\nstorage  99 0 cs0 2000 2 4 d -\n";
+        for b in &mut blocks {
+            if b.0 == "ZONE_TABLE" {
+                b.1 = zone;
+            }
+        }
+        let err = from_blocks(&blocks).unwrap_err().to_string();
+        assert!(
+            err.contains("h1") && err.contains("eth2") && err.contains("domain d"),
+            "name the member, the rank-0 wire and its lonely domain: {err}"
+        );
+        assert!(
+            err.contains("eth0") && err.contains("WIRE_PREF"),
+            "and the wire that does reach a peer, plus the remedy: {err}"
+        );
+    }
+
+    /// The same lonely domain is NOT an error when no wire of that member reaches anyone:
+    /// that member is domain-disjoint and the universal bond is exactly what serves it.
+    #[test]
+    fn a_member_alone_on_every_domain_is_not_a_rank_zero_error() {
+        let members = "
+h1 1 host eth2@d:1000
+h2 2 host eth0@a:1000 eth1@b:1000
+h3 3 host eth0@a:1000 eth1@b:1000
+";
+        let segments = "
+cfab-st     a   storage 1 100
+cfab-st-bk  b   storage 2 101
+cfab-st-b3  d   storage 4 103
+cfab-st-fb  any storage 9 300
+";
+        let f = one_zone_fabric("a b d", members, segments).unwrap();
+        assert_eq!(order_of(&f, "h1", "storage"), vec!["eth2"]);
+    }
+
     #[test]
     fn gen_prefs_renders_every_member_and_zone() {
         let f = fabric();
