@@ -298,7 +298,13 @@ fn trace_mark(trace: &Option<Arc<Mutex<Vec<String>>>>, s: String) {
 
 /// The public entry point (`cfab run`): build the multi-thread runtime and drive the whole
 /// lifecycle on its `block_on` future — the main thread every child is forked from.
-pub fn run(_fabric: &Fabric, view: &View, exe: &str, config: &str) -> crate::error::Result<u8> {
+pub fn run(
+    _fabric: &Fabric,
+    view: &View,
+    exe: &str,
+    config: &str,
+    decl_text: &str,
+) -> crate::error::Result<u8> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -316,6 +322,7 @@ pub fn run(_fabric: &Fabric, view: &View, exe: &str, config: &str) -> crate::err
             &mut spawner,
             exe,
             config,
+            decl_text,
             "/etc/pve",
             cmd_tx,
             cmd_rx,
@@ -357,6 +364,7 @@ pub(crate) async fn run_with(
     spawner: &mut dyn Spawner,
     exe: &str,
     config: &str,
+    decl_text: &str,
     pmxcfs_root: &str,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -418,6 +426,21 @@ pub(crate) async fn run_with(
     let opts = apply::ApplyOpts {
         pmxcfs_root: pmxcfs_root.to_string(),
     };
+
+    // 1c. The declaration we are about to apply, kept beside the fabric it produces (finding F9).
+    // `cfab status` reads it so it can describe the RUNNING fabric while the file on disk is
+    // mid-edit or refused. Written after the two refusals above, so a supervisor that never
+    // starts never overwrites the live one's copy, and before the apply, so the copy exists for
+    // every fabric that exists. `cfab down` removes the run dir whole, so it goes with the
+    // fabric. A write failure is a warning, not a refusal: it costs status a diagnostic, not the
+    // fabric.
+    let applied_decl = crate::applied_decl_path(&run_dir);
+    if let Err(e) = sys.write(&applied_decl, decl_text) {
+        eprintln!(
+            "cfab: warn: cannot write {applied_decl}: {e} — cfab status will fall back to \
+             {config} and fail while that file is invalid"
+        );
+    }
 
     // 2. The initial apply. A refusal is terminal (§10) and has started no child — the whole
     // point of exit 3.
@@ -908,26 +931,21 @@ pub(crate) enum Reload {
 /// table, or a whitespace edit re-applies in place instead of restarting the fabric. Row order
 /// (`[[member]]`, `[[zone]]`, segments) is part of the fabric and does count.
 pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
-    let refuse = |e: crate::error::Error| Reload::Invalid(format!("{config}: {e}"));
-    let decl = match crate::decl::Declaration::parse(text) {
-        Ok(d) => d,
-        Err(e) => return refuse(e),
-    };
-    let next = match Fabric::from_decl(&decl) {
-        Ok(f) => f,
-        Err(e) => return refuse(e),
-    };
-    // A declaration that no longer names this host is invalid *for this supervisor*: applying it
-    // would be applying somebody else's fabric, and exiting on it would tear this one down for
-    // what is far more likely a typo than a decommission.
-    if let Err(e) = next.member(member) {
-        return refuse(e);
+    match parse_for_member(member, text) {
+        Err(e) => Reload::Invalid(format!("{config}: {e}")),
+        Ok(next) if next == *current => Reload::Identical,
+        Ok(_) => Reload::Changed,
     }
-    if next == *current {
-        Reload::Identical
-    } else {
-        Reload::Changed
-    }
+}
+
+/// Parse a declaration and require that it still names `member`. A declaration that no longer
+/// names this host is invalid *for this supervisor*: applying it would be applying somebody
+/// else's fabric, and exiting on it would tear this one down for what is far more likely a typo
+/// than a decommission. `cfab status` asks the same question of the file on disk.
+pub(crate) fn parse_for_member(member: &str, text: &str) -> crate::error::Result<Fabric> {
+    let next = Fabric::from_decl(&crate::decl::Declaration::parse(text)?)?;
+    next.member(member)?;
+    Ok(next)
 }
 
 /// The impure half: read `config` through `Sys` (never `std::fs`, so the mocks see it) and
@@ -1479,6 +1497,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1528,6 +1547,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1589,6 +1609,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1665,6 +1686,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1749,6 +1771,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1834,6 +1857,7 @@ mod tests {
                 &mut spawner,
                 EXE,
                 CONFIG,
+                &decl_text(tmp.path()),
                 &no_pmx(tmp.path()),
                 cmd_tx,
                 cmd_rx,
@@ -1985,6 +2009,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2058,6 +2083,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2345,6 +2371,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &clustered_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2473,6 +2500,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,

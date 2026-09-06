@@ -108,7 +108,7 @@ impl Counts {
 
 /// Reason lines. Not verdicts: a posture condition either actuates (the links go down and the
 /// state follows) or lands here, where it never moves the state.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Ctx {
     reasons: Vec<String>,
 }
@@ -119,8 +119,24 @@ impl Ctx {
     }
 }
 
-pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Result<StatusReport> {
+/// `declared` is the on-disk declaration to compare the running fabric against — `Some` only
+/// when `view.fabric` came from the applied copy in the run dir (finding F9). When status is
+/// reading the file itself there is nothing to compare, and this is `None`.
+pub fn run(
+    sys: &mut dyn Sys,
+    view: &View,
+    wait_s: u64,
+    permissive: bool,
+    declared: Option<&std::path::Path>,
+) -> Result<StatusReport> {
     let f = view.fabric;
+    // Read once, before the `--wait` loop: the file on disk is not what the loop is waiting for.
+    let mut base = Ctx::default();
+    if let Some(cfg) = declared
+        && let Some(note) = declaration_note(&*sys, view, cfg)
+    {
+        base.note(note);
+    }
     // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not desired,
     // and there is nothing to wait for.
     if !sys.exists(&f.run_dir) {
@@ -130,7 +146,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
             view,
             State::Down,
             "fabric not applied".to_string(),
-            &Ctx::default(),
+            &base,
             permissive,
             None,
             false,
@@ -141,7 +157,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
     let mut t = 0u64;
     let (mut counts, mut c, mut comps);
     loop {
-        c = Ctx::default();
+        c = base.clone();
         comps = read_components(sys, f);
         counts = read(sys, view, &expected, &mut c, comps.as_ref())?;
         // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
@@ -161,6 +177,64 @@ pub fn run(sys: &mut dyn Sys, view: &View, wait_s: u64, permissive: bool) -> Res
         comps.as_ref(),
         true,
     ))
+}
+
+/// The fabric the supervisor applied, if it is still on disk: `<run_dir>/fabric.toml.applied`,
+/// written by `cfab run` before its initial apply and removed with the run dir by `cfab down`.
+/// `None` means nothing is running (or the copy is unreadable), and status falls back to the
+/// declared file exactly as it always did.
+///
+/// `run_dir` lives *inside* the declaration, so finding the copy means knowing the run dir
+/// before parsing anything: read `config` for it, and fall back to the packaged default
+/// `/run/cfab` when that file is the very thing that will not parse. Both are tried, since a
+/// declaration whose `run_dir` was edited since the apply points at the wrong directory.
+pub fn applied_fabric(sys: &dyn Sys, config: &std::path::Path) -> Option<Fabric> {
+    let declared_run_dir = sys
+        .read(&config.to_string_lossy())
+        .ok()
+        .and_then(|t| crate::decl::Declaration::parse(&t).ok())
+        .and_then(|d| Fabric::from_decl(&d).ok())
+        .map(|f| f.run_dir);
+    let mut dirs: Vec<String> = declared_run_dir.into_iter().collect();
+    if !dirs.iter().any(|d| d == crate::decl::RUN_DIR) {
+        dirs.push(crate::decl::RUN_DIR.to_string());
+    }
+    dirs.iter()
+        .map(|d| crate::applied_decl_path(d))
+        .filter_map(|p| sys.read(&p).ok())
+        .find_map(|t| {
+            crate::decl::Declaration::parse(&t)
+                .ok()
+                .and_then(|d| Fabric::from_decl(&d).ok())
+        })
+}
+
+/// The one reason line the on-disk declaration can earn while status describes the applied copy.
+/// A reason, never a state (see `Ctx`): the fabric on the wire is whatever it is regardless of
+/// what the file now says.
+fn declaration_note(sys: &dyn Sys, view: &View, config: &std::path::Path) -> Option<String> {
+    let config = config.display().to_string();
+    let stale = |why: String| {
+        format!(
+            "declaration {config}: {why} (status describes the running fabric; a reload of \
+             this file will be refused)"
+        )
+    };
+    let text = match sys.read(&config) {
+        Ok(t) => t,
+        Err(e) => return Some(stale(e.to_string())),
+    };
+    match crate::supervisor::parse_for_member(&view.member.name, &text) {
+        // The `fabric.toml: ` prefix an `Error::Config` carries is redundant once the line has
+        // already named the file: print the message the parser gave, line/column and all.
+        Err(crate::Error::Config(msg)) => Some(stale(msg)),
+        Err(e) => Some(stale(e.to_string())),
+        Ok(next) if next == *view.fabric => None,
+        Ok(_) => Some(format!(
+            "declaration {config} changed since apply (systemctl reload cfab to apply; the \
+             fabric will restart)"
+        )),
+    }
 }
 
 /// The `components` document over `<run_dir>/cfab.sock` (spec §9). A read, never a write; the
@@ -217,7 +291,12 @@ fn finish(
         view.member.name
     );
     for r in once_each(&c.reasons) {
-        let _ = writeln!(out, "  {r}");
+        // A TOML parse error arrives as several lines (message, then the caret snippet); its
+        // continuation lines are indented one step further so the block still reads as one
+        // reason under the headline.
+        for (i, line) in r.lines().enumerate() {
+            let _ = writeln!(out, "{}{line}", if i == 0 { "  " } else { "    " });
+        }
     }
     // This member's wire order per zone, with the derived/override marker: the one thing an
     // operator cannot infer from the interface names, and what every OSPF cost below comes
@@ -1637,7 +1716,7 @@ mod tests {
     /// call must be on the read-only allowlist.
     fn assert_never_writes(label: &str, sys: &mut MockSys, view: &View, wait: u64) {
         let before = sys.files.clone();
-        let report = run(sys, view, wait, false).unwrap();
+        let report = run(sys, view, wait, false, None).unwrap();
         let changed: BTreeSet<&String> = before
             .keys()
             .chain(sys.files.keys())
@@ -1882,7 +1961,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
             headline(&report),
@@ -1902,7 +1981,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up);
         assert!(!report.output.contains("ceiling"), "{}", report.output);
     }
@@ -1918,7 +1997,7 @@ mod tests {
             &["nft", "list", "table", "inet", "cfab"],
             &ceiling_listing(&view, 28),
         );
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert_eq!(
@@ -1949,7 +2028,7 @@ mod tests {
             &["nft", "list", "table", "inet", "cfab"],
             &ceiling_listing(&view, 28),
         );
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert_eq!(
@@ -1975,7 +2054,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view).file("/run/cfab/mark.nft", "table inet cfab\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains("mark drift — re-run cfab up"),
             "{}",
@@ -2039,7 +2118,7 @@ mod tests {
     fn the_mark_backend_is_named_and_the_ceiling_only_one_says_what_it_lacks() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let report = run(&mut ipt_leaf(&view, 0), &view, 0, false).unwrap();
+        let report = run(&mut ipt_leaf(&view, 0), &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert!(
@@ -2061,7 +2140,7 @@ mod tests {
     fn a_tripped_ceiling_on_the_iptables_backend_is_the_same_reason_line() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let report = run(&mut ipt_leaf(&view, 28), &view, 0, false).unwrap();
+        let report = run(&mut ipt_leaf(&view, 28), &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         for zone in ["storage", "cluster", "mgmt"] {
@@ -2095,7 +2174,7 @@ mod tests {
         assert!(save.contains("-A OUTPUT -j cfab-out\n"), "{save}");
         let unhooked_save = save.replace("-A OUTPUT -j cfab-out\n", "");
         unhooked = unhooked.on_stdout(&["iptables-legacy-save", "-t", "mangle"], &unhooked_save);
-        let report = run(&mut unhooked, &view, 0, false).unwrap();
+        let report = run(&mut unhooked, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains("mark drift — re-run cfab up"),
             "an unhooked ceiling read clean:\n{}",
@@ -2111,7 +2190,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut stale = ipt_leaf(&view, 0).file("/run/cfab/mark.ipt", "*mangle\nCOMMIT\n");
         assert!(
-            run(&mut stale, &view, 0, false)
+            run(&mut stale, &view, 0, false, None)
                 .unwrap()
                 .output
                 .contains("mark drift — re-run cfab up")
@@ -2121,7 +2200,7 @@ mod tests {
             &["iptables-legacy-save", "-t", "mangle"],
             "*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n",
         );
-        let report = run(&mut flushed, &view, 0, false).unwrap();
+        let report = run(&mut flushed, &view, 0, false, None).unwrap();
         assert_eq!(
             report
                 .output
@@ -2164,7 +2243,7 @@ mod tests {
             &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
             "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
         );
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
             headline(&report),
@@ -2187,7 +2266,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(report.code, 0);
         assert_eq!(
@@ -2213,7 +2292,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             !report.output.contains("gw ") && !report.output.contains("table 249"),
@@ -2239,7 +2318,7 @@ mod tests {
             // A zombie of the same name holds nothing and must not be reported.
             .file("/proc/813/comm", "bfdd\n")
             .file("/proc/813/status", "Name:\tbfdd\nState:\tZ (zombie)\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "a reason line moves no state");
         assert_eq!(report.code, 0);
         assert!(
@@ -2260,7 +2339,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = leaf_env(&view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Failed, "output:\n{}", report.output);
         assert_eq!(report.code, 2);
         assert_eq!(
@@ -2303,7 +2382,7 @@ mod tests {
         }
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             report.state,
             State::UpDegraded,
@@ -2335,7 +2414,7 @@ mod tests {
         ]);
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &doc.to_string());
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             report.state,
             State::UpDegraded,
@@ -2380,7 +2459,7 @@ mod tests {
                 { "peer": "192.168.249.254", "state": "Idle", "pfx_snt": 0 }
             ]),
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "mgmt ingress: bgp 192.168.249.254 Idle (not Established - the router is \
@@ -2403,7 +2482,7 @@ mod tests {
                 { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 0 }
             ]),
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "mgmt ingress: bgp 192.168.249.254 Established but advertising nothing \
@@ -2425,7 +2504,7 @@ mod tests {
                 { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(!report.output.contains("ingress: bgp"), "{}", report.output);
     }
 
@@ -2446,7 +2525,7 @@ mod tests {
             &["ip", "route", "show", "table", "249"],
             "default via 10.249.3.1 dev cfab-mg proto ospf metric 20 linkdown\n",
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown - the \
@@ -2482,7 +2561,7 @@ mod tests {
             "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n\
              default via 10.249.3.2 dev cfab-mg proto ospf metric 30 linkdown\n",
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "mgmt gw 192.168.249.254 unreachable (table 249 default is linkdown - the \
@@ -2506,7 +2585,7 @@ mod tests {
             ]),
         )
         .on_stdout(&["ip", "route", "show", "table", "249"], "");
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             report
                 .output
@@ -2532,7 +2611,7 @@ mod tests {
                 { "peer": "192.168.249.254", "state": "Established", "pfx_snt": 5 }
             ]),
         );
-        let report = run(&mut sys, &host, 0, false).unwrap();
+        let report = run(&mut sys, &host, 0, false, None).unwrap();
         assert!(
             !report.output.contains("has no default") && !report.output.contains("is linkdown"),
             "{}",
@@ -2547,7 +2626,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = MockSys::default();
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Down);
         assert_eq!(report.code, 3);
         assert_eq!(
@@ -2568,23 +2647,23 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
 
         let mut sys = healthy_leaf(&view);
-        assert_eq!(run(&mut sys, &view, 0, true).unwrap().code, 0);
+        assert_eq!(run(&mut sys, &view, 0, true, None).unwrap().code, 0);
 
         let mut bfd = all_bfd_up(&f);
         bfd[0].1 = "down";
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        let r = run(&mut sys, &view, 0, true).unwrap();
+        let r = run(&mut sys, &view, 0, true, None).unwrap();
         assert_eq!(r.state, State::UpDegraded, "{}", r.output);
         assert_eq!(r.code, 0, "--permissive: UP-DEGRADED exits 0");
 
         let mut sys = leaf_env(&view);
-        let r = run(&mut sys, &view, 0, true).unwrap();
+        let r = run(&mut sys, &view, 0, true, None).unwrap();
         assert_eq!(r.state, State::Failed);
         assert_eq!(r.code, 2, "--permissive never masks FAILED");
 
         let mut sys = MockSys::default();
-        let r = run(&mut sys, &view, 0, true).unwrap();
+        let r = run(&mut sys, &view, 0, true, None).unwrap();
         assert_eq!(r.state, State::Down);
         assert_eq!(r.code, 3, "--permissive never masks DOWN");
     }
@@ -2598,7 +2677,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         assert!(view.fallback_rows().is_empty());
         let mut sys = healthy_leaf(&view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
             headline(&report),
@@ -2618,7 +2697,7 @@ mod tests {
         // The count reads the engine socket once per pass; the last reply repeats forever.
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket_seq("/run/cfab/engine.sock", &[degraded, up]);
-        let report = run(&mut sys, &view, 30, false).unwrap();
+        let report = run(&mut sys, &view, 30, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert_eq!(
             sys.slept,
@@ -2634,7 +2713,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = leaf_env(&view);
-        let report = run(&mut sys, &view, 6, false).unwrap();
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
         assert_eq!(report.state, State::Failed, "{}", report.output);
         assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps: FAILED waited it out");
     }
@@ -2645,7 +2724,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = MockSys::default();
-        let report = run(&mut sys, &view, 600, false).unwrap();
+        let report = run(&mut sys, &view, 600, false, None).unwrap();
         assert_eq!(report.state, State::Down);
         assert!(sys.slept.is_empty(), "DOWN never waits");
     }
@@ -2660,7 +2739,7 @@ mod tests {
         bfd[0].1 = "down";
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        let report = run(&mut sys, &view, 6, false).unwrap();
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
         assert_eq!(report.state, State::UpDegraded, "{}", report.output);
         assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps");
     }
@@ -2678,7 +2757,7 @@ mod tests {
                 "cfab-st-fb-c\n",
             )
             .file("/sys/class/net/eth9/carrier", "1\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             report
@@ -2701,7 +2780,7 @@ mod tests {
                 "cfab-st-fb-c\n",
             )
             .file("/sys/class/net/eth9/carrier", "0\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             report.output.contains("  fallback storage via eth0\n"),
@@ -2721,7 +2800,7 @@ mod tests {
             "/sys/class/net/cfab-st-fb/bonding/active_slave",
             "cfab-st-fb-c\n",
         );
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report
                 .output
@@ -2739,7 +2818,7 @@ mod tests {
         let mut sys = healthy_leaf(&view)
             .file("/sys/class/net/cfab-cl-fb/bonding/mii_status", "down\n")
             .file("/sys/class/net/cfab-cl-fb/bonding/active_slave", "\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains("  fallback cluster no carrier\n"),
             "{}",
@@ -2761,7 +2840,7 @@ mod tests {
                 "/sys/class/net/cfab-st-fb/bonding/active_slave",
                 "someone-elses0\n",
             );
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report
                 .output
@@ -2790,7 +2869,7 @@ mod tests {
             .remove("cfab-st-fb");
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &doc.to_string());
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             headline(&report),
             "UP-DEGRADED (2/2 | 18/18 | 4/6) on pve3-tb (leaf)"
@@ -2815,7 +2894,7 @@ mod tests {
         doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["neighbors"] = serde_json::json!([]);
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &doc.to_string());
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             headline(&report),
             "UP-DEGRADED (2/2 | 18/18 | 4/6) on pve3-tb (leaf)"
@@ -2854,7 +2933,7 @@ mod tests {
         link["metric"] = serde_json::json!(31000);
         let mut sys = primary_routes(leaf_env(&view), &view)
             .socket("/run/cfab/engine.sock", &doc.to_string());
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "a wrong cost never amputates");
         assert!(
             report.output.contains(
@@ -2874,7 +2953,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys =
             healthy_leaf(&view).file("/proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter", "1\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             report
@@ -2936,7 +3015,7 @@ mod tests {
             }
         }
         let mut sys = sys.socket("/run/cfab/engine.sock", &engine_doc(&view, &bfd));
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "  wire eth9 absent (no such netdev) — its segments are not configured\n"
@@ -2963,7 +3042,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys =
             healthy_leaf(&view).file("/proc/sys/net/ipv4/conf/cfab-st-fb/forwarding", "1\n");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report
                 .output
@@ -2980,7 +3059,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view).on_stdout(&["ip", "rule", "show", "pref", "1001"], "");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             report
@@ -2997,7 +3076,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view).on_stdout(&["ip", "rule", "show", "pref", "2002"], "");
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             report
@@ -3196,7 +3275,7 @@ mod tests {
                 ),
             );
         }
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             report.state,
             State::UpDegraded,
@@ -3270,7 +3349,7 @@ mod tests {
                 ),
             );
         }
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(
             report.state,
             State::UpDegraded,
@@ -3306,7 +3385,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         let last = report.output.lines().last().unwrap();
         assert_eq!(
             last,
@@ -3324,7 +3403,7 @@ mod tests {
         // The fabric is applied (leaf_env creates the run dir) but no cfab.sock answers, and the
         // engine's own socket is silent too.
         let mut sys = leaf_env(&view);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "  engine not running: no supervisor answering on /run/cfab/cfab.sock — start it \
@@ -3368,7 +3447,7 @@ mod tests {
         })
         .to_string();
         let mut sys = healthy_host(&f, &view).socket("/run/cfab/cfab.sock", &comps);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         let out = &report.output;
         assert!(
             out.contains(
@@ -3412,7 +3491,7 @@ mod tests {
         let mut sys = leaf_env(&view)
             .socket_verb("/run/cfab/cfab.sock", "components", &comps)
             .socket_verb("/run/cfab/cfab.sock", "log", &log);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
                 "  bfd udp/3784: the engine is not running and could not bind it — bfd: cannot \
@@ -3456,7 +3535,7 @@ mod tests {
                 &healthy_components(&view),
             )
             .socket_verb("/run/cfab/cfab.sock", "log", &log);
-        let report = run(&mut sys, &view, 0, false).unwrap();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
             !report
