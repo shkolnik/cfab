@@ -1575,6 +1575,102 @@ mod tests {
         assert_eq!(comp("conf-sync").why.as_deref(), Some("not clustered"));
     }
 
+    /// F9: the supervisor keeps the declaration it applied beside the fabric, so `cfab status`
+    /// can describe the running fabric while the file on disk is mid-edit. It is the TEXT the
+    /// supervisor was handed — not a re-read of `CONFIG`, which is what a later edit changes —
+    /// and it is written BEFORE the apply, so no fabric ever exists without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_supervisor_keeps_the_declaration_it_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // Same fabric, distinguishable bytes: only the text handed to `run_with` carries the
+        // marker, so a re-read of CONFIG would produce a copy without it.
+        let handed = format!(
+            "# the text the supervisor loaded\n{}",
+            decl_text(tmp.path())
+        );
+        // MockSys::default() refuses the apply (as `the_initial_apply_refusal_is_terminal`
+        // does), which is exactly what pins the write to BEFORE it: nothing is torn down, so
+        // whatever is in the run dir is what the apply would have found. CONFIG is present
+        // only so `applied_fabric` below can learn the run dir the way production does.
+        let mut sys = MockSys::default().file(CONFIG, &decl_text(tmp.path()));
+        let (mut spawner, _recs) = rec();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &handed,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            Hooks {
+                on_ready: None,
+                run_watchdog: false,
+                serve_socket: false,
+                shared: None,
+                trace: None,
+                stop_grace: CHILD_STOP_GRACE,
+                feed: Arc::new(|| {}),
+            },
+        )
+        .await;
+        assert_eq!(code, EXIT_APPLY_REFUSED);
+        let applied = crate::applied_decl_path(tmp.path().to_str().unwrap());
+        assert_eq!(
+            sys.writes_to(&applied),
+            Some(handed.as_str()),
+            "the applied copy must be the exact text that was applied, written before the apply"
+        );
+        // ...and it is what `cfab status` resolves to, at the run dir the declaration names.
+        let got = crate::commands::status::applied_fabric(&sys, Path::new(CONFIG))
+            .expect("status finds the applied copy");
+        assert_eq!(got, f);
+    }
+
+    /// The copy is state of the fabric, not of the host: the teardown that removes the run dir
+    /// takes it with it, so `cfab status` on a torn-down member reads the file again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_applied_declaration_goes_with_the_run_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            quiet_hooks(shared, ready_tx),
+        )
+        .await;
+        driver.await.unwrap();
+        assert_eq!(code, 0);
+        let applied = crate::applied_decl_path(tmp.path().to_str().unwrap());
+        assert_eq!(
+            sys.writes_to(&applied),
+            None,
+            "the teardown removes the run dir whole; the applied copy must not survive it"
+        );
+    }
+
     /// SIGHUP-equivalent re-apply restarts the engine and the shape daemon, never tears down
     /// (no `ip link del`), and leaves conf-sync untouched.
     #[tokio::test(flavor = "multi_thread")]

@@ -2283,6 +2283,185 @@ mod tests {
         assert!(sys.slept.is_empty(), "--wait 0 is one instant read");
     }
 
+    /// The packaged example, as text — the same declaration `fabric()` types, so a status run
+    /// pointed at it must read "identical" and say nothing.
+    fn example_text() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+            .unwrap()
+    }
+
+    const CONFIG: &str = "/etc/cfab/fabric.toml";
+
+    /// The declaration path this status run compares against.
+    fn cfg() -> &'static std::path::Path {
+        std::path::Path::new(CONFIG)
+    }
+
+    /// F9: the file on disk will not parse (an operator mid-edit), but the applied copy is in
+    /// the run dir. `status` describes the RUNNING fabric — full counts, UP — and the broken
+    /// file is a reason line naming the parse error, never a state and never exit 1.
+    #[test]
+    fn an_unparseable_declaration_is_a_reason_line_and_status_still_describes_the_fabric() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).file(CONFIG, "[[member]]\nname = \n");
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(
+            report.code, 0,
+            "a reason line moves no state and no exit code"
+        );
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)",
+            "the counts come from the running fabric, not the file"
+        );
+        assert!(
+            report.output.contains(
+                "declaration /etc/cfab/fabric.toml: TOML parse error at line 2, column 8"
+            ),
+            "the parser's own line/column must survive into the reason line: {}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "(status describes the running fabric; a reload of this file will be refused)"
+            ),
+            "{}",
+            report.output
+        );
+        // The parse error is several lines: every continuation line is indented past the first
+        // so the reason still reads as one block under the headline.
+        for line in report.output.lines().skip(1) {
+            assert!(
+                line.starts_with("  "),
+                "an unindented continuation line breaks the block: {:?} in\n{}",
+                line,
+                report.output
+            );
+        }
+    }
+
+    /// A declaration that parses but no longer names this member is the same reason line: the
+    /// reload would refuse it, so status says so rather than describing somebody else's fabric.
+    #[test]
+    fn a_declaration_that_drops_this_member_is_the_same_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let text = example_text().replace("pve3-tb", "pve4-tb");
+        let mut sys = healthy_leaf(&view).file(CONFIG, &text);
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("declaration /etc/cfab/fabric.toml: ")
+                && report
+                    .output
+                    .contains("a reload of this file will be refused"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// A valid file that differs from what is running: one line, in the reload's own vocabulary
+    /// — the restart is the cost of applying it, and the operator should know that before typing.
+    #[test]
+    fn a_changed_declaration_is_the_changed_since_apply_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let text = example_text().replace("node = 3", "node = 7");
+        assert_ne!(text, example_text(), "the fixture edit must land");
+        let mut sys = healthy_leaf(&view).file(CONFIG, &text);
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            report.output.contains(
+                "declaration /etc/cfab/fabric.toml changed since apply (systemctl reload cfab \
+                 to apply; the fabric will restart)"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The ordinary case: the file on disk is the fabric that is running. Not one extra line —
+    /// the healthy leaf's output is byte-identical to the run that never looked at the file.
+    #[test]
+    fn a_declaration_identical_to_the_applied_one_says_nothing() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut quiet = healthy_leaf(&view);
+        let expected = run(&mut quiet, &view, 0, false, None).unwrap().output;
+        let mut sys = healthy_leaf(&view).file(CONFIG, &example_text());
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert_eq!(report.output, expected);
+    }
+
+    /// Equality is SEMANTIC (the derived `Fabric`, as `classify_reload` decides it), so a
+    /// comment or a whitespace edit is not "changed" — a reason line the operator cannot act on
+    /// is noise.
+    #[test]
+    fn a_comment_only_edit_is_not_a_changed_declaration() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let text = format!("# an operator's note\n{}", example_text());
+        let mut sys = healthy_leaf(&view).file(CONFIG, &text);
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert!(!report.output.contains("declaration "), "{}", report.output);
+    }
+
+    /// A file that vanished under a running fabric reads as the same stale-file reason, not a
+    /// crash: the fabric is still up and status still describes it.
+    #[test]
+    fn a_missing_declaration_under_a_running_fabric_is_a_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view);
+        let report = run(&mut sys, &view, 0, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("declaration /etc/cfab/fabric.toml: ")
+                && report
+                    .output
+                    .contains("a reload of this file will be refused"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// `applied_fabric` finds the copy at the run dir the declaration names.
+    #[test]
+    fn the_applied_copy_is_found_at_the_declared_run_dir() {
+        let text = example_text().replace("run_dir = \"/run/cfab\"", "run_dir = \"/run/other\"");
+        assert_ne!(text, example_text(), "the example's run_dir line moved");
+        let sys = MockSys::default()
+            .file(CONFIG, &text)
+            .file("/run/other/fabric.toml.applied", &example_text());
+        let got = applied_fabric(&sys, cfg()).expect("the applied copy is the running fabric");
+        assert_eq!(got.run_dir, "/run/cfab", "the copy is what was APPLIED");
+    }
+
+    /// The file that will not parse cannot name a run dir, so the packaged default is where the
+    /// copy is looked for — the case the whole feature exists for.
+    #[test]
+    fn an_unparseable_declaration_falls_back_to_the_default_run_dir() {
+        let sys = MockSys::default()
+            .file(CONFIG, "nonsense = [")
+            .file("/run/cfab/fabric.toml.applied", &example_text());
+        assert!(applied_fabric(&sys, cfg()).is_some());
+    }
+
+    /// Nothing applied: `None`, and the caller keeps today's behavior (parse the file, and its
+    /// error is exit 1 — there is no running fabric to describe).
+    #[test]
+    fn no_applied_copy_is_none() {
+        let sys = MockSys::default().file(CONFIG, "nonsense = [");
+        assert!(applied_fabric(&sys, cfg()).is_none());
+    }
+
     /// A leaf carries no ingress leg: the gw-zone return-path check is skipped, so a leaf whose
     /// table-<id> does not exist (the real state — VERIFIED pve3-tb 2026-09-06) reads UP with no
     /// reason line. Reaching a leaf from outside at a fabric identity is unsupported by design,
