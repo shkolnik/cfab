@@ -1973,23 +1973,21 @@ mod tests {
     /// their DROP rules.
     fn ipt_leaf(view: &View, drops: u64) -> MockSys {
         let f = view.fabric;
+        let rendered = crate::emit::ceiling_ipt::generate(view).unwrap();
+        // Our half taken verbatim from the render, so the fixture cannot drift from what `up`
+        // loads; the built-ins and the foreign chain are what the live table has beside it.
         let mut save = String::from(
             "*mangle\n:PREROUTING ACCEPT [0:0]\n:OUTPUT ACCEPT [9:600]\n\
-             :DOCKER-USER - [0:0]\n:cfab-out - [0:0]\n",
+             :DOCKER-USER - [0:0]\n",
         );
-        for c in crate::emit::mark::ceilings(view) {
-            save.push_str(&format!(":cfab-ceil-{} - [0:0]\n", c.zone));
+        for l in rendered.lines().filter(|l| l.starts_with(':')) {
+            save.push_str(l);
+            save.push('\n');
         }
         save.push_str("-A OUTPUT -j cfab-out\n");
-        for c in crate::emit::mark::ceilings(view) {
-            save.push_str(&format!("-A cfab-out -j cfab-ceil-{}\n", c.zone));
-        }
-        for c in crate::emit::mark::ceilings(view) {
-            save.push_str(&format!(
-                "-A cfab-ceil-{} -o {} -p 89 -m limit --limit {}/second --limit-burst {} \
-                 -j RETURN\n-A cfab-ceil-{} -j DROP\n",
-                c.zone, c.ifname, c.rate_pps, c.burst_pkts, c.zone
-            ));
+        for l in rendered.lines().filter(|l| l.starts_with("-A ")) {
+            save.push_str(l);
+            save.push('\n');
         }
         save.push_str("COMMIT\n");
         // The `-c` dump is the same text with counters: only the DROP rules carry any.
