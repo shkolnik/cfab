@@ -19,11 +19,12 @@ use crate::commands::common::{conf_interfaces, foreign_forward_remedy, unresolve
 use crate::commands::engine_ctl;
 use crate::derive::{View, segments_of};
 use crate::emit;
+use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
 use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Components, render_line};
-use crate::sys::{Sys, run_optional};
+use crate::sys::{Output, Sys, run_optional};
 
 /// The re-read cadence of `--wait`.
 const POLL_SECS: u64 = 2;
@@ -978,19 +979,46 @@ fn return_path_and_ingress(
     Ok(())
 }
 
+/// The backend `up` recorded, or nft when there is no record: nft is what every member ran
+/// before the record existed, and it is the only backend a host ever has. Never a re-probe —
+/// `status` reports, it does not ask the kernel to change anything.
+fn mark_backend(sys: &mut dyn Sys, f: &Fabric) -> MarkBackend {
+    emit::ceiling_ipt::recorded(sys, &f.run_dir).unwrap_or(MarkBackend::Nft)
+}
+
 fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
-    // Every kind: `up` installs `table inet cfab` on every kind. The DSCP plane is a queueing
+    // Every kind: `up` installs the mark state on every kind. The DSCP plane is a queueing
     // switch's actual isolation mechanism and the ceiling is the fallback segment's only
-    // containment, so drift in either is worth a line.
+    // containment, so drift in either is worth a line. Which mechanism holds it is printed
+    // unconditionally — on the ceiling-only backend the missing bulk clamp is a real, named
+    // degradation an operator must not have to infer.
     let f = view.fabric;
-    let want = emit::mark::generate(view)?;
-    let loaded = sys
-        .read(&format!("{}/mark.nft", f.run_dir))
-        .unwrap_or_default();
+    let backend = mark_backend(sys, f);
+    c.note(backend.status_line());
+    let (want, loaded_path, live) = match backend {
+        MarkBackend::Nft => (
+            emit::mark::generate(view)?,
+            format!("{}/mark.nft", f.run_dir),
+            sys.run(&["nft", "-s", "list", "table", "inet", "cfab"])?,
+        ),
+        MarkBackend::IptablesLegacy => {
+            let save = sys.run(&["iptables-legacy-save", "-t", "mangle"])?;
+            let live = Output {
+                status: save.status,
+                stdout: emit::ceiling_ipt::ours(&save.stdout),
+                stderr: save.stderr,
+            };
+            (
+                emit::ceiling_ipt::generate(view)?,
+                format!("{}/mark.ipt", f.run_dir),
+                live,
+            )
+        }
+    };
+    let loaded = sys.read(&loaded_path).unwrap_or_default();
     if want != loaded {
         c.note("mark drift — re-run cfab up");
     }
-    let live = sys.run(&["nft", "-s", "list", "table", "inet", "cfab"])?;
     let applied = sys
         .read(&format!("{}/mark.applied", f.run_dir))
         .unwrap_or_default();
@@ -1012,14 +1040,26 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     if ceilings.is_empty() {
         return Ok(());
     }
-    // Stateful listing: `-s` is what `mark.applied` is compared against and deliberately omits
-    // the counters this reads.
-    let table = sys.run(&["nft", "list", "table", "inet", "cfab"])?;
-    if !table.ok() {
-        return Ok(()); // mark_drift already said the table is not loaded
+    // Stateful listing: `nft -s` (and `iptables-legacy-save` without `-c`) is what
+    // `mark.applied` is compared against and deliberately omits the counters this reads.
+    let backend = mark_backend(sys, view.fabric);
+    let listing = match backend {
+        MarkBackend::Nft => sys.run(&["nft", "list", "table", "inet", "cfab"])?,
+        MarkBackend::IptablesLegacy => sys.run(&["iptables-legacy-save", "-c", "-t", "mangle"])?,
+    };
+    if !listing.ok() {
+        return Ok(()); // mark_drift already said the mark state is not loaded
     }
     for ce in ceilings {
-        if let Some(n) = counter_packets(&table.stdout, &format!("ceiling-{}", ce.zone))
+        // Either backend's number is the DROP's own counter, and both reset it on re-apply:
+        // what a reader sees is the count since this member's last `up`, one spelling.
+        let dropped = match backend {
+            MarkBackend::Nft => counter_packets(&listing.stdout, &format!("ceiling-{}", ce.zone)),
+            MarkBackend::IptablesLegacy => {
+                emit::ceiling_ipt::drop_packets(&listing.stdout, &ce.zone)
+            }
+        };
+        if let Some(n) = dropped
             && n > 0
         {
             c.note(format!(
@@ -1986,7 +2026,7 @@ mod tests {
         assert_eq!(report.code, 0);
         assert_eq!(
             report.output,
-            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  components: engine running 1h00m \
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  mark: nft\n  components: engine running 1h00m \
              (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
              | watchdog ok 2s ago\n",
             "{}",
