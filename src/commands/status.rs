@@ -453,10 +453,15 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Componen
     let f = view.fabric;
     let port = f.bfd_port;
     let engine = comps.and_then(|c| c.components.iter().find(|k| k.name == "engine"));
-    port_custody(sys, port, c, engine);
-    // A bind failure in the ring buffer is only news while the engine is gone. The supervisor is
-    // the authority on that: no engine component (no supervisor answering — the frr/bfdd probe
-    // above already ran and we cannot read the ring) means no scan, and a `running` engine holds
+    if port_custody(sys, port, c, engine) {
+        // One condition, one diagnosis: the live custody read is the more specific account of
+        // exactly the fact the bind line reports, and it names a holder that is still there.
+        return Ok(());
+    }
+    // A bind failure in the ring buffer is only news while the engine is gone, and only when the
+    // holder has since let go — otherwise the custody probe above already said it. The supervisor
+    // is the authority on "gone": no engine component (no supervisor answering — the custody
+    // probe already ran and we cannot read the ring) means no scan, and a `running` engine holds
     // the port (nothing else can), so any bind line it left is history. Only an engine the
     // supervisor reports down earns the diagnosis, read from its child ring buffer over cfab.sock
     // (spec §3/§9) — best effort, a silent or unparseable socket just leaves the generic reason.
@@ -493,8 +498,9 @@ struct LogReply {
     lines: Vec<String>,
 }
 
-/// Who holds udp/`port` right now, and the reason line if that is not us. Two notes or none:
-/// what holds it, then the one spelling of the remedy (`engine_ctl::bfd_port_remedy`).
+/// Who holds udp/`port` right now, and the reason line if that is not us. Two notes or none —
+/// what holds it, then the one spelling of the remedy (`engine_ctl::bfd_port_remedy`) — and
+/// `true` when it said something, which stands the ring-buffer diagnosis down.
 ///
 /// Ownership is decided by the least-assuming evidence available, in this order:
 ///   * a socket on the port whose inode is in a live bfdd's fd table — a named foreign holder,
@@ -504,10 +510,14 @@ struct LogReply {
 ///   * otherwise silence. A running engine binds the port itself, and an engine we cannot ask
 ///     about (no supervisor answering) leaves us unable to tell its socket from a stranger's —
 ///     a false conflict is worse than a missed one, because the supported layout produces it.
-fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Component>) {
-    let bound = udp_inodes_on(sys, port);
+fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Component>) -> bool {
+    let bound = udp_inodes_on(
+        sys,
+        port,
+        engine.is_some_and(|e| e.state == CompState::Running),
+    );
     if bound.is_empty() {
-        return;
+        return false;
     }
     let units = bfd_units(sys);
     let pids = bfdd_pids(sys);
@@ -518,7 +528,9 @@ fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Compo
         Some(pid) => {
             let mut bits = vec![format!("pid {pid}")];
             bits.extend(units.iter().map(|u| format!("{u}.service enabled")));
-            let handle = match units.first() {
+            // bfdd.service manages this process directly; frr.service is the coarser handle and
+            // may not even own the bfdd we found.
+            let handle = match units.iter().find(|u| *u == "bfdd").or(units.first()) {
                 Some(u) => engine_ctl::BfdHolder::Unit(u.clone()),
                 None => engine_ctl::BfdHolder::Pid(pid.clone()),
             };
@@ -529,7 +541,7 @@ fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Compo
             "another process".to_string(),
             engine_ctl::BfdHolder::Unknown,
         ),
-        None => return,
+        None => return false,
     };
     c.note(format!(
         "bfd udp/{port}: {what} holds this port, which the engine needs exclusively"
@@ -538,6 +550,7 @@ fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Compo
         "remedy: {}",
         engine_ctl::bfd_port_remedy(&remedy, port)
     ));
+    true
 }
 
 /// The BFD-capable systemd units enabled here, by base name (`frr`, `bfdd`) — context for a
@@ -574,11 +587,18 @@ fn bfdd_pids(sys: &mut dyn Sys) -> Vec<String> {
         .collect()
 }
 
-/// The inodes of every UDP socket bound to `port`, over both families — one port number covers
-/// IPv4 and IPv6, and a holder that took only `[::]` still takes our packets.
-fn udp_inodes_on(sys: &dyn Sys, port: u16) -> Vec<u64> {
+/// The inodes of every UDP socket bound to `port` that could cost the engine the port.
+///
+/// The engine binds IPv4 only (`engine::bfd_socket_policy`, `ipv6: false`), so the two families
+/// are not symmetric. A v6 socket can only ever hurt us by being dual-stack (not `V6ONLY`) and
+/// bound BEFORE we are, blocking our IPv4 bind; once our v4 socket is bound it takes every
+/// packet we care about and a `[::]` holder beside it is harmless. So the v6 table counts only
+/// while the engine is not bound — `engine_bound` drops it once the supervisor says the engine
+/// is running.
+fn udp_inodes_on(sys: &dyn Sys, port: u16, engine_bound: bool) -> Vec<u64> {
     ["/proc/net/udp", "/proc/net/udp6"]
         .into_iter()
+        .filter(|path| !engine_bound || !path.ends_with('6'))
         .filter_map(|path| sys.read(path).ok())
         .flat_map(|table| udp_table_inodes(&table, port))
         .collect()
