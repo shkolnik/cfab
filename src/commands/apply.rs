@@ -324,24 +324,15 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         // the embedded engine's static path cannot — holo installs a static only when its
         // nexthop names an interface, and the fork has no `table` augment — so cfab owns it,
         // torn down by exact key in `down`. proto 205 is outside the engine's swept 201..204
-        // range, so neither the startup purge nor `down`'s engine sweep removes it.
-        run_ok(
-            sys,
-            &[
-                "ip",
-                "route",
-                "replace",
-                "default",
-                "via",
-                &gw.router,
-                "dev",
-                &r.ifname,
-                "table",
-                &z.id.to_string(),
-                "proto",
-                &emit::engine::CFAB_PROTO.to_string(),
-            ],
-        )?;
+        // range, so neither the startup purge nor `down`'s engine sweep removes it. The watchdog
+        // restores it after a leg flap (the kernel drops a dev-scoped route on link-down and
+        // never re-adds it), via the same `GwReturnDefault` so the two spellings cannot drift.
+        common::GwReturnDefault {
+            table: z.id.to_string(),
+            via: gw.router.clone(),
+            dev: r.ifname.clone(),
+        }
+        .install(sys)?;
     }
     // The fallback leg: one active-backup bond per zone over a tagged sub-interface of every
     // wire, so the member keeps a path in the zone when the physical islands are disjointly

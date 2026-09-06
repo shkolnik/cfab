@@ -115,6 +115,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
     restore_rp_filter(sys, view, &mut restored, &mut unrestored)?;
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
     restore_rules(sys, view, &mut restored, &mut downed)?;
+    restore_gw_return_defaults(sys, view, &mut restored)?;
     for line in restored
         .iter()
         .chain(downed.iter())
@@ -257,6 +258,36 @@ fn restore_rules(
         "fabric legs down: could not restore {} — re-run cfab up",
         unrestorable.join(", ")
     ));
+    Ok(())
+}
+
+/// The gw-zone return-path default (`default via <router> ... table <id> proto 205`). The kernel
+/// deletes this dev-scoped route when its ingress leg goes down and never re-adds it on link-up,
+/// so a single gw-leg flap black-holes off-fabric ingress until the next reapply (measured on the
+/// pve3 fixture, 2026-09-06). `up` installs it and this restores it — through the same
+/// `GwReturnDefault` so the spellings cannot drift.
+///
+/// Best-effort, unlike the rules: a re-add that fails means the leg is down, which is already the
+/// reported fault and self-resolves on link-up, so it is neither logged as a fault nor allowed to
+/// down anything — a missing return path while the leg is down is not a hazard to actuate on. A
+/// successful re-add IS recorded, so a flap recovery shows in the journal. No-op on a member with
+/// no ingress leg (`gw_return_defaults` is empty).
+fn restore_gw_return_defaults(
+    sys: &mut dyn Sys,
+    view: &View,
+    restored: &mut Vec<String>,
+) -> Result<()> {
+    for d in common::gw_return_defaults(view) {
+        if d.present(sys)? {
+            continue;
+        }
+        if d.install(sys).is_ok() {
+            restored.push(format!(
+                "re-added return-path default table {} via {}",
+                d.table, d.via
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -418,6 +449,14 @@ mod tests {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
                 "1\n",
+            );
+        }
+        // A healthy gw member's per-zone table holds cfab's return-path default; the restore is
+        // then a no-op. A flap test overrides this stub with an empty table.
+        for d in common::gw_return_defaults(view) {
+            sys = sys.on_stdout(
+                &["ip", "route", "show", "table", &d.table, "default"],
+                &format!("default via {} dev {} proto cfab-return\n", d.via, d.dev),
             );
         }
         rules_present(sys, view)
@@ -914,6 +953,74 @@ mod tests {
         for ifname in fabric_legs(&view) {
             assert!(sys.ran(&format!("ip link set {ifname} down")), "{ifname}");
         }
+    }
+
+    /// Finding C (2026-09-06): after a gw-leg flap the kernel has dropped cfab's return-path
+    /// default from the zone's table; the tick must re-add it, and must NOT down anything (a
+    /// missing return path is not a member-wide hazard like a missing rule). Its teeth: without
+    /// `restore_gw_return_defaults` the `ip route replace` is never issued.
+    #[test]
+    fn a_flapped_gw_return_default_is_re_added() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let defaults = common::gw_return_defaults(&view);
+        assert!(
+            !defaults.is_empty(),
+            "the fixture member must carry a gw zone for this test to prove anything"
+        );
+        let d = defaults[0].clone();
+        // The leg flapped: the table now has no default (the kernel dropped the dev-scoped route).
+        let mut sys = healthy_sys(&view)
+            .on_stdout(&["ip", "route", "show", "table", &d.table, "default"], "");
+        let report = run(&mut sys, &view).unwrap();
+        assert!(
+            report.downed.is_empty(),
+            "a missing return-path default must not down anything: {:?}",
+            report.downed
+        );
+        assert!(
+            sys.ran(&format!(
+                "ip route replace default via {} dev {} table {} proto 205",
+                d.via, d.dev, d.table
+            )),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            report
+                .restored
+                .iter()
+                .any(|s| s.contains(&format!("return-path default table {}", d.table))),
+            "{:?}",
+            report.restored
+        );
+    }
+
+    /// Best-effort: when the leg is down the re-add fails, and that is neither a fault to report
+    /// nor a reason to down a leg — the leg-down is the reported fault and self-resolves on
+    /// link-up (the next tick then re-adds the default).
+    #[test]
+    fn a_gw_return_default_that_cannot_be_re_added_is_silent() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let d = common::gw_return_defaults(&view)[0].clone();
+        let mut sys = healthy_sys(&view)
+            .on_stdout(&["ip", "route", "show", "table", &d.table, "default"], "")
+            .on_fail(
+                &["ip", "route", "replace", "default", "via", &d.via],
+                2,
+                "RTNETLINK: Nexthop device is down",
+            );
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.downed.is_empty(), "{:?}", report.downed);
+        assert!(
+            !report
+                .restored
+                .iter()
+                .any(|s| s.contains("return-path default")),
+            "a failed re-add must not claim it restored anything: {:?}",
+            report.restored
+        );
     }
 
     /// Row 19, restore. The hazard is the foreign slave, so the intruder is released and ours

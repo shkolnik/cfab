@@ -80,6 +80,79 @@ pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
     out
 }
 
+/// cfab's own gw-zone return-path default: `default via <router> dev <leg> table <id> proto
+/// 205`, one per gw zone this member carries. A reply sourced from a fabric identity is sent to
+/// the zone's table by return-path rule 2001; this default is that table's only exit, so without
+/// it the reply hits rule 2002 (`unreachable`) and an off-fabric ingress client is black-holed.
+///
+/// `up`/apply install it when the leg is built; the watchdog restores it after a gw-leg flap.
+/// The kernel deletes a dev-scoped route when its device goes down and never re-adds it on
+/// link-up, so a single leg flap otherwise black-holes ingress until the next reapply (measured
+/// on the pve3 fixture, 2026-09-06). One definition, two consumers, so the installed and restored
+/// spellings cannot drift (cf. `FabricRule`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GwReturnDefault {
+    pub table: String,
+    pub via: String,
+    pub dev: String,
+}
+
+impl GwReturnDefault {
+    fn argv(&self, verb: &str) -> Vec<String> {
+        [
+            "ip",
+            "route",
+            verb,
+            "default",
+            "via",
+            &self.via,
+            "dev",
+            &self.dev,
+            "table",
+            &self.table,
+            "proto",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(crate::emit::engine::CFAB_PROTO.to_string()))
+        .collect()
+    }
+
+    /// Whether the table already holds a default via our router.
+    pub fn present(&self, sys: &mut dyn Sys) -> Result<bool> {
+        Ok(sys
+            .run(&["ip", "route", "show", "table", &self.table, "default"])?
+            .stdout
+            .contains(&format!("default via {}", self.via)))
+    }
+
+    /// Unconditional install (`up`/apply): `ip route replace` is idempotent by itself.
+    pub fn install(&self, sys: &mut dyn Sys) -> Result<()> {
+        let owned = self.argv("replace");
+        let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+        run_ok(sys, &argv)?;
+        Ok(())
+    }
+}
+
+/// The gw-zone return-path defaults this member carries, one per gw zone. Empty on a member with
+/// no ingress leg. Built from the same `gw_rows`/zone/gw data `up` installs from.
+pub fn gw_return_defaults(view: &View) -> Vec<GwReturnDefault> {
+    let f = view.fabric;
+    view.gw_rows()
+        .into_iter()
+        .filter_map(|r| {
+            let z = f.zone(&r.zone).ok()?;
+            let gw = z.gw.as_ref()?;
+            Some(GwReturnDefault {
+                table: z.id.to_string(),
+                via: gw.router.clone(),
+                dev: r.ifname,
+            })
+        })
+        .collect()
+}
+
 pub fn fabric_rule_present(sys: &mut dyn Sys, r: &FabricRule) -> Result<bool> {
     Ok(sys
         .run(&["ip", "rule", "show", "pref", &r.pref])?
