@@ -42,7 +42,8 @@ enum Command {
     },
     /// Apply the fabric on this member and supervise its components (the systemd/container
     /// entry point; root). Applies, keeps `cfab engine`, `cfab shape-daemon` and `cfab
-    /// conf-sync` running, re-applies on SIGHUP, and tears the fabric down on SIGTERM.
+    /// conf-sync` running, re-reads the declaration on SIGHUP (re-apply, restart-to-apply, or
+    /// refuse), and tears the fabric down on SIGTERM.
     Run,
     /// Remove everything `run` created: stop the routing engine, sweep its routes, tear down (root)
     Down,

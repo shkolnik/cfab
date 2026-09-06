@@ -92,6 +92,12 @@ fn watchdog(w: &WatchdogInfo) -> String {
 pub fn render_line(c: &Components) -> String {
     let mut parts: Vec<String> = c.components.iter().map(component).collect();
     parts.push(watchdog(&c.watchdog));
+    // A refused reload leaves every component healthy — the running fabric is exactly the one
+    // that was up — so the only place an operator can learn that their edit did NOT take is
+    // here. It rides the always-printed line rather than a reason row for that reason.
+    if let Some(e) = &c.supervisor.last_apply_error {
+        parts.push(format!("last apply: {e}"));
+    }
     format!("components: {}", parts.join(" | "))
 }
 
@@ -120,6 +126,25 @@ mod tests {
             render_line(&c),
             "components: engine running 1h02m (0 restarts) | shape-daemon restarting (3 restarts, \
              last exit signal SIGKILL 1s ago) | conf-sync stopped (not clustered) | watchdog ok 2s ago"
+        );
+    }
+
+    /// A refused reload leaves every component healthy, so the components line is the only
+    /// place `cfab status` can say the operator's edit did not take.
+    #[test]
+    fn a_refused_reload_is_named_on_the_components_line() {
+        let mut c: Components = serde_json::from_str(FIXTURE).unwrap();
+        c.supervisor.last_apply_error = Some(
+            "reload refused, keeping the running fabric: /etc/cfab/fabric.toml: unknown key"
+                .to_string(),
+        );
+        let line = render_line(&c);
+        assert!(
+            line.ends_with(
+                "| last apply: reload refused, keeping the running fabric: \
+                 /etc/cfab/fabric.toml: unknown key"
+            ),
+            "{line}"
         );
     }
 

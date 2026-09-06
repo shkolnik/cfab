@@ -4,8 +4,18 @@
 //! The lifecycle (spec §6): take the instance lock, apply the fabric, spawn the engine and wait
 //! for it to become ready, read the engine back, spawn the shape daemon and conf-sync where
 //! their predicates hold, then supervise — restart any child 2 s after it exits while it is
-//! wanted, re-apply on SIGHUP or a `reapply` request, and on SIGTERM/SIGINT tear the fabric
+//! wanted, reload on SIGHUP or a `reapply` request, and on SIGTERM/SIGINT tear the fabric
 //! down and exit 0.
+//!
+//! **A reload re-reads the declaration** (James's ruling, 2026-09-06). SIGHUP and the socket
+//! `reapply` are one path: read `--config` through `Sys`, derive the `Fabric` it now describes
+//! and compare it with the running one (`classify_reload`). The same fabric re-applies in place
+//! as before (a repair); a changed, valid one runs the stop sequence and exits `EXIT_RELOAD` so
+//! systemd starts a fresh supervisor on it — `apply::run` creates and repairs but never prunes
+//! what a declaration stopped declaring, so an in-place switch would leave the old fabric's
+//! netdevs, rules and tables resident; anything else (unreadable, invalid, or no longer naming
+//! this member) is refused, leaving the running fabric untouched and the reason in
+//! `last_apply_error`, where `cfab status` prints it.
 //!
 //! **The spawn-site invariant (spec §7) is structural, not a preference.** Every
 //! `Command::spawn` — the initial spawns, every backoff respawn, and the re-apply's restarts —
@@ -45,6 +55,12 @@ pub const EXIT_INTERNAL: u8 = 1;
 pub const EXIT_APPLY_REFUSED: u8 = 3;
 /// Another supervisor already holds `<run_dir>/cfab.lock` (spec §14).
 pub const EXIT_LOCK_HELD: u8 = 4;
+/// The declaration on disk changed under a reload: the fabric was torn down and this process
+/// exits so systemd starts a fresh one on the new file. NOT 5 — that status already means
+/// "a supervised child could not arm `PR_SET_PDEATHSIG`" in this same binary, and one number
+/// must not carry two meanings. The unit turns it into a restart with
+/// `RestartForceExitStatus=6` and `SuccessExitStatus=6`.
+pub const EXIT_RELOAD: u8 = 6;
 
 /// The engine's readiness poll — the same values `engine_ctl` uses privately (spec §4/§8): the
 /// state socket answers `"ready": true` within `START_WAIT_MS`, retried every `POLL_MS`.
@@ -69,7 +85,7 @@ pub(crate) enum Cmd {
     /// A `reapply` over `cfab.sock`: the reply carries the apply result back to the (blocked)
     /// socket connection thread, so `reapply` answers only after the re-apply finishes (§9).
     Reapply(std::sync::mpsc::Sender<crate::error::Result<()>>),
-    /// SIGHUP: re-apply in place, no reply.
+    /// SIGHUP: reload, no reply.
     Hangup,
     /// SIGTERM/SIGINT: begin the stop sequence and exit 0.
     Terminate,
@@ -570,6 +586,10 @@ pub(crate) async fn run_with(
         Duration::from_millis(POLL_MS),
     );
 
+    // Set by a reload that found a changed declaration: the stop sequence below runs unchanged,
+    // and the exit status asks systemd for the restart that applies the new file.
+    let mut reload = false;
+
     loop {
         let next_respawn = pending.iter().map(|(_, d)| *d).min();
         let respawn_sleep = async {
@@ -619,22 +639,50 @@ pub(crate) async fn run_with(
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
-                match cmd {
+                // SIGHUP and a socket `reapply` are the SAME path (James's ruling, 2026-09-06):
+                // re-read the declaration and act on what it says. The only difference is
+                // whether anybody is waiting for an answer.
+                let reply = match cmd {
                     Cmd::Terminate => break,
-                    Cmd::Hangup => {
-                        let _ = do_reapply(
-                            sys, view, &opts, &shared, spawner, exe, config, pid,
-                            &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
-                        )
-                        .await;
-                    }
-                    Cmd::Reapply(reply) => {
+                    Cmd::Hangup => None,
+                    Cmd::Reapply(tx) => Some(tx),
+                };
+                match read_reload(&*sys, view, config) {
+                    // `Identical` means the re-read fabric is `Eq` to `view.fabric`, so the
+                    // repair applies the view built at start: it IS the file's fabric. The
+                    // freshly parsed one is dropped, never applied — if this equality is ever
+                    // loosened, thread the parsed fabric through instead.
+                    Reload::Identical => {
                         let r = do_reapply(
                             sys, view, &opts, &shared, spawner, exe, config, pid,
                             &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
                         )
                         .await;
-                        let _ = reply.send(r);
+                        if let Some(tx) = reply {
+                            let _ = tx.send(r);
+                        }
+                    }
+                    Reload::Changed => {
+                        eprintln!(
+                            "cfab: declaration changed, restarting to apply {config}"
+                        );
+                        // Answer the requester BEFORE the stop sequence: the restart takes the
+                        // socket with it, and a blocked `cfab reapply` must not hang for it.
+                        if let Some(tx) = reply {
+                            let _ = tx.send(Ok(()));
+                        }
+                        reload = true;
+                        break;
+                    }
+                    Reload::Invalid(why) => {
+                        let e = crate::error::Error::config(format!(
+                            "reload refused, keeping the running fabric: {why}"
+                        ));
+                        shared.lock().unwrap().last_apply_error = Some(e.to_string());
+                        eprintln!("cfab: {e}");
+                        if let Some(tx) = reply {
+                            let _ = tx.send(Err(e));
+                        }
                     }
                 }
             }
@@ -751,8 +799,9 @@ pub(crate) async fn run_with(
         Ok(msg) => print!("{msg}"),
         Err(e) => eprintln!("{e}"),
     }
-    // 6. Exit 0.
-    EXIT_OK
+    // 6. Exit 0 — or `EXIT_RELOAD`, which is the same clean stop plus "start me again on the
+    // declaration I just read".
+    if reload { EXIT_RELOAD } else { EXIT_OK }
 }
 
 /// Argv for a supervised child: exactly today's `<exe> --config <config> --host <member>
@@ -834,6 +883,60 @@ fn launch(
             pending.retain(|(n, _)| *n != name);
             pending.push((name, now + BACKOFF));
         }
+    }
+}
+
+/// What a reload (SIGHUP, or a `reapply` request — one code path) found in the declaration on
+/// disk. The supervisor runs on the `Fabric` it was started with, so "the file changed" is a
+/// question that can only be answered by re-reading it at reload time (finding F2: before this,
+/// `systemctl reload cfab` silently re-applied the declaration loaded at start).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reload {
+    /// The same fabric: re-apply in place (repair), exactly as every reload did before.
+    Identical,
+    /// A different, valid fabric that still declares this member. `apply::run` is
+    /// create-if-absent / refuse-foreign and prunes nothing a declaration stopped declaring, so
+    /// the only correct way to reach the new fabric is the full stop sequence plus a restart.
+    Changed,
+    /// Unreadable, unparseable, invalid, or no longer declaring this member: refuse and keep
+    /// running on the fabric that is already up. Carries the operator-facing reason.
+    Invalid(String),
+}
+
+/// The pure half of the reload decision: the running fabric plus the text now on disk. Equality
+/// is over the DERIVED `Fabric`, not the file bytes, so a comment, a reordered key inside a
+/// table, or a whitespace edit re-applies in place instead of restarting the fabric. Row order
+/// (`[[member]]`, `[[zone]]`, segments) is part of the fabric and does count.
+pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
+    let refuse = |e: crate::error::Error| Reload::Invalid(format!("{config}: {e}"));
+    let decl = match crate::decl::Declaration::parse(text) {
+        Ok(d) => d,
+        Err(e) => return refuse(e),
+    };
+    let next = match Fabric::from_decl(&decl) {
+        Ok(f) => f,
+        Err(e) => return refuse(e),
+    };
+    // A declaration that no longer names this host is invalid *for this supervisor*: applying it
+    // would be applying somebody else's fabric, and exiting on it would tear this one down for
+    // what is far more likely a typo than a decommission.
+    if let Err(e) = next.member(member) {
+        return refuse(e);
+    }
+    if next == *current {
+        Reload::Identical
+    } else {
+        Reload::Changed
+    }
+}
+
+/// The impure half: read `config` through `Sys` (never `std::fs`, so the mocks see it) and
+/// classify it. An unreadable or missing file is `Invalid` — never a reason to tear a running
+/// fabric down.
+fn read_reload(sys: &dyn Sys, view: &View, config: &str) -> Reload {
+    match sys.read(config) {
+        Ok(text) => classify_reload(view.fabric, &view.member.name, config, &text),
+        Err(e) => Reload::Invalid(format!("cannot read {config}: {e}")),
     }
 }
 
@@ -1136,13 +1239,23 @@ mod tests {
     const EXE: &str = "/usr/bin/cfab";
     const CONFIG: &str = "/etc/cfab/fabric.toml";
 
-    fn fabric_at(run_dir: &Path) -> Fabric {
+    /// The packaged example declaration with `[runtime] run_dir` moved into the test's tempdir.
+    /// It is the TEXT, not just the model: a reload re-reads `CONFIG`, so the fixture's file and
+    /// the fixture's fabric must be the same declaration or every reload would read "changed".
+    fn decl_text(run_dir: &Path) -> String {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        let mut f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
-        f.run_dir = run_dir.to_str().unwrap().to_string();
-        f
+        let out = text.replace(
+            "run_dir = \"/run/cfab\"",
+            &format!("run_dir = \"{}\"", run_dir.display()),
+        );
+        assert_ne!(out, text, "the example's run_dir line moved");
+        out
+    }
+
+    fn fabric_at(run_dir: &Path) -> Fabric {
+        Fabric::from_decl(&Declaration::parse(&decl_text(run_dir)).unwrap()).unwrap()
     }
 
     /// A pmxcfs root with no `.members` — `probe()` returns `None`, so conf-sync is stopped
@@ -1156,6 +1269,7 @@ mod tests {
     /// readable, and the engine socket answering a healthy state document for `view`.
     fn fresh_sys(view: &View, run_dir: &Path) -> MockSys {
         let mut sys = MockSys::default()
+            .file(CONFIG, &decl_text(run_dir))
             .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n")
             .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
             .on_stdout(
@@ -1582,6 +1696,256 @@ mod tests {
             snap.supervisor.last_apply_error.is_some(),
             "the failed re-apply is recorded for the operator surface"
         );
+    }
+
+    // ---- reload: SIGHUP / `reapply` re-reads the declaration (ruling (b), 2026-09-06) -------
+
+    /// What one reload did. `Cmd::Reapply` is the driven verb because it carries a reply
+    /// channel; `Cmd::Hangup` reaches the identical decision through the identical arm.
+    struct ReloadOutcome {
+        code: u8,
+        res: crate::error::Result<()>,
+        applies: u64,
+        engine_spawns: usize,
+        /// Every `Sys` call the whole run made, including the stop sequence.
+        calls: Vec<String>,
+        /// The calls at the moment the reload answered — before any stop sequence, so "an
+        /// in-place re-apply tore nothing down" is a claim about the re-apply alone.
+        calls_at_reload: Vec<String>,
+        last_apply_error: Option<String>,
+    }
+
+    /// Bring a supervisor up on the example declaration, let `edit` rewrite what is on disk at
+    /// `CONFIG` (the file the reload re-reads), then reload and stop.
+    async fn reload_with(edit: impl FnOnce(&mut MockSys, &Path)) -> ReloadOutcome {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut mock = fresh_sys(&view, tmp.path());
+        edit(&mut mock, tmp.path());
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sys = TestSys::new(mock, calls.clone());
+        let (mut spawner, recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let calls_c = calls.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            driver_tx.send(Cmd::Reapply(rtx)).ok();
+            let res = tokio::task::spawn_blocking(move || rrx.recv().unwrap())
+                .await
+                .unwrap();
+            let at_reload = calls_c.lock().unwrap().clone();
+            // A reload that restarts has already left the loop; this is then a no-op.
+            driver_tx.send(Cmd::Terminate).ok();
+            (res, at_reload)
+        });
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            quiet_hooks(shared.clone(), ready_tx),
+        )
+        .await;
+        let (res, calls_at_reload) = driver.await.unwrap();
+        let st = shared.lock().unwrap();
+        ReloadOutcome {
+            code,
+            res,
+            applies: st.applies,
+            engine_spawns: recs
+                .lock()
+                .unwrap()
+                .spawned
+                .iter()
+                .filter(|n| *n == "engine")
+                .count(),
+            calls: calls.lock().unwrap().clone(),
+            calls_at_reload,
+            last_apply_error: st.last_apply_error.clone(),
+        }
+    }
+
+    /// A declaration that gained a comment is the SAME fabric: the reload repairs in place —
+    /// the engine restarts, the apply count rises, nothing is torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_an_unchanged_declaration_re_applies_in_place() {
+        let o = reload_with(|m, dir| {
+            let text = format!("# an operator's note, not a change\n{}", decl_text(dir));
+            m.files.insert(CONFIG.to_string(), text);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert!(
+            o.res.is_ok(),
+            "an unchanged declaration re-applies: {:?}",
+            o.res
+        );
+        assert_eq!(o.applies, 2, "the initial apply plus the re-apply");
+        assert_eq!(o.engine_spawns, 2, "the re-apply restarts the engine");
+        assert_eq!(o.last_apply_error, None);
+        assert!(
+            !o.calls_at_reload
+                .iter()
+                .any(|c| c.starts_with("tc qdisc del")),
+            "an in-place re-apply tears nothing down"
+        );
+    }
+
+    /// SIGHUP itself (not the socket verb) reaches the same decision: a changed declaration makes
+    /// the supervisor tear down and exit `EXIT_RELOAD` with nobody waiting for an answer. Guarded
+    /// by a timeout so a regression that turns `Hangup` into a no-op fails instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sighup_on_a_changed_declaration_stops_and_asks_for_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut mock = fresh_sys(&view, tmp.path());
+        let text = decl_text(tmp.path()).replace("leaf_offset = 30000", "leaf_offset = 30001");
+        assert!(
+            text.contains("30001"),
+            "the fixture must carry the tunable this test edits"
+        );
+        mock.files.insert(CONFIG.to_string(), text);
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sys = TestSys::new(mock, calls.clone());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx.send(Cmd::Hangup).ok();
+        });
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_with(
+                &mut sys,
+                &view,
+                &mut spawner,
+                EXE,
+                CONFIG,
+                &no_pmx(tmp.path()),
+                cmd_tx,
+                cmd_rx,
+                quiet_hooks(shared.clone(), ready_tx),
+            ),
+        )
+        .await
+        .expect("SIGHUP on a changed declaration must end the supervisor");
+        assert_eq!(code, EXIT_RELOAD);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("tc qdisc del")),
+            "the stop sequence tears the fabric down before the restart"
+        );
+    }
+
+    /// A changed, valid declaration cannot be applied in place — `apply::run` never removes what
+    /// the previous declaration had — so the reload tears the fabric down and exits `EXIT_RELOAD`
+    /// for systemd to start a supervisor on the new file. Nothing is applied in-process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_a_changed_declaration_stops_and_asks_for_a_restart() {
+        let o = reload_with(|m, dir| {
+            let text = decl_text(dir).replace("fabric.example", "fabric.changed");
+            m.files.insert(CONFIG.to_string(), text);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_RELOAD, "the exit status asks for the restart");
+        assert!(o.res.is_ok(), "the requester is answered, not left hanging");
+        assert_eq!(
+            o.applies, 1,
+            "the new declaration is NOT applied in-process"
+        );
+        assert_eq!(
+            o.engine_spawns, 1,
+            "no engine restart: the process is going away"
+        );
+        assert!(
+            o.calls.iter().any(|c| c.starts_with("tc qdisc del")),
+            "the full stop sequence ran (spec §13 teardown)"
+        );
+        assert_eq!(o.last_apply_error, None);
+    }
+
+    /// An invalid declaration is refused: the running fabric is kept, no child is touched, and
+    /// the reason reaches both the requester and `cfab status`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_an_invalid_declaration_is_refused_and_says_why() {
+        let o = reload_with(|m, _| {
+            m.files.insert(
+                CONFIG.to_string(),
+                "dns_domain = \"x\"\nnot_a_key = 1\n".to_string(),
+            );
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK, "a refusal never restarts anything");
+        let err = o.res.unwrap_err().to_string();
+        assert!(err.contains("reload refused"), "{err}");
+        assert!(err.contains(CONFIG), "the refusal names the file: {err}");
+        assert_eq!(o.applies, 1, "nothing was applied");
+        assert_eq!(o.engine_spawns, 1, "no child is restarted");
+        let recorded = o
+            .last_apply_error
+            .expect("the refusal is on the status surface");
+        assert!(recorded.contains("reload refused"), "{recorded}");
+        assert!(recorded.contains(CONFIG), "{recorded}");
+    }
+
+    /// The declaration is gone. Same answer as invalid — a file an operator (or a package) is
+    /// mid-edit on must never take a running fabric down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_with_the_declaration_missing_is_refused() {
+        let o = reload_with(|m, _| {
+            m.files.remove(CONFIG);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        let err = o.res.unwrap_err().to_string();
+        assert!(err.contains("reload refused"), "{err}");
+        assert!(err.contains("cannot read"), "{err}");
+        assert_eq!(o.applies, 1);
+        assert_eq!(o.engine_spawns, 1);
+        assert!(o.last_apply_error.is_some());
+    }
+
+    /// The decision itself, without a supervisor around it: the four answers, including the one
+    /// a live host cares most about — a valid fabric that no longer names this member is a
+    /// refusal, not a teardown.
+    #[test]
+    fn classify_reload_answers_the_four_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let text = decl_text(tmp.path());
+        let c = |t: &str| classify_reload(&f, "pve1-tb", CONFIG, t);
+        assert_eq!(c(&text), Reload::Identical);
+        assert_eq!(
+            c(&format!("# comment\n{text}")),
+            Reload::Identical,
+            "equality is over the derived fabric, not the bytes"
+        );
+        assert_eq!(
+            c(&text.replace("fabric.example", "fabric.changed")),
+            Reload::Changed
+        );
+        assert!(matches!(c("nonsense = ["), Reload::Invalid(_)));
+        // Valid, but this member is gone from it.
+        assert!(matches!(
+            classify_reload(&f, "pve9-tb", CONFIG, &text),
+            Reload::Invalid(_)
+        ));
     }
 
     /// Spec §7: `PR_SET_PDEATHSIG` follows the parent thread, and tokio retires idle blocking

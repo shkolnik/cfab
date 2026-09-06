@@ -23,7 +23,9 @@ pub trait ComponentsSource {
     /// The last `n` captured lines of that child, or `None` if this member has no such
     /// component.
     fn log_tail(&self, name: &str, n: usize) -> Option<Vec<String>>;
-    /// Re-apply the fabric, blocking until it finishes.
+    /// Reload: re-read the declaration and act on it (the SIGHUP path), blocking until it
+    /// finishes. `Ok(())` on an in-place re-apply and on a changed declaration the supervisor
+    /// is restarting for; the refusal reason on an invalid one.
     fn reapply(&self) -> Result<()>;
 }
 
