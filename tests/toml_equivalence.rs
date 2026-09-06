@@ -208,7 +208,7 @@ fn the_minimal_declaration_generates_the_same_artifacts() {
 /// Every check `Fabric::from_decl`/`validate` still makes, each with the declaration that
 /// trips it and the words its message must carry. Deleting a check makes its case fail;
 /// deleting a CASE fails the count below. Grow both together when a check is added.
-const CASES: usize = 28;
+const CASES: usize = 30;
 
 fn edited(edits: &[(&str, &str)]) -> String {
     let mut text = example();
@@ -423,6 +423,16 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
                 "prefs = { storage = [\"eth1\", \"eth9\"] }",
             )]),
             "an override is the COMPLETE order",
+        ),
+        (
+            "a member name declared twice",
+            edited(&[("name = \"pve2-tb\"", "name = \"pve1-tb\"")]),
+            "member pve1-tb declared twice",
+        ),
+        (
+            "a node id used twice",
+            edited(&[("node = 2\n", "node = 1\n")]),
+            "node id 1 used twice",
         ),
     ];
     assert_eq!(

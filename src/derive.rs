@@ -421,11 +421,8 @@ pub fn universal_cost(fabric: &Fabric, zone: &str) -> u32 {
 
 /// This member's universal segments (table order): each `any` row fanned out over the member's
 /// wires in `[[member]]` order, one slave per wire, homed on the zone's cheapest wire this
-/// member has. A member with no wires at all has no such row (it has no fabric).
+/// member has. A member always has a wire: `Fabric::validate` refuses a wireless one.
 pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
-    if member.wires.is_empty() {
-        return Vec::new();
-    }
     fabric
         .segments
         .iter()

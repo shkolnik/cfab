@@ -306,7 +306,7 @@ fn the_preference_order_per_zone_reproduces_v0_except_mgmt() {
 ///
 /// That is a real change of failure behavior, not a cosmetic one: after eth0 dies, mgmt lands
 /// on the wire that carries storage bulk instead of the wire that carries cluster control. It
-/// is reversible with three a member's `prefs` rows. James's call; until then the derived order stands
+/// is reversible with a `prefs` entry on each host. James's call; until then the derived order stands
 /// and this test states it.
 #[test]
 fn the_mgmt_backup_order_is_the_one_real_behavior_change() {
