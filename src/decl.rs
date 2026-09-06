@@ -547,6 +547,53 @@ mod tests {
         text[..cut].to_string()
     }
 
+    /// Parse -> serialize -> parse is a fixed point: every field the file states survives
+    /// the struct tree, so `cfab schema` describes the file cfab actually reads.
+    #[test]
+    fn the_example_round_trips_through_the_struct_tree() {
+        let once = Declaration::parse(&example()).unwrap();
+        let text = toml::to_string(&once).expect("the declaration serializes");
+        let twice = Declaration::parse(&text).expect("the serialized form parses");
+        assert_eq!(
+            toml::to_string(&twice).unwrap(),
+            text,
+            "the struct tree is not a fixed point"
+        );
+    }
+
+    /// `cfab schema` emits the INPUT schema: the required tables are required, the tunables
+    /// are not, and an unknown key is refused by the schema exactly as the parser refuses it.
+    #[test]
+    fn the_schema_describes_the_declaration() {
+        let schema = schemars::schema_for!(Declaration);
+        let json = serde_json::to_value(&schema).unwrap();
+        let required: Vec<&str> = json["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for want in ["dns_domain", "domains", "member", "zone", "forward"] {
+            assert!(required.contains(&want), "{want} must be required: {json}");
+        }
+        for tunable in ["admin", "marking", "cost", "bfd", "ospf", "bgp", "runtime"] {
+            assert!(
+                !required.contains(&tunable),
+                "{tunable} is a tunable with defaults: {json}"
+            );
+            assert!(
+                json["properties"][tunable] != serde_json::Value::Null,
+                "{tunable} must still be in the schema"
+            );
+        }
+        assert_eq!(json["additionalProperties"], serde_json::json!(false));
+        // ...and every property the example states is described.
+        let props = json["properties"].as_object().expect("properties");
+        for key in ["dns_domain", "domains", "member", "zone", "forward"] {
+            assert!(props.contains_key(key), "{key}");
+        }
+    }
+
     /// The retired shell format is not a declaration: it fails at parse, loudly.
     #[test]
     fn a_v0_shell_format_file_is_refused_at_parse() {
