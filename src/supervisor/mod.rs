@@ -1453,6 +1453,9 @@ mod tests {
         fn list_dir(&self, p: &str) -> crate::error::Result<Vec<String>> {
             self.inner.list_dir(p)
         }
+        fn read_link(&self, p: &str) -> crate::error::Result<String> {
+            self.inner.read_link(p)
+        }
         fn mkdir_p(&mut self, p: &str) -> crate::error::Result<()> {
             self.inner.mkdir_p(p)
         }

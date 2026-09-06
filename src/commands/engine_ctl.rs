@@ -921,13 +921,14 @@ pub(crate) mod tests {
             r.starts_with("stop the daemon named in the line above;"),
             "{r}"
         );
-        // Every branch carries the fabric-wide-port caveat.
+        // Every branch carries the fabric-wide-port caveat, spelled as the declaration key is.
         assert!(
             r.contains(
-                "or declare a free BFD_PORT (now 3784) in fabric.toml on EVERY member — \
+                "or declare a free [bfd] port (now 3784) in fabric.toml on EVERY member — \
                  every peer of a session must use the same port"
             ),
             "{r}"
         );
+        assert!(!r.contains("BFD_PORT"), "{r}");
     }
 }

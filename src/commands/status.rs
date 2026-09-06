@@ -1340,6 +1340,72 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    /// The same fabric with `[bfd] port` declared away from FRR's default — the supported way
+    /// to run cfab beside an FRR that owns udp/3784.
+    fn fabric_on_bfd_port(port: u16) -> Fabric {
+        let mut f = fabric();
+        f.bfd_port = port;
+        f
+    }
+
+    /// `/proc/net/udp` as the kernel prints it (captured shape, pve1-tb 2026-09-06): a header
+    /// line, then one bound socket per line. The probe reads two columns out of it — the port
+    /// half of `local_address` (4 uppercase hex digits) and `inode` — so the rows carry a
+    /// wildcard address and the header stays verbatim.
+    fn proc_net_udp(sockets: &[(u16, u64)]) -> String {
+        let mut out = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when \
+                       retrnsmt   uid  timeout inode ref pointer drops\n"
+            .to_string();
+        for (i, (port, inode)) in sockets.iter().enumerate() {
+            out += &format!(
+                "{:5}: 00000000:{port:04X} 00000000:0000 07 00000000:00000000 00:00000000 \
+                 00000000     0        0 {inode} 2 0000000000000000 0\n",
+                4600 + i
+            );
+        }
+        out
+    }
+
+    /// `/proc/net/udp6`: the same columns with a 128-bit `local_address`.
+    fn proc_net_udp6(sockets: &[(u16, u64)]) -> String {
+        let mut out = "   sl  local_address                         remote_address              \
+                       st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref \
+                       pointer drops\n"
+            .to_string();
+        for (i, (port, inode)) in sockets.iter().enumerate() {
+            out += &format!(
+                "{:5}: {z}:{port:04X} {z}:0000 07 00000000:00000000 00:00000000 \
+                 00000000     0        0 {inode} 2 0000000000000000 0\n",
+                4700 + i,
+                z = "0".repeat(32)
+            );
+        }
+        out
+    }
+
+    /// A live FRR bfdd on this host: the unit enabled, the process running (plus a zombie of
+    /// the same name, which holds no socket), and the fd table that ties it to `inodes`.
+    fn frr_bfdd(sys: MockSys, inodes: &[u64]) -> MockSys {
+        let mut sys = sys
+            .on_stdout(&["systemctl", "is-enabled", "frr.service"], "enabled\n")
+            .file("/proc/812/comm", "bfdd\n")
+            .file("/proc/812/status", "Name:\tbfdd\nState:\tS (sleeping)\n")
+            // A reaped-but-not-waited bfdd keeps its /proc entry and its name (the container
+            // fixture, whose init reaps nothing): a zombie holds no socket.
+            .file("/proc/813/comm", "bfdd\n")
+            .file("/proc/813/status", "Name:\tbfdd\nState:\tZ (zombie)\n");
+        // fd 0..2 are the standard streams (a non-socket target the scan must skip); the
+        // sockets start at 3, as they do live.
+        sys = sys.link("/proc/812/fd/0", "/dev/null");
+        for (i, inode) in inodes.iter().enumerate() {
+            sys = sys.link(
+                &format!("/proc/812/fd/{}", i + 3),
+                &format!("socket:[{inode}]"),
+            );
+        }
+        sys
+    }
+
     /// The engine's state document as `engine::state::document` shapes it: every instance
     /// healthy with transit links at the leaf offset, one BFD session per (peer, state), and
     /// every peer that carries the zone's fallback row adjacent on the fallback bond.
@@ -2488,31 +2554,149 @@ mod tests {
         );
     }
 
-    /// A BFD-capable daemon on the host is a reason line, never a state: it takes the port at
-    /// our next engine restart, but nothing is down yet.
+    /// F13, VERIFIED live on pve1-tb 2026-09-06 with 0.4.1: FRR's bfdd holds udp/3784 while our
+    /// declaration says 13784, and status still called it a conflict. Running beside FRR on a
+    /// declared free port is the designed coexistence, not a fault: the probe must look at who
+    /// holds OUR port, never at who is on the host.
     #[test]
-    fn a_second_bfd_daemon_is_a_reason_line_while_we_are_up() {
+    fn frr_on_another_port_is_not_a_conflict() {
+        let f = fabric_on_bfd_port(13784);
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = frr_bfdd(healthy_leaf(&view), &[41231, 41232])
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[(3784, 41232)]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report.output.contains("bfd udp/"),
+            "bfdd on 3784 is no news while we declared 13784:\n{}",
+            report.output
+        );
+    }
+
+    /// A daemon that really holds our port is a reason line, never a state: it keeps the port
+    /// at our next engine restart, but nothing is down yet. The line names the holder.
+    #[test]
+    fn a_daemon_holding_our_bfd_port_is_a_reason_line_while_we_are_up() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = healthy_leaf(&view)
-            .on_stdout(&["systemctl", "is-enabled", "frr.service"], "enabled\n")
-            .file("/proc/812/comm", "bfdd\n")
-            .file("/proc/812/status", "Name:\tbfdd\nState:\tS (sleeping)\n")
-            // A zombie of the same name holds nothing and must not be reported.
-            .file("/proc/813/comm", "bfdd\n")
-            .file("/proc/813/status", "Name:\tbfdd\nState:\tZ (zombie)\n");
+        let mut sys = frr_bfdd(healthy_leaf(&view), &[41231])
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "a reason line moves no state");
         assert_eq!(report.code, 0);
         assert!(
             report.output.contains(
-                "  bfd udp/3784: another BFD daemon is on this host (frr.service enabled, \
-                 bfdd running (pid 812)) — it takes the port at our next engine restart; stop it \
-                 (systemctl disable --now frr), or declare a free BFD_PORT on EVERY member\n"
+                "  bfd udp/3784: bfdd (pid 812, frr.service enabled) holds this port, which the \
+                 engine needs exclusively\n"
             ),
             "{}",
             report.output
         );
+        assert!(
+            report.output.contains(
+                "  remedy: stop FRR, which owns bfdd: systemctl disable --now frr; or declare a \
+                 free [bfd] port (now 3784) in fabric.toml on EVERY member — every peer of a \
+                 session must use the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("BFD_PORT"),
+            "the declaration key is `[bfd] port`, one spelling everywhere:\n{}",
+            report.output
+        );
+    }
+
+    /// The port is one port across both families: a holder that bound only `[::]` still takes
+    /// every packet from the engine, so /proc/net/udp6 is read the same way.
+    #[test]
+    fn a_holder_on_our_port_over_ipv6_only_is_a_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = frr_bfdd(healthy_leaf(&view), &[41232])
+            .file("/proc/net/udp", &proc_net_udp(&[(9000, 41240)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[(3784, 41232)]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  bfd udp/3784: bfdd (pid 812, frr.service enabled) holds this port, which the \
+                 engine needs exclusively\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Nobody on the port and no BFD daemon anywhere: silence.
+    #[test]
+    fn a_free_bfd_port_says_nothing() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file("/proc/net/udp", &proc_net_udp(&[(9000, 41240)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(!report.output.contains("bfd udp/"), "{}", report.output);
+    }
+
+    /// An unidentified holder: the engine is down (the supervisor says so), yet the port is
+    /// bound — so the socket is provably not ours, and status says so without naming a daemon
+    /// it could not resolve. The same socket while the engine RUNS is our own and is silent
+    /// (`a_bound_port_is_our_own_engine_while_it_runs`).
+    #[test]
+    fn an_unidentified_holder_is_reported_while_the_engine_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 60, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 4, "last_exit": {"cause": "exit 1", "s_ago": 1}}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string();
+        let mut sys = leaf_env(&view)
+            .socket_verb("/run/cfab/cfab.sock", "components", &comps)
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  bfd udp/3784: another process holds this port, which the engine needs \
+                 exclusively\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
+                 free [bfd] port (now 3784) in fabric.toml on EVERY member — every peer of a \
+                 session must use the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Teeth for the ownership rule: a socket on our port while the supervisor reports the
+    /// engine running IS the engine's own — reporting it would flag every healthy host.
+    #[test]
+    fn a_bound_port_is_our_own_engine_while_it_runs() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(!report.output.contains("bfd udp/"), "{}", report.output);
     }
 
     /// The engine is simply absent (no port thief): still zero adjacencies, still FAILED, and
@@ -3686,7 +3870,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
-                 free BFD_PORT (now 3784) in fabric.toml on EVERY member — every peer of a \
+                 free [bfd] port (now 3784) in fabric.toml on EVERY member — every peer of a \
                  session must use the same port\n"
             ),
             "{}",
