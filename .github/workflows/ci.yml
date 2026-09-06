@@ -24,6 +24,8 @@ jobs:
           components: rustfmt, clippy
       - name: Holo pin and feature guard
         run: bash scripts/holo-check.sh
+      - name: Fork socket tests (control-mark order is a fork invariant cfab depends on)
+        run: cargo test --manifest-path ../holo/Cargo.toml -p holo-utils --lib socket
       - name: Format
         run: cargo fmt --check
       - name: Clippy

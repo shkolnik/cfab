@@ -367,8 +367,13 @@ fn parse_port(raw: &RawConfig, key: &str, default: u16) -> Result<u16> {
 /// the engine down at start.
 fn parse_pcp(raw: &RawConfig, key: &str) -> Result<u8> {
     let pcp: u8 = parse_num(raw, key)?;
-    if pcp > 7 {
-        return Err(Error::config(format!("{key}={pcp} is outside 0..7")));
+    // 7 is representable on the wire but SO_PRIORITY 7 needs CAP_NET_ADMIN, which the engine drops
+    // before it opens its sockets; the failure there is a logged raise and a silently down
+    // interface, so the declaration refuses it here instead.
+    if pcp > 6 {
+        return Err(Error::config(format!(
+            "{key}={pcp} is outside 0..6 (7 needs CAP_NET_ADMIN on the engine's control sockets)"
+        )));
     }
     Ok(pcp)
 }
@@ -817,14 +822,18 @@ mod tests {
     fn pcp_ctrl_is_range_checked() {
         assert_eq!(parse_fabric(|_| {}).unwrap().pcp_ctrl, 6);
         assert_eq!(
-            parse_fabric(|t| *t = t.replace("PCP_CTRL=6", "PCP_CTRL=7"))
+            parse_fabric(|t| *t = t.replace("PCP_CTRL=6", "PCP_CTRL=5"))
                 .unwrap()
                 .pcp_ctrl,
-            7
+            5
         );
         for (bad, want) in [
-            ("PCP_CTRL=8", "PCP_CTRL=8 is outside 0..7"),
-            ("PCP_CTRL=255", "PCP_CTRL=255 is outside 0..7"),
+            (
+                "PCP_CTRL=7",
+                "PCP_CTRL=7 is outside 0..6 (7 needs CAP_NET_ADMIN on the engine's control sockets)",
+            ),
+            ("PCP_CTRL=8", "PCP_CTRL=8 is outside 0..6"),
+            ("PCP_CTRL=255", "PCP_CTRL=255 is outside 0..6"),
             ("PCP_CTRL=256", "PCP_CTRL='256' is not a valid number"),
             ("PCP_CTRL=six", "PCP_CTRL='six' is not a valid number"),
         ] {
