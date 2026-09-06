@@ -5,10 +5,13 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# Workflow level, never job level: a job-level `permissions:` REPLACES this block wholesale,
+# which would silently drop id-token/attestations and break the deb attestation below.
 permissions:
   contents: write
   id-token: write
   attestations: write
+  packages: write
 
 # Serialize per ref so rapid main pushes can't interleave the dev-release
 # delete/recreate. No cancel-in-progress: a half-cancelled publish could
@@ -144,3 +147,182 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "cfab dev (rolling)" \
             --notes-file notes.md
+
+      # ---- Generic runtime image (formal releases only) -------------------
+      # Appended LAST on purpose: an image failure reddens the run but never
+      # withholds the GitHub release, the deb assets, or the apt-repo dispatch,
+      # all of which have already happened above. Unlike the pkg notify these
+      # steps are NOT continue-on-error: the image is a first-class release
+      # deliverable, so a failure must be loud.
+      - name: Stage the deb into the image build context
+        if: steps.meta.outputs.channel == 'formal'
+        id: image_meta
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(dist/*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "expected exactly one deb in dist/, found ${#debs[@]}: ${debs[*]-}" >&2
+            exit 1
+          fi
+          deb="${debs[0]}"
+          cp "$deb" packaging/docker/cfab.deb
+          # cfab_<upstream>-<debrev>_<arch>.deb — parse the revision, never
+          # hardcode it: [package.metadata.deb] declares no `revision`, so
+          # cargo-deb's default 1 applies today and could change.
+          base="$(basename "$deb")"
+          debrev="${base#cfab_}"
+          debrev="${debrev%%_*}"
+          case "$debrev" in
+            *-*) debrev="${debrev##*-}" ;;   # last hyphen: a prerelease upstream (0.4.0-rc1) has its own
+            *)   debrev="" ;;
+          esac
+          if [ -z "$debrev" ]; then
+            echo "could not parse a deb revision out of $base" >&2
+            exit 1
+          fi
+          echo "debrev=$debrev" >> "$GITHUB_OUTPUT"
+          echo "deb=$base debrev=$debrev"
+      - name: Log in to ghcr.io
+        if: steps.meta.outputs.channel == 'formal'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Set up Buildx
+        if: steps.meta.outputs.channel == 'formal'
+        uses: docker/setup-buildx-action@v3
+      - name: Compute image tags
+        if: steps.meta.outputs.channel == 'formal'
+        id: image_tags
+        env:
+          VER: ${{ steps.meta.outputs.ver }}
+          DEBREV: ${{ steps.image_meta.outputs.debrev }}
+        run: |
+          set -euo pipefail
+          img=ghcr.io/shkolnik/cfab
+          tags="$img:$VER,$img:$VER-$DEBREV"
+          # :latest moves only for a plain X.Y.Z that sorts strictly above the
+          # version currently wearing :latest — a prerelease, or a patch tag cut
+          # on an older branch, must not take it. `buildx imagetools` reads the
+          # label straight from the registry (no pull) and, unlike
+          # `docker manifest inspect`, is not an experimental CLI command.
+          take_latest=no
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if cur=$(docker buildx imagetools inspect "$img:latest" --format \
+                  '{{ index .Image.Config.Labels "org.opencontainers.image.version" }}' \
+                  2>/tmp/latest-query.err); then
+              if [ -z "$cur" ] || [ "$cur" = "<no value>" ]; then
+                echo "$img:latest carries no org.opencontainers.image.version label;" \
+                     "cannot decide whether $VER supersedes it" >&2
+                exit 1
+              fi
+              # >= not >: a re-run of this same tag (after a transient failure
+              # downstream) rebuilds the version tags to a fresh digest and must
+              # re-point :latest with them, or the two tags name different images.
+              if [ "$(printf '%s\n%s\n' "$cur" "$VER" | sort -V | tail -1)" = "$VER" ]; then
+                take_latest=yes
+              else
+                echo "not taking :latest — current :latest is $cur, this release is $VER"
+              fi
+            elif grep -qiE 'manifest unknown|not found|name unknown|denied' /tmp/latest-query.err; then
+              # No :latest yet: first push, or the package does not exist.
+              echo "no existing :latest — taking it"
+              take_latest=yes
+            else
+              echo "querying $img:latest failed:" >&2
+              cat /tmp/latest-query.err >&2
+              exit 1
+            fi
+          else
+            echo "not taking :latest — $VER is a prerelease"
+          fi
+          [ "$take_latest" = yes ] && tags="$tags,$img:latest"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "local=$img:ci-local" >> "$GITHUB_OUTPUT"
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+          echo "tags: $tags"
+      - name: Build the runtime image
+        if: steps.meta.outputs.channel == 'formal'
+        id: image_build
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging/docker
+          platforms: linux/amd64
+          push: false
+          load: true
+          # buildx's inline SLSA attestation would turn the push into an index
+          # and duplicate the provenance story; attest-build-provenance below
+          # is the one source of it.
+          provenance: false
+          tags: ${{ steps.image_tags.outputs.local }}
+          # source is what links the GHCR package to this repo, which is what
+          # authorizes GITHUB_TOKEN to write it — load-bearing, not cosmetic.
+          labels: |
+            org.opencontainers.image.source=https://github.com/shkolnik/cfab
+            org.opencontainers.image.version=${{ steps.meta.outputs.ver }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Smoke-test the image before pushing
+        if: steps.meta.outputs.channel == 'formal'
+        env:
+          LOCAL: ${{ steps.image_tags.outputs.local }}
+          VER: ${{ steps.meta.outputs.ver }}
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm "$LOCAL" --version)
+          if [ "$got" != "cfab $VER" ]; then
+            echo "image reports '$got', expected 'cfab $VER'" >&2
+            exit 1
+          fi
+          # The whole runtime chain, including the iptables-legacy binaries the
+          # leaf's ceiling-only fallback shells out to, and no baked declaration.
+          # One `command -v` per name: the image's /bin/sh is dash, whose
+          # `command -v a b c` checks only `a` and exits 0 — measured 2026-09-06
+          # on the real image, where the single-call form passed while reporting
+          # nft alone.
+          docker run --rm --entrypoint sh "$LOCAL" -c '
+            set -e
+            for t in nft ip ethtool iptables-legacy iptables-legacy-save iptables-legacy-restore; do
+              p=$(command -v "$t") || { echo "missing: $t" >&2; exit 1; }
+              echo "$t -> $p"
+            done
+            if [ -e /etc/cfab/fabric.conf ]; then
+              echo "image bakes /etc/cfab/fabric.conf; it must not" >&2
+              exit 1
+            fi'
+      - name: Push the runtime image
+        if: steps.meta.outputs.channel == 'formal'
+        id: image_push
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging/docker
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.image_tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/shkolnik/cfab
+            org.opencontainers.image.version=${{ steps.meta.outputs.ver }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Pushed image is the smoke-tested image
+        # Two builds of one context on one builder are a cache hit in practice,
+        # never a guarantee: a miss would push and attest an image nobody tested.
+        if: steps.meta.outputs.channel == 'formal'
+        env:
+          BUILT: ${{ steps.image_build.outputs.imageid }}
+          PUSHED: ${{ steps.image_push.outputs.imageid }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUILT" ] || [ "$BUILT" != "$PUSHED" ]; then
+            echo "pushed image id '$PUSHED' differs from the smoke-tested '$BUILT'" >&2
+            exit 1
+          fi
+          echo "image id $BUILT smoke-tested and pushed"
+      - name: Attest image build provenance
+        if: steps.meta.outputs.channel == 'formal'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ steps.image_tags.outputs.image }}
+          subject-digest: ${{ steps.image_push.outputs.digest }}
+          push-to-registry: true
