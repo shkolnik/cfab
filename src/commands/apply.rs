@@ -153,7 +153,8 @@ fn remove_other_mark_backend(
 fn install_mark_ipt(sys: &mut dyn Sys, view: &View) -> Result<()> {
     let f = view.fabric;
     let path = format!("{}/mark.ipt", f.run_dir);
-    sys.write(&path, &emit::ceiling_ipt::generate(view)?)?;
+    let rendered = emit::ceiling_ipt::generate(view)?;
+    sys.write(&path, &rendered)?;
     // A filename argument, not stdin: `Sys` runs argv vectors, never a shell.
     run_ok(sys, &["iptables-legacy-restore", "--noflush", &path])?;
     // The jump, idempotently: `-C` is the only way to ask "is it already there?".
@@ -186,7 +187,7 @@ fn install_mark_ipt(sys: &mut dyn Sys, view: &View) -> Result<()> {
     // A zone that lost its fallback row leaves an empty chain behind: the restore's `-F
     // cfab-out` unhooked it, but the chain is still resident. Delete it by the exact name the
     // readback gave us — never by pattern over chains that are not ours.
-    let wanted: Vec<String> = emit::ceiling_ipt::chains_in(&emit::ceiling_ipt::generate(view)?);
+    let wanted: Vec<String> = emit::ceiling_ipt::chains_in(&rendered);
     let stale: Vec<String> = emit::ceiling_ipt::chains_in(&save)
         .into_iter()
         .filter(|c| !wanted.contains(c))
