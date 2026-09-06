@@ -75,6 +75,15 @@ PID 1 is `cfab run`; the restart policy is the runtime's (`restart: unless-stopp
 up -d` starts the supervisor, which applies the fabric and keeps its children alive;
 `docker compose down` (SIGTERM) runs the stop sequence, tearing down everything cfab created.
 
+**Reloading the declaration in a container** (measured 2026-09-06 on the pve3 leaf, exit 6 →
+restart → UP in 4 s): send SIGHUP from *inside* the container —
+`docker exec <name> sh -c 'kill -HUP 1'`. Not `docker kill -s HUP`: Docker records a
+`docker kill` as a manual stop and skips the restart policy, so a changed declaration (which
+exits 6 to be restarted) leaves the container dead. And edit `fabric.toml` in place: a
+single-file bind mount follows the inode, so `sed -i` and editors that write a new file and
+rename hand the container the old content forever. Append, write-then-truncate, or mount the
+directory instead.
+
 The declaration's fallback segment (active-backup bond leg over every wire's fallback VLAN,
 role `fallback`, no BFD, cost 5000) reaches this container the same way any other segment
 does — through the mounted `fabric.toml` and the host network namespace; nothing about the
