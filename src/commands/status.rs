@@ -1968,6 +1968,131 @@ mod tests {
         );
     }
 
+    /// A leaf on the iptables-legacy backend, as `up` left it: the recorded choice, the
+    /// restore input, the readback, and a live dump whose ceiling chains have `drops` on
+    /// their DROP rules.
+    fn ipt_leaf(view: &View, drops: u64) -> MockSys {
+        let f = view.fabric;
+        let mut save = String::from(
+            "*mangle\n:PREROUTING ACCEPT [0:0]\n:OUTPUT ACCEPT [9:600]\n\
+             :DOCKER-USER - [0:0]\n:cfab-out - [0:0]\n",
+        );
+        for c in crate::emit::mark::ceilings(view) {
+            save.push_str(&format!(":cfab-ceil-{} - [0:0]\n", c.zone));
+        }
+        save.push_str("-A OUTPUT -j cfab-out\n");
+        for c in crate::emit::mark::ceilings(view) {
+            save.push_str(&format!("-A cfab-out -j cfab-ceil-{}\n", c.zone));
+        }
+        for c in crate::emit::mark::ceilings(view) {
+            save.push_str(&format!(
+                "-A cfab-ceil-{} -o {} -p 89 -m limit --limit {}/second --limit-burst {} \
+                 -j RETURN\n-A cfab-ceil-{} -j DROP\n",
+                c.zone, c.ifname, c.rate_pps, c.burst_pkts, c.zone
+            ));
+        }
+        save.push_str("COMMIT\n");
+        // The `-c` dump is the same text with counters: only the DROP rules carry any.
+        let counted: String = save
+            .lines()
+            .map(|l| {
+                if l.starts_with("-A cfab-ceil-") && l.ends_with("-j DROP") {
+                    format!("[{drops}:{}] {l}\n", drops * 52)
+                } else if l.starts_with("-A ") {
+                    format!("[0:0] {l}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        healthy_leaf(view)
+            .file(&format!("{}/mark.backend", f.run_dir), "iptables-legacy\n")
+            .file(
+                &format!("{}/mark.ipt", f.run_dir),
+                &crate::emit::ceiling_ipt::generate(view).unwrap(),
+            )
+            .file(
+                &format!("{}/mark.applied", f.run_dir),
+                &crate::emit::ceiling_ipt::ours(&save),
+            )
+            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], &save)
+            .on_stdout(&["iptables-legacy-save", "-c", "-t", "mangle"], &counted)
+    }
+
+    /// The backend is named on every kind, and the ceiling-only one says what it cannot do —
+    /// the missing bulk DSCP clamp is a real degradation an operator must not have to infer.
+    /// It is a reason line, not a state: the ceiling is on the wire either way.
+    #[test]
+    fn the_mark_backend_is_named_and_the_ceiling_only_one_says_what_it_lacks() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let report = run(&mut ipt_leaf(&view, 0), &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(report.code, 0);
+        assert!(
+            report.output.contains(
+                "\n  mark: iptables-legacy (ceiling only; bulk DSCP clamp unavailable on this \
+                 kernel)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(!report.output.contains("mark drift"), "{}", report.output);
+        // The nft table is never consulted on this member.
+        assert!(!ipt_leaf(&view, 0).ran("nft"), "the ipt backend ran nft");
+    }
+
+    /// The tripped line is one spelling for both backends: same words, same numbers, read
+    /// from the DROP rule's own counter.
+    #[test]
+    fn a_tripped_ceiling_on_the_iptables_backend_is_the_same_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let report = run(&mut ipt_leaf(&view, 28), &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(report.code, 0);
+        for zone in ["storage", "cluster", "mgmt"] {
+            let want =
+                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+            assert!(
+                report.output.lines().filter(|l| *l == want).count() == 1,
+                "expected exactly one {want:?} in:\n{}",
+                report.output
+            );
+        }
+    }
+
+    /// Drift on this backend has the same two halves as on nft: what `up` rendered against
+    /// what it wrote, and the live ruleset against the readback it stored.
+    #[test]
+    fn the_iptables_backend_reports_declaration_and_live_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut stale = ipt_leaf(&view, 0).file("/run/cfab/mark.ipt", "*mangle\nCOMMIT\n");
+        assert!(
+            run(&mut stale, &view, 0, false)
+                .unwrap()
+                .output
+                .contains("mark drift — re-run cfab up")
+        );
+        // Live: the ceiling chains were flushed out from under us.
+        let mut flushed = ipt_leaf(&view, 0).on_stdout(
+            &["iptables-legacy-save", "-t", "mangle"],
+            "*mangle\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n",
+        );
+        let report = run(&mut flushed, &view, 0, false).unwrap();
+        assert_eq!(
+            report
+                .output
+                .lines()
+                .filter(|l| l.contains("mark drift"))
+                .count(),
+            1,
+            "{}",
+            report.output
+        );
+    }
+
     /// `burst 160 packets` sits before the counter on a ceiling rule, so a parse anchored on
     /// the first `packets` reads the burst size (or fails) instead of the drop count.
     #[test]

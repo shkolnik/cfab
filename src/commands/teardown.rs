@@ -370,6 +370,95 @@ mod tests {
             )
     }
 
+    /// A mangle dump with our chains resident, plus a foreign chain that must survive.
+    fn ipt_mangle_save() -> &'static str {
+        "*mangle\n:PREROUTING ACCEPT [0:0]\n:OUTPUT ACCEPT [9:600]\n:DOCKER-USER - [0:0]\n\
+         :cfab-out - [0:0]\n:cfab-ceil-storage - [0:0]\n-A OUTPUT -j cfab-out\n\
+         -A cfab-out -j cfab-ceil-storage\n-A cfab-ceil-storage -j DROP\nCOMMIT\n"
+    }
+
+    /// The recorded backend is the one torn down, and only that one: an nft member never
+    /// runs iptables at all.
+    #[test]
+    fn down_on_the_nft_record_touches_only_nft() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg().file("/run/cfab/mark.backend", "nft\n");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("nft delete table inet cfab"), "{:?}", sys.calls);
+        // (`iptables -S DOCKER-USER` is the foreign-transit-accept removal, unrelated to the
+        // mark state and unchanged; the legacy binaries are what this backend never runs.)
+        assert!(!sys.ran("iptables-legacy"), "{:?}", sys.calls);
+    }
+
+    /// The iptables-legacy record: the OUTPUT jump goes, then every `cfab-*` mangle chain the
+    /// readback names — flushed before deleted, by exact name. The foreign chain in the same
+    /// table is never touched, and nft is not consulted.
+    #[test]
+    fn down_on_the_iptables_record_removes_our_chains_by_exact_name() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .file("/run/cfab/mark.backend", "iptables-legacy\n")
+            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], ipt_mangle_save());
+        run(&mut sys, &view).unwrap();
+        let ipt: Vec<String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("iptables-legacy"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ipt,
+            vec![
+                "iptables-legacy-save -t mangle",
+                "iptables-legacy -t mangle -D OUTPUT -j cfab-out",
+                "iptables-legacy -t mangle -F cfab-out",
+                "iptables-legacy -t mangle -F cfab-ceil-storage",
+                "iptables-legacy -t mangle -X cfab-out",
+                "iptables-legacy -t mangle -X cfab-ceil-storage",
+            ],
+            "{:?}",
+            sys.calls
+        );
+        assert!(!sys.ran("DOCKER-USER"), "{:?}", sys.calls);
+        assert!(!sys.ran("nft delete table inet cfab\n"), "{:?}", sys.calls);
+    }
+
+    /// No record at all — a wiped run dir, a downgrade from a version that never wrote one.
+    /// BOTH backends are torn down: leaving a member policed by a mechanism we could not
+    /// remember choosing is the failure this teardown exists to prevent.
+    #[test]
+    fn down_with_no_record_tears_down_both_backends() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], ipt_mangle_save());
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("nft delete table inet cfab"), "{:?}", sys.calls);
+        assert!(
+            sys.ran("iptables-legacy -t mangle -X cfab-ceil-storage"),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// ...and each half is guarded, so a member that no longer has the other backend's
+    /// binaries still tears down cleanly instead of failing on an absent tool.
+    #[test]
+    fn down_with_no_record_survives_a_member_without_iptables() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg().on_fail(
+            &["/usr/bin/env", "sh", "-c", "command -v iptables-legacy"],
+            1,
+            "",
+        );
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("nft delete table inet cfab"), "{:?}", sys.calls);
+        assert!(!sys.ran("iptables-legacy -t"), "{:?}", sys.calls);
+    }
+
     /// `ip link del <bond>` RELEASES its slaves, it does not delete them — so the slaves get
     /// their own deletes, and the bond goes first (ownership-proof clarity: the engine is
     /// already stopped and swept before any netdev is touched).
