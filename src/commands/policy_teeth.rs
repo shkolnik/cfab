@@ -20,7 +20,6 @@
 
 use std::fmt::Write as _;
 
-use crate::config::RawConfig;
 use crate::derive::View;
 use crate::emit;
 use crate::error::{Error, Result};
@@ -58,7 +57,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRepor
 }
 
 fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethReport> {
-    let f = view.fabric;
     let mut out = String::new();
     let mut ifs: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
     // Fallback bonds are in the zone's forward-policy set (`zone_ifs`) like a segment, so the
@@ -172,17 +170,14 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
         out,
         "== 2. teeth: allow storage>cluster in the model -> the storage->cluster negative must go RED"
     );
-    // regress the MODEL, not the output: an edited declaration through the real parser+generator
-    let declared: Vec<String> = f
-        .forward_allow
-        .iter()
-        .map(|(a, b)| format!("{a}>{b}"))
-        .collect();
-    let regressed_conf = replace_forward_allow(
-        conf_text,
-        &format!("{} storage>cluster", declared.join(" ")),
-    );
-    let regressed_fabric = Fabric::from_raw(&RawConfig::parse(&regressed_conf)?)?;
+    // Regress the MODEL, not the output: the real declaration, one field edited, back through
+    // the real validation and generator. A named field, so the regression cannot miss.
+    let mut regressed_decl = crate::decl::Declaration::parse(conf_text)?;
+    regressed_decl
+        .forward
+        .allow
+        .push("storage>cluster".to_string());
+    let regressed_fabric = Fabric::from_decl(&regressed_decl)?;
     let regressed_view = View::new(&regressed_fabric, &view.member.name)?;
     let regressed = emit::policy::generate(&regressed_view)?;
     if !regressed.contains("allow-storage-cluster") {
@@ -448,33 +443,8 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
     Ok(ok)
 }
 
-/// Replace the FORWARD_ALLOW literal in the declaration text.
-fn replace_forward_allow(conf: &str, new_value: &str) -> String {
-    conf.lines()
-        .map(|l| {
-            if l.starts_with("FORWARD_ALLOW=") {
-                format!("FORWARD_ALLOW=\"{new_value}\"")
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn forward_allow_replacement() {
-        let conf = "A=1\nFORWARD_ALLOW=\"storage>storage\"\nB=2\n";
-        let got = replace_forward_allow(conf, "storage>storage storage>cluster");
-        assert!(got.contains("FORWARD_ALLOW=\"storage>storage storage>cluster\""));
-        assert!(got.contains("A=1\n") && got.contains("B=2\n"));
-    }
-
     #[test]
     fn ping_reply_parse() {
         // parsing lives in reach(); test the line format it expects

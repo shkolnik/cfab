@@ -173,14 +173,14 @@ pub fn drop_packets(save_c_output: &str, zone: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The whole restore input for the shipped example, byte for byte: the same three
@@ -241,13 +241,8 @@ mod tests {
     /// leaving them resident.
     #[test]
     fn a_member_with_no_fallback_row_renders_an_empty_but_flushing_ruleset() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let view = View::new(&f, "pve3-tb").unwrap();
         assert_eq!(
             generate(&view).unwrap(),

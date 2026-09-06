@@ -197,33 +197,32 @@ pub fn generate(view: &View) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The same declaration grown to `n` members (node ids 1..=n, all hosts with all three
     /// wires), so the ceiling derivation is exercised across the project's scale bounds
     /// (< 50 members, most < 10) rather than only at the three-member testbed.
     fn fabric_with_members(n: u8) -> Fabric {
-        let rows: String = (1..=n)
-            .map(|i| format!("pve{i}-tb {i} host eth9@a:5000 eth1@b:1000 eth0@c:1000\n"))
+        let members: String = (1..=n)
+            .map(|i| {
+                fixtures::member(
+                    &format!("pve{i}-tb"),
+                    i,
+                    "host",
+                    "eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                )
+            })
             .collect();
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000\n\
-                     pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000\n\
-                     pve3-tb 3 leaf eth9@a:10000 eth1@b:1000 eth0@c:1000\n",
-                    &rows,
-                );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_members(&fixtures::example(), &members);
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The threshold is a function of the declaration and of one measured number, at every size
@@ -374,11 +373,11 @@ mod tests {
         for port in [3784u16, 9784] {
             let text = std::fs::read_to_string(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/examples/fabric.conf"
+                "/examples/fabric.toml"
             ))
             .unwrap()
-            .replace("BFD_PORT=3784", &format!("BFD_PORT={port}"));
-            let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+            .replace("port = 3784", &format!("port = {port}"));
+            let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
             assert_eq!(f.bfd_port, port);
             for member in ["pve1-tb", "pve3-tb"] {
                 let v = View::new(&f, member).unwrap();
@@ -443,13 +442,8 @@ mod tests {
     /// a zone has no home wire for its fallback leg, so it carries none.
     #[test]
     fn a_member_with_no_fallback_row_gets_no_ceiling() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert!(v.fallback_rows().is_empty());
         assert!(ceilings(&v).is_empty());

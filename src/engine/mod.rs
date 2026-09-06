@@ -277,10 +277,10 @@ mod tests {
     #[test]
     fn the_control_priority_is_the_declared_pcp_ctrl() {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         let mut fabric =
-            Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+            Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap();
         assert_eq!(control_priority(&fabric), Some(6));
         fabric.pcp_ctrl = 5;
         assert_eq!(control_priority(&fabric), Some(5));
@@ -289,10 +289,10 @@ mod tests {
     #[test]
     fn the_bfd_policy_asks_for_exactly_one_rx_socket() {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         let mut fabric =
-            Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+            Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap();
         fabric.bfd_port = 3785;
         let policy = bfd_socket_policy(&fabric);
         assert_eq!(policy.port(holo_utils::bfd::PathType::IpSingleHop), 3785);
@@ -311,9 +311,9 @@ mod tests {
     #[test]
     fn no_member_of_the_shipped_fabric_binds_a_bgp_listener() {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        let fabric = Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+        let fabric = Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap();
         assert!(!fabric.members.is_empty());
         for m in &fabric.members {
             let view = View::new(&fabric, &m.name).unwrap();

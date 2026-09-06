@@ -126,10 +126,10 @@ pub fn derive(
     for (rank, (band, label)) in order.into_iter().enumerate() {
         let minor = (rank as u32 + 1) * 10;
         let (class, mut floor) = if label == "admin" {
-            (BandClass::Untagged, view.fabric.admin_floor_mbit as u64)
+            (BandClass::Untagged, view.fabric.admin_floor_mbps as u64)
         } else {
             let z = view.fabric.zone(&label)?;
-            (BandClass::Dscp(z.dscp), z.floor_mbit as u64)
+            (BandClass::Dscp(z.dscp), z.floor_mbps as u64)
         };
         let is_default = class == BandClass::Dscp(Dscp::Cs0);
         let mut effective_primary = None;
@@ -393,14 +393,14 @@ impl Derivation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
                 .iter()
                 .find(|b| b.label == "admin")
                 .unwrap_or_else(|| panic!("{wire} has no admin band"));
-            assert_eq!(admin.floor, f.admin_floor_mbit as u64, "{wire}");
+            assert_eq!(admin.floor, f.admin_floor_mbps as u64, "{wire}");
         }
         let leaf = View::new(&f, "pve3-tb").unwrap();
         for wire in ["eth0", "eth1", "eth9"] {

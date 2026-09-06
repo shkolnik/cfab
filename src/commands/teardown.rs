@@ -307,15 +307,15 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
@@ -446,10 +446,10 @@ mod tests {
     /// The same declaration with the ingress leg on domain `any`.
     fn fabric_with_a_migrating_gw() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
-                .replace("c:249:", "any:249:");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,

@@ -33,7 +33,7 @@ struct Cli {
 enum Command {
     /// Parse and validate fabric.conf; print the resolved view for this member
     Check,
-    /// Print the fabric.conf data model as JSON Schema
+    /// Print the fabric.toml declaration schema as JSON Schema
     Schema,
     /// Print a generated artifact (pure: reads the declaration, changes nothing)
     Gen {
@@ -271,7 +271,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     let path = config_path(&cli.config);
     if let Command::Schema = cli.command {
         // Schema needs no config file at all.
-        let schema = schemars::schema_for!(cfab::model::Fabric);
+        let schema = schemars::schema_for!(cfab::decl::Declaration);
         println!(
             "{}",
             serde_json::to_string_pretty(&schema).expect("schema serializes")
@@ -529,15 +529,15 @@ fn shape_for<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cfab::config::RawConfig;
+    use cfab::decl::Declaration;
     use cfab::model::Fabric;
 
     fn fabric_from(text: &str) -> Fabric {
-        Fabric::from_raw(&RawConfig::parse(text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(text).unwrap()).unwrap()
     }
 
     fn example() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
             .unwrap()
     }
 
@@ -584,9 +584,7 @@ mod tests {
     fn check_on_a_fallback_free_fabric_counts_zero() {
         let text = example()
             .lines()
-            .filter(|l| {
-                !l.starts_with("cfab-") || !l.split_whitespace().nth(1).is_some_and(|d| d == "any")
-            })
+            .filter(|l| !l.starts_with("universal = "))
             .collect::<Vec<_>>()
             .join("\n");
         let f = fabric_from(&text);

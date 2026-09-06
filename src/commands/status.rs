@@ -1240,15 +1240,15 @@ fn read_cap(sys: &mut dyn Sys, view: &View, dev: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The engine's state document as `engine::state::document` shapes it: every instance
@@ -1794,13 +1794,8 @@ mod tests {
         );
 
         // The runtime-disjoint shape, over the fabric that has no fallback rows at all.
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
-        let nofb = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let nofb = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let nofb_view = View::new(&nofb, "pve3-tb").unwrap();
         assert_never_writes(
             "a member declaring no fallback rows",
@@ -2569,13 +2564,8 @@ mod tests {
     /// line has one shape everywhere and a reader never has to count separators.
     #[test]
     fn a_member_with_no_fallback_rows_prints_zero_of_zero() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let view = View::new(&f, "pve3-tb").unwrap();
         assert!(view.fallback_rows().is_empty());
         let mut sys = healthy_leaf(&view);
@@ -2993,19 +2983,12 @@ mod tests {
     /// wire, so they share no segment in any zone. The fallback bond is the only path between
     /// them — and reaching them over it is health.
     fn disjoint_fabric() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve1-tb 1 host eth9@a:5000",
-                )
-                .replace(
-                    "pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve2-tb 2 host eth1@b:1000",
-                )
-                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_wires(
+            &fixtures::with_wires(&fixtures::example(), "pve1-tb", "eth9@a:5000"),
+            "pve2-tb",
+            "eth1@b:1000",
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every declared BFD leg up, as the runtime half of the expectation rule.
@@ -3124,23 +3107,16 @@ mod tests {
     /// segment with pve3-tb in any zone, while pve1-tb shares two per zone (so one of them can
     /// go dark without the zone losing its only session).
     fn half_disjoint_fabric() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve1-tb 1 host eth9@a:5000 eth0@c:1000",
-                )
-                .replace(
-                    "pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve2-tb 2 host eth1@b:1000",
-                )
-                .replace(
-                    "pve3-tb 3 leaf eth9@a:10000 eth1@b:1000 eth0@c:1000",
-                    "pve3-tb 3 leaf eth9@a:10000 eth0@c:1000",
-                )
-                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_wires(
+            &fixtures::with_wires(
+                &fixtures::with_wires(&fixtures::example(), "pve1-tb", "eth9@a:5000 eth0@c:1000"),
+                "pve2-tb",
+                "eth1@b:1000",
+            ),
+            "pve3-tb",
+            "eth9@a:10000 eth0@c:1000",
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// D3, closed. A cable pull makes two members disjoint at RUNTIME while the declaration

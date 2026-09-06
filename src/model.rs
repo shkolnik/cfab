@@ -1,26 +1,26 @@
-//! The typed fabric declaration — the data model behind `fabric.conf`.
+//! The typed fabric — the model `fabric.toml` is turned into.
 //!
-//! Four tables declare the fabric (DOMAINS, MEMBER_TABLE, ZONE_TABLE, SEGMENT_TABLE) plus the
-//! optional WIRE_PREF override; everything else is generated from them. This module types every
-//! field, and `Fabric::validate` enforces the declaration invariants: unique member names, node
-//! ids, segment vids and interface names, one segment per zone × domain, known zones and known
-//! domains everywhere either is named, at most one wire per member per domain, complete
-//! WIRE_PREF overrides, and ingress gateways that collide with neither a segment vid nor any member's leg address.
-//! `cfab schema` emits this model as JSON Schema (schemars).
+//! `decl` parses the file into a struct tree; this module resolves that tree into the typed
+//! model everything downstream reads (`Fabric::from_decl`), and `Fabric::validate` enforces
+//! every invariant the shape alone cannot: unique member names, node ids, segment vids and
+//! interface names, one segment per zone x domain, known zones and known domains everywhere
+//! either is named, at most one wire per member per domain, a member with at least one wire,
+//! complete per-zone preference overrides, and ingress gateways that collide with neither a
+//! segment vid nor any member's leg address.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::config::RawConfig;
+use crate::decl::Declaration;
 use crate::error::{Error, Result};
 
 /// A physical switch domain: an opaque DECLARED token, so a typo in a wire's or a segment's
 /// domain is an error and not a phantom domain. One letter — the bond-slave suffix
 /// `-<domain>` must fit inside IFNAMSIZ (see `MAX_BOND_IFNAME`).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DomainId(String);
 
 /// The widest a domain token may be. One character, and `MAX_BOND_IFNAME` is derived from it:
@@ -51,7 +51,7 @@ impl fmt::Display for DomainId {
 /// Where a segment (or an ingress leg) lives: on one switch domain, or on every wire the
 /// member has. `Universal` is a SCOPE, not a domain: exactly the old `island any` fallback row,
 /// fanned out by the derive layer into an active-backup bond over the member's wires.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SegScope {
     Domain(DomainId),
@@ -88,9 +88,9 @@ impl fmt::Display for SegScope {
     }
 }
 
-/// Membership taxonomy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+/// Membership taxonomy. A closed set, so `kind = "router"` fails at parse naming host|leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum MemberKind {
     /// Transits between zones, shapes, carries every domain it has wires on.
     Host,
@@ -99,26 +99,14 @@ pub enum MemberKind {
     Leaf,
 }
 
-impl MemberKind {
-    pub fn parse(s: &str) -> Result<MemberKind> {
-        match s {
-            "host" => Ok(MemberKind::Host),
-            "leaf" => Ok(MemberKind::Leaf),
-            other => Err(Error::config(format!(
-                "MEMBER_TABLE kind '{other}' (expected host|leaf)"
-            ))),
-        }
-    }
-}
-
 /// A member's physical NIC, the switch domain it is plugged into, and its DECLARED link speed
 /// (Mb/s). One wire is pinned to exactly ONE domain: a single NIC into a single switch IS one
 /// domain, and the "one wire, several domains" trunk is deliberately not modelled (spec §3.4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Wire {
     pub name: String,
     pub domain: DomainId,
-    pub speed_mbit: u32,
+    pub speed_mbps: u32,
 }
 
 /// The widest ifname a bond leg (a universal segment, or a migrating ingress leg) may carry.
@@ -132,7 +120,7 @@ fn bond_ifname_too_long(ifname: &str) -> bool {
 }
 
 /// One MEMBER_TABLE row.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Member {
     pub name: String,
     /// Node id: the host octet of every address this member holds (identity 10.<id>.0.<node>).
@@ -161,9 +149,10 @@ impl Member {
 
 /// DSCP class selectors the fabric uses. A closed set on purpose: the shaper must know each
 /// value's tos byte, and each value needs measured switch-queue behavior behind it — extend
-/// here, with both, when a new band appears.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+/// this enum, with both, when a new band appears. A value outside it fails at parse, naming
+/// the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Dscp {
     Cs0,
     Cs2,
@@ -171,18 +160,6 @@ pub enum Dscp {
 }
 
 impl Dscp {
-    pub fn parse(s: &str) -> Result<Dscp> {
-        match s {
-            "cs0" => Ok(Dscp::Cs0),
-            "cs2" => Ok(Dscp::Cs2),
-            "cs6" => Ok(Dscp::Cs6),
-            other => Err(Error::config(format!(
-                "unknown dscp '{other}' (cs0|cs2|cs6 — extend the Dscp model with its tos byte \
-                 and switch-queue evidence)"
-            ))),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Dscp::Cs0 => "cs0",
@@ -209,7 +186,7 @@ impl fmt::Display for Dscp {
 
 /// Where the OUTSIDE enters a zone: a router-owned VLAN, distinct from every fabric segment,
 /// so the router never holds an address inside a segment and never sees the fabric's IGP.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ZoneGw {
     pub scope: SegScope,
     pub vid: u16,
@@ -244,8 +221,8 @@ impl ZoneGw {
     }
 }
 
-/// One ZONE_TABLE row: a traffic class.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+/// A traffic class and the segments that carry it.
+#[derive(Debug, Clone, Serialize)]
 pub struct Zone {
     pub name: String,
     /// The zone's number: OSPF instance, identity netdev cfab-id<id>, block 10.<id>.0.0/16.
@@ -256,7 +233,7 @@ pub struct Zone {
     /// The plane a DSCP-trusting switch queues the zone's traffic on.
     pub dscp: Dscp,
     /// MINIMUM Mb/s guarantee for the zone's HTB band.
-    pub floor_mbit: u32,
+    pub floor_mbps: u32,
     /// HTB prio band (0 = control … 2 = bulk).
     pub band: u32,
     /// Quantum ratio within a shared band.
@@ -278,7 +255,7 @@ impl Zone {
 
 /// One SEGMENT_TABLE row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
 /// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Segment {
     pub ifname: String,
     pub scope: SegScope,
@@ -289,7 +266,7 @@ pub struct Segment {
 
 /// One WIRE_PREF row: this member's complete wire order for this zone, replacing the derived
 /// one. Complete or an error — an override is never blended with the default.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WirePref {
     pub member: String,
     pub zone: String,
@@ -297,9 +274,8 @@ pub struct WirePref {
 }
 
 /// The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize)]
 pub struct Fabric {
-    pub fabric_mode: String,
     /// The declared switch domains, in declaration order.
     pub domains: Vec<DomainId>,
     pub members: Vec<Member>,
@@ -310,7 +286,7 @@ pub struct Fabric {
     pub host_forward: bool,
     /// Allowed forward pairs (from, to); unlisted = dropped by policy, counted.
     pub forward_allow: Vec<(String, String)>,
-    pub admin_floor_mbit: u32,
+    pub admin_floor_mbps: u32,
     pub admin_band: u32,
     pub pcp_ctrl: u8,
     pub dscp_mark: bool,
@@ -330,164 +306,189 @@ pub struct Fabric {
     pub usb_nics: Vec<(String, String)>,
     /// Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).
     pub run_dir: String,
-    pub fabric_domain: String,
+    pub dns_domain: String,
 }
 
-/// Every key the model consumes from fabric.conf (for unknown-literal-key warnings).
-pub const CONSUMED_KEYS: &[&str] = &[
-    "FABRIC_MODE",
-    "DOMAINS",
-    "MEMBER_TABLE",
-    "FABRIC_DOMAIN",
-    "ZONE_TABLE",
-    "SEGMENT_TABLE",
-    "WIRE_PREF",
-    "LEAF_COST_OFFSET",
-    "HOST_FORWARD",
-    "ADMIN_FLOOR",
-    "ADMIN_BAND",
-    "FORWARD_ALLOW",
-    "PCP_CTRL",
-    "DSCP_MARK",
-    "BFD_RX_MS",
-    "BFD_TX_MS",
-    "BFD_MULT",
-    "BFD_PORT",
-    "OSPF_HELLO",
-    "OSPF_DEAD",
-    "BGP_AS",
-    "BGP_KEEPALIVE_S",
-    "BGP_HOLD_S",
-    "BGP_CONNECT_S",
-    "USB_NICS",
-    "CFAB_RUN",
-];
+/// RFC 5881's single-hop port, as `[bfd] port` defaults to it.
+pub const BFD_PORT_DEFAULT: u16 = crate::decl::BFD_PORT;
 
-/// Keys the v0 declaration had and v1 does not. Pre-release there is no compatibility shim: an
-/// old file fails at parse with an error that names the new layout, rather than falling through
-/// to the generic unknown-key warning and silently generating a fabric nobody declared.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "CLASS_TABLE",
-    "CLASS_TABLE was replaced by SEGMENT_TABLE (rows are segments, and \"class\" is a zone \
-     word). New layout: `ifname domain|any zone seg vid` — the role and ospf-cost columns are \
-     gone, both are derived from ZONE_TABLE's `primary` column and the per-member wire order",
-)];
+/// The lowest port the engine may be told to bind: it drops privileges before opening its
+/// BFD socket, so anything below 1024 would fail at start instead of here.
+const MIN_BFD_PORT: u16 = 1024;
 
-fn parse_num<T: std::str::FromStr>(raw: &RawConfig, key: &str) -> Result<T> {
-    let v = raw.require(key)?;
-    v.parse()
-        .map_err(|_| Error::config(format!("{key}='{v}' is not a valid number")))
-}
-
-/// RFC 5881's single-hop port: what every BFD implementation binds unless told otherwise.
-pub const BFD_PORT_DEFAULT: u16 = 3784;
-
-/// An optional port key: absent = the default, present = a registered/dynamic port. Ports below
-/// 1024 are refused (the engine drops privileges to bind nothing else there) and 0 is not a port.
-fn parse_port(raw: &RawConfig, key: &str, default: u16) -> Result<u16> {
-    let Some(v) = raw.get(key) else {
-        return Ok(default);
+/// A zone's ingress row, typed. The router is declared WITH its prefix (`.../24`, the only
+/// length the design supports) and stored without it, because every derived address is built
+/// from the /24 it names.
+fn resolve_gw(zone: &str, g: &crate::decl::GwDecl) -> Result<ZoneGw> {
+    let bad = || {
+        Error::config(format!(
+            "zone {zone}: gw router '{}' (expected an IPv4 address with /24, e.g. \
+             192.168.249.254/24)",
+            g.router
+        ))
     };
-    let port: u16 = v
-        .parse()
-        .map_err(|_| Error::config(format!("{key}='{v}' is not a valid port")))?;
-    if !(1024..=65535).contains(&port) {
-        return Err(Error::config(format!(
-            "{key}={port} is outside 1024..65535"
-        )));
+    let (router, len) = g.router.split_once('/').ok_or_else(bad)?;
+    if len != "24" {
+        return Err(bad());
     }
-    Ok(port)
-}
-
-/// An 802.1p priority: a 3-bit field. Refused loudly here rather than at the socket, where
-/// the engine sets it as SO_PRIORITY on its control sockets and a rejected value would take
-/// the engine down at start.
-fn parse_pcp(raw: &RawConfig, key: &str) -> Result<u8> {
-    let pcp: u8 = parse_num(raw, key)?;
-    // 7 is representable on the wire but SO_PRIORITY 7 needs CAP_NET_ADMIN, which the engine drops
-    // before it opens its sockets; the failure there is a logged raise and a silently down
-    // interface, so the declaration refuses it here instead.
-    if pcp > 6 {
-        return Err(Error::config(format!(
-            "{key}={pcp} is outside 0..6 (7 needs CAP_NET_ADMIN on the engine's control sockets)"
-        )));
+    if router.split('.').count() != 4 || router.split('.').any(|o| o.parse::<u8>().is_err()) {
+        return Err(bad());
     }
-    Ok(pcp)
-}
-
-fn parse_bool01(raw: &RawConfig, key: &str) -> Result<bool> {
-    match raw.require(key)? {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        other => Err(Error::config(format!("{key}='{other}' (expected 0|1)"))),
-    }
+    Ok(ZoneGw {
+        scope: SegScope::parse(&g.domain)
+            .map_err(|e| Error::config(format!("zone {zone}: gw {e}")))?,
+        vid: g.vid,
+        router: router.to_string(),
+    })
 }
 
 impl Fabric {
-    pub fn from_raw(raw: &RawConfig) -> Result<Fabric> {
-        for (key, why) in REMOVED_KEYS {
-            if raw.get(key).is_some() {
-                return Err(Error::config((*why).to_string()));
+    /// Resolve a parsed declaration into the typed model, then validate it. The declaration's
+    /// SHAPE was already proven by serde; everything here is meaning.
+    pub fn from_decl(d: &Declaration) -> Result<Fabric> {
+        let domains = d
+            .domains
+            .keys()
+            .map(|t| DomainId::parse(t))
+            .collect::<Result<Vec<_>>>()?;
+        let mut members = Vec::new();
+        let mut wire_prefs = Vec::new();
+        let mut usb_nics = Vec::new();
+        for m in &d.members {
+            let mut wires = Vec::new();
+            for w in &m.wires {
+                let domain = DomainId::parse(&w.domain).map_err(|e| {
+                    Error::config(format!("member {}: wire {}: {e}", m.name, w.nic))
+                })?;
+                if w.usb {
+                    usb_nics.push((m.name.clone(), w.nic.clone()));
+                }
+                wires.push(Wire {
+                    name: w.nic.clone(),
+                    domain,
+                    speed_mbps: w.speed_mbps,
+                });
             }
+            // A zone appears at most once per member (a TOML table has one key per name), so
+            // the only completeness question left is the one `check_wire_prefs` asks.
+            for (zone, order) in &m.prefs {
+                wire_prefs.push(WirePref {
+                    member: m.name.clone(),
+                    zone: zone.clone(),
+                    order: order.clone(),
+                });
+            }
+            members.push(Member {
+                name: m.name.clone(),
+                node: m.node,
+                kind: m.kind,
+                wires,
+            });
         }
-        let domains = parse_domains(raw.require("DOMAINS")?)?;
-        let members = parse_member_table(raw.require("MEMBER_TABLE")?)?;
-        let zones = parse_zone_table(raw.require("ZONE_TABLE")?)?;
-        let segments = parse_segment_table(raw.require("SEGMENT_TABLE")?)?;
-        let wire_prefs = match raw.get("WIRE_PREF") {
-            Some(text) => parse_wire_pref(text)?,
-            None => Vec::new(),
-        };
-        let forward_allow = raw
-            .require("FORWARD_ALLOW")?
-            .split_whitespace()
+        let mut zones = Vec::new();
+        let mut segments = Vec::new();
+        for z in &d.zones {
+            // Declaration order inside a zone, zones in declaration order: the order every
+            // derived per-member row list inherits.
+            for s in &z.segments {
+                let domain = DomainId::parse(&s.domain).map_err(|e| {
+                    Error::config(format!("zone {}: segment {}: {e}", z.name, s.ifname))
+                })?;
+                segments.push(Segment {
+                    ifname: s.ifname.clone(),
+                    scope: SegScope::Domain(domain),
+                    zone: z.name.clone(),
+                    seg: s.seg,
+                    vid: s.vid,
+                });
+            }
+            if let Some(u) = &z.universal {
+                segments.push(Segment {
+                    ifname: u.ifname.clone(),
+                    scope: SegScope::Universal,
+                    zone: z.name.clone(),
+                    seg: u.seg,
+                    vid: u.vid,
+                });
+            }
+            let gw = match &z.gw {
+                Some(g) => Some(resolve_gw(&z.name, g)?),
+                None => None,
+            };
+            zones.push(Zone {
+                name: z.name.clone(),
+                id: z.id,
+                pcp: z.pcp,
+                dscp: z.dscp,
+                floor_mbps: z.floor_mbps,
+                band: z.band,
+                weight: z.weight,
+                primary: DomainId::parse(&z.primary)
+                    .map_err(|e| Error::config(format!("zone {}: primary {e}", z.name)))?,
+                gw,
+            });
+        }
+        let forward_allow = d
+            .forward
+            .allow
+            .iter()
             .map(|pair| {
                 pair.split_once('>')
                     .map(|(f, t)| (f.to_string(), t.to_string()))
                     .ok_or_else(|| {
-                        Error::config(format!("FORWARD_ALLOW '{pair}' (expected from>to)"))
+                        Error::config(format!("[forward] allow '{pair}' (expected \"from>to\")"))
                     })
             })
             .collect::<Result<Vec<_>>>()?;
+        let admin = d.admin.clone().unwrap_or_default();
+        let marking = d.marking.clone().unwrap_or_default();
+        let cost = d.cost.clone().unwrap_or_default();
+        let bfd = d.bfd.clone().unwrap_or_default();
+        let ospf = d.ospf.clone().unwrap_or_default();
+        let bgp = d.bgp.clone().unwrap_or_default();
+        let runtime = d.runtime.clone().unwrap_or_default();
+        // 7 is representable on the wire but SO_PRIORITY 7 needs CAP_NET_ADMIN, which the
+        // engine drops before it opens its sockets; the failure there is a logged raise and a
+        // silently down interface, so the declaration refuses it here instead.
+        if marking.pcp_ctrl > 6 {
+            return Err(Error::config(format!(
+                "[marking] pcp_ctrl = {} is outside 0..6 (7 needs CAP_NET_ADMIN on the \
+                 engine's control sockets)",
+                marking.pcp_ctrl
+            )));
+        }
+        if bfd.port < MIN_BFD_PORT {
+            return Err(Error::config(format!(
+                "[bfd] port = {} is outside {MIN_BFD_PORT}..65535",
+                bfd.port
+            )));
+        }
         let fabric = Fabric {
-            fabric_mode: raw.require("FABRIC_MODE")?.to_string(),
             domains,
             members,
             zones,
             segments,
             wire_prefs,
-            leaf_cost_offset: parse_num(raw, "LEAF_COST_OFFSET")?,
-            host_forward: parse_bool01(raw, "HOST_FORWARD")?,
+            leaf_cost_offset: cost.leaf_offset,
+            host_forward: d.forward.enabled,
             forward_allow,
-            admin_floor_mbit: parse_num(raw, "ADMIN_FLOOR")?,
-            admin_band: parse_num(raw, "ADMIN_BAND")?,
-            pcp_ctrl: parse_pcp(raw, "PCP_CTRL")?,
-            dscp_mark: parse_bool01(raw, "DSCP_MARK")?,
-            bfd_rx_ms: parse_num(raw, "BFD_RX_MS")?,
-            bfd_tx_ms: parse_num(raw, "BFD_TX_MS")?,
-            bfd_mult: parse_num(raw, "BFD_MULT")?,
-            bfd_port: parse_port(raw, "BFD_PORT", BFD_PORT_DEFAULT)?,
-            ospf_hello: parse_num(raw, "OSPF_HELLO")?,
-            ospf_dead: parse_num(raw, "OSPF_DEAD")?,
-            bgp_as: parse_num(raw, "BGP_AS")?,
-            bgp_keepalive_s: parse_num(raw, "BGP_KEEPALIVE_S")?,
-            bgp_hold_s: parse_num(raw, "BGP_HOLD_S")?,
-            bgp_connect_s: parse_num(raw, "BGP_CONNECT_S")?,
-            usb_nics: raw
-                .require("USB_NICS")?
-                .split_whitespace()
-                .map(|entry| {
-                    entry
-                        .split_once(':')
-                        .filter(|(m, d)| !m.is_empty() && !d.is_empty())
-                        .map(|(m, d)| (m.to_string(), d.to_string()))
-                        .ok_or_else(|| {
-                            Error::config(format!("USB_NICS entry '{entry}' is not member:dev"))
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            run_dir: raw.require("CFAB_RUN")?.to_string(),
-            fabric_domain: raw.require("FABRIC_DOMAIN")?.to_string(),
+            admin_floor_mbps: admin.floor_mbps,
+            admin_band: admin.band,
+            pcp_ctrl: marking.pcp_ctrl,
+            dscp_mark: marking.set_dscp,
+            bfd_rx_ms: bfd.rx_ms,
+            bfd_tx_ms: bfd.tx_ms,
+            bfd_mult: bfd.mult,
+            bfd_port: bfd.port,
+            ospf_hello: ospf.hello_s,
+            ospf_dead: ospf.dead_s,
+            bgp_as: bgp.asn,
+            bgp_keepalive_s: bgp.keepalive_s,
+            bgp_hold_s: bgp.hold_s,
+            bgp_connect_s: bgp.connect_s,
+            usb_nics,
+            run_dir: runtime.run_dir,
+            dns_domain: d.dns_domain.clone(),
         };
         fabric.validate()?;
         Ok(fabric)
@@ -503,20 +504,30 @@ impl Fabric {
         // ---- domains first: nothing below may index by a domain that was never declared ----
         if self.domains.is_empty() {
             return Err(Error::config(
-                "DOMAINS is empty (declare one token per physical switch domain, e.g. \
-                 DOMAINS=\"a b c\")"
+                "[domains] is empty (declare one token per physical switch domain, e.g. a = \"the 10G \
+                 switch\")"
                     .to_string(),
             ));
         }
         if let Some(d) = dup(self.domains.iter().map(|d| d.to_string())) {
-            return Err(Error::config(format!("DOMAINS token {d} declared twice")));
+            return Err(Error::config(format!("[domains] token {d} declared twice")));
         }
         let declared: BTreeSet<&DomainId> = self.domains.iter().collect();
         for m in &self.members {
+            // Representable in the file (`wires = []`) and meaningless in the fabric: a member
+            // with no wire has no segment, no admin plane and no bond to fan out. Refused here
+            // so every derivation downstream may assume at least one wire.
+            if m.wires.is_empty() {
+                return Err(Error::config(format!(
+                    "member {}: declares no wires (a member needs at least one \
+                     wire = {{ nic, domain, speed_mbps }})",
+                    m.name
+                )));
+            }
             for w in &m.wires {
                 if !declared.contains(&w.domain) {
                     return Err(Error::config(format!(
-                        "MEMBER_TABLE {}: wire {}@{} names a domain that is not in DOMAINS ({})",
+                        "member {}: wire {} on domain {} is not in [domains] ({})",
                         m.name,
                         w.name,
                         w.domain,
@@ -531,7 +542,7 @@ impl Fabric {
             for w in &m.wires {
                 if !seen.insert(&w.domain) {
                     return Err(Error::config(format!(
-                        "MEMBER_TABLE {}: two wires on domain {} ({}). The model cannot express \
+                        "member {}: two wires on domain {} ({}). The model cannot express \
                          it: a domain has one segment per zone, addressed 10.<id>.<seg>.<node>/24, \
                          so two wires in one broadcast domain would hold two addresses of one /24 \
                          on one node — ARP-ambiguous. Put the wires in different domains. The \
@@ -554,7 +565,7 @@ impl Fabric {
                 && !declared.contains(d)
             {
                 return Err(Error::config(format!(
-                    "SEGMENT_TABLE {}: domain {d} is not in DOMAINS ({})",
+                    "segment {}: domain {d} is not in [domains] ({})",
                     s.ifname,
                     self.domains_list()
                 )));
@@ -563,7 +574,7 @@ impl Fabric {
         for z in &self.zones {
             if !declared.contains(&z.primary) {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {}: primary domain {} is not in DOMAINS ({})",
+                    "zone {}: primary domain {} is not in [domains] ({})",
                     z.name,
                     z.primary,
                     self.domains_list()
@@ -574,7 +585,7 @@ impl Fabric {
                 && !declared.contains(d)
             {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {}: gw domain {d} is not in DOMAINS ({})",
+                    "zone {}: gw domain {d} is not in [domains] ({})",
                     z.name,
                     self.domains_list()
                 )));
@@ -585,8 +596,8 @@ impl Fabric {
         for d in &self.domains {
             if !self.members.iter().any(|m| m.wire_on(d).is_some()) {
                 return Err(Error::config(format!(
-                    "DOMAINS declares {d} but no member has a wire on it (drop the token, or \
-                     give a member a wire@{d}:<speed>)"
+                    "[domains] declares {d} but no member has a wire on it (drop the token, or \
+                     give a member a wire on domain {d})"
                 )));
             }
         }
@@ -594,24 +605,20 @@ impl Fabric {
         let st = &self.segments;
         if let Some(d) = dup(st.iter().map(|r| r.vid.to_string())) {
             return Err(Error::config(format!(
-                "SEGMENT_TABLE vid {d} used by two segments (one VLAN id per segment)"
+                "vid {d} used by two segments (one VLAN id per segment)"
             )));
         }
         if let Some(d) = dup(st.iter().map(|r| format!("{}:{}", r.zone, r.seg))) {
-            return Err(Error::config(format!(
-                "SEGMENT_TABLE segment {d} declared twice"
-            )));
+            return Err(Error::config(format!("segment {d} declared twice")));
         }
         if let Some(d) = dup(st.iter().map(|r| format!("{}:{}", r.zone, r.scope))) {
             return Err(Error::config(format!(
-                "SEGMENT_TABLE zone:domain {d} declared twice (a zone has one segment per \
-                 domain, and one universal segment)"
+                "zone:domain {d} declared twice (a zone has one segment per domain, and one \
+                 universal segment)"
             )));
         }
         if let Some(d) = dup(st.iter().map(|r| r.ifname.clone())) {
-            return Err(Error::config(format!(
-                "SEGMENT_TABLE ifname {d} declared twice"
-            )));
+            return Err(Error::config(format!("segment ifname {d} declared twice")));
         }
         for r in st {
             self.zone(&r.zone)?;
@@ -619,7 +626,7 @@ impl Fabric {
         for r in st.iter().filter(|r| r.scope.is_universal()) {
             if bond_ifname_too_long(&r.ifname) {
                 return Err(Error::config(format!(
-                    "SEGMENT_TABLE {}: a universal (any) segment's ifname must be \
+                    "zone {}: the universal leg's ifname must be \
                      {MAX_BOND_IFNAME} characters or fewer (slaves are named <ifname>-<domain>, \
                      IFNAMSIZ 15)",
                     r.ifname
@@ -628,12 +635,12 @@ impl Fabric {
         }
         // ---- zones ----
         if let Some(d) = dup(self.zones.iter().map(|z| z.id.to_string())) {
-            return Err(Error::config(format!("ZONE_TABLE id {d} used twice")));
+            return Err(Error::config(format!("zone id {d} used twice")));
         }
         for z in &self.zones {
             if z.id < 1 {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE id {} is not a valid block octet (1-254)",
+                    "zone id {} is not a valid block octet (1-254)",
                     z.id
                 )));
             }
@@ -644,22 +651,18 @@ impl Fabric {
                 .any(|r| r.zone == z.name && r.scope == SegScope::Domain(z.primary.clone()))
             {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {}: primary domain {} has no segment in SEGMENT_TABLE (the \
-                     zone's rank-0 wire is the wire on its primary domain)",
+                    "zone {}: primary domain {} has no segment (the zone's rank-0 wire is the \
+                     wire on its primary domain)",
                     z.name, z.primary
                 )));
             }
         }
         // ---- members ----
         if let Some(d) = dup(self.members.iter().map(|m| m.name.clone())) {
-            return Err(Error::config(format!(
-                "MEMBER_TABLE member {d} declared twice"
-            )));
+            return Err(Error::config(format!("member {d} declared twice")));
         }
         if let Some(d) = dup(self.members.iter().map(|m| m.node.to_string())) {
-            return Err(Error::config(format!(
-                "MEMBER_TABLE node id {d} used twice"
-            )));
+            return Err(Error::config(format!("node id {d} used twice")));
         }
         // ---- wire preference overrides ----
         self.check_wire_prefs()?;
@@ -668,21 +671,9 @@ impl Fabric {
             for z in [from, to] {
                 if self.zones.iter().all(|zz| zz.name != *z) {
                     return Err(Error::config(format!(
-                        "FORWARD_ALLOW '{from}>{to}': unknown zone '{z}'"
+                        "[forward] allow '{from}>{to}': unknown zone '{z}'"
                     )));
                 }
-            }
-        }
-        for (m, dev) in &self.usb_nics {
-            let member = self
-                .members
-                .iter()
-                .find(|mm| mm.name == *m)
-                .ok_or_else(|| Error::config(format!("USB_NICS names unknown member '{m}'")))?;
-            if member.wire_named(dev).is_none() {
-                return Err(Error::config(format!(
-                    "USB_NICS {m}:{dev}: '{dev}' is not one of {m}'s wires"
-                )));
             }
         }
         for z in &self.zones {
@@ -692,14 +683,14 @@ impl Fabric {
             // leave room for the `-<domain>` suffix.
             if gw.scope.is_universal() && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
+                    "zone {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
                      characters or fewer (slaves are named <ifname>-<domain>, IFNAMSIZ 15)",
                     z.name, z.id
                 )));
             }
             if st.iter().any(|r| r.vid == gw.vid) {
                 return Err(Error::config(format!(
-                    "ZONE_TABLE {} ingress vid {} is also a segment vid",
+                    "zone {} ingress vid {} is also a segment vid",
                     z.name, gw.vid
                 )));
             }
@@ -709,7 +700,7 @@ impl Fabric {
                 // equal to the router octet is a landmine for any future wire, so check all.
                 if m.node == octet {
                     return Err(Error::config(format!(
-                        "ZONE_TABLE {} router {} collides with node {} ({})'s leg address",
+                        "zone {} router {} collides with node {} ({})'s leg address",
                         z.name, gw.router, m.node, m.name
                     )));
                 }
@@ -736,19 +727,19 @@ impl Fabric {
         for p in &self.wire_prefs {
             let m = self
                 .member(&p.member)
-                .map_err(|e| Error::config(format!("WIRE_PREF {} {}: {e}", p.member, p.zone)))?;
+                .map_err(|e| Error::config(format!("member {} prefs {}: {e}", p.member, p.zone)))?;
             self.zone(&p.zone)
-                .map_err(|e| Error::config(format!("WIRE_PREF {} {}: {e}", p.member, p.zone)))?;
+                .map_err(|e| Error::config(format!("member {} prefs {}: {e}", p.member, p.zone)))?;
             if !seen.insert((p.member.clone(), p.zone.clone())) {
                 return Err(Error::config(format!(
-                    "WIRE_PREF {} {} declared twice",
+                    "member {} prefs {} declared twice",
                     p.member, p.zone
                 )));
             }
             for w in &p.order {
                 if m.wire_named(w).is_none() {
                     return Err(Error::config(format!(
-                        "WIRE_PREF {} {}: '{w}' is not one of {}'s wires",
+                        "member {} prefs {}: '{w}' is not one of {}'s wires",
                         p.member, p.zone, p.member
                     )));
                 }
@@ -761,13 +752,13 @@ impl Fabric {
             let got: BTreeSet<&str> = p.order.iter().map(String::as_str).collect();
             if got.len() != p.order.len() {
                 return Err(Error::config(format!(
-                    "WIRE_PREF {} {}: a wire is listed twice",
+                    "member {} prefs {}: a wire is listed twice",
                     p.member, p.zone
                 )));
             }
             if got != want {
                 return Err(Error::config(format!(
-                    "WIRE_PREF {} {}: an override is the COMPLETE order, never blended with the \
+                    "member {} prefs {}: an override is the COMPLETE order, never blended with the \
                      derived one — list exactly [{}], got [{}]",
                     p.member,
                     p.zone,
@@ -799,7 +790,7 @@ impl Fabric {
         self.members.iter().find(|m| m.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.members.iter().map(|m| m.name.as_str()).collect();
             Error::config(format!(
-                "'{name}' is not in MEMBER_TABLE (members: {})",
+                "'{name}' is not a declared member (members: {})",
                 names.join(" ")
             ))
         })
@@ -809,7 +800,7 @@ impl Fabric {
         self.zones.iter().find(|z| z.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.zones.iter().map(|z| z.name.as_str()).collect();
             Error::config(format!(
-                "'{name}' is not in ZONE_TABLE (zones: {})",
+                "'{name}' is not a declared zone (zones: {})",
                 names.join(" ")
             ))
         })
@@ -821,233 +812,6 @@ impl Fabric {
             .iter()
             .find(|p| p.member == member && p.zone == zone)
     }
-}
-
-/// Non-empty, non-comment rows of a table, split into fields. Row ARITY is each parser's own
-/// business: a row with the wrong number of columns is an error that names the layout, never a
-/// silently dropped row (which is how an old-format file used to become a half-empty fabric).
-fn table_rows(text: &str) -> Vec<Vec<&str>> {
-    text.lines()
-        .map(|l| l.split_whitespace().collect::<Vec<_>>())
-        .filter(|f| !f.is_empty() && !f[0].starts_with('#'))
-        .collect()
-}
-
-fn parse_domains(text: &str) -> Result<Vec<DomainId>> {
-    text.split_whitespace().map(DomainId::parse).collect()
-}
-
-/// `name@domain:speed`. Three distinct errors, because the three mistakes have three different
-/// remedies: a v0 `name:speed` wire (no domain), a wire with no speed, and a malformed token.
-fn parse_wire(member: &str, spec: &str) -> Result<Wire> {
-    let bad_shape = || {
-        Error::config(format!(
-            "MEMBER_TABLE {member}: wire '{spec}' is malformed (expected name@domain:speed, \
-             e.g. eth9@a:5000)"
-        ))
-    };
-    let Some((name, rest)) = spec.split_once('@') else {
-        return Err(Error::config(format!(
-            "MEMBER_TABLE {member}: wire '{spec}' has no switch domain (expected \
-             name@domain:speed, e.g. eth9@a:5000). A v1 wire is pinned to exactly one declared \
-             domain; the v0 `name:speed` form named an island position instead"
-        )));
-    };
-    let Some((domain, speed)) = rest.split_once(':') else {
-        return Err(Error::config(format!(
-            "MEMBER_TABLE {member}: wire '{spec}' has no link speed (expected \
-             name@domain:speed, e.g. eth9@a:5000; the speed is DECLARED in Mb/s and only \
-             cross-checked against ethtool)"
-        )));
-    };
-    if name.is_empty() || rest.contains('@') || speed.contains(':') {
-        return Err(bad_shape());
-    }
-    Ok(Wire {
-        name: name.to_string(),
-        domain: DomainId::parse(domain).map_err(|_| bad_shape())?,
-        speed_mbit: speed.parse().map_err(|_| bad_shape())?,
-    })
-}
-
-fn parse_member_table(text: &str) -> Result<Vec<Member>> {
-    table_rows(text)
-        .into_iter()
-        .map(|f| {
-            if f.len() < 4 {
-                return Err(Error::config(format!(
-                    "MEMBER_TABLE {}: {} columns (expected at least 4: member node kind \
-                     wire@domain:speed …)",
-                    f[0],
-                    f.len()
-                )));
-            }
-            // The v0 row was `member node kind st:speed cl:speed mg:speed`: three fixed island
-            // slots. Named here rather than left to the wire parser's "no domain" error,
-            // because the upgrade has a REGRESSION worth stating: v0 accepted the same NIC in
-            // all three slots (a 1-NIC host trunking every segment), and v1 pins a wire to ONE
-            // domain — such a member now carries one domain's segments and reaches the rest
-            // over the universal segment.
-            if f[3..].iter().any(|s| s.contains(':') && !s.contains('@')) {
-                return Err(Error::config(format!(
-                    "MEMBER_TABLE {}: '{}' looks like a v0 island wire. The v1 row is `member \
-                     node kind wire@domain:speed …`: the three fixed st/cl/mg slots became a \
-                     wire SET, each wire pinned to one declared DOMAINS token. REGRESSION to \
-                     check while upgrading: a v0 member naming the SAME NIC in all three slots \
-                     was trunking every segment over one wire; in v1 one wire is one domain, so \
-                     that member carries only that domain's segments and reaches the rest over \
-                     the universal segment",
-                    f[0],
-                    f[3..]
-                        .iter()
-                        .find(|s| s.contains(':') && !s.contains('@'))
-                        .expect("just matched"),
-                )));
-            }
-            let kind = MemberKind::parse(f[2])?;
-            let wires = f[3..]
-                .iter()
-                .map(|spec| parse_wire(f[0], spec))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Member {
-                name: f[0].to_string(),
-                node: f[1].parse().map_err(|_| {
-                    Error::config(format!(
-                        "MEMBER_TABLE {}: node '{}' is not a number",
-                        f[0], f[1]
-                    ))
-                })?,
-                kind,
-                wires,
-            })
-        })
-        .collect()
-}
-
-fn parse_zone_table(text: &str) -> Result<Vec<Zone>> {
-    table_rows(text)
-        .into_iter()
-        .map(|f| {
-            if f.len() != 9 {
-                return Err(Error::config(format!(
-                    "ZONE_TABLE {}: {} columns (expected 9: zone id pcp dscp floor band weight \
-                     primary gw). `primary` is new in v1: the switch domain carrying this zone's \
-                     rank-0 wire on every member, which is where the per-interface OSPF costs \
-                     come from now that SEGMENT_TABLE declares none",
-                    f[0],
-                    f.len()
-                )));
-            }
-            let num = |i: usize, what: &str| -> Result<u32> {
-                f[i].parse().map_err(|_| {
-                    Error::config(format!(
-                        "ZONE_TABLE {}: {what} '{}' is not a number",
-                        f[0], f[i]
-                    ))
-                })
-            };
-            let gw = if f[8] == "-" {
-                None
-            } else {
-                let parts: Vec<&str> = f[8].split(':').collect();
-                let bad = || {
-                    Error::config(format!(
-                        "ZONE_TABLE {} gw '{}' (expected domain:vid:router/24, any:vid:router/24 \
-                         or -)",
-                        f[0], f[8]
-                    ))
-                };
-                if parts.len() != 3 {
-                    return Err(bad());
-                }
-                let (router, len) = parts[2].split_once('/').ok_or_else(bad)?;
-                if len != "24" {
-                    return Err(bad());
-                }
-                if router.split('.').count() != 4
-                    || router.split('.').any(|o| o.parse::<u8>().is_err())
-                {
-                    return Err(bad());
-                }
-                Some(ZoneGw {
-                    scope: SegScope::parse(parts[0]).map_err(|_| bad())?,
-                    vid: parts[1].parse().map_err(|_| bad())?,
-                    router: router.to_string(),
-                })
-            };
-            Ok(Zone {
-                name: f[0].to_string(),
-                id: f[1].parse().map_err(|_| {
-                    Error::config(format!(
-                        "ZONE_TABLE {}: id {} is not a valid block octet (1-254)",
-                        f[0], f[1]
-                    ))
-                })?,
-                pcp: num(2, "pcp")? as u8,
-                dscp: Dscp::parse(f[3])?,
-                floor_mbit: num(4, "floor")?,
-                band: num(5, "band")?,
-                weight: num(6, "weight")?,
-                primary: DomainId::parse(f[7])
-                    .map_err(|e| Error::config(format!("ZONE_TABLE {}: primary {e}", f[0])))?,
-                gw,
-            })
-        })
-        .collect()
-}
-
-fn parse_segment_table(text: &str) -> Result<Vec<Segment>> {
-    table_rows(text)
-        .into_iter()
-        .map(|f| {
-            if f.len() != 5 {
-                return Err(Error::config(format!(
-                    "SEGMENT_TABLE {}: {} columns (expected 5: ifname domain|any zone seg vid). \
-                     The v0 role and ospf-cost columns are gone: a segment's role is its scope \
-                     ('any' = universal) and its cost is derived from ZONE_TABLE's primary \
-                     domain and the per-member wire order",
-                    f[0],
-                    f.len()
-                )));
-            }
-            let num = |i: usize, what: &str| -> Result<u32> {
-                f[i].parse().map_err(|_| {
-                    Error::config(format!(
-                        "SEGMENT_TABLE {}: {what} '{}' is not a number",
-                        f[0], f[i]
-                    ))
-                })
-            };
-            Ok(Segment {
-                ifname: f[0].to_string(),
-                scope: SegScope::parse(f[1])
-                    .map_err(|e| Error::config(format!("SEGMENT_TABLE {}: {e}", f[0])))?,
-                zone: f[2].to_string(),
-                seg: num(3, "seg")? as u8,
-                vid: num(4, "vid")? as u16,
-            })
-        })
-        .collect()
-}
-
-fn parse_wire_pref(text: &str) -> Result<Vec<WirePref>> {
-    table_rows(text)
-        .into_iter()
-        .map(|f| {
-            if f.len() < 3 {
-                return Err(Error::config(format!(
-                    "WIRE_PREF {}: {} columns (expected at least 3: member zone wire …)",
-                    f[0],
-                    f.len()
-                )));
-            }
-            Ok(WirePref {
-                member: f[0].to_string(),
-                zone: f[1].to_string(),
-                order: f[2..].iter().map(|s| s.to_string()).collect(),
-            })
-        })
-        .collect()
 }
 
 /// Every member's wires, keyed by name — the map several derivations want and none should
@@ -1063,18 +827,19 @@ pub fn wires_by_member(fabric: &Fabric) -> BTreeMap<&str, &[Wire]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
 
-    fn real_conf() -> String {
-        // The example declaration shipped with the crate: a real, live-proven 3-member fabric.
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-            .expect("examples/fabric.conf")
+    /// The example declaration shipped with the crate: a real, live-proven 3-member fabric.
+    fn real_decl() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+            .expect("examples/fabric.toml")
     }
 
+    /// The example with one edit — the whole gate, parse and validation, as `cfab` runs it.
     fn parse_fabric(mut edit: impl FnMut(&mut String)) -> Result<Fabric> {
-        let mut text = real_conf();
+        let mut text = real_decl();
         edit(&mut text);
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap())
+        Fabric::from_decl(&Declaration::parse(&text)?)
     }
 
     fn a() -> DomainId {
@@ -1082,9 +847,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_real_declaration() {
-        let raw = RawConfig::parse(&real_conf()).unwrap();
-        let f = Fabric::from_raw(&raw).unwrap();
+    fn resolves_the_real_declaration() {
+        let f = parse_fabric(|_| {}).unwrap();
         assert_eq!(f.members.len(), 3);
         assert_eq!(f.zones.len(), 3);
         assert_eq!(
@@ -1095,8 +859,29 @@ mod tests {
                 DomainId::parse("c").unwrap()
             ]
         );
-        // 9 domain segments + 3 universal rows (one per zone).
+        // 9 domain segments + 3 universal legs (one per zone).
         assert_eq!(f.segments.len(), 12);
+        // Declaration order: a zone's segments, then its universal leg, zone by zone.
+        assert_eq!(
+            f.segments
+                .iter()
+                .map(|s| s.ifname.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cfab-st",
+                "cfab-st-bk",
+                "cfab-st-b2",
+                "cfab-st-fb",
+                "cfab-cl",
+                "cfab-cl-bk",
+                "cfab-cl-b2",
+                "cfab-cl-fb",
+                "cfab-mg",
+                "cfab-mg-bk",
+                "cfab-mg-b2",
+                "cfab-mg-fb",
+            ]
+        );
         assert_eq!(f.zone("mgmt").unwrap().id, 249);
         assert_eq!(f.zone("storage").unwrap().primary, a());
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
@@ -1122,32 +907,49 @@ mod tests {
                 .unwrap()
                 .wire_on(&a())
                 .unwrap()
-                .speed_mbit,
+                .speed_mbps,
             5000
         );
-        // No literal key in the real file is unknown to the model.
-        assert_eq!(raw.unconsumed(CONSUMED_KEYS), Vec::<&str>::new());
+        assert_eq!(f.dns_domain, "fabric.example");
+        assert_eq!(f.run_dir, "/run/cfab");
+        assert!(f.host_forward);
+        assert_eq!(f.forward_allow.len(), 3);
+    }
+
+    /// `usb = true` on a wire IS the USB list: the pair is built from the member's own wires,
+    /// so a USB entry can no longer name a member or a device that does not exist.
+    #[test]
+    fn usb_wires_become_the_usb_list() {
+        let f = parse_fabric(|_| {}).unwrap();
+        assert_eq!(
+            f.usb_nics,
+            vec![
+                ("pve1-tb".to_string(), "eth9".to_string()),
+                ("pve2-tb".to_string(), "eth9".to_string())
+            ]
+        );
     }
 
     #[test]
     fn bfd_port_defaults_and_is_range_checked() {
         // The shipped declaration states it; a declaration that omits it gets RFC 5881's port.
         assert_eq!(parse_fabric(|_| {}).unwrap().bfd_port, 3784);
-        let f = parse_fabric(|t| *t = t.replace("BFD_PORT=3784\n", "")).unwrap();
+        let f = parse_fabric(|t| *t = t.replace("port = 3784\n", "")).unwrap();
         assert_eq!(f.bfd_port, BFD_PORT_DEFAULT);
         assert_eq!(
-            parse_fabric(|t| *t = t.replace("BFD_PORT=3784", "BFD_PORT=3785"))
+            parse_fabric(|t| *t = t.replace("port = 3784", "port = 3785"))
                 .unwrap()
                 .bfd_port,
             3785
         );
         for (bad, want) in [
-            ("BFD_PORT=1023", "BFD_PORT=1023 is outside 1024..65535"),
-            ("BFD_PORT=0", "BFD_PORT=0 is outside 1024..65535"),
-            ("BFD_PORT=70000", "BFD_PORT='70000' is not a valid port"),
-            ("BFD_PORT=bfd", "BFD_PORT='bfd' is not a valid port"),
+            ("port = 1023", "[bfd] port = 1023 is outside 1024..65535"),
+            ("port = 0", "[bfd] port = 0 is outside 1024..65535"),
+            // Outside u16 or not a number: the parser refuses the VALUE, naming it.
+            ("port = 70000", "70000"),
+            ("port = \"bfd\"", "bfd"),
         ] {
-            let err = parse_fabric(|t| *t = t.replace("BFD_PORT=3784", bad))
+            let err = parse_fabric(|t| *t = t.replace("port = 3784", bad))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "{bad}: {err}");
@@ -1158,22 +960,23 @@ mod tests {
     fn pcp_ctrl_is_range_checked() {
         assert_eq!(parse_fabric(|_| {}).unwrap().pcp_ctrl, 6);
         assert_eq!(
-            parse_fabric(|t| *t = t.replace("PCP_CTRL=6", "PCP_CTRL=5"))
+            parse_fabric(|t| *t = t.replace("pcp_ctrl = 6", "pcp_ctrl = 5"))
                 .unwrap()
                 .pcp_ctrl,
             5
         );
         for (bad, want) in [
             (
-                "PCP_CTRL=7",
-                "PCP_CTRL=7 is outside 0..6 (7 needs CAP_NET_ADMIN on the engine's control sockets)",
+                "pcp_ctrl = 7",
+                "[marking] pcp_ctrl = 7 is outside 0..6 (7 needs CAP_NET_ADMIN on the engine's \
+                 control sockets)",
             ),
-            ("PCP_CTRL=8", "PCP_CTRL=8 is outside 0..6"),
-            ("PCP_CTRL=255", "PCP_CTRL=255 is outside 0..6"),
-            ("PCP_CTRL=256", "PCP_CTRL='256' is not a valid number"),
-            ("PCP_CTRL=six", "PCP_CTRL='six' is not a valid number"),
+            ("pcp_ctrl = 8", "pcp_ctrl = 8 is outside 0..6"),
+            ("pcp_ctrl = 255", "pcp_ctrl = 255 is outside 0..6"),
+            ("pcp_ctrl = 256", "256"),
+            ("pcp_ctrl = \"six\"", "six"),
         ] {
-            let err = parse_fabric(|t| *t = t.replace("PCP_CTRL=6", bad))
+            let err = parse_fabric(|t| *t = t.replace("pcp_ctrl = 6", bad))
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "{bad}: {err}");
@@ -1181,42 +984,9 @@ mod tests {
     }
 
     #[test]
-    fn usb_nics_entry_without_dev_fails() {
-        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve1-tb")).unwrap_err();
-        assert!(
-            err.to_string().contains("'pve1-tb' is not member:dev"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn usb_nics_unknown_member_fails() {
-        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve9-tb:eth9")).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown member 'pve9-tb'"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn usb_nics_non_wire_dev_fails() {
-        let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve1-tb:eth5")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("'eth5' is not one of pve1-tb's wires"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn duplicate_vid_fails() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st-bk  b   storage 2 101",
-                "cfab-st-bk  b   storage 2 100",
-            )
-        })
-        .unwrap_err();
+        let err = parse_fabric(|t| *t = t.replace("seg = 2, vid = 101", "seg = 2, vid = 100"))
+            .unwrap_err();
         assert!(
             err.to_string().contains("vid 100 used by two segments"),
             "{err}"
@@ -1225,7 +995,8 @@ mod tests {
 
     #[test]
     fn gw_vid_colliding_with_segment_vid_fails() {
-        let err = parse_fabric(|t| *t = t.replace("c:249:", "c:250:")).unwrap_err();
+        let err =
+            parse_fabric(|t| *t = t.replace("vid = 249, router", "vid = 250, router")).unwrap_err();
         assert!(
             err.to_string()
                 .contains("ingress vid 250 is also a segment vid"),
@@ -1242,14 +1013,17 @@ mod tests {
 
     #[test]
     fn unknown_forward_allow_zone_fails() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "FORWARD_ALLOW=\"storage>storage",
-                "FORWARD_ALLOW=\"public>storage",
-            )
-        })
-        .unwrap_err();
+        let err = parse_fabric(|t| *t = t.replace("\"storage>storage\"", "\"public>storage\""))
+            .unwrap_err();
         assert!(err.to_string().contains("unknown zone 'public'"), "{err}");
+    }
+
+    #[test]
+    fn a_forward_pair_without_a_direction_fails() {
+        let err = parse_fabric(|t| *t = t.replace("\"storage>storage\"", "\"storage\""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[forward] allow 'storage'"), "{err}");
     }
 
     #[test]
@@ -1257,26 +1031,70 @@ mod tests {
         let err = parse_fabric(|t| *t = t.replace("192.168.249.254/24", "192.168.249.254/25"))
             .unwrap_err();
         assert!(
-            err.to_string().contains("expected domain:vid:router/24"),
+            err.to_string()
+                .contains("expected an IPv4 address with /24"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gw_router_without_a_prefix_fails() {
+        let err =
+            parse_fabric(|t| *t = t.replace("192.168.249.254/24", "192.168.249.254")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected an IPv4 address with /24"),
             "{err}"
         );
     }
 
     #[test]
     fn duplicate_node_id_fails() {
-        let err = parse_fabric(|t| *t = t.replace("pve2-tb 2 host", "pve2-tb 1 host")).unwrap_err();
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "name = \"pve2-tb\"\nnode = 2",
+                "name = \"pve2-tb\"\nnode = 1",
+            )
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("node id 1 used twice"), "{err}");
     }
 
     #[test]
+    fn duplicate_member_name_fails() {
+        let err = parse_fabric(|t| *t = t.replace("name = \"pve2-tb\"", "name = \"pve1-tb\""))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("member pve1-tb declared twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn unknown_member_error_lists_members() {
-        let raw = RawConfig::parse(&real_conf()).unwrap();
-        let f = Fabric::from_raw(&raw).unwrap();
+        let f = parse_fabric(|_| {}).unwrap();
         let err = f.member("nope").unwrap_err();
         assert!(
             err.to_string().contains("members: pve1-tb pve2-tb pve3-tb"),
             "{err}"
         );
+    }
+
+    /// Representable in TOML (`wires = []`), meaningless in a fabric — and every derivation
+    /// downstream assumes a member has at least one wire.
+    #[test]
+    fn a_member_with_no_wires_is_refused() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "wires = [\n  { nic = \"eth9\", domain = \"a\", speed_mbps = 10000 },\n  \
+                 { nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  \
+                 { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]",
+                "wires = []",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("member pve3-tb: declares no wires"), "{err}");
     }
 
     #[test]
@@ -1295,14 +1113,23 @@ mod tests {
         for bad in ["", "ab", "1", "-", "a1"] {
             assert!(DomainId::parse(bad).is_err(), "{bad}");
         }
+        // ...and a declaration naming a two-character token says which wire holds it.
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth1\", domain = \"b\"",
+                "{ nic = \"eth1\", domain = \"bb\"",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("member pve1-tb: wire eth1:"), "{err}");
+        assert!(err.contains("is not a switch-domain token"), "{err}");
     }
 
     #[test]
     fn universal_ifname_over_the_budget_fails() {
-        let err = parse_fabric(|t| {
-            *t = t.replace("cfab-st-fb  any storage", "cfab-storage-fb any storage")
-        })
-        .unwrap_err();
+        let err =
+            parse_fabric(|t| *t = t.replace("\"cfab-st-fb\"", "\"cfab-storage-fb\"")).unwrap_err();
         assert!(
             err.to_string().contains("must be 13 characters or fewer"),
             "{err}"
@@ -1319,7 +1146,7 @@ mod tests {
         assert!(bond_ifname_too_long("12345678901234"));
     }
 
-    /// ...and no ZONE_TABLE declaration can reach it today: a zone id is a u8, so the widest
+    /// ...and no zone declaration can reach it today: a zone id is a u8, so the widest
     /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-a` (12).
     #[test]
     fn every_zone_id_yields_an_ingress_bond_name_that_fits() {
@@ -1333,7 +1160,9 @@ mod tests {
     /// The ingress leg migrates, so `any` is a legal gw scope.
     #[test]
     fn gw_scope_any_is_accepted() {
-        let f = parse_fabric(|t| *t = t.replace("c:249:", "any:249:")).unwrap();
+        let f =
+            parse_fabric(|t| *t = t.replace("gw = { domain = \"c\"", "gw = { domain = \"any\""))
+                .unwrap();
         assert!(
             f.zone("mgmt")
                 .unwrap()
@@ -1345,126 +1174,92 @@ mod tests {
         );
     }
 
+    // ---- domains: the two-directional check ------------------------------------------------
+
     #[test]
-    fn schema_still_emits() {
-        let schema = schemars::schema_for!(Fabric);
-        let json = serde_json::to_string(&schema).expect("schema serializes");
-        assert!(json.contains("universal"), "{json}");
-        assert!(json.contains("speed_mbit"), "{json}");
+    fn an_undeclared_wire_domain_is_refused() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                "{ nic = \"eth1\", domain = \"d\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("is not in [domains] (a b c)"), "{err}");
     }
 
-    // ---- v0 declarations fail loud, naming the v1 layout ------------------------------------
-
     #[test]
-    fn a_v0_class_table_key_names_segment_table() {
-        let err = parse_fabric(|t| *t = t.replace("SEGMENT_TABLE=", "CLASS_TABLE=")).unwrap_err();
+    fn an_undeclared_segment_domain_is_refused() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ ifname = \"cfab-st-b2\", domain = \"c\"",
+                "{ ifname = \"cfab-st-b2\", domain = \"d\"",
+            )
+        })
+        .unwrap_err()
+        .to_string();
         assert!(
-            err.to_string()
-                .contains("CLASS_TABLE was replaced by SEGMENT_TABLE"),
+            err.contains("segment cfab-st-b2: domain d is not in [domains]"),
             "{err}"
         );
     }
 
     #[test]
-    fn a_v0_member_row_names_the_new_layout_and_the_trunk_regression() {
+    fn a_declared_domain_nobody_wires_into_is_refused() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+                "c = \"1G admin switch\"",
+                "c = \"1G admin switch\"\nd = \"a switch nobody is plugged into\"",
             )
         })
         .unwrap_err()
         .to_string();
-        assert!(err.contains("looks like a v0 island wire"), "{err}");
-        assert!(err.contains("wire@domain:speed"), "{err}");
-        assert!(err.contains("REGRESSION"), "{err}");
+        assert!(
+            err.contains("[domains] declares d but no member has a wire on it"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn a_v0_zone_row_names_the_primary_column() {
+    fn a_zone_primary_domain_without_a_segment_is_refused() {
+        // Trips ONLY this check: domain d is declared and wired (so the two-directional domain
+        // check is satisfied) but carries no segment, and storage names it as its primary.
         let err = parse_fabric(|t| {
-            *t = t.replace(
-                "storage  99 0 cs0 2000 2 4 a -",
-                "storage  99 0 cs0 2000 2 4 -",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("8 columns (expected 9"), "{err}");
-        assert!(err.contains("primary gw"), "{err}");
-    }
-
-    #[test]
-    fn a_v0_segment_row_names_the_dropped_role_and_cost_columns() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st     a   storage 1 100",
-                "cfab-st     a   storage 1 100 primary 10",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("7 columns (expected 5"), "{err}");
-        assert!(err.contains("role and ospf-cost columns are gone"), "{err}");
-    }
-
-    // ---- name@domain:speed: three mistakes, three errors ------------------------------------
-
-    /// A bare name reaches the "no domain" error. The v0 `name:speed` spelling does NOT: the
-    /// old-format detector above catches it first and says more, which is the point of having
-    /// both.
-    #[test]
-    fn a_wire_without_a_domain_says_so() {
-        let err = parse_fabric(|t| {
-            *t = t.replace("eth1@b:1000 eth0@c:1000\npve2", "eth1 eth0@c:1000\npve2")
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("has no switch domain"), "{err}");
-        let v0 = parse_fabric(|t| {
-            *t = t.replace(
-                "eth1@b:1000 eth0@c:1000\npve2",
-                "eth1:1000 eth0@c:1000\npve2",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(v0.contains("looks like a v0 island wire"), "{v0}");
-    }
-
-    #[test]
-    fn a_wire_without_a_speed_says_so() {
-        let err = parse_fabric(|t| {
-            *t = t.replace("eth1@b:1000 eth0@c:1000\npve2", "eth1@b eth0@c:1000\npve2")
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("has no link speed"), "{err}");
-    }
-
-    #[test]
-    fn a_malformed_wire_says_so() {
-        for bad in ["eth1@bb:1000", "eth1@b:fast", "@b:1000", "eth1@b:1:0"] {
-            let err = parse_fabric(|t| {
-                *t = t.replace(
-                    "eth1@b:1000 eth0@c:1000\npve2",
-                    &format!("{bad} eth0@c:1000\npve2"),
+            *t = t
+                .replace(
+                    "c = \"1G admin switch\"",
+                    "c = \"1G admin switch\"\nd = \"a fourth switch\"",
                 )
-            })
-            .unwrap_err()
-            .to_string();
-            assert!(err.contains("is malformed"), "{bad}: {err}");
-        }
+                .replace(
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n  { nic = \"eth2\", \
+                     domain = \"d\", speed_mbps = 1000 },\n]\n# Optional",
+                )
+                .replace("weight = 4\nprimary = \"a\"", "weight = 4\nprimary = \"d\"");
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("zone storage") && err.contains("primary domain d"),
+            "the error must name the zone and its primary domain: {err}"
+        );
+        assert!(err.contains("has no segment"), "{err}");
     }
-
-    // ---- the new refusals -------------------------------------------------------------------
 
     #[test]
     fn two_wires_on_one_domain_are_refused_with_the_reason() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                "pve1-tb 1 host eth9@a:5000 eth8@a:5000 eth1@b:1000 eth0@c:1000",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },\n  { nic = \
+                 \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \
+                 \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },\n  { nic = \
+                 \"eth8\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \"eth1\", domain = \
+                 \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = \
+                 1000 },\n]\n# Optional",
             )
         })
         .unwrap_err()
@@ -1485,80 +1280,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_undeclared_wire_domain_is_refused() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "eth1@b:1000 eth0@c:1000\npve2",
-                "eth1@d:1000 eth0@c:1000\npve2",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not in DOMAINS (a b c)"), "{err}");
+    // ---- per-zone preference overrides ------------------------------------------------------
+
+    /// The commented-out override in the example, uncommented: the whole order for one zone.
+    fn with_pref(pref: &str) -> String {
+        real_decl().replace(
+            "# prefs = { storage = [\"eth1\", \"eth9\", \"eth0\"] }",
+            pref,
+        )
     }
 
     #[test]
-    fn a_declared_domain_nobody_wires_into_is_refused() {
-        let err = parse_fabric(|t| *t = t.replace("DOMAINS=\"a b c\"", "DOMAINS=\"a b c d\""))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("DOMAINS declares d but no member has a wire on it"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_zone_primary_domain_without_a_segment_is_refused() {
-        // Trips ONLY this check: domain d is declared and wired (so the two-directional domain
-        // check is satisfied) but carries no segment, and storage names it as its primary.
-        let err = parse_fabric(|t| {
-            *t = t
-                .replace("DOMAINS=\"a b c\"", "DOMAINS=\"a b c d\"")
-                .replace(
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:1000",
-                )
-                .replace(
-                    "storage  99 0 cs0 2000 2 4 a -",
-                    "storage  99 0 cs0 2000 2 4 d -",
-                );
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("ZONE_TABLE storage") && err.contains("primary domain d"),
-            "the error must name the zone and its primary domain: {err}"
-        );
-        assert!(err.contains("no segment in SEGMENT_TABLE"), "{err}");
-    }
-
-    // ---- WIRE_PREF --------------------------------------------------------------------------
-
-    #[test]
-    fn a_complete_wire_pref_override_parses() {
-        let f =
-            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth0\n\"\n"))
-                .unwrap();
+    fn a_complete_pref_override_parses() {
+        let text = with_pref("prefs = { storage = [\"eth1\", \"eth9\", \"eth0\"] }");
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let p = f.wire_pref("pve1-tb", "storage").unwrap();
         assert_eq!(p.order, vec!["eth1", "eth9", "eth0"]);
     }
 
     #[test]
-    fn a_partial_wire_pref_override_is_refused() {
-        let err = parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9\n\"\n"))
+    fn a_partial_pref_override_is_refused() {
+        let text = with_pref("prefs = { storage = [\"eth1\", \"eth9\"] }");
+        let err = Fabric::from_decl(&Declaration::parse(&text).unwrap())
             .unwrap_err()
             .to_string();
         assert!(err.contains("COMPLETE order"), "{err}");
     }
 
     #[test]
-    fn a_wire_pref_naming_an_unknown_wire_is_refused() {
-        let err =
-            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth5\n\"\n"))
-                .unwrap_err()
-                .to_string();
+    fn a_pref_naming_an_unknown_wire_is_refused() {
+        let text = with_pref("prefs = { storage = [\"eth1\", \"eth9\", \"eth5\"] }");
+        let err = Fabric::from_decl(&Declaration::parse(&text).unwrap())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("'eth5' is not one of pve1-tb's wires"),
             "{err}"
@@ -1566,43 +1320,20 @@ mod tests {
     }
 
     #[test]
-    fn a_wire_pref_for_an_unknown_member_or_zone_is_refused() {
-        let err =
-            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve9-tb storage eth1 eth9 eth0\n\"\n"))
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("WIRE_PREF pve9-tb storage"), "{err}");
-        let err =
-            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb backup eth1 eth9 eth0\n\"\n"))
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("WIRE_PREF pve1-tb backup"), "{err}");
+    fn a_pref_for_an_unknown_zone_is_refused() {
+        let text = with_pref("prefs = { backup = [\"eth1\", \"eth9\", \"eth0\"] }");
+        let err = Fabric::from_decl(&Declaration::parse(&text).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("member pve1-tb prefs backup"), "{err}");
     }
 
     #[test]
-    fn the_same_wire_pref_row_twice_is_refused() {
-        let err = parse_fabric(|t| {
-            t.push_str(
-                "\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth0\npve1-tb storage eth9 eth1 eth0\n\"\n",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("declared twice"), "{err}");
-    }
-
-    /// A table row with the wrong column count used to be dropped SILENTLY (`table_rows`
-    /// filtered on an exact arity), which turned a typo into a half-declared fabric.
-    #[test]
-    fn a_short_member_row_is_an_error_not_a_dropped_row() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                "pve2-tb 2 host",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("3 columns (expected at least 4"), "{err}");
+    fn a_pref_listing_a_wire_twice_is_refused() {
+        let text = with_pref("prefs = { storage = [\"eth1\", \"eth1\", \"eth9\"] }");
+        let err = Fabric::from_decl(&Declaration::parse(&text).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a wire is listed twice"), "{err}");
     }
 }

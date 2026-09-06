@@ -419,8 +419,8 @@ impl ConfSync {
 }
 
 fn validate(text: &str, member: &str) -> Result<()> {
-    let raw = crate::config::RawConfig::parse(text)?;
-    let fabric = crate::model::Fabric::from_raw(&raw)?;
+    let decl = crate::decl::Declaration::parse(text)?;
+    let fabric = crate::model::Fabric::from_decl(&decl)?;
     crate::derive::View::new(&fabric, member)?;
     Ok(())
 }
@@ -492,7 +492,7 @@ mod tests {
     }"#;
 
     fn valid_conf() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
             .unwrap()
     }
 

@@ -265,12 +265,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     } else {
         MarkBackend::Nft
     };
-    if f.fabric_mode != "tagged" {
-        return Err(Error::fatal(format!(
-            "FABRIC_MODE='{}' (expected tagged)",
-            f.fabric_mode
-        )));
-    }
     // Lockout guard: at least one wire must carry an untagged IPv4 address BEFORE we touch
     // anything — the admin session rides the untagged path of some wire, and bringup
     // deliberately never assigns or flushes any of them. Every wire is an admin wire on a
@@ -933,15 +927,15 @@ fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Task 5: the engine start, the shape daemon, the watchdog and conf-sync all moved to
@@ -1404,10 +1398,10 @@ mod tests {
     /// The same declaration with the ingress leg on domain `any`.
     fn fabric_with_a_migrating_gw() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
-                .replace("c:249:", "any:249:");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Task 9: a gw domain of `any` builds the ingress leg as the very same bond a fallback

@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use cfab::config::RawConfig;
+use cfab::decl::Declaration;
 use cfab::derive::{View, class_rows_of, fallback_rows_of, prefs_of};
 use cfab::model::Fabric;
 use serde_json::Value;
@@ -36,9 +36,9 @@ const RENAME: [(&str, &str); 3] = [("st", "a"), ("cl", "b"), ("mg", "c")];
 
 fn fabric() -> Fabric {
     let text =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
             .expect("examples/fabric.conf");
-    Fabric::from_raw(&RawConfig::parse(&text).unwrap()).expect("the v1 example parses")
+    Fabric::from_decl(&Declaration::parse(&text).unwrap()).expect("the v1 example parses")
 }
 
 fn fixture(member: &str, file: &str) -> String {
@@ -330,13 +330,24 @@ fn the_mgmt_backup_order_is_the_one_real_behavior_change() {
         );
         assert_eq!(cost("cfab-mg-b2") - base, 200, "v0: eth9 was the second");
     }
-    // ...and one WIRE_PREF row per member restores v0's order exactly.
-    let text =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-            .unwrap()
-            + "\nWIRE_PREF=\"\npve1-tb mgmt eth0 eth1 eth9\npve2-tb mgmt eth0 eth1 eth9\n\
-           pve3-tb mgmt eth0 eth1 eth9\n\"\n";
-    let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+    // ...and one `prefs` row per member restores v0's order exactly.
+    let mut text =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+            .unwrap();
+    for member in MEMBERS {
+        // Insert the override right after that member's wire array.
+        let at = text
+            .find(&format!("name = \"{member}\""))
+            .expect("the member block");
+        let start = at + text[at..].find("wires = [").expect("a wires array");
+        let end = start + text[start..].find("]\n").expect("the array ends") + 2;
+        text = format!(
+            "{}prefs = {{ mgmt = [\"eth0\", \"eth1\", \"eth9\"] }}\n{}",
+            &text[..end],
+            &text[end..]
+        );
+    }
+    let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
     for member in MEMBERS {
         let p = prefs_of(&f, f.member(member).unwrap())
             .into_iter()

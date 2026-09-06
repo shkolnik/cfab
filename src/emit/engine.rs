@@ -359,15 +359,15 @@ pub fn prefsrc_rules(view: &View) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use serde_json::Value;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
@@ -692,25 +692,26 @@ mod tests {
     /// is exercised against a neighbor that must not see it.
     fn fabric_with_two_gw_zones() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
                 .replace(
-                    "cluster 199 6 cs6  200 0 1 b -",
-                    "cluster 199 6 cs6  200 0 1 b b:199:192.168.199.254/24",
+                    "universal = { ifname = \"cfab-cl-fb\", seg = 9, vid = 301 }",
+                    "universal = { ifname = \"cfab-cl-fb\", seg = 9, vid = 301 }\n\
+                     gw = { domain = \"b\", vid = 199, router = \"192.168.199.254/24\" }",
                 );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The same fabric with no ingress at all.
     fn fabric_without_a_gw() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
                 .replace(
-                    "mgmt    249 2 cs2  100 1 1 c c:249:192.168.249.254/24",
-                    "mgmt    249 2 cs2  100 1 1 c -",
+                    "gw = { domain = \"c\", vid = 249, router = \"192.168.249.254/24\" }\n",
+                    "",
                 );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every string value under `key`, anywhere in the tree.

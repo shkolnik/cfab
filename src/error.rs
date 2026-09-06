@@ -1,11 +1,11 @@
 use std::fmt;
 
-/// One error type for the whole binary. Config errors carry a `fabric.conf: ` prefix so
+/// One error type for the whole binary. Config errors carry a `fabric.toml: ` prefix so
 /// operators (and greps) can tell a declaration problem from a host problem at a glance.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A problem in fabric.conf itself (parse or validation). Printed as `fabric.conf: <msg>`.
-    #[error("fabric.conf: {0}")]
+    /// A problem in fabric.toml itself (parse or validation). Printed as `fabric.toml: <msg>`.
+    #[error("fabric.toml: {0}")]
     Config(String),
     /// A precondition on the running system failed (missing tool, missing interface, read-only
     /// /proc/sys …). Fatal, never degrade.

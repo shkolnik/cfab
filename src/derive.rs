@@ -256,7 +256,7 @@ impl<'a> View<'a> {
     pub fn link_speed(&self, wire: &str) -> Result<u32> {
         self.member
             .wire_named(wire)
-            .map(|w| w.speed_mbit)
+            .map(|w| w.speed_mbps)
             .ok_or_else(|| {
                 Error::config(format!(
                     "no declared link speed for {}:{wire} in MEMBER_TABLE",
@@ -306,7 +306,7 @@ pub fn prefs_of(fabric: &Fabric, member: &Member) -> Vec<HostZonePref> {
                 .collect();
             // Speed descending; the enumerate index keeps MEMBER_TABLE order on a tie, which is
             // the only tie-break the operator can see in the declaration.
-            rest.sort_by(|a, b| b.1.speed_mbit.cmp(&a.1.speed_mbit).then(a.0.cmp(&b.0)));
+            rest.sort_by(|a, b| b.1.speed_mbps.cmp(&a.1.speed_mbps).then(a.0.cmp(&b.0)));
             let mut order: Vec<String> = Vec::new();
             if let Some(w) = candidates.iter().find(|w| w.domain == z.primary) {
                 order.push(w.name.clone());
@@ -511,8 +511,8 @@ pub fn validate_derived(fabric: &Fabric) -> Result<()> {
         if cost >= fabric.leaf_cost_offset {
             return Err(Error::config(format!(
                 "zone {}: the derived universal-segment cost {cost} is not below \
-                 LEAF_COST_OFFSET ({}) — a universal path must still beat a black-holing leaf. \
-                 The cost is no longer declared, so the remedy is to raise LEAF_COST_OFFSET \
+                 [cost] leaf_offset ({}) — a universal path must still beat a black-holing \
+                 leaf. The cost is no longer declared, so the remedy is to raise leaf_offset \
                  (or shorten the zone: it is the sum of its domain segments' costs + \
                  {LADDER_STEP})",
                 z.name, fabric.leaf_cost_offset
@@ -576,7 +576,7 @@ fn check_rank0_is_shared(fabric: &Fabric, zone: &str) -> Result<()> {
             "zone {zone}: {}'s rank-0 wire {first} is on domain {domain}, which no other member \
              wires into, while {reaches} does reach a peer — the cheapest interface reaches \
              nobody, so every path through {} costs more than a one-hop backup. Rank {reaches} \
-             first (WIRE_PREF), or change the zone's primary domain",
+             first (the member's `prefs`), or change the zone's primary domain",
             m.name, m.name
         )));
     }
@@ -690,7 +690,7 @@ fn check_no_equal_cost_paths(fabric: &Fabric, zone: &str) -> Result<()> {
                     "zone {zone}: {} reaches {dst} over {n} distinct paths of equal cost {} \
                      (last hops: {}). OSPF installs both and the kernel prunes a dead ECMP \
                      nexthop with no route event, so a failure there is invisible. Change one \
-                     of the zone's wire orders (WIRE_PREF) so the paths differ",
+                     of the zone's wire orders (a member's `prefs`) so the paths differ",
                     src.name,
                     dist.get(dst).copied().unwrap_or(0),
                     via.get(dst).map(|v| v.join(", ")).unwrap_or_default()
@@ -715,27 +715,27 @@ pub fn render_prefs(fabric: &Fabric) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
 
     fn fabric() -> Fabric {
-        Fabric::from_raw(&RawConfig::parse(&conf_text()).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&conf_text()).unwrap()).unwrap()
     }
 
     fn conf_text() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
             .unwrap()
     }
 
     fn edited(edit: impl Fn(&mut String)) -> Fabric {
         let mut t = conf_text();
         edit(&mut t);
-        Fabric::from_raw(&RawConfig::parse(&t).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&t).unwrap()).unwrap()
     }
 
     fn err_of(edit: impl Fn(&mut String)) -> String {
         let mut t = conf_text();
         edit(&mut t);
-        Fabric::from_raw(&RawConfig::parse(&t).unwrap())
+        Fabric::from_decl(&Declaration::parse(&t).unwrap())
             .unwrap_err()
             .to_string()
     }
@@ -792,7 +792,13 @@ mod tests {
 
     #[test]
     fn a_wire_pref_row_replaces_the_whole_order_and_is_marked() {
-        let f = edited(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth0\n\"\n"));
+        let f = edited(|t| {
+            *t = fixtures::with_prefs(
+                t,
+                "pve1-tb",
+                "prefs = { storage = [\"eth1\", \"eth9\", \"eth0\"] }",
+            )
+        });
         let p = prefs_of(&f, f.member("pve1-tb").unwrap());
         let storage = p.iter().find(|x| x.zone == "storage").unwrap();
         assert_eq!(storage.order, vec!["eth1", "eth9", "eth0"]);
@@ -832,9 +838,9 @@ mod tests {
 
     #[test]
     fn a_universal_cost_at_or_above_the_leaf_offset_is_refused() {
-        let err = err_of(|t| *t = t.replace("LEAF_COST_OFFSET=30000", "LEAF_COST_OFFSET=400"));
-        assert!(err.contains("is not below LEAF_COST_OFFSET"), "{err}");
-        assert!(err.contains("raise LEAF_COST_OFFSET"), "{err}");
+        let err = err_of(|t| *t = t.replace("leaf_offset = 30000", "leaf_offset = 400"));
+        assert!(err.contains("is not below [cost] leaf_offset"), "{err}");
+        assert!(err.contains("raise leaf_offset"), "{err}");
     }
 
     #[test]
@@ -855,7 +861,7 @@ mod tests {
 
     /// The same declaration with the ingress on scope `any`.
     fn fabric_with_a_migrating_gw() -> Fabric {
-        edited(|t| *t = t.replace("c:249:", "any:249:"))
+        edited(|t| *t = t.replace("gw = { domain = \"c\"", "gw = { domain = \"any\""))
     }
 
     #[test]
@@ -1087,25 +1093,42 @@ mod tests {
 
     /// A conf built from the example by replacing whole table blocks, so these fabrics stay
     /// readable next to the reference one and keep every unrelated key.
-    fn conf_with(blocks: &[(&str, &str)]) -> String {
-        let mut t = conf_text();
-        for (key, body) in blocks {
-            let head = format!("{key}=\"");
-            let start = t
-                .find(&head)
-                .unwrap_or_else(|| panic!("no {key} in the example conf"));
-            let end = t[start + head.len()..]
-                .find('"')
-                .expect("unterminated value")
-                + start
-                + head.len();
-            t.replace_range(start..=end, &format!("{key}=\"{body}\""));
-        }
-        t
+    /// A synthetic one-zone declaration from the test shorthands: `(name, node, wires)`
+    /// members, `ifname@domain:seg:vid` segments.
+    fn one_zone_decl(
+        domains: &[&str],
+        members: &[(&str, u8, &str)],
+        primary: &str,
+        segments: &str,
+    ) -> String {
+        let member_blocks: String = members
+            .iter()
+            .map(|(n, node, w)| fixtures::member(n, *node, "host", w))
+            .collect();
+        fixtures::declaration(
+            domains,
+            &member_blocks,
+            &fixtures::zone(
+                "storage",
+                99,
+                primary,
+                segments,
+                Some("cfab-st-fb:9:300"),
+                None,
+            ),
+            "\"storage>storage\"",
+        )
     }
 
-    fn from_blocks(blocks: &[(&str, &str)]) -> Result<Fabric> {
-        Fabric::from_raw(&RawConfig::parse(&conf_with(blocks)).unwrap())
+    fn one_zone_fabric(
+        domains: &[&str],
+        members: &[(&str, u8, &str)],
+        primary: &str,
+        segments: &str,
+    ) -> Result<Fabric> {
+        Fabric::from_decl(&Declaration::parse(&one_zone_decl(
+            domains, members, primary, segments,
+        ))?)
     }
 
     fn order_of(f: &Fabric, member: &str, zone: &str) -> Vec<String> {
@@ -1121,17 +1144,7 @@ mod tests {
     /// segment it carries costs 10 and it still gets the universal bond — over one slave.
     #[test]
     fn a_one_wire_member_ranks_that_wire_first_in_every_zone() {
-        let f = edited(|t| {
-            *t = t
-                .replace(
-                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
-                    "pve1-tb 1 host eth9@a:5000",
-                )
-                .replace(
-                    "USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"",
-                    "USB_NICS=\"pve2-tb:eth9\"",
-                );
-        });
+        let f = edited(|t| *t = fixtures::with_wires(t, "pve1-tb", "eth9@a:5000"));
         let m = f.member("pve1-tb").unwrap();
         for zone in ["storage", "cluster", "mgmt"] {
             assert_eq!(order_of(&f, "pve1-tb", zone), vec!["eth9"], "{zone}");
@@ -1168,38 +1181,53 @@ mod tests {
     /// follow by DECLARED speed descending, so the ladder runs 10/100/200/300.
     #[test]
     fn a_four_wire_member_ranks_primary_then_speed_across_four_domains() {
-        let f = from_blocks(&[
-            ("DOMAINS", "a b c d"),
+        let members: String = [
             (
-                "MEMBER_TABLE",
-                "
-pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500
-pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500
-pve3-tb 3 leaf eth9@a:10000 eth1@b:1000 eth0@c:1000
-",
+                "pve1-tb",
+                1u8,
+                "host",
+                "eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500",
             ),
             (
-                "SEGMENT_TABLE",
-                "
-cfab-st     a   storage 1 100
-cfab-st-bk  b   storage 2 101
-cfab-st-b2  c   storage 3 102
-cfab-st-b3  d   storage 4 103
-cfab-cl     b   cluster 1 200
-cfab-cl-bk  a   cluster 2 201
-cfab-cl-b2  c   cluster 3 202
-cfab-cl-b3  d   cluster 4 203
-cfab-mg     c   mgmt    1 250
-cfab-mg-bk  b   mgmt    2 251
-cfab-mg-b2  a   mgmt    3 252
-cfab-mg-b3  d   mgmt    4 253
-cfab-st-fb  any storage 9 300
-cfab-cl-fb  any cluster 9 301
-cfab-mg-fb  any mgmt    9 302
-",
+                "pve2-tb",
+                2,
+                "host",
+                "eth9@a:5000 eth1@b:1000 eth0@c:1000 eth2@d:2500",
             ),
-        ])
-        .unwrap();
+            ("pve3-tb", 3, "leaf", "eth9@a:10000 eth1@b:1000 eth0@c:1000"),
+        ]
+        .iter()
+        .map(|(n, node, kind, w)| fixtures::member(n, *node, kind, w))
+        .collect();
+        let zones = fixtures::zone(
+            "storage",
+            99,
+            "a",
+            "cfab-st@a:1:100 cfab-st-bk@b:2:101 cfab-st-b2@c:3:102 cfab-st-b3@d:4:103",
+            Some("cfab-st-fb:9:300"),
+            None,
+        ) + &fixtures::zone(
+            "cluster",
+            199,
+            "b",
+            "cfab-cl@b:1:200 cfab-cl-bk@a:2:201 cfab-cl-b2@c:3:202 cfab-cl-b3@d:4:203",
+            Some("cfab-cl-fb:9:301"),
+            None,
+        ) + &fixtures::zone(
+            "mgmt",
+            249,
+            "c",
+            "cfab-mg@c:1:250 cfab-mg-bk@b:2:251 cfab-mg-b2@a:3:252 cfab-mg-b3@d:4:253",
+            Some("cfab-mg-fb:9:302"),
+            None,
+        );
+        let text = fixtures::declaration(
+            &["a", "b", "c", "d"],
+            &members,
+            &zones,
+            "\"storage>storage\", \"cluster>cluster\", \"mgmt>mgmt\"",
+        );
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         assert_eq!(
             order_of(&f, "pve1-tb", "storage"),
             vec!["eth9", "eth2", "eth1", "eth0"],
@@ -1240,44 +1268,17 @@ cfab-mg-fb  any mgmt    9 302
     /// through h2 or h3, and those two transits are indistinguishable, so the SPF would ECMP
     /// across them. Distinct INTERFACE costs do not imply distinct PATH costs — this is the
     /// check that catches it at validate time.
-    const DISJOINT_MEMBERS: &str = "
-h1 1 host eth0@a:1000
-h2 2 host eth0@a:1000 eth1@b:1000
-h3 3 host eth0@a:1000 eth1@b:1000
-h4 4 host eth0@b:1000
-";
-    const ONE_ZONE_SEGMENTS: &str = "
-cfab-st     a   storage 1 100
-cfab-st-bk  b   storage 2 101
-cfab-st-fb  any storage 9 300
-";
-
-    fn one_zone_blocks(domains: &str, members: &str, segments: &str) -> Vec<(String, String)> {
-        vec![
-            ("DOMAINS".to_string(), domains.to_string()),
-            ("MEMBER_TABLE".to_string(), members.to_string()),
-            (
-                "ZONE_TABLE".to_string(),
-                "\nstorage  99 0 cs0 2000 2 4 a -\n".to_string(),
-            ),
-            ("SEGMENT_TABLE".to_string(), segments.to_string()),
-            ("FORWARD_ALLOW".to_string(), "storage>storage".to_string()),
-            ("USB_NICS".to_string(), String::new()),
-        ]
-    }
-
-    fn one_zone_fabric(domains: &str, members: &str, segments: &str) -> Result<Fabric> {
-        let owned = one_zone_blocks(domains, members, segments);
-        let blocks: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        from_blocks(&blocks)
-    }
+    const DISJOINT_MEMBERS: [(&str, u8, &str); 4] = [
+        ("h1", 1, "eth0@a:1000"),
+        ("h2", 2, "eth0@a:1000 eth1@b:1000"),
+        ("h3", 3, "eth0@a:1000 eth1@b:1000"),
+        ("h4", 4, "eth0@b:1000"),
+    ];
+    const ONE_ZONE_SEGMENTS: &str = "cfab-st@a:1:100 cfab-st-bk@b:2:101";
 
     #[test]
     fn two_equal_cost_transits_between_domain_disjoint_members_are_refused() {
-        let err = one_zone_fabric("a b", DISJOINT_MEMBERS, ONE_ZONE_SEGMENTS)
+        let err = one_zone_fabric(&["a", "b"], &DISJOINT_MEMBERS, "a", ONE_ZONE_SEGMENTS)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1295,16 +1296,12 @@ cfab-st-fb  any storage 9 300
     /// re-ranks one transit's wires.
     #[test]
     fn the_same_fabric_passes_once_a_wire_pref_distinguishes_the_transits() {
-        let owned = one_zone_blocks("a b", DISJOINT_MEMBERS, ONE_ZONE_SEGMENTS);
-        let blocks: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let text = format!(
-            "{}\nWIRE_PREF=\"\nh3 storage eth1 eth0\n\"\n",
-            conf_with(&blocks)
+        let text = fixtures::with_prefs(
+            &one_zone_decl(&["a", "b"], &DISJOINT_MEMBERS, "a", ONE_ZONE_SEGMENTS),
+            "h3",
+            "prefs = { storage = [\"eth1\", \"eth0\"] }",
         );
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         assert_eq!(order_of(&f, "h3", "storage"), vec!["eth1", "eth0"]);
         assert_eq!(order_of(&f, "h2", "storage"), vec!["eth0", "eth1"]);
     }
@@ -1314,35 +1311,21 @@ cfab-st-fb  any storage 9 300
     /// one-hop backup, which is never what the operator meant.
     #[test]
     fn a_rank_zero_wire_alone_on_its_domain_is_refused_when_another_wire_reaches_a_peer() {
-        let members = "
-h1 1 host eth2@d:1000 eth0@a:1000
-h2 2 host eth0@a:1000 eth1@b:1000
-h3 3 host eth0@a:1000 eth1@b:1000
-";
-        let segments = "
-cfab-st     a   storage 1 100
-cfab-st-bk  b   storage 2 101
-cfab-st-b3  d   storage 4 103
-cfab-st-fb  any storage 9 300
-";
-        let owned = one_zone_blocks("a b d", members, segments);
-        let mut blocks: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let zone = "\nstorage  99 0 cs0 2000 2 4 d -\n";
-        for b in &mut blocks {
-            if b.0 == "ZONE_TABLE" {
-                b.1 = zone;
-            }
-        }
-        let err = from_blocks(&blocks).unwrap_err().to_string();
+        let members = [
+            ("h1", 1u8, "eth2@d:1000 eth0@a:1000"),
+            ("h2", 2, "eth0@a:1000 eth1@b:1000"),
+            ("h3", 3, "eth0@a:1000 eth1@b:1000"),
+        ];
+        let segments = "cfab-st@a:1:100 cfab-st-bk@b:2:101 cfab-st-b3@d:4:103";
+        let err = one_zone_fabric(&["a", "b", "d"], &members, "d", segments)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("h1") && err.contains("eth2") && err.contains("domain d"),
             "name the member, the rank-0 wire and its lonely domain: {err}"
         );
         assert!(
-            err.contains("eth0") && err.contains("WIRE_PREF"),
+            err.contains("eth0") && err.contains("prefs"),
             "and the wire that does reach a peer, plus the remedy: {err}"
         );
     }
@@ -1351,18 +1334,13 @@ cfab-st-fb  any storage 9 300
     /// that member is domain-disjoint and the universal bond is exactly what serves it.
     #[test]
     fn a_member_alone_on_every_domain_is_not_a_rank_zero_error() {
-        let members = "
-h1 1 host eth2@d:1000
-h2 2 host eth0@a:1000 eth1@b:1000
-h3 3 host eth0@a:1000 eth1@b:1000
-";
-        let segments = "
-cfab-st     a   storage 1 100
-cfab-st-bk  b   storage 2 101
-cfab-st-b3  d   storage 4 103
-cfab-st-fb  any storage 9 300
-";
-        let f = one_zone_fabric("a b d", members, segments).unwrap();
+        let members = [
+            ("h1", 1u8, "eth2@d:1000"),
+            ("h2", 2, "eth0@a:1000 eth1@b:1000"),
+            ("h3", 3, "eth0@a:1000 eth1@b:1000"),
+        ];
+        let segments = "cfab-st@a:1:100 cfab-st-bk@b:2:101 cfab-st-b3@d:4:103";
+        let f = one_zone_fabric(&["a", "b", "d"], &members, "a", segments).unwrap();
         assert_eq!(order_of(&f, "h1", "storage"), vec!["eth2"]);
     }
 
