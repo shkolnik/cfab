@@ -114,6 +114,10 @@ the point of use, with identical single-host behavior when absent:
 - **Pure core, thin exec.** Parse → typed model + validation → derivation → pure generators
   are all side-effect free. Everything that touches the system goes through a `Sys` trait:
   argv vectors, no shell, fully mockable — every imperative branch is unit-tested.
+- **A leaf is reached from outside at its own addresses.** Only hosts carry a zone's ingress
+  leg, so fabric members reach a leaf at its identities while the general network reaches it
+  at the leaf's own IPs. Ingress to a leaf's fabric identity is unsupported by design (the
+  leaf answers such a packet with a local unreachable, never a leak), not a gap.
 - **Fail loud, never degrade silently.** A missing capability, absent interface, or unmet
   precondition is a clear, actionable error, never a partial apply.
 - **Detectors actuate, `status` reports.** A condition that makes a link unsafe is brought down

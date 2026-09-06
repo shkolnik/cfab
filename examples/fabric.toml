@@ -99,7 +99,9 @@ segments = [
 ]
 universal = { ifname = "cfab-mg-fb", seg = 9, vid = 302 }
 # Where the OUTSIDE enters: a router-owned VLAN distinct from every segment. domain = "any"
-# makes the leg migrate (rack precondition applies).
+# makes the leg migrate (rack precondition applies). Hosts carry the leg; a leaf never does,
+# so the outside reaches a leaf at the leaf's own addresses, not at its fabric identity
+# (unsupported by design, not a gap).
 gw = { domain = "c", vid = 249, router = "192.168.249.254/24" }
 
 # ---- forward: REQUIRED (an omitted table must never decide the isolation posture) --------

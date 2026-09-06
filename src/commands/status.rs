@@ -913,6 +913,12 @@ fn return_path_and_ingress(
             ));
         }
         let Some(gw) = &z.gw else { continue };
+        // A leaf carries no ingress leg and no table-<id>: the outside reaches a leaf at the
+        // leaf's own addresses, never at a fabric identity (unsupported by design, James
+        // 2026-09-06), so there is no return path to check and nothing to report.
+        if view.kind() == MemberKind::Leaf {
+            continue;
+        }
         let table = sys.run(&["ip", "route", "show", "table", &id])?.stdout;
         // Two distinct failures, each with its own wording (neither reachable for the other):
         // no default line at all, versus a default line the kernel has marked inactive. A
@@ -1368,9 +1374,10 @@ mod tests {
                 "2001: from 10.99.0.0/16 lookup 99\n2001: from 10.199.0.0/16 lookup 199\n2001: from 10.249.0.0/16 lookup 249\n")
             .on_stdout(&["ip", "rule", "show", "pref", "2002"],
                 "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
-            // gw zone (mgmt): the leaf learns the ingress default via OSPF from the hosts
-            .on_stdout(&["ip", "route", "show", "table", "249"],
-                "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+            // gw zone (mgmt): a leaf has no table 249 at all (no ingress leg, no return
+            // default) — reading it would fail, and status must never read it on a leaf
+            .on_fail(&["ip", "route", "show", "table", "249"], 2,
+                "Error: ipv4: FIB table does not exist.")
     }
 
     /// Every expected BFD session, up.
@@ -2195,6 +2202,28 @@ mod tests {
             report.output
         );
         assert!(sys.slept.is_empty(), "--wait 0 is one instant read");
+    }
+
+    /// A leaf carries no ingress leg: the gw-zone return-path check is skipped, so a leaf whose
+    /// table-<id> does not exist (the real state — VERIFIED pve3-tb 2026-09-06) reads UP with no
+    /// reason line. Reaching a leaf from outside at a fabric identity is unsupported by design,
+    /// not a degraded return path.
+    #[test]
+    fn a_leaf_skips_the_gw_return_path_check() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view);
+        let report = run(&mut sys, &view, 0, false).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report.output.contains("gw ") && !report.output.contains("table 249"),
+            "a leaf must not report the gw return path: {}",
+            report.output
+        );
+        assert!(
+            !sys.ran("ip route show table 249"),
+            "status must not read table 249 on a leaf"
+        );
     }
 
     /// A BFD-capable daemon on the host is a reason line, never a state: it takes the port at
