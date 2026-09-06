@@ -140,6 +140,16 @@ the point of use, with identical single-host behavior when absent:
   neighbors, identities, source pinning, forward posture) and reports one of four states with
   three counts, `(<peers> | <links> | <fallbacks>)`. Its exit code — 0 UP, 1 UP-DEGRADED,
   2 FAILED, 3 DOWN — is the contract every other mechanism builds on.
+- **`status` describes the fabric that is *running*, not the file.** `cfab run` keeps the
+  declaration it applied at `<run_dir>/fabric.toml.applied` (written before the initial apply,
+  removed with the run dir by `cfab down`), and `status` prefers that copy — so an operator
+  editing `fabric.toml`, or one whose bad edit the reload has just refused, still gets the state
+  of the fabric instead of a parse error. Every other subcommand keeps reading the file: they act
+  on what is *declared*. A disagreement is one reason line and never a state:
+  `declaration /etc/cfab/fabric.toml: <error> (status describes the running fabric; a reload of
+  this file will be refused)`, with the parser's own line and column, or
+  `declaration /etc/cfab/fabric.toml changed since apply (systemctl reload cfab to apply; the
+  fabric will restart)`. Equality is semantic, so a comment or whitespace edit is not a change.
 
 ## Building
 

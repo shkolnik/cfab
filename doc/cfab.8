@@ -148,6 +148,42 @@ never writes: a condition that makes a link unsafe is brought down by
 and the state then follows from the counts; everything else is a reason line
 that does not move the state.
 .IP
+.B status
+describes the fabric that is
+.IR running ,
+not the file: the supervisor keeps the declaration it applied at
+.IR RUN_DIR/fabric.toml.applied ,
+and
+.B status
+prefers that copy, so an operator editing
+.I /etc/cfab/fabric.toml
+\(em or one whose bad edit
+.B reload
+has just refused \(em still gets the state of the fabric instead of a parse
+error. Every other subcommand keeps reading the file: they act on what is
+declared. When the file on disk disagrees with the running fabric,
+.B status
+adds one reason line and the state is unchanged. An unreadable, unparseable or
+invalid file \(em including one that no longer declares this member \(em reads
+.IP
+.nf
+declaration /etc/cfab/fabric.toml: \fIerror\fP (status describes the running
+fabric; a reload of this file will be refused)
+.fi
+.IP
+with the parser's own line, column and snippet, its continuation lines
+indented; a valid file that differs from what is running reads
+.IP
+.nf
+declaration /etc/cfab/fabric.toml changed since apply (systemctl reload cfab
+to apply; the fabric will restart)
+.fi
+.IP
+Equality is semantic, so a comment or whitespace edit is not a change. The
+copy lives with the fabric:
+.B down
+removes the run dir whole and takes it along.
+.IP
 .B \-\-wait
 .I N
 re\-reads every 2\ s until the state is UP or
@@ -435,6 +471,15 @@ maintains it as the last-known-good cluster conf.
 The
 .B conf\-sync
 revert target: the conf that was live before the last cluster apply.
+.TP
+.I RUN_DIR/fabric.toml.applied
+The declaration the supervisor applied, written before its initial apply and
+removed with the run dir by
+.BR down .
+.B status
+reads it so it can describe the running fabric while
+.I /etc/cfab/fabric.toml
+is mid\-edit or refused. Never re\-read by anything else.
 .TP
 .I RUN_DIR/conf\-sync\-attempted, RUN_DIR/conf\-sync\-committed
 The daemon's generation state (decimal), under the declaration's run
