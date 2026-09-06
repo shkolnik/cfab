@@ -431,8 +431,9 @@ pub(crate) async fn run_with(
     // `cfab status` reads it so it can describe the RUNNING fabric while the file on disk is
     // mid-edit or refused. Written after the two refusals above, so a supervisor that never
     // starts never overwrites the live one's copy, and before the apply, so the copy exists for
-    // every fabric that exists. `cfab down` removes the run dir whole, so it goes with the
-    // fabric. A write failure is a warning, not a refusal: it costs status a diagnostic, not the
+    // every apply attempted (a refused apply leaves it behind; status still reads the run dir,
+    // engine and socket, so it reports the refusal, not the copy). `cfab down` removes the run
+    // dir whole, so it goes with the fabric. A write failure is a warning, not a refusal: it costs status a diagnostic, not the
     // fabric.
     let applied_decl = crate::applied_decl_path(&run_dir);
     if let Err(e) = sys.write(&applied_decl, decl_text) {

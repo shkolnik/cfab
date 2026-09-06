@@ -144,7 +144,9 @@ the point of use, with identical single-host behavior when absent:
   declaration it applied at `<run_dir>/fabric.toml.applied` (written before the initial apply,
   removed with the run dir by `cfab down`), and `status` prefers that copy — so an operator
   editing `fabric.toml`, or one whose bad edit the reload has just refused, still gets the state
-  of the fabric instead of a parse error. Every other subcommand keeps reading the file: they act
+  of the fabric instead of a parse error. The one gap: a member that moved `run_dir` off the
+  default *and* whose file will not parse has nothing on disk that says where the copy is, so
+  `status` fails on the parse error as before. Every other subcommand keeps reading the file: they act
   on what is *declared*. A disagreement is one reason line and never a state:
   `declaration /etc/cfab/fabric.toml: <error> (status describes the running fabric; a reload of
   this file will be refused)`, with the parser's own line and column, or

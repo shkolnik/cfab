@@ -479,7 +479,13 @@ removed with the run dir by
 .B status
 reads it so it can describe the running fabric while
 .I /etc/cfab/fabric.toml
-is mid\-edit or refused. Never re\-read by anything else.
+is mid\-edit or refused. Found through the
+.B run_dir
+the file declares, else the packaged default; a member that both moved
+.B run_dir
+and has an unparseable file leaves nothing on disk to say where the copy is, and
+.B status
+then fails on the parse error as before. Never re\-read by anything else.
 .TP
 .I RUN_DIR/conf\-sync\-attempted, RUN_DIR/conf\-sync\-committed
 The daemon's generation state (decimal), under the declaration's run
