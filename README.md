@@ -28,7 +28,7 @@ depend on.
 
 ```
 cfab check                      # parse + validate fabric.toml, print this member's resolved view
-cfab schema                     # the fabric.toml data model as JSON Schema
+cfab schema                     # the fabric.toml declaration schema as JSON Schema
 cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
 cfab run                        # apply the fabric and supervise its daemons (systemd notify, root)
@@ -57,7 +57,7 @@ skipped and `cfab status` names the backend and says so. The choice is made at `
 kernel's own refusal, never on a knob, and recorded in the run dir. A leaf gets the ceiling
 either way because it sources a fallback-segment control storm exactly as a host does, so a
 containment it escaped would be half a containment. (This member's OWN control marking is not
-in that table: the engine sets DSCP CS6 and skb-priority PCP_CTRL on its OSPF and BFD
+in that table: the engine sets DSCP CS6 and skb-priority `[marking] pcp_ctrl` on its OSPF and BFD
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
 The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc` and
 `ethtool` for its shaping trees and per-NIC offload posture; a **leaf** shapes nothing, its

@@ -67,13 +67,14 @@ are pure: they read the declaration and change nothing.
 Parse and validate
 .BR fabric.toml ;
 print the resolved view for this member (zones, segments, wires, ingress
-legs). Validation fails loudly on any inconsistency; unknown declaration keys
-warn.
+legs). Validation fails loudly on any inconsistency; an unknown key in the
+declaration is a parse error naming its line and column.
 .TP
 .B schema
 Print the
 .B fabric.toml
-data model as JSON Schema. Needs no config file.
+declaration schema (the file an operator writes, not cfab's internal model) as
+JSON Schema. Needs no config file.
 .TP
 .BR "gen policy" | "mark [--backend nft|iptables-legacy]" | engine
 Print a generated artifact: the nft forward policy (table inet cfab-fwd:
