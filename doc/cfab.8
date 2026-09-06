@@ -56,13 +56,17 @@ Print the
 .B fabric.conf
 data model as JSON Schema. Needs no config file.
 .TP
-.BR "gen policy" | mark | engine
+.BR "gen policy" | "mark [--backend nft|iptables-legacy]" | engine
 Print a generated artifact: the nft forward policy (table inet cfab-fwd:
 default-deny for anything touching a cfab interface, declared pairs pass, the
 admin NIC never transits, packets touching no cfab interface are accepted as
 another stack's business), the traffic-class marking (table inet cfab: the
 PCP and DSCP planes plus one derived control-egress ceiling per fallback
-bond), or
+bond \(em or, with
+.BR --backend " iptables-legacy" ,
+the ceiling alone as an
+.BR iptables-legacy-restore (8)
+input, which is what a leaf installs on a kernel without nf_tables), or
 this member's routing-engine configuration tree (JSON).
 .TP
 .BI "gen shape " DEV " " [\fB\-\-tc\fR|\fB\-\-expect\fR]
