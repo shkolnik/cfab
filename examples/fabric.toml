@@ -125,7 +125,8 @@ leaf_offset = 30000   # a leaf never transits: its paths cost ≥ this above any
 rx_ms = 250
 tx_ms = 250
 mult = 3              # ~750 ms detect
-port = 3784
+port = 3784           # FRR's bfdd default too: declare a free one (13784) on every member
+                      # of a fabric whose hosts also run FRR — both ends must agree on it
 
 [ospf]
 hello_s = 1

@@ -46,6 +46,10 @@ pub trait Sys {
     fn exists(&self, path: &str) -> bool;
     fn is_writable(&self, path: &str) -> bool;
     fn list_dir(&self, path: &str) -> Result<Vec<String>>;
+    /// The target of one symlink, unresolved. `/proc/<pid>/fd/<n>` is the only caller so far:
+    /// its target (`socket:[<inode>]`) is not a path and has no contents, so `read` cannot
+    /// answer it.
+    fn read_link(&self, path: &str) -> Result<String>;
     fn mkdir_p(&mut self, path: &str) -> Result<()>;
     fn remove(&mut self, path: &str) -> Result<()>;
     fn rename(&mut self, from: &str, to: &str) -> Result<()>;
@@ -138,6 +142,10 @@ impl Sys for RealSys {
         Ok(names)
     }
 
+    fn read_link(&self, path: &str) -> Result<String> {
+        Ok(std::fs::read_link(path)?.to_string_lossy().into_owned())
+    }
+
     fn mkdir_p(&mut self, path: &str) -> Result<()> {
         Ok(std::fs::create_dir_all(path)?)
     }
@@ -219,6 +227,9 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockSys {
         pub files: BTreeMap<String, String>,
+        /// path → symlink target, read back by `read_link` and listed by `list_dir` alongside
+        /// the files (a `/proc/<pid>/fd` entry is a link, not a file).
+        pub links: BTreeMap<String, String>,
         pub writable: Vec<String>,
         /// Paths whose `write` fails (a read-only `/proc`, an EPERM sysctl): the only way to
         /// exercise "the restore itself could not be done".
@@ -249,6 +260,12 @@ pub mod mock {
     impl MockSys {
         pub fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        /// A symlink at `path` pointing at `target` (e.g. `/proc/812/fd/7` → `socket:[41231]`).
+        pub fn link(mut self, path: &str, target: &str) -> Self {
+            self.links.insert(path.to_string(), target.to_string());
             self
         }
 
@@ -373,12 +390,20 @@ pub mod mock {
             let mut names: Vec<String> = self
                 .files
                 .keys()
+                .chain(self.links.keys())
                 .filter_map(|k| k.strip_prefix(&prefix))
                 .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
                 .collect();
             names.sort();
             names.dedup();
             Ok(names)
+        }
+
+        fn read_link(&self, path: &str) -> Result<String> {
+            self.links
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::fatal(format!("mock: no link {path}")))
         }
 
         fn mkdir_p(&mut self, path: &str) -> Result<()> {
