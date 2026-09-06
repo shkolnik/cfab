@@ -1122,18 +1122,18 @@ fn signal_pid(pid: u32, sig: nix::sys::signal::Signal) {
 mod tests {
     use super::*;
     use crate::commands::engine_ctl::tests::healthy_doc;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::sys::mock::MockSys;
     use std::path::Path;
 
     const EXE: &str = "/usr/bin/cfab";
-    const CONFIG: &str = "/etc/cfab/fabric.conf";
+    const CONFIG: &str = "/etc/cfab/fabric.toml";
 
     fn fabric_at(run_dir: &Path) -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        let mut f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let mut f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         f.run_dir = run_dir.to_str().unwrap().to_string();
         f
     }

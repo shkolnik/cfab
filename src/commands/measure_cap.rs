@@ -41,12 +41,12 @@ pub fn run(
         .collect();
     if sub_ifs.is_empty() {
         return Err(Error::fatal(format!(
-            "measure-cap: '{dev}' is not a wire in CLASS_TABLE — refusing to measure"
+            "measure-cap: '{dev}' is not a wire in a zone's `segments` — refusing to measure"
         )));
     }
-    if view.admin_if() == Some(dev) {
+    if view.is_admin_if(dev) {
         out.push_str(&format!(
-            "measure-cap: '{dev}' is the admin NIC (ADMIN_IF): the admin session shares it for the next {secs}s (paced flood)\n"
+            "measure-cap: '{dev}' carries an untagged admin path: an admin session shares it for the next {secs}s (paced flood)\n"
         ));
     }
 
@@ -242,15 +242,15 @@ pub fn native_flood(spec: &FloodSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     const CLUSTERED: &str = r#"{
@@ -295,7 +295,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("not a wire in CLASS_TABLE"),
+            err.to_string()
+                .contains("not a wire in a zone's `segments`"),
             "{err}"
         );
     }

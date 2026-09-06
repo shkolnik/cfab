@@ -11,7 +11,7 @@ cfab \- per-host runtime of the resilient converged fabric for small clusters
 .B cfab
 applies, verifies, and removes the converged network fabric on one cluster
 member. The fabric is declared once, in
-.BR fabric.conf ;
+.BR fabric.toml ;
 everything else \(em segment sub-interfaces, the nft forward policy and
 traffic-class marking, per-NIC HTB shaping trees, and the FRR
 (OSPF/BFD/BGP) configuration \(em is derived from that declaration and
@@ -65,15 +65,16 @@ are pure: they read the declaration and change nothing.
 .TP
 .B check
 Parse and validate
-.BR fabric.conf ;
+.BR fabric.toml ;
 print the resolved view for this member (zones, segments, wires, ingress
-legs). Validation fails loudly on any inconsistency; unknown declaration keys
-warn.
+legs). Validation fails loudly on any inconsistency; an unknown key in the
+declaration is a parse error naming its line and column.
 .TP
 .B schema
 Print the
-.B fabric.conf
-data model as JSON Schema. Needs no config file.
+.B fabric.toml
+declaration schema (the file an operator writes, not cfab's internal model) as
+JSON Schema. Needs no config file.
 .TP
 .BR "gen policy" | "mark [--backend nft|iptables-legacy]" | engine
 Print a generated artifact: the nft forward policy (table inet cfab-fwd:
@@ -131,7 +132,7 @@ each
 .B fallbacks
 = OSPF neighbors on the fallback segment, one per peer carrying that zone's
 row, available at 2\-Way or better. All three denominators come from
-.BR fabric.conf ,
+.BR fabric.toml ,
 so a cable pull moves the numerator and never the denominator. A member
 declaring no fallback row prints
 .BR 0/0 ,
@@ -228,7 +229,7 @@ a routed bridge, a host-level CNI) is not cfab's to police.
 Report the pmxcfs coordination state: presence, quorum (the
 .I /etc/pve/local
 owner-write-bit probe), the member list with online flags, the published
-.B fabric.conf
+.B fabric.toml
 (generation, size, first line), and the published measured caps (one line per
 member). When
 .I /etc/pve
@@ -237,12 +238,12 @@ report and exits 0 \(em coordination is additive, never a dependency.
 .TP
 .B conf publish
 Validate the local
-.B fabric.conf
+.B fabric.toml
 fully (a declaration that does not validate is refused, never published),
 require a quorate cluster, then publish it cluster-wide: take the
 .I priv/lock/cfab\-conf
 cluster lock (with stale-lock recovery after the 120\ s pmxcfs expiry), write
-.I /etc/pve/cfab/fabric.conf
+.I /etc/pve/cfab/fabric.toml
 atomically (temp file + rename), bump
 .IR /etc/pve/cfab/gen ,
 and release the lock. Ack directories older than the previous generation are
@@ -257,9 +258,9 @@ do nothing, reads may be stale) and the published generation. On a new
 generation it validates the published conf with the full gate (an invalid
 publish is refused loudly and never applied, and that generation is never
 retried), caches the current
-.I /etc/cfab/fabric.conf
+.I /etc/cfab/fabric.toml
 to
-.IR fabric.conf.prev ,
+.IR fabric.toml.prev ,
 installs the published text, asks the supervisor to re-apply it over
 .BR cfab.sock ,
 and runs
@@ -284,17 +285,17 @@ is back.
 .TP
 .BI \-c ", " \-\-config " PATH"
 Path to
-.BR fabric.conf .
+.BR fabric.toml .
 Default search order: a
-.B fabric.conf
+.B fabric.toml
 beside the binary, then
-.IR /etc/cfab/fabric.conf ,
+.IR /etc/cfab/fabric.toml ,
 then
-.B ./fabric.conf
+.B ./fabric.toml
 in the working directory.
 .TP
 .BI \-\-host " MEMBER"
-The MEMBER_TABLE row to run as. Default:
+The `[[member]]` row to run as. Default:
 .BR $CFAB_HOST ,
 else the kernel hostname.
 .TP
@@ -333,7 +334,7 @@ For every other subcommand, failure: a validation error, a failed apply, a
 bitten watchdog, or
 .B policy\-teeth
 finding the policy (or its own teeth) broken. A
-.B fabric.conf
+.B fabric.toml
 that is present but unparseable also exits 1, from any subcommand
 .B status
 included \(em we cannot know what was desired.
@@ -355,7 +356,7 @@ up is not desired: there is no run dir \(em
 was run, or
 .B cfab run
 never was \(em or there is no
-.B fabric.conf
+.B fabric.toml
 on this host at all.
 .B \-\-permissive
 does not mask it. For
@@ -384,14 +385,14 @@ Directory holding
 measured-capacity files (default: the declaration's run directory).
 .SH FILES
 .TP
-.I /etc/cfab/fabric.conf
+.I /etc/cfab/fabric.toml
 Site declaration (not shipped; an example is in
 .IR /usr/share/doc/cfab/examples/ ).
 On a clustered member,
 .B conf\-sync
 maintains it as the last-known-good cluster conf.
 .TP
-.I /etc/cfab/fabric.conf.prev
+.I /etc/cfab/fabric.toml.prev
 The
 .B conf\-sync
 revert target: the conf that was live before the last cluster apply.
@@ -410,7 +411,7 @@ output only (
 .BR cfab\-ospf ", " cfab\-static ", " cfab\-bgp ", " cfab\-other ,
 201\-204); cosmetic, cfab's own sweep matches the numeric ids.
 .TP
-.I /etc/pve/cfab/fabric.conf
+.I /etc/pve/cfab/fabric.toml
 The cluster-published declaration (pmxcfs; written by
 .BR "conf publish" ).
 .TP
@@ -445,7 +446,7 @@ The Debian package ships
 installed
 .B disabled and not started
 \(em installing cfab never changes the network. Write
-.I /etc/cfab/fabric.conf
+.I /etc/cfab/fabric.toml
 first, then
 .BR "systemctl enable \-\-now cfab" .
 .PP
@@ -459,7 +460,7 @@ the long-lived supervisor.
 is
 .BR "kill \-HUP $MAINPID" ,
 which re\-applies the declaration in place \(em no teardown, no netdev churn.
-.B ConditionPathExists=/etc/cfab/fabric.conf
+.B ConditionPathExists=/etc/cfab/fabric.toml
 skips it on a host that has the package but no declaration, so that host boots clean
 instead of failing.
 .B RestartPreventExitStatus=3\ 4

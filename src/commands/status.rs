@@ -219,6 +219,12 @@ fn finish(
     for r in once_each(&c.reasons) {
         let _ = writeln!(out, "  {r}");
     }
+    // This member's wire order per zone, with the derived/override marker: the one thing an
+    // operator cannot infer from the interface names, and what every OSPF cost below comes
+    // from. Same spelling as `cfab gen prefs`, minus the member column.
+    for p in view.prefs() {
+        let _ = writeln!(out, "  prefs {}", p.render());
+    }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
         match comps {
@@ -530,7 +536,7 @@ fn posture(
                 if below {
                     c.note(format!(
                         "ospf {}: a transit link in our router LSA is advertised below \
-                         LEAF_COST_OFFSET={} (we could be chosen as a transit) — re-run cfab up",
+                         `[cost] leaf_offset`={} (we could be chosen as a transit) — re-run cfab up",
                         z.id, f.leaf_cost_offset
                     ));
                 }
@@ -578,7 +584,8 @@ fn posture(
                 }
                 c.note(foreign_forward_remedy(&ifs));
             }
-            if let Some(admin) = view.admin_if() {
+            if !view.admin_ifs().is_empty() {
+                let admin = view.admin_ifs().join(" ");
                 for counter in ["admin-in", "admin-out"] {
                     match counter_packets(&chain, counter) {
                         Some(0) => {}
@@ -590,9 +597,11 @@ fn posture(
                         )),
                     }
                 }
-                let v = sys.read(&format!("/proc/sys/net/ipv4/conf/{admin}/forwarding"))?;
-                if v.trim() != "0" {
-                    c.note(format!("{admin} forwarding=1"));
+                for a in view.admin_ifs() {
+                    let v = sys.read(&format!("/proc/sys/net/ipv4/conf/{a}/forwarding"))?;
+                    if v.trim() != "0" {
+                        c.note(format!("{a} forwarding=1"));
+                    }
                 }
             }
             let present = conf_interfaces(sys)?;
@@ -626,7 +635,7 @@ fn posture(
         }
         MemberKind::Host => {
             if sys.run(&["nft", "list", "table", "inet", "cfab-fwd"])?.ok() {
-                c.note("HOST_FORWARD=0 but table inet cfab-fwd is loaded");
+                c.note("`[forward] enabled`=0 but table inet cfab-fwd is loaded");
             }
             for ifn in conf_interfaces(sys)? {
                 if !view.owns_if(&ifn) {
@@ -634,7 +643,7 @@ fn posture(
                 }
                 let path = format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding");
                 if sys.read(&path)?.trim() != "0" {
-                    c.note(format!("{path} = 1 with HOST_FORWARD=0"));
+                    c.note(format!("{path} = 1 with `[forward] enabled`=0"));
                 }
             }
         }
@@ -1231,15 +1240,15 @@ fn read_cap(sys: &mut dyn Sys, view: &View, dev: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The engine's state document as `engine::state::document` shapes it: every instance
@@ -1288,7 +1297,7 @@ mod tests {
 
     /// The `bonding/` sysfs a live active-backup bond exposes, captured from the spike
     /// container (`cat /sys/class/net/cfab-st-fb/bonding/{mii_status,active_slave}` →
-    /// `up` / `cfab-st-fb-st`), plus the L3 posture `up` sets on the bond itself.
+    /// `up` / `cfab-st-fb-a`), plus the L3 posture `up` sets on the bond itself.
     fn fallback_sysfs(mut sys: MockSys, view: &View, forwarding: &str) -> MockSys {
         for r in view.fallback_rows() {
             let home = r
@@ -1548,8 +1557,12 @@ mod tests {
                     &format!("{}\n", view.link_speed(&w).unwrap()),
                 );
         }
+        // Every wire is an admin wire on a host, and `status` reads the forwarding flag of
+        // each one.
+        for a in view.admin_ifs() {
+            sys = sys.file(&format!("/proc/sys/net/ipv4/conf/{a}/forwarding"), "0\n");
+        }
         sys = sys
-            .file("/proc/sys/net/ipv4/conf/eth0/forwarding", "0\n")
             .file(
                 &format!("{}/policy.nft", f.run_dir),
                 &crate::emit::policy::generate(view).unwrap(),
@@ -1724,7 +1737,7 @@ mod tests {
             &mut healthy_leaf(&leaf)
                 .file(
                     "/sys/class/net/cfab-st-fb/bonding/active_slave",
-                    "cfab-st-fb-mg\n",
+                    "cfab-st-fb-c\n",
                 )
                 .file("/sys/class/net/eth9/carrier", "1\n"),
             &leaf,
@@ -1781,13 +1794,8 @@ mod tests {
         );
 
         // The runtime-disjoint shape, over the fabric that has no fallback rows at all.
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
-        let nofb = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let nofb = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let nofb_view = View::new(&nofb, "pve3-tb").unwrap();
         assert_never_writes(
             "a member declaring no fallback rows",
@@ -2177,7 +2185,10 @@ mod tests {
         assert_eq!(report.code, 0);
         assert_eq!(
             report.output,
-            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  mark: nft\n  components: engine running 1h00m \
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  mark: nft\n\
+             \x20 prefs storage: eth9 eth1 eth0 (derived)\n\
+             \x20 prefs cluster: eth1 eth9 eth0 (derived)\n\
+             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n  components: engine running 1h00m \
              (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
              | watchdog ok 2s ago\n",
             "{}",
@@ -2282,7 +2293,7 @@ mod tests {
         );
     }
 
-    /// A fallback neighbor below the bar is the same grade on the third field: the island-
+    /// A fallback neighbor below the bar is the same grade on the third field: the domain-
     /// disjoint safety net is gone for that peer even though every BFD session is up.
     #[test]
     fn a_down_fallback_neighbor_is_up_degraded() {
@@ -2512,7 +2523,10 @@ mod tests {
         assert_eq!(report.code, 3);
         assert_eq!(
             report.output,
-            "DOWN (fabric not applied) on pve3-tb (leaf)\n"
+            "DOWN (fabric not applied) on pve3-tb (leaf)\n\
+             \x20 prefs storage: eth9 eth1 eth0 (derived)\n\
+             \x20 prefs cluster: eth1 eth9 eth0 (derived)\n\
+             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n"
         );
         assert!(sys.calls.is_empty(), "{:?}", sys.calls);
     }
@@ -2550,13 +2564,8 @@ mod tests {
     /// line has one shape everywhere and a reader never has to count separators.
     #[test]
     fn a_member_with_no_fallback_rows_prints_zero_of_zero() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let view = View::new(&f, "pve3-tb").unwrap();
         assert!(view.fallback_rows().is_empty());
         let mut sys = healthy_leaf(&view);
@@ -2637,7 +2646,7 @@ mod tests {
             // storage homes on eth9 (cfab-st, cost 10); the bond sits on the mg slave
             .file(
                 "/sys/class/net/cfab-st-fb/bonding/active_slave",
-                "cfab-st-fb-mg\n",
+                "cfab-st-fb-c\n",
             )
             .file("/sys/class/net/eth9/carrier", "1\n");
         let report = run(&mut sys, &view, 0, false).unwrap();
@@ -2660,7 +2669,7 @@ mod tests {
         let mut sys = healthy_leaf(&view)
             .file(
                 "/sys/class/net/cfab-st-fb/bonding/active_slave",
-                "cfab-st-fb-mg\n",
+                "cfab-st-fb-c\n",
             )
             .file("/sys/class/net/eth9/carrier", "0\n");
         let report = run(&mut sys, &view, 0, false).unwrap();
@@ -2681,7 +2690,7 @@ mod tests {
         // no /sys/class/net/eth9/carrier at all — the read fails
         let mut sys = healthy_leaf(&view).file(
             "/sys/class/net/cfab-st-fb/bonding/active_slave",
-            "cfab-st-fb-mg\n",
+            "cfab-st-fb-c\n",
         );
         let report = run(&mut sys, &view, 0, false).unwrap();
         assert!(
@@ -2811,7 +2820,7 @@ mod tests {
             .iter_mut()
             .find(|l| l["if"] == fallback_addr.as_str())
             .expect("the fallback bond advertises a transit link");
-        // Above LEAF_COST_OFFSET, so the weak arm accepts it; not cost + offset, so the
+        // Above `[cost] leaf_offset`, so the weak arm accepts it; not cost + offset, so the
         // exact arm must not.
         link["metric"] = serde_json::json!(31000);
         let mut sys = primary_routes(leaf_env(&view), &view)
@@ -2821,7 +2830,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  ospf 99: a transit link in our router LSA is advertised below \
-                 LEAF_COST_OFFSET=30000"
+                 `[cost] leaf_offset`=30000"
             ),
             "{}",
             report.output
@@ -2970,23 +2979,16 @@ mod tests {
         );
     }
 
-    /// Two members with no island in common: pve1-tb has only its st wire, pve2-tb only its cl
+    /// Two members with no domain in common: pve1-tb has only its st wire, pve2-tb only its cl
     /// wire, so they share no segment in any zone. The fallback bond is the only path between
     /// them — and reaching them over it is health.
     fn disjoint_fabric() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
-                    "pve1-tb 1 host eth9:5000 - -",
-                )
-                .replace(
-                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
-                    "pve2-tb 2 host - eth1:1000 -",
-                )
-                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_wires(
+            &fixtures::with_wires(&fixtures::example(), "pve1-tb", "eth9@a:5000"),
+            "pve2-tb",
+            "eth1@b:1000",
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every declared BFD leg up, as the runtime half of the expectation rule.
@@ -3033,7 +3035,7 @@ mod tests {
     }
 
     #[test]
-    fn an_island_disjoint_peer_is_expected_over_the_fallback_bond() {
+    fn a_domain_disjoint_peer_is_expected_over_the_fallback_bond() {
         let f = disjoint_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         assert!(
@@ -3043,7 +3045,7 @@ mod tests {
                 .is_none()
         );
         let mut sys = disjoint_routes([
-            // the island-disjoint peer: over the storage/cluster/mgmt fallback bonds
+            // the domain-disjoint peer: over the storage/cluster/mgmt fallback bonds
             "cfab-st-fb",
             "cfab-cl-fb",
             "cfab-mg-fb",
@@ -3072,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn an_island_disjoint_peer_off_the_fallback_bond_is_named() {
+    fn a_domain_disjoint_peer_off_the_fallback_bond_is_named() {
         let f = disjoint_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = disjoint_routes([
@@ -3101,27 +3103,20 @@ mod tests {
         );
     }
 
-    /// pve1-tb and pve3-tb sit on the st and mg islands, pve2-tb only on cl: pve2-tb shares no
+    /// pve1-tb and pve3-tb sit on the st and mg domains, pve2-tb only on cl: pve2-tb shares no
     /// segment with pve3-tb in any zone, while pve1-tb shares two per zone (so one of them can
     /// go dark without the zone losing its only session).
     fn half_disjoint_fabric() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
-                    "pve1-tb 1 host eth9:5000 - eth0:1000",
-                )
-                .replace(
-                    "pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000",
-                    "pve2-tb 2 host - eth1:1000 -",
-                )
-                .replace(
-                    "pve3-tb 3 leaf eth9:10000 eth1:1000 eth0:1000",
-                    "pve3-tb 3 leaf eth9:10000 - eth0:1000",
-                )
-                .replace("USB_NICS=\"pve1-tb:eth9 pve2-tb:eth9\"", "USB_NICS=\"\"");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_wires(
+            &fixtures::with_wires(
+                &fixtures::with_wires(&fixtures::example(), "pve1-tb", "eth9@a:5000 eth0@c:1000"),
+                "pve2-tb",
+                "eth1@b:1000",
+            ),
+            "pve3-tb",
+            "eth9@a:10000 eth0@c:1000",
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// D3, closed. A cable pull makes two members disjoint at RUNTIME while the declaration
@@ -3202,10 +3197,10 @@ mod tests {
         );
     }
 
-    /// A leaf that is island-disjoint from one peer: the bond is that peer's expected path in
+    /// A leaf that is domain-disjoint from one peer: the bond is that peer's expected path in
     /// every zone, and being on it is health — the reason line only appears where it is not.
     #[test]
-    fn an_island_disjoint_peer_off_the_bond_is_named_while_a_segment_is_down() {
+    fn a_domain_disjoint_peer_off_the_bond_is_named_while_a_segment_is_down() {
         let f = half_disjoint_fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         assert!(
@@ -3213,7 +3208,7 @@ mod tests {
                 .intersection(&segments_of(&f, f.member("pve2-tb").unwrap()))
                 .next()
                 .is_none(),
-            "pve2-tb must be island-disjoint from pve3-tb in every zone"
+            "pve2-tb must be domain-disjoint from pve3-tb in every zone"
         );
         // pve1-tb shares two segments per zone; storage seg 1 is dark, the rest up.
         let bfd: Vec<(String, &str)> = [
@@ -3233,7 +3228,7 @@ mod tests {
             ("10.99.0.1", "cfab-st"),
             ("10.199.0.1", "cfab-cl-bk"),
             ("10.249.0.1", "cfab-mg"),
-            // the island-disjoint peer: cluster and mgmt over the bond, storage NOT
+            // the domain-disjoint peer: cluster and mgmt over the bond, storage NOT
             ("10.99.0.2", "cfab-st-b2"),
             ("10.199.0.2", "cfab-cl-fb"),
             ("10.249.0.2", "cfab-mg-fb"),
@@ -3400,7 +3395,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
-                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
+                 free BFD_PORT (now 3784) in fabric.toml on EVERY member — every peer of a \
                  session must use the same port\n"
             ),
             "{}",

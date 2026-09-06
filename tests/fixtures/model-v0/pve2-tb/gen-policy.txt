@@ -1,0 +1,21 @@
+table inet cfab-fwd
+delete table inet cfab-fwd
+table inet cfab-fwd {
+  set admin { type ifname; elements = { "eth0" } }
+  set storage { type ifname; elements = { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } }
+  set cluster { type ifname; elements = { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } }
+  set mgmt { type ifname; elements = { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } }
+  set cfab { type ifname; elements = { "cfab-cl","cfab-cl-b2","cfab-cl-bk","cfab-cl-fb","cfab-cl-fb-cl","cfab-cl-fb-mg","cfab-cl-fb-st","cfab-gw249","cfab-id199","cfab-id199-peer","cfab-id249","cfab-id249-peer","cfab-id99","cfab-id99-peer","cfab-mg","cfab-mg-b2","cfab-mg-bk","cfab-mg-fb","cfab-mg-fb-cl","cfab-mg-fb-mg","cfab-mg-fb-st","cfab-st","cfab-st-b2","cfab-st-bk","cfab-st-fb","cfab-st-fb-cl","cfab-st-fb-mg","cfab-st-fb-st","eth0","eth1","eth9" } }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    iifname @admin counter drop comment "admin-in"
+    oifname @admin counter drop comment "admin-out"
+    iifname != @cfab oifname != @cfab counter accept comment "foreign-transit"
+    ct state invalid counter comment "ct-invalid-seen"
+    ct state established,related accept comment "return-of-allowed"
+    iifname @storage oifname @storage counter accept comment "allow-storage-storage"
+    iifname @cluster oifname @cluster counter accept comment "allow-cluster-cluster"
+    iifname @mgmt oifname @mgmt counter accept comment "allow-mgmt-mgmt"
+    counter comment "default-deny"
+  }
+}

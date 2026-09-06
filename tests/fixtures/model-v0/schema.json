@@ -1,0 +1,435 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fabric",
+  "description": "The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.",
+  "type": "object",
+  "properties": {
+    "fabric_mode": {
+      "type": "string"
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Member"
+      }
+    },
+    "zones": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Zone"
+      }
+    },
+    "class_table": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Segment"
+      }
+    },
+    "leaf_cost_offset": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "host_forward": {
+      "type": "boolean"
+    },
+    "forward_allow": {
+      "description": "Allowed forward pairs (from, to); unlisted = dropped by policy, counted.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "admin_floor_mbit": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "admin_band": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "pcp_ctrl": {
+      "type": "integer",
+      "format": "uint8",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "dscp_mark": {
+      "type": "boolean"
+    },
+    "bfd_rx_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_tx_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_mult": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_port": {
+      "description": "UDP port for single-hop BFD (RFC 5881: 3784). A port is an external contract — every\nmember and every peer must agree — so it is a declared key, not a derived threshold.",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "ospf_hello": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "ospf_dead": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_as": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_keepalive_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_hold_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_connect_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "usb_nics": {
+      "description": "`(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "run_dir": {
+      "description": "Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).",
+      "type": "string"
+    },
+    "fabric_domain": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fabric_mode",
+    "members",
+    "zones",
+    "class_table",
+    "leaf_cost_offset",
+    "host_forward",
+    "forward_allow",
+    "admin_floor_mbit",
+    "admin_band",
+    "pcp_ctrl",
+    "dscp_mark",
+    "bfd_rx_ms",
+    "bfd_tx_ms",
+    "bfd_mult",
+    "bfd_port",
+    "ospf_hello",
+    "ospf_dead",
+    "bgp_as",
+    "bgp_keepalive_s",
+    "bgp_hold_s",
+    "bgp_connect_s",
+    "usb_nics",
+    "run_dir",
+    "fabric_domain"
+  ],
+  "$defs": {
+    "Member": {
+      "description": "One MEMBER_TABLE row.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "node": {
+          "description": "Node id: the host octet of every address this member holds (identity 10.<id>.0.<node>).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "kind": {
+          "$ref": "#/$defs/MemberKind"
+        },
+        "wires": {
+          "description": "Wire per island, in st/cl/mg order; None = no wire on that island (\"-\").",
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Wire"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      },
+      "required": [
+        "name",
+        "node",
+        "kind",
+        "wires"
+      ]
+    },
+    "MemberKind": {
+      "description": "Membership taxonomy.",
+      "oneOf": [
+        {
+          "description": "Transits between zones, shapes, carries every island it has wires on.",
+          "type": "string",
+          "const": "host"
+        },
+        {
+          "description": "Own identity + OSPF/BFD, stub-router, never transits, no shaping; its\nuntagged/externally-managed L3 is never touched (the NAS).",
+          "type": "string",
+          "const": "leaf"
+        }
+      ]
+    },
+    "Wire": {
+      "description": "A member's physical NIC on one island + its DECLARED link speed (Mb/s).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "speed_mbit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "speed_mbit"
+      ]
+    },
+    "Zone": {
+      "description": "One ZONE_TABLE row: a traffic class.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "id": {
+          "description": "The zone's number: OSPF instance, identity netdev cfab-id<id>, block 10.<id>.0.0/16.\nNOT a VLAN id (segments carry those).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "pcp": {
+          "description": "802.1p for the zone's traffic (sub-if egress-qos-map 0:pcp).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "dscp": {
+          "description": "The plane a DSCP-trusting switch queues the zone's traffic on.",
+          "$ref": "#/$defs/Dscp"
+        },
+        "floor_mbit": {
+          "description": "MINIMUM Mb/s guarantee for the zone's HTB band.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "band": {
+          "description": "HTB prio band (0 = control … 2 = bulk).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "weight": {
+          "description": "Quantum ratio within a shared band.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "gw": {
+          "description": "Ingress, or None = the outside never enters this zone.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ZoneGw"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "id",
+        "pcp",
+        "dscp",
+        "floor_mbit",
+        "band",
+        "weight"
+      ]
+    },
+    "Dscp": {
+      "description": "DSCP class selectors the fabric uses. A closed set on purpose: the shaper must know each\nvalue's tos byte, and each value needs measured switch-queue behavior behind it — extend\nhere, with both, when a new band appears.",
+      "type": "string",
+      "enum": [
+        "cs0",
+        "cs2",
+        "cs6"
+      ]
+    },
+    "ZoneGw": {
+      "description": "Where the OUTSIDE enters a zone: a router-owned VLAN, distinct from every fabric segment,\nso the router never holds an address inside a segment and never sees the fabric's IGP.",
+      "type": "object",
+      "properties": {
+        "island": {
+          "$ref": "#/$defs/Island"
+        },
+        "vid": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "router": {
+          "description": "The router's address; the subnet is its /24 (the only length the design supports).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "island",
+        "vid",
+        "router"
+      ]
+    },
+    "Island": {
+      "description": "The three switch domains, named by the zone whose PRIMARY segment they carry.",
+      "oneOf": [
+        {
+          "description": "The storage island.",
+          "type": "string",
+          "const": "st"
+        },
+        {
+          "description": "The cluster island.",
+          "type": "string",
+          "const": "cl"
+        },
+        {
+          "description": "The management island; a host's wire here also carries its untagged admin path.",
+          "type": "string",
+          "const": "mg"
+        },
+        {
+          "description": "Not a physical switch domain: \"every island this member has a wire on\". Only a\nfallback segment (`Role::Fallback`) is declared on it; `Member::wire` always returns\n`None` for it (a fallback leg is a bond over every wire, resolved in the derive layer,\nnever a single indexed wire).",
+          "type": "string",
+          "const": "any"
+        }
+      ]
+    },
+    "Segment": {
+      "description": "One CLASS_TABLE row: zone `zone` on island `island`, addressed 10.<id>.<seg>.<node>/24,\ntagged `vid` on the island's switch.",
+      "type": "object",
+      "properties": {
+        "ifname": {
+          "type": "string"
+        },
+        "island": {
+          "$ref": "#/$defs/Island"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "seg": {
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "vid": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "ospf_cost": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ifname",
+        "island",
+        "zone",
+        "seg",
+        "vid",
+        "role",
+        "ospf_cost"
+      ]
+    },
+    "Role": {
+      "description": "primary|backup — a segment's role for its zone on this member.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "primary",
+            "backup"
+          ]
+        },
+        {
+          "description": "A fallback segment: island `any`, one per zone, no BFD, reached only when every\nisland segment of its zone is gone.",
+          "type": "string",
+          "const": "fallback"
+        }
+      ]
+    }
+  }
+}

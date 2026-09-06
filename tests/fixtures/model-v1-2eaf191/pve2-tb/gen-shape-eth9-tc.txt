@@ -1,0 +1,14 @@
+tc qdisc del dev eth9 root 2>/dev/null || true
+tc qdisc add dev eth9 root handle 1: htb default 40
+tc class add dev eth9 parent 1: classid 1:1 htb rate 4850mbit ceil 4850mbit burst 64k quantum 60000
+tc class add dev eth9 parent 1:1 classid 1:10 htb rate 200mbit ceil 4850mbit prio 0 burst 64k quantum 1514
+tc class add dev eth9 parent 1:1 classid 1:20 htb rate 100mbit ceil 4850mbit prio 1 burst 64k quantum 1514
+tc class add dev eth9 parent 1:1 classid 1:30 htb rate 100mbit ceil 4850mbit prio 1 burst 64k quantum 1514
+tc class add dev eth9 parent 1:1 classid 1:40 htb rate 2000mbit ceil 4850mbit prio 2 burst 64k quantum 60000
+tc qdisc add dev eth9 parent 1:10 handle 10: fq_codel
+tc qdisc add dev eth9 parent 1:20 handle 20: fq_codel
+tc qdisc add dev eth9 parent 1:30 handle 30: fq_codel
+tc qdisc add dev eth9 parent 1:40 handle 40: fq_codel
+tc filter add dev eth9 parent 1: protocol 802.1Q prio 1 flower vlan_ethtype ip ip_tos 0xc0 flowid 1:10
+tc filter add dev eth9 parent 1: protocol ip prio 2 flower flowid 1:20
+tc filter add dev eth9 parent 1: protocol 802.1Q prio 3 flower vlan_ethtype ip ip_tos 0x40 flowid 1:30

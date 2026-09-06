@@ -1,0 +1,433 @@
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "cfab-st",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id99",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id199",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id249",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-gw249",
+        "type": "iana-if-type:ethernetCsmacd"
+      }
+    ]
+  },
+  "ietf-routing-policy:routing-policy": {
+    "defined-sets": {
+      "prefix-sets": {
+        "prefix-set": [
+          {
+            "name": "cfab-mgmt-id",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "10.249.0.0/24",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "policy-definitions": {
+      "policy-definition": [
+        {
+          "name": "cfab-mgmt-import",
+          "statements": {
+            "statement": [
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-med": "igp"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "cfab-mgmt-export",
+          "statements": {
+            "statement": [
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-next-hop": "self"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "storage",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.99.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-st",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 100,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 300,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 5000
+                      },
+                      {
+                        "name": "cfab-id99",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "cluster",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.199.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-cl",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 200,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 300,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 5000
+                      },
+                      {
+                        "name": "cfab-id199",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "mgmt",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.249.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-mg",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 100,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 200,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 5000
+                      },
+                      {
+                        "name": "cfab-id249",
+                        "passive": true
+                      },
+                      {
+                        "name": "cfab-gw249",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-bgp:bgp",
+          "name": "cfab",
+          "ietf-bgp:bgp": {
+            "global": {
+              "as": 65000,
+              "identifier": "10.249.0.1",
+              "afi-safis": {
+                "afi-safi": [
+                  {
+                    "name": "iana-bgp-types:ipv4-unicast",
+                    "apply-policy": {
+                      "import-policy": [
+                        "cfab-mgmt-import"
+                      ]
+                    },
+                    "ipv4-unicast": {
+                      "holo-bgp:redistribution": [
+                        {
+                          "type": "ietf-routing:direct"
+                        },
+                        {
+                          "type": "ietf-ospf:ospfv2"
+                        }
+                      ],
+                      "holo-bgp:network": [
+                        "10.249.0.1/32"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "neighbors": {
+              "neighbor": [
+                {
+                  "remote-address": "192.168.249.254",
+                  "peer-as": 65000,
+                  "timers": {
+                    "connect-retry-interval": 3,
+                    "hold-time": 3,
+                    "keepalive": 1
+                  },
+                  "transport": {
+                    "local-address": "192.168.249.1"
+                  },
+                  "afi-safis": {
+                    "afi-safi": [
+                      {
+                        "name": "iana-bgp-types:ipv4-unicast",
+                        "enabled": true,
+                        "apply-policy": {
+                          "export-policy": [
+                            "cfab-mgmt-export"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

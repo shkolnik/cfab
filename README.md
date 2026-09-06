@@ -14,21 +14,21 @@ and critical control traffic (Corosync, etcd) stays protected under line-rate lo
 the policy layer; the physical network is asked for as little as possible — dumb, cheap
 switches are a design assumption, not a limitation.
 
-`cfab` is the per-host runtime, a single static binary: `fabric.conf` declares the fabric,
+`cfab` is the per-host runtime, a single static binary: `fabric.toml` declares the fabric,
 and the binary validates it, generates every artifact from it (nftables forward policy and
 traffic-class marking, HTB shaping trees, FRR configuration), applies and verifies the fabric
 on the host, and tears it down.
 
 **Status: early, working prototype.** The mechanisms are live-proven on a three-node physical
 testbed (cable pulls, switch power loss, driver resets, saturation, poison-config recovery),
-but interfaces and the `fabric.conf` format are still moving. Not yet ready for machines you
+but interfaces and the `fabric.toml` format are still moving. Not yet ready for machines you
 depend on.
 
 ## Commands
 
 ```
-cfab check                      # parse + validate fabric.conf, print this member's resolved view
-cfab schema                     # the fabric.conf data model as JSON Schema
+cfab check                      # parse + validate fabric.toml, print this member's resolved view
+cfab schema                     # the fabric.toml declaration schema as JSON Schema
 cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
 cfab run                        # apply the fabric and supervise its daemons (systemd notify, root)
@@ -38,11 +38,11 @@ cfab status [--wait N] [--permissive]
 cfab measure-cap <dev> <peer>   # measure a wire's real capacity; feeds the shape derivation
 cfab policy-teeth               # prove the forward policy in throwaway netnses — and prove the proof bites
 cfab cluster status             # Proxmox (pmxcfs) coordination state; clean "not clustered" when absent
-cfab conf publish               # validate the local fabric.conf, publish it cluster-wide
+cfab conf publish               # validate the local fabric.toml, publish it cluster-wide
 cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands started by `run`; not for hands
 ```
 
-`--config` defaults to `fabric.conf` beside the binary; `--host` to `$CFAB_HOST`, else the
+`--config` defaults to `fabric.toml` beside the binary; `--host` to `$CFAB_HOST`, else the
 kernel hostname.
 
 ## Runtime requirements
@@ -57,7 +57,7 @@ skipped and `cfab status` names the backend and says so. The choice is made at `
 kernel's own refusal, never on a knob, and recorded in the run dir. A leaf gets the ceiling
 either way because it sources a fallback-segment control storm exactly as a host does, so a
 containment it escaped would be half a containment. (This member's OWN control marking is not
-in that table: the engine sets DSCP CS6 and skb-priority PCP_CTRL on its OSPF and BFD
+in that table: the engine sets DSCP CS6 and skb-priority `[marking] pcp_ctrl` on its OSPF and BFD
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
 The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc` and
 `ethtool` for its shaping trees and per-NIC offload posture; a **leaf** shapes nothing, its
@@ -67,7 +67,7 @@ applies a thing. The Debian package's `Depends` covers all of it.
 ## Running it as a service
 
 The Debian package ships `cfab.service`, **installed disabled and not started** —
-installing cfab never changes the network. Write `/etc/cfab/fabric.conf`, then:
+installing cfab never changes the network. Write `/etc/cfab/fabric.toml`, then:
 
 ```
 systemctl enable --now cfab
@@ -76,7 +76,7 @@ systemctl enable --now cfab
 The unit is `Type=notify`; `ExecStart` is `cfab run`, the long-lived supervisor that applies the
 fabric and keeps the engine, shape daemon, and conf-sync alive. `ExecReload` is
 `kill -HUP $MAINPID`, which re-applies the declaration in place — no teardown, no netdev churn.
-`ConditionPathExists=/etc/cfab/fabric.conf` means a host with the package but no declaration is
+`ConditionPathExists=/etc/cfab/fabric.toml` means a host with the package but no declaration is
 skipped at boot rather than failed. Set `CFAB_HOST` in `/etc/default/cfab` only when this
 member's row is not named by the kernel hostname.
 
@@ -100,7 +100,7 @@ matches the numeric ids.
 On a Proxmox cluster, `cfab` additionally coordinates through pmxcfs (`/etc/pve`) — probed at
 the point of use, with identical single-host behavior when absent:
 
-- `conf publish` distributes one validated `fabric.conf` cluster-wide (atomic rename publish,
+- `conf publish` distributes one validated `fabric.toml` cluster-wide (atomic rename publish,
   generation counter, stale-lock reclaim).
 - `conf-sync` applies published configurations under a **peer-witness protocol**: validate →
   apply → status → ack, then commit only once at least one fresh peer ack proves the new

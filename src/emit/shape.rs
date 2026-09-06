@@ -105,12 +105,12 @@ pub fn derive(
     zones.dedup();
     if zones.is_empty() {
         return Err(Error::config(format!(
-            "gen-shape: no CLASS_TABLE zone on wire '{dev}'"
+            "gen-shape: no a zone's `segments` zone on wire '{dev}'"
         )));
     }
 
     // One band per zone, ordered by (band, name); the admin NIC gets the extra untagged band.
-    let is_admin = view.admin_if() == Some(dev);
+    let is_admin = view.is_admin_if(dev);
     let mut order: Vec<(u32, String)> = zones
         .iter()
         .map(|z| Ok((view.fabric.zone(z)?.band, z.clone())))
@@ -126,10 +126,10 @@ pub fn derive(
     for (rank, (band, label)) in order.into_iter().enumerate() {
         let minor = (rank as u32 + 1) * 10;
         let (class, mut floor) = if label == "admin" {
-            (BandClass::Untagged, view.fabric.admin_floor_mbit as u64)
+            (BandClass::Untagged, view.fabric.admin_floor_mbps as u64)
         } else {
             let z = view.fabric.zone(&label)?;
-            (BandClass::Dscp(z.dscp), z.floor_mbit as u64)
+            (BandClass::Dscp(z.dscp), z.floor_mbps as u64)
         };
         let is_default = class == BandClass::Dscp(Dscp::Cs0);
         let mut effective_primary = None;
@@ -393,14 +393,14 @@ impl Derivation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     #[test]
@@ -465,18 +465,27 @@ mod tests {
         assert!(cluster.eff < cluster.floor);
     }
 
+    /// The untagged path of EVERY host wire is the admin plane (James 2026-09-06), so every
+    /// wire of a host gets the untagged `[admin] floor_mbps` band — not just one nominated NIC. A leaf
+    /// owns no wire's L3 and gets none.
     #[test]
-    fn admin_band_only_on_admin_nic() {
+    fn every_host_wire_gets_the_admin_band_and_no_leaf_wire_does() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let on_admin = derive(&v, "eth0", None, &|_| true).unwrap();
-        assert!(on_admin.bands.iter().any(|b| b.label == "admin"));
-        let on_other = derive(&v, "eth9", None, &|_| true).unwrap();
-        assert!(!on_other.bands.iter().any(|b| b.label == "admin"));
-        // A leaf shapes nothing, but the derivation for its wire still has no admin band.
+        for wire in ["eth0", "eth1", "eth9"] {
+            let d = derive(&v, wire, None, &|_| true).unwrap();
+            let admin = d
+                .bands
+                .iter()
+                .find(|b| b.label == "admin")
+                .unwrap_or_else(|| panic!("{wire} has no admin band"));
+            assert_eq!(admin.floor, f.admin_floor_mbps as u64, "{wire}");
+        }
         let leaf = View::new(&f, "pve3-tb").unwrap();
-        let d = derive(&leaf, "eth0", None, &|_| true).unwrap();
-        assert!(!d.bands.iter().any(|b| b.label == "admin"));
+        for wire in ["eth0", "eth1", "eth9"] {
+            let d = derive(&leaf, wire, None, &|_| true).unwrap();
+            assert!(!d.bands.iter().any(|b| b.label == "admin"), "{wire}");
+        }
     }
 
     #[test]
@@ -490,11 +499,11 @@ mod tests {
                 .contains("no declared link speed for pve1-tb:eth5"),
             "{err}"
         );
-        // A wire with a measured cap but no CLASS_TABLE rows hits the no-zone error.
+        // A wire with a measured cap but no a zone's `segments` rows hits the no-zone error.
         let err = derive(&v, "eth5", Some(1000), &|_| true).unwrap_err();
         assert!(
             err.to_string()
-                .contains("no CLASS_TABLE zone on wire 'eth5'"),
+                .contains("no a zone's `segments` zone on wire 'eth5'"),
             "{err}"
         );
     }

@@ -35,7 +35,7 @@ pub struct Ceiling {
     /// one of them also carries the zone's fallback row (the row needs a home wire, which is a
     /// class row in the zone), so this is the fallback LAN's membership too.
     pub members: u64,
-    /// Broadcast LANs in the zone = the zone's CLASS_TABLE rows, fallback row included: the
+    /// Broadcast LANs in the zone = the zone's a zone's `segments` rows, universal row included: the
     /// network-LSA candidates.
     pub lans: u64,
     /// LSDB size for the zone: one router-LSA per member, one network-LSA per LAN.
@@ -76,11 +76,11 @@ impl Ceiling {
 }
 
 /// The arithmetic, separated from the declaration so the three design-bound sizes can be tested
-/// as numbers. `hello_s` is OSPF_HELLO in whole seconds.
+/// as numbers. `hello_s` is `[ospf] hello_s` in whole seconds.
 fn ceiling_pps(members: u64, lans: u64, hello_s: u32) -> (u64, u64, u64, u64) {
     let peers = members.saturating_sub(1);
     let lsas = members + lans;
-    // At most one hello per second: OSPF_HELLO is whole seconds and never below 1.
+    // At most one hello per second: `[ospf] hello_s` is whole seconds and never below 1.
     let hello = 1u64.div_ceil(u64::from(hello_s).max(1));
     // A full convergence, compressed into a single second: every LSA flooded once (multicast)
     // and acknowledged once.
@@ -104,7 +104,7 @@ pub fn ceilings(view: &View) -> Vec<Ceiling> {
                 .iter()
                 .filter(|m| class_rows_of(f, m).iter().any(|c| c.zone == r.zone))
                 .count() as u64;
-            let lans = f.class_table.iter().filter(|s| s.zone == r.zone).count() as u64;
+            let lans = f.segments.iter().filter(|s| s.zone == r.zone).count() as u64;
             let (peers, lsas, base_pps, rate_pps) = ceiling_pps(members, lans, f.ospf_hello);
             Ceiling {
                 zone: r.zone,
@@ -131,7 +131,7 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("    type filter hook output priority mangle;\n");
     // The fallback control-egress ceiling, FIRST: the guard rules below `return` on OSPF, so a
     // ceiling placed after them would never see the packets it exists to count. Containment, not
-    // policing: a fallback segment is one broadcast domain spanning every island, so a
+    // policing: a fallback segment is one broadcast domain spanning every domain, so a
     // control-plane loop on it reaches every switch port in the fabric. Over the derived rate the
     // packets are dropped and counted (`cfab status` reads the counter) — a member whose control
     // plane has gone mad stops shouting and at worst loses its own fallback adjacency, which is
@@ -140,7 +140,7 @@ pub fn generate(view: &View) -> Result<String> {
     // OSPF only, and only on the bond: a fallback leg carries NO BFD by construction (`emit/
     // engine.rs` gives the bond no `bfd` key at all, and `segments_of()` keeps it out of BFD
     // pairing), so `ip protocol 89` (OSPF) is the whole control class on this interface. Only the
-    // control class is policed — when a zone is island-disjoint the bond carries that zone's
+    // control class is policed — when a zone is domain-disjoint the bond carries that zone's
     // real traffic, which is exactly what the fallback exists for.
     for ce in ceilings(view) {
         out.push_str(&ce.comment());
@@ -197,37 +197,36 @@ pub fn generate(view: &View) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The same declaration grown to `n` members (node ids 1..=n, all hosts with all three
     /// wires), so the ceiling derivation is exercised across the project's scale bounds
     /// (< 50 members, most < 10) rather than only at the three-member testbed.
     fn fabric_with_members(n: u8) -> Fabric {
-        let rows: String = (1..=n)
-            .map(|i| format!("pve{i}-tb {i} host eth9:5000 eth1:1000 eth0:1000\n"))
+        let members: String = (1..=n)
+            .map(|i| {
+                fixtures::member(
+                    &format!("pve{i}-tb"),
+                    i,
+                    "host",
+                    "eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                )
+            })
             .collect();
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace(
-                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000\n\
-                     pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000\n\
-                     pve3-tb 3 leaf eth9:10000 eth1:1000 eth0:1000\n",
-                    &rows,
-                );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        let text = fixtures::with_members(&fixtures::example(), &members);
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The threshold is a function of the declaration and of one measured number, at every size
-    /// the project designs for. Storage has 4 CLASS_TABLE rows (3 segments + the fallback), so
+    /// the project designs for. Storage has 4 a zone's `segments` rows (3 segments + the universal), so
     /// the LSDB is `members + 4` and the peer count on the fallback LAN is `members - 1`.
     ///
     /// The two margins this has to keep, as numbers (fixture measurements,
@@ -272,7 +271,7 @@ mod tests {
     }
 
     /// The rule is emitted with its arithmetic beside it, and it is OSPF on the bond and
-    /// nothing else: never a slave (the bond is the L3 interface), never the zone's island
+    /// nothing else: never a slave (the bond is the L3 interface), never the zone's domain
     /// segments (policing those would police the fabric it is protecting), never BFD (a
     /// fallback leg carries none — `emit/engine.rs` gives the bond no `bfd` key at all).
     #[test]
@@ -304,7 +303,7 @@ mod tests {
                 "\"cfab-cl\"",
                 "\"cfab-mg\"",
             ] {
-                assert!(!r.contains(seg), "the ceiling names an island segment: {r}");
+                assert!(!r.contains(seg), "the ceiling names an domain segment: {r}");
             }
         }
         // Ahead of the guard rules: they `return` on OSPF, so a ceiling behind them would never
@@ -374,11 +373,11 @@ mod tests {
         for port in [3784u16, 9784] {
             let text = std::fs::read_to_string(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/examples/fabric.conf"
+                "/examples/fabric.toml"
             ))
             .unwrap()
-            .replace("BFD_PORT=3784", &format!("BFD_PORT={port}"));
-            let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+            .replace("port = 3784", &format!("port = {port}"));
+            let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
             assert_eq!(f.bfd_port, port);
             for member in ["pve1-tb", "pve3-tb"] {
                 let v = View::new(&f, member).unwrap();
@@ -443,13 +442,8 @@ mod tests {
     /// a zone has no home wire for its fallback leg, so it carries none.
     #[test]
     fn a_member_with_no_fallback_row_gets_no_ceiling() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
-                .unwrap()
-                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
-        let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+        let text = fixtures::without_universal_legs(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert!(v.fallback_rows().is_empty());
         assert!(ceilings(&v).is_empty());

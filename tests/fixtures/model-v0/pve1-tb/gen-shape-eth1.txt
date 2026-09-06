@@ -1,0 +1,6 @@
+gen-shape derive: dev eth1, link L = 970 Mb/s = 0.97 × 1000 (declared for pve1-tb:eth1, UNMEASURED)
+  bands (one HTB class per DSCP band; rate=effective floor guarantee, ceil=L so idle bands lend):
+    1:10  cluster  prio 0  floor 200 Mb/s  [filtered on cs6 / tos 0xc0]  — cluster marked traffic (cs6 on every sub-if, incl. control) -> full floor
+    1:20  mgmt  prio 1  floor 100 Mb/s  [filtered on cs2 / tos 0x40]  — mgmt marked traffic (cs2 on every sub-if, incl. control) -> full floor
+    1:30  storage  prio 2  floor 1 Mb/s  [default/bulk, no filter (htb default)]  — storage not effective-primary on eth1 -> 1mbit token (real floor re-derives on failover)
+H = L - Sum(effective) = 970 - 301 = 669 Mb/s  (borrowable headroom; H<0 impossible post-degrade)

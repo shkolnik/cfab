@@ -1,5 +1,5 @@
 //! The nft forward policy (table inet cfab-fwd) derived from the class table. Default-deny for
-//! everything that touches a cfab interface: only FORWARD_ALLOW pairs pass, the admin interface
+//! everything that touches a cfab interface: only `[forward] allow` pairs pass, the admin interface
 //! never transits, every drop is counted. A packet that touches no cfab interface on either
 //! side is another stack's business and is accepted here (nft forward hooks are cumulative, so
 //! that stack's own policy still applies) — scoped posture. Pure text out.
@@ -13,11 +13,20 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("table inet cfab-fwd\n");
     out.push_str("delete table inet cfab-fwd\n");
     out.push_str("table inet cfab-fwd {\n");
-    match view.admin_if() {
-        Some(a) => out.push_str(&format!(
-            "  set admin {{ type ifname; elements = {{ \"{a}\" }} }}\n"
-        )),
-        None => out.push_str("  set admin { type ifname; }\n"),
+    // Every wire of a host: the untagged path of each NIC is the admin plane, so each is
+    // fenced out of transit. A leaf owns no L3 of ours on any wire, and its set is empty.
+    let admin: Vec<String> = view
+        .admin_ifs()
+        .into_iter()
+        .map(|a| format!("\"{a}\""))
+        .collect();
+    if admin.is_empty() {
+        out.push_str("  set admin { type ifname; }\n");
+    } else {
+        out.push_str(&format!(
+            "  set admin {{ type ifname; elements = {{ {} }} }}\n",
+            admin.join(",")
+        ));
     }
     for z in &f.zones {
         let ifs: Vec<String> = view
@@ -66,20 +75,20 @@ pub fn generate(view: &View) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
     /// fallback bond after a zone's segments, and this generator just emits whatever `zone_ifs`
     /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
-    /// (so `FORWARD_ALLOW storage>storage` covers island-disjoint transit through it) and in
+    /// (so ``[forward] allow` storage>storage` covers domain-disjoint transit through it) and in
     /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
     /// A slave is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
     /// own — the bond does), but it IS in `owned_forwarding()` (Task 2, `false`/never-transit)
@@ -128,6 +137,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Every wire of a HOST is the admin plane (its untagged path), so the admin set lists
+    /// them all and the first two rules drop anything forwarded in or out of any of them. A
+    /// leaf owns none of it: the set is present but empty, and an empty `@admin` matches
+    /// nothing, so the drop rules are inert rather than absent.
+    #[test]
+    fn the_admin_set_is_every_wire_on_a_host_and_empty_on_a_leaf() {
+        let f = fabric();
+        let host = View::new(&f, "pve1-tb").unwrap();
+        let line = |out: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with("set admin "))
+                .unwrap()
+                .to_string()
+        };
+        let out = generate(&host).unwrap();
+        let set_line = line(&out);
+        for wire in host.wires() {
+            assert!(
+                set_line.contains(&format!("\"{wire}\"")),
+                "host admin set missing {wire}: {set_line}"
+            );
+        }
+        assert_eq!(set_line.matches('"').count() / 2, host.wires().len());
+
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let leaf_out = generate(&leaf).unwrap();
+        assert_eq!(line(&leaf_out).trim(), "set admin { type ifname; }");
+        for rule in ["iifname @admin counter drop", "oifname @admin counter drop"] {
+            assert!(leaf_out.contains(rule), "leaf lost {rule}");
         }
     }
 }

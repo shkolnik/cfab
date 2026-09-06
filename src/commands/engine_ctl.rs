@@ -127,7 +127,7 @@ pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
 }
 
 /// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
-/// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
+/// cfab knows the remedy: the port is declared in fabric.toml, and it is a fabric-wide
 /// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
 /// Used by `status`, which diagnoses the failure from the engine's ring buffer.
 pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
@@ -139,7 +139,7 @@ pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
         "stop the daemon named in the line above".to_string()
     };
     format!(
-        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.conf on EVERY member — \
+        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.toml on EVERY member — \
          every peer of a session must use the same port"
     )
 }
@@ -236,7 +236,7 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             if got != Some(want) {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' {ifname} cost is {} (want {want} = cost + \
-                     LEAF_COST_OFFSET)",
+                     `[cost] leaf_offset`)",
                     z.name, inst["interfaces"][ifname]["cost"]
                 )));
             }
@@ -262,7 +262,7 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             if link["metric"].as_u64() != Some(want) {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' transit link {ifname} ({addr}) advertised at {} \
-                     (want {want} = cost + LEAF_COST_OFFSET)",
+                     (want {want} = cost + `[cost] leaf_offset`)",
                     z.name, link["metric"]
                 )));
             }
@@ -374,15 +374,15 @@ pub fn is_transit(t: &Value) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::sys::mock::MockSys;
     use serde_json::json;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// A state document in the shape `engine::state::document` produces, for every zone of
@@ -553,7 +553,7 @@ pub(crate) mod tests {
     }
 
     /// Gate-0 evidence §8.4: an interface the engine reports `down` — a wire with no carrier
-    /// at `up` time, or one `fabric.conf` names that the kernel does not have — is named, not
+    /// at `up` time, or one `fabric.toml` names that the kernel does not have — is named, not
     /// silently accepted. Only after the settle, and only as a list for the caller to warn
     /// about: `settled_down_ifs` never errors.
     #[test]
@@ -726,11 +726,11 @@ pub(crate) mod tests {
     fn readback_leaf_checks_the_fallback_interface_and_its_transit_link() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        // The healthy leaf document advertises it: 5000 + 30000.
+        // The healthy leaf document advertises it: the derived 410 + 30000.
         let doc = healthy_doc(&view);
         assert_eq!(
             doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["cost"],
-            json!(35000)
+            json!(30410)
         );
         assert!(
             doc["ospf"]["storage"]["self_lsa_links"]
@@ -747,7 +747,7 @@ pub(crate) mod tests {
         doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["cost"] = json!(5000);
         let e = readback(&view, &doc).unwrap_err().to_string();
         assert!(
-            e.contains("ospf 'storage' cfab-st-fb cost is 5000 (want 35000"),
+            e.contains("ospf 'storage' cfab-st-fb cost is 5000 (want 30410"),
             "{e}"
         );
 
@@ -762,7 +762,7 @@ pub(crate) mod tests {
         rs["metric"] = json!(5000);
         let e = readback(&view, &doc).unwrap_err().to_string();
         assert!(
-            e.contains("transit link cfab-st-fb (10.99.9.3) advertised at 5000 (want 35000"),
+            e.contains("transit link cfab-st-fb (10.99.9.3) advertised at 5000 (want 30410"),
             "{e}"
         );
     }
@@ -924,7 +924,7 @@ pub(crate) mod tests {
         // Every branch carries the fabric-wide-port caveat.
         assert!(
             r.contains(
-                "or declare a free BFD_PORT (now 3784) in fabric.conf on EVERY member — \
+                "or declare a free BFD_PORT (now 3784) in fabric.toml on EVERY member — \
                  every peer of a session must use the same port"
             ),
             "{r}"

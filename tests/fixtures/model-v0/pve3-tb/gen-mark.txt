@@ -1,0 +1,25 @@
+table inet cfab
+delete table inet cfab
+table inet cfab {
+  chain out {
+    type filter hook output priority mangle;
+    # ceiling storage: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-st-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-storage"
+    # ceiling cluster: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-cl-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-cluster"
+    # ceiling mgmt: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-mg-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-mgmt"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip protocol 89 return comment "guard-storage-ospf"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } udp dport 3784 return comment "guard-storage-bfd"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-storage-bulk"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } ip protocol 89 return comment "guard-cluster-ospf"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } udp dport 3784 return comment "guard-cluster-bfd"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } ip dscp set cs6 comment "dscp-cluster-bulk"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb" } ip protocol 89 return comment "guard-mgmt-ospf"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb" } udp dport 3784 return comment "guard-mgmt-bfd"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb" } ip dscp set cs2 comment "dscp-mgmt-bulk"
+  }
+}

@@ -20,11 +20,10 @@
 
 use std::fmt::Write as _;
 
-use crate::config::RawConfig;
 use crate::derive::View;
 use crate::emit;
 use crate::error::{Error, Result};
-use crate::model::{Fabric, Role};
+use crate::model::Fabric;
 use crate::sys::{Sys, run_ignore, run_ok};
 
 const ROUTER: &str = "cfab-teeth-r";
@@ -58,7 +57,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRepor
 }
 
 fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethReport> {
-    let f = view.fabric;
     let mut out = String::new();
     let mut ifs: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
     // Fallback bonds are in the zone's forward-policy set (`zone_ifs`) like a segment, so the
@@ -68,9 +66,7 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     // the only proof of actual fallback transit (Task 7.2(c)). Slaves are NOT added: they carry no
     // L3 and are not in any forward-policy set.
     ifs.extend(view.fallback_rows().into_iter().map(|r| r.ifname));
-    if let Some(a) = view.admin_if() {
-        ifs.push(a.to_string());
-    }
+    ifs.extend(view.admin_ifs().into_iter().map(|a| a.to_string()));
     ifs.extend(FOREIGN.iter().map(|s| s.to_string()));
 
     cleanup(sys)?;
@@ -174,17 +170,14 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
         out,
         "== 2. teeth: allow storage>cluster in the model -> the storage->cluster negative must go RED"
     );
-    // regress the MODEL, not the output: an edited declaration through the real parser+generator
-    let declared: Vec<String> = f
-        .forward_allow
-        .iter()
-        .map(|(a, b)| format!("{a}>{b}"))
-        .collect();
-    let regressed_conf = replace_forward_allow(
-        conf_text,
-        &format!("{} storage>cluster", declared.join(" ")),
-    );
-    let regressed_fabric = Fabric::from_raw(&RawConfig::parse(&regressed_conf)?)?;
+    // Regress the MODEL, not the output: the real declaration, one field edited, back through
+    // the real validation and generator. A named field, so the regression cannot miss.
+    let mut regressed_decl = crate::decl::Declaration::parse(conf_text)?;
+    regressed_decl
+        .forward
+        .allow
+        .push("storage>cluster".to_string());
+    let regressed_fabric = Fabric::from_decl(&regressed_decl)?;
     let regressed_view = View::new(&regressed_fabric, &view.member.name)?;
     let regressed = emit::policy::generate(&regressed_view)?;
     if !regressed.contains("allow-storage-cluster") {
@@ -217,35 +210,53 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
         out,
         "== 3. teeth: strip the admin drop rules from the ruleset -> the admin negative must go RED"
     );
-    let admin = view
-        .admin_if()
-        .ok_or_else(|| Error::fatal("policy-teeth: no admin NIC on this member (host only)"))?;
+    let admins: Vec<String> = view
+        .admin_ifs()
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect();
+    if admins.is_empty() {
+        return Err(Error::fatal(
+            "policy-teeth: no admin NIC on this member (host only)",
+        ));
+    }
     let noadmin: String = prod
         .lines()
         .filter(|l| !l.contains("comment \"admin-"))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    // Simulate the worst case: a hand-edit that adds the admin NIC to the storage zone set.
+    // Simulate the worst case: a hand-edit that adds EVERY admin NIC to the storage zone set.
+    // Every wire of a host is the admin plane, so proving the teeth on the first wire alone
+    // would leave wires 2..N covered by nothing but the rule text.
     let noadmin = noadmin.replace(
         "set storage { type ifname; elements = { ",
-        &format!("set storage {{ type ifname; elements = {{ \"{admin}\", "),
+        &format!(
+            "set storage {{ type ifname; elements = {{ {}, ",
+            admins
+                .iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     );
     load(sys, &noadmin)?;
-    let got = reach(sys, &fx, admin, first_if(view, "storage")?)?;
-    let r3 = if got == 0 {
-        let _ = writeln!(
-            out,
-            "  NO TEETH: admin test did not notice the missing admin rules"
-        );
-        false
-    } else {
-        let _ = writeln!(
-            out,
-            "  RED  mutated: {admin} -> storage = {got}/3 (want 0) — the wanted outcome"
-        );
-        true
-    };
+    let mut r3 = true;
+    for admin in &admins {
+        let got = reach(sys, &fx, admin, first_if(view, "storage")?)?;
+        if got == 0 {
+            let _ = writeln!(
+                out,
+                "  NO TEETH: admin test did not notice the missing admin rules for {admin}"
+            );
+            r3 = false;
+        } else {
+            let _ = writeln!(
+                out,
+                "  RED  mutated: {admin} -> storage = {got}/3 (want 0) — the wanted outcome"
+            );
+        }
+    }
 
     let _ = writeln!(
         out,
@@ -345,15 +356,15 @@ fn reach(sys: &mut dyn Sys, fx: &Fixture, from: &str, to: &str) -> Result<u32> {
 
 fn first_if<'v>(view: &'v View, zone: &str) -> Result<&'v str> {
     // Only segment sub-ifs get endpoints (the gw leg exists in the set but has no netns).
-    // Excludes Role::Fallback explicitly: a fallback row shares the zone name but has no endpoint
+    // Excludes the universal row explicitly: it shares the zone name but has no endpoint
     // in this fixture (its ifname is never added to `ifs` — class_rows() drops it by
     // construction), so picking one up here would fail loudly via `Fixture::endpoint`, not
     // silently — but the guard makes the intended row (a real segment) explicit rather than
     // relying on fallback rows happening to sort last in the table.
     view.fabric
-        .class_table
+        .segments
         .iter()
-        .filter(|r| r.role != Role::Fallback)
+        .filter(|r| !r.scope.is_universal())
         .find(|r| r.zone == zone)
         .map(|r| r.ifname.as_str())
         .ok_or_else(|| Error::fatal(format!("policy-teeth: zone {zone} has no interface")))
@@ -363,9 +374,9 @@ fn second_if<'v>(view: &'v View, zone: &str) -> Option<&'v str> {
     // Same exclusion as `first_if`: never let a fallback row (no fixture endpoint) satisfy the
     // "zone's second interface" lookup.
     view.fabric
-        .class_table
+        .segments
         .iter()
-        .filter(|r| r.zone == zone && r.role != Role::Fallback)
+        .filter(|r| r.zone == zone && !r.scope.is_universal())
         .nth(1)
         .map(|r| r.ifname.as_str())
 }
@@ -416,7 +427,7 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
             expect(sys, "pair", first_if(view, z1)?, to, want, out)?;
         }
     }
-    if let Some(admin) = view.admin_if() {
+    for admin in view.admin_ifs() {
         expect(sys, "admin-in", admin, first_if(view, "storage")?, 0, out)?;
         expect(sys, "admin-out", first_if(view, "storage")?, admin, 0, out)?;
     }
@@ -426,39 +437,14 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
     expect(sys, "foreign-transit", FOREIGN[0], FOREIGN[1], 3, out)?;
     expect(sys, "foreign-in", FOREIGN[0], storage, 0, out)?;
     expect(sys, "foreign-out", storage, FOREIGN[0], 0, out)?;
-    if let Some(admin) = view.admin_if() {
+    for admin in view.admin_ifs() {
         expect(sys, "admin-to-foreign", admin, FOREIGN[0], 0, out)?;
     }
     Ok(ok)
 }
 
-/// Replace the FORWARD_ALLOW literal in the declaration text.
-fn replace_forward_allow(conf: &str, new_value: &str) -> String {
-    conf.lines()
-        .map(|l| {
-            if l.starts_with("FORWARD_ALLOW=") {
-                format!("FORWARD_ALLOW=\"{new_value}\"")
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn forward_allow_replacement() {
-        let conf = "A=1\nFORWARD_ALLOW=\"storage>storage\"\nB=2\n";
-        let got = replace_forward_allow(conf, "storage>storage storage>cluster");
-        assert!(got.contains("FORWARD_ALLOW=\"storage>storage storage>cluster\""));
-        assert!(got.contains("A=1\n") && got.contains("B=2\n"));
-    }
-
     #[test]
     fn ping_reply_parse() {
         // parsing lives in reach(); test the line format it expects

@@ -383,15 +383,15 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn view_fixture() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// `nft -j list chains` with only cfab's own tables. `extra` appends a foreign chain.
@@ -444,7 +444,7 @@ mod tests {
             );
         }
         // The bonds are transit-eligible like a segment (a fallback leg for one zone can carry
-        // another zone's island-disjoint traffic on a forwarding host).
+        // another zone's domain-disjoint traffic on a forwarding host).
         for r in view.fallback_rows() {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
@@ -602,7 +602,7 @@ mod tests {
 
     /// PROVING existing behavior, not new logic: `owned_forwarding()` (Task 2) already flags
     /// the fallback bond `transit`-eligible like a class segment (a fallback leg for one zone can
-    /// carry another zone's island-disjoint traffic on a forwarding host) — this test exercises
+    /// carry another zone's domain-disjoint traffic on a forwarding host) — this test exercises
     /// that through the watchdog's own correction path rather than reading `owned_forwarding`
     /// directly, so a regression here fails where it would actually bite in production.
     #[test]

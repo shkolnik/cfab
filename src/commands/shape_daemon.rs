@@ -5,7 +5,7 @@
 //! floor on every wire, so its failover needs NO shaping re-derivation.
 //!
 //! On ANY exit (stop/signal) restores fq_codel on every fabric wire: the service being down =
-//! no floors, which `cfab status` reports. Touches ONLY the CLASS_TABLE wires.
+//! no floors, which `cfab status` reports. Touches ONLY the a zone's `segments` wires.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -150,7 +150,9 @@ pub fn teardown(sys: &mut dyn Sys, devs: &[String]) -> Result<()> {
 pub fn run(sys: &mut dyn Sys, view: &View, debounce: Duration) -> Result<()> {
     let devs = view.wires();
     if devs.is_empty() {
-        return Err(Error::fatal("shape-daemon: no wires in CLASS_TABLE"));
+        return Err(Error::fatal(
+            "shape-daemon: no wires in a zone's `segments`",
+        ));
     }
     println!(
         "shape-daemon: start devs=[{}] debounce={}s",
@@ -229,16 +231,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, debounce: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
     use std::sync::mpsc::channel;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     #[test]

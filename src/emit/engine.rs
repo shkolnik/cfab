@@ -41,7 +41,7 @@ const SPF_HOLD_DOWN_MS: u32 = 3000;
 pub enum TransitCost {
     /// The cost the declaration asks for.
     Declared,
-    /// The declared cost plus `LEAF_COST_OFFSET`: reachable, never chosen as a path through.
+    /// The declared cost plus ``[cost] leaf_offset``: reachable, never chosen as a path through.
     LeafOffset,
 }
 
@@ -95,10 +95,10 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
     let mut protocols: Vec<Value> = Vec::new();
     for z in &f.zones {
         let mut ospf_ifs: Vec<Value> = Vec::new();
-        // Segments: a leaf's transit links carry cost + LEAF_COST_OFFSET (never a transit).
+        // Segments: a leaf's transit links carry cost + `[cost] leaf_offset` (never a transit).
         for r in class_rows.iter().filter(|r| r.zone == z.name) {
             let cost = link_cost(view, transit, r.ospf_cost);
-            // ietf-bfd intervals are microseconds; fabric.conf declares milliseconds.
+            // ietf-bfd intervals are microseconds; fabric.toml declares milliseconds.
             ospf_ifs.push(json!({
                 "name": r.ifname,
                 "interface-type": "broadcast",
@@ -190,9 +190,9 @@ fn export_policy(zone: &str) -> String {
 /// (`holo-bgp/src/ibus/rx.rs`), so a dangling name is a panic in the engine, not a warning.
 fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>> {
     let f = view.fabric;
-    let Some(first) = gw_rows.first() else {
+    if gw_rows.is_empty() {
         return Ok(None);
-    };
+    }
 
     let mut prefix_sets: Vec<Value> = Vec::new();
     let mut policies: Vec<Value> = Vec::new();
@@ -287,8 +287,18 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
     }
 
     // The BGP router-id. `/routing/router-id` is deviated `not-supported` in holo, so
-    // per-instance is the only place it can go; the first gw zone in ZONE_TABLE order owns it.
-    let identifier = view.identity_addr(f.zone(&first.zone)?);
+    // per-instance is the only place it can go, and ONE instance spans every gw zone — so the
+    // id needs a total order over the gw zones that survives a second one appearing. Table
+    // order does not (inserting a row above would move the id); the LOWEST zone id does, and
+    // costs no config surface (spec §6 C, option 3).
+    let owner = gw_rows
+        .iter()
+        .map(|r| f.zone(&r.zone))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|z| z.id)
+        .expect("gw_rows is non-empty");
+    let identifier = view.identity_addr(owner);
     let bgp = json!({
         "type": "ietf-bgp:bgp",
         // One instance per member spanning every gw zone, so a zone name would be wrong the
@@ -335,7 +345,7 @@ fn link_cost(view: &View, transit: TransitCost, declared: u32) -> u32 {
     }
 }
 
-/// Source pinning, one rule per zone in ZONE_TABLE order: a route inside the zone's `/16`
+/// Source pinning, one rule per zone in `[[zone]]` order: a route inside the zone's `/16`
 /// block is installed with this member's identity as its preferred source, so identities are
 /// the addresses on the wire (the embedded engine's stand-in for FRR's `set src` route-map).
 pub fn prefsrc_rules(view: &View) -> Vec<(String, String)> {
@@ -349,15 +359,15 @@ pub fn prefsrc_rules(view: &View) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use serde_json::Value;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
@@ -506,7 +516,7 @@ mod tests {
     }
 
     /// Spec §12 (b): a fail-closed transit host advertises every transit link at the declared
-    /// cost + LEAF_COST_OFFSET, so no peer keeps choosing it as a path through — and back at
+    /// cost + `[cost] leaf_offset`, so no peer keeps choosing it as a path through — and back at
     /// the declared cost when the policy is restored. Asserted on the candidate the engine
     /// commits, which is the only thing the peers ever see.
     #[test]
@@ -525,8 +535,9 @@ mod tests {
             ("storage", "cfab-st-bk", 100),
             ("cluster", "cfab-cl", 10),
             ("mgmt", "cfab-mg", 10),
-            // The fallback bond is a transit link too: offset with the rest.
-            ("storage", "cfab-st-fb", 5000),
+            // The universal bond is a transit link too: offset with the rest. Its cost is
+            // derived: storage's segments sum to 10 + 100 + 200, plus one ladder step.
+            ("storage", "cfab-st-fb", 410),
         ] {
             assert_eq!(ospf_if(instance(&normal, zone), ifn)["cost"], declared);
             assert_eq!(
@@ -580,7 +591,7 @@ mod tests {
     /// must be absent, so holo never builds a session for it.
     #[test]
     fn fallback_interface_carries_a_cost_and_no_bfd_after_the_segments() {
-        for (member, cost) in [("pve1-tb", 5000), ("pve3-tb", 35000)] {
+        for (member, cost) in [("pve1-tb", 410), ("pve3-tb", 30410)] {
             let t = tree(member);
             for (zone, bond) in [
                 ("storage", "cfab-st-fb"),
@@ -623,7 +634,7 @@ mod tests {
                 assert!(ifs.contains(&bond.to_string()), "{member}: {ifs:?}");
             }
             let s = serde_json::to_string(&t).unwrap();
-            for slave in ["cfab-st-fb-st", "cfab-st-fb-cl", "cfab-st-fb-mg"] {
+            for slave in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
                 assert!(!s.contains(slave), "{member} carries slave {slave}");
             }
         }
@@ -681,25 +692,26 @@ mod tests {
     /// is exercised against a neighbor that must not see it.
     fn fabric_with_two_gw_zones() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
                 .replace(
-                    "cluster 199 6 cs6  200 0 1 -",
-                    "cluster 199 6 cs6  200 0 1 cl:199:192.168.199.254/24",
+                    "universal = { ifname = \"cfab-cl-fb\", seg = 9, vid = 301 }",
+                    "universal = { ifname = \"cfab-cl-fb\", seg = 9, vid = 301 }\n\
+                     gw = { domain = \"b\", vid = 199, router = \"192.168.199.254/24\" }",
                 );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// The same fabric with no ingress at all.
     fn fabric_without_a_gw() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
                 .replace(
-                    "mgmt    249 2 cs2  100 1 1 mg:249:192.168.249.254/24",
-                    "mgmt    249 2 cs2  100 1 1 -",
+                    "gw = { domain = \"c\", vid = 249, router = \"192.168.249.254/24\" }\n",
+                    "",
                 );
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every string value under `key`, anywhere in the tree.

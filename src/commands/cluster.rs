@@ -82,7 +82,7 @@ fn read_caps(pmx: &Pmxcfs) -> Vec<(String, Vec<(String, String)>)> {
 }
 
 fn not_clustered(reason: &str) -> String {
-    format!("not clustered: {reason}; coordination disabled, local fabric.conf only\n")
+    format!("not clustered: {reason}; coordination disabled, local fabric.toml only\n")
 }
 
 /// Pure rendering, unit-testable without a filesystem.
@@ -121,10 +121,10 @@ pub fn render_status(
     }
     match conf {
         Some(c) => out.push_str(&format!(
-            "published fabric.conf: gen {} ({} bytes) — first line: {}\n",
+            "published fabric.toml: gen {} ({} bytes) — first line: {}\n",
             c.generation, c.bytes, c.first_line
         )),
-        None => out.push_str("published fabric.conf: none\n"),
+        None => out.push_str("published fabric.toml: none\n"),
     }
     if caps.is_empty() {
         out.push_str("published caps: none\n");
@@ -141,21 +141,21 @@ pub fn render_status(
     out
 }
 
-/// Publish the (already fully validated) local fabric.conf cluster-wide: require clustered +
+/// Publish the (already fully validated) local fabric.toml cluster-wide: require clustered +
 /// quorate, take the `cfab-conf` lock, temp+rename the conf, bump the generation, release.
 pub fn publish(sys: &mut dyn Sys, pmx: &Pmxcfs, conf_text: &str) -> Result<String> {
     match pmx.probe()? {
         None => {
             return Err(Error::fatal(format!(
                 "refusing to publish: {} is not a pmxcfs mount (no .members); \
-                 not clustered — the local fabric.conf is already the only one",
+                 not clustered — the local fabric.toml is already the only one",
                 pmx.root().display()
             )));
         }
         Some(m) if m.cluster.is_none() => {
             return Err(Error::fatal(
                 "refusing to publish: pmxcfs is in local mode (single node); \
-                 not clustered — the local fabric.conf is already the only one",
+                 not clustered — the local fabric.toml is already the only one",
             ));
         }
         Some(_) => {}
@@ -181,7 +181,7 @@ pub fn publish(sys: &mut dyn Sys, pmx: &Pmxcfs, conf_text: &str) -> Result<Strin
     released?;
     clean_old_acks(pmx, generation);
     Ok(format!(
-        "published fabric.conf gen {generation} ({} bytes) to {}/\n",
+        "published fabric.toml gen {generation} ({} bytes) to {}/\n",
         conf_text.len(),
         pmx.cfab_dir().display()
     ))
@@ -260,7 +260,7 @@ mod tests {
         let dir = clustered_root();
         let pmx = Pmxcfs::at(dir.path());
         std::fs::create_dir_all(pmx.cfab_dir()).unwrap();
-        std::fs::write(pmx.conf_path(), "ZONE_TABLE=\"x\"\nmore\n").unwrap();
+        std::fs::write(pmx.conf_path(), "`[[zone]]`=\"x\"\nmore\n").unwrap();
         std::fs::write(pmx.gen_path(), "4\n").unwrap();
         let out = status(&pmx).unwrap();
         assert!(
@@ -270,7 +270,7 @@ mod tests {
         assert!(out.contains("pve1-tb  id 1  online  10.249.0.1"), "{out}");
         assert!(out.contains("pve3-tb  id 3  OFFLINE"), "{out}");
         assert!(
-            out.contains("gen 4 (20 bytes) — first line: ZONE_TABLE=\"x\""),
+            out.contains("gen 4 (20 bytes) — first line: `[[zone]]`=\"x\""),
             "{out}"
         );
     }
@@ -279,7 +279,7 @@ mod tests {
     fn status_clustered_without_published_conf() {
         let dir = clustered_root();
         let out = status(&Pmxcfs::at(dir.path())).unwrap();
-        assert!(out.contains("published fabric.conf: none"), "{out}");
+        assert!(out.contains("published fabric.toml: none"), "{out}");
         assert!(out.contains("published caps: none"), "{out}");
     }
 
@@ -348,7 +348,7 @@ mod tests {
         let mut sys = MockSys::default();
         let out = publish(&mut sys, &pmx, "A=1\n").unwrap();
         assert!(
-            out.contains("published fabric.conf gen 1 (4 bytes)"),
+            out.contains("published fabric.toml gen 1 (4 bytes)"),
             "{out}"
         );
         assert_eq!(std::fs::read_to_string(pmx.conf_path()).unwrap(), "A=1\n");

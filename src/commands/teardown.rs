@@ -188,7 +188,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     // routes swept above, so this order is ownership-proof clarity, nothing more.
     let fallback_rows = view.fallback_rows();
     let gw_rows = view.gw_rows();
-    // An ingress leg on gw island `any` is the same bond and is torn down the same way.
+    // An ingress leg on gw domain `any` is the same bond and is torn down the same way.
     let bond_legs: Vec<(&str, &[Slave])> = fallback_rows
         .iter()
         .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
@@ -307,15 +307,15 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RawConfig;
+    use crate::decl::Declaration;
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
 
     fn fabric() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
@@ -328,12 +328,12 @@ mod tests {
                 "9: cfab-st-fb: bond \n",
             )
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st\n",
+                &["ip", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st@eth9: vlan protocol 802.1Q id 300 \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a@eth9: vlan protocol 802.1Q id 300 \n",
             )
     }
 
@@ -440,19 +440,16 @@ mod tests {
             .iter()
             .filter(|c| c.starts_with("ip link del"))
             .collect();
-        assert_eq!(
-            dels,
-            ["ip link del cfab-st-fb", "ip link del cfab-st-fb-st"]
-        );
+        assert_eq!(dels, ["ip link del cfab-st-fb", "ip link del cfab-st-fb-a"]);
     }
 
-    /// The same declaration with the ingress leg on island `any`.
+    /// The same declaration with the ingress leg on domain `any`.
     fn fabric_with_a_migrating_gw() -> Fabric {
         let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
-                .replace("mg:249:", "any:249:");
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
+                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
@@ -469,12 +466,12 @@ mod tests {
                 "20: cfab-gw249: bond \n",
             )
             .on_stdout(
-                &["ip", "link", "show", "cfab-gw249-mg"],
-                "21: cfab-gw249-mg\n",
+                &["ip", "link", "show", "cfab-gw249-c"],
+                "21: cfab-gw249-c\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-gw249-mg"],
-                "21: cfab-gw249-mg@eth0: vlan protocol 802.1Q id 249 \n",
+                &["ip", "-d", "link", "show", "cfab-gw249-c"],
+                "21: cfab-gw249-c@eth0: vlan protocol 802.1Q id 249 \n",
             );
         run(&mut sys, &view).unwrap();
         let dels: Vec<&String> = sys
@@ -487,8 +484,8 @@ mod tests {
             [
                 "ip link del cfab-st-fb",
                 "ip link del cfab-gw249",
-                "ip link del cfab-st-fb-st",
-                "ip link del cfab-gw249-mg",
+                "ip link del cfab-st-fb-a",
+                "ip link del cfab-gw249-c",
             ]
         );
     }
@@ -512,15 +509,15 @@ mod tests {
         assert!(!sys.ran("ip link del cfab-st-fb"));
 
         let mut sys = sys_with_a_storage_fallback_leg().on_stdout(
-            &["ip", "-d", "link", "show", "cfab-st-fb-st"],
-            "10: cfab-st-fb-st: macvlan \n",
+            &["ip", "-d", "link", "show", "cfab-st-fb-a"],
+            "10: cfab-st-fb-a: macvlan \n",
         );
         let e = run(&mut sys, &view).unwrap_err().to_string();
         assert!(
-            e.contains("REFUSING: cfab-st-fb-st exists but is not a vlan"),
+            e.contains("REFUSING: cfab-st-fb-a exists but is not a vlan"),
             "{e}"
         );
-        assert!(!sys.ran("ip link del cfab-st-fb-st"));
+        assert!(!sys.ran("ip link del cfab-st-fb-a"));
     }
 
     /// Routes the engine left behind (a crash) are swept by `down`, one delete per route,
@@ -661,7 +658,7 @@ mod tests {
     /// refuses, names the running pid and the remedy, and changes nothing (no `ip link del`).
     #[test]
     fn down_refuses_while_a_supervisor_answers() {
-        let f = fabric(); // CFAB_RUN=/run/cfab
+        let f = fabric(); // `[runtime] run_dir`=/run/cfab
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = MockSys::default()
             .socket(
