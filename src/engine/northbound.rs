@@ -139,6 +139,26 @@ pub struct Northbound {
     pub rx_providers: NbProviderReceiver,
 }
 
+/// The embedder constants holo carries to every protocol instance. Extracted so the wiring is
+/// assertable without starting the providers.
+fn instance_shared(
+    hostname: &str,
+    fib_policy: FibPolicy,
+    bfd_socket_policy: BfdSocketPolicy,
+    bgp_listen_policy: BgpListenPolicy,
+    control_priority: Option<u32>,
+) -> InstanceShared {
+    InstanceShared {
+        db: None,
+        hostname: Some(hostname.to_string()),
+        fib_policy: Arc::new(fib_policy),
+        bfd_socket_policy,
+        bgp_listen_policy,
+        control_priority,
+        ..Default::default()
+    }
+}
+
 impl Northbound {
     /// Start holo-interface, holo-policy and holo-routing (which spawns the OSPF, BFD and
     /// BGP instances itself). Must run inside the tokio runtime: the providers spawn tasks.
@@ -154,15 +174,13 @@ impl Northbound {
 
         let (ibus_tx, ibus_rx) = ibus::ibus_channels();
         let (provider_tx, rx_providers) = mpsc::unbounded_channel();
-        let shared = InstanceShared {
-            db: None,
-            hostname: Some(hostname.to_string()),
-            fib_policy: Arc::new(fib_policy),
+        let shared = instance_shared(
+            hostname,
+            fib_policy,
             bfd_socket_policy,
             bgp_listen_policy,
             control_priority,
-            ..Default::default()
-        };
+        );
 
         let mut providers = Vec::new();
         let mut registered_paths = HashMap::new();
@@ -549,6 +567,23 @@ mod tests {
             BfdSocketPolicy::default(),
             BgpListenPolicy::NoListener,
             Some(6),
+        );
+        // What `start` just handed holo: the priority reaches every OSPF interface socket and
+        // BFD Tx socket these providers open (the socket itself cannot be read back from here;
+        // the wire capture on pve3 is what proves the frame).
+        assert_eq!(
+            instance_shared(
+                "pve1-tb",
+                FibPolicy {
+                    proto_base: Some(TEST_PROTO_BASE),
+                    prefsrc: Vec::new(),
+                },
+                BfdSocketPolicy::default(),
+                BgpListenPolicy::NoListener,
+                Some(6),
+            )
+            .control_priority,
+            Some(6)
         );
         assert!(
             nb.commit(candidate).await.unwrap(),

@@ -46,10 +46,7 @@ pub fn run(fabric: &Fabric, view: &View, unsafe_no_prefsrc: bool) -> Result<()> 
     };
     let bfd_policy = bfd_socket_policy(fabric);
     let bgp_policy = bgp_listen_policy(fabric);
-    // The engine marks its own OSPF/BFD frames with the fabric's control priority: the VLAN
-    // sub-interface's egress-qos-map turns sk_priority into the 802.1p bits, so this needs no
-    // netfilter and works on kernels that have none.
-    let control_priority = Some(u32::from(fabric.pcp_ctrl));
+    let control_priority = control_priority(fabric);
     let sock_path = PathBuf::from(&fabric.run_dir).join(SOCK_NAME);
     let lock_path = PathBuf::from(&fabric.run_dir).join(LOCK_NAME);
     // Before anything destructive: starting the providers purges the private-proto routes
@@ -256,6 +253,14 @@ pub fn parse_prefsrc(
         .collect()
 }
 
+/// The engine marks its own OSPF/BFD frames with the fabric's control priority: the VLAN
+/// sub-interface's egress-qos-map turns sk_priority into the 802.1p bits, so the lift needs no
+/// netfilter and works on kernels that have none. Always set: PCP_CTRL is required and range
+/// checked at parse.
+fn control_priority(fabric: &Fabric) -> Option<u32> {
+    Some(u32::from(fabric.pcp_ctrl))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +272,18 @@ mod tests {
         std::fs::write(&sock, "").unwrap();
         cleanup(&sock);
         assert!(!sock.exists());
+    }
+
+    #[test]
+    fn the_control_priority_is_the_declared_pcp_ctrl() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
+                .unwrap();
+        let mut fabric =
+            Fabric::from_raw(&crate::config::RawConfig::parse(&text).unwrap()).unwrap();
+        assert_eq!(control_priority(&fabric), Some(6));
+        fabric.pcp_ctrl = 5;
+        assert_eq!(control_priority(&fabric), Some(5));
     }
 
     #[test]
