@@ -465,10 +465,11 @@ instead of failing.
 .B RestartPreventExitStatus=3\ 4
 stops systemd from retrying a refused apply or a lost lock.
 .PP
-A package upgrade neither stops nor restarts the unit: stopping it tears the fabric
-down and takes every identity on the host with it. The supervisor that is already
-running keeps the old binary's inode, so the new binary takes effect at the next
-.RB ( "systemctl restart cfab" ).
+A package upgrade restarts the unit once the new files are in place (teardown and
+re\-apply: every identity on the host is down for the restart). It is not left running
+on the old binary: the supervisor respawns its children from
+.IR /usr/bin/cfab ,
+so an un\-restarted upgrade would run the next engine under the previous supervisor.
 .RB ( "systemctl reload cfab" )
 re\-applies the declaration in place (no teardown, no netdev churn) but restarts the
 engine and the shape daemon: measured 2026\-09\-06 on the testbed, 6\(en10 s of loss on

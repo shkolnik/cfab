@@ -64,11 +64,11 @@ unit-scripts = "packaging/deb"
 unit-name = "cfab"
 enable = false
 start = false
-# An upgrade must not tear the fabric down: stopping the unit runs `cfab down`, an outage
-# for every identity on the host. Both false leaves the running unit alone; the new binary
-# takes effect on the next `systemctl reload cfab`.
+# Restart, never stop-then-install: the unit is down only for the restart itself. Leaving
+# the old supervisor running was worse (James 2026-09-06): it respawns its children from
+# /usr/bin/cfab, so the next crash or reload runs a NEW engine under an OLD supervisor.
 stop-on-upgrade = false
-restart-after-upgrade = false
+restart-after-upgrade = true
 
 [lints.rust]
 unsafe_code = "forbid"
