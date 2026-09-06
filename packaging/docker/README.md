@@ -6,18 +6,28 @@ A generic runtime image for hosts whose OS cannot run cfab natively (e.g. a NAS)
 declaration and, when it differs from the container's own hostname, which row in
 `MEMBER_TABLE` this container is — is supplied at `docker run`/compose time.
 
-## Build
+## Published image
+
+Formal releases are built and pushed by CI to `ghcr.io/shkolnik/cfab` (public, `linux/amd64`),
+tagged `:X.Y.Z`, `:X.Y.Z-<deb revision>`, and `:latest`. Prefer the published image:
 
 ```
-cp /path/to/cfab_0.2.0-1_amd64.deb packaging/docker/cfab.deb
-docker build --build-arg CFAB_DEB=cfab.deb -t cfab packaging/docker
+docker pull ghcr.io/shkolnik/cfab:0.3.2
 ```
 
-or, with BuildKit, point at a deb that lives elsewhere without copying it into the tree first:
+## Build it yourself
+
+The deb goes beside the Dockerfile — that is the default `CFAB_DEB` and the path CI uses:
 
 ```
-docker buildx build --build-context debdir=/path/to/out \
-    --build-arg CFAB_DEB=debdir/cfab_0.2.0-1_amd64.deb -t cfab packaging/docker
+cp /path/to/cfab_0.3.2-1_amd64.deb packaging/docker/cfab.deb
+docker build -t cfab packaging/docker
+```
+
+A differently named deb in the same directory works with a build-arg:
+
+```
+docker build --build-arg CFAB_DEB=cfab_0.3.2-1_amd64.deb -t cfab packaging/docker
 ```
 
 ## Run — validate only (`cfab check`)
@@ -28,8 +38,11 @@ No network privilege is needed to lint a declaration:
 docker run --rm --network none \
     -v /path/to/fabric.conf:/etc/cfab/fabric.conf:ro \
     -e CFAB_HOST=pve1-tb \
-    cfab cfab check
+    ghcr.io/shkolnik/cfab:0.3.2 check
 ```
+
+The entrypoint is `/usr/bin/cfab`, so the argv after the image name is the subcommand only —
+`check`, not `cfab check`.
 
 `CFAB_HOST` selects which `MEMBER_TABLE` row this container is; leave it unset to fall back to
 the container's own hostname (`docker run --hostname`).
@@ -46,7 +59,7 @@ multicast, so this is `network_mode: host`, not a published-ports bridge:
 ```yaml
 services:
   cfab:
-    image: cfab
+    image: ghcr.io/shkolnik/cfab:0.3.2
     network_mode: host
     privileged: true
     restart: unless-stopped
@@ -81,6 +94,10 @@ bakes its own `fabric.conf` and a leaf-specific entrypoint, and is the thing act
 - **No systemd shims** — those exist only so a *test fixture* can assert `systemctl is-active`
   without a real init system; they are not part of running cfab and would be actively
   misleading baked into a real deployment image.
+- **`iptables` IS baked in**, although the deb only recommends it: a leaf on a kernel without
+  `nf_tables` (a real Synology — DSM 7.3.2, Linux 4.4) falls back to an `iptables-legacy`
+  ceiling-only backend, and that fallback is a main reason this image exists. The image installs
+  with `--no-install-recommends`, so it is named explicitly in the Dockerfile.
 - **No diagnostic tools** (`tcpdump`, `python3`, `jq`, ...) baked in — they are fixture/test
   conveniences, not part of the runtime contract; add them in a derived `FROM cfab` image if a
   deployment wants them.
