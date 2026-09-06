@@ -933,6 +933,9 @@ pub(crate) enum Reload {
 /// (`[[member]]`, `[[zone]]`, segments) is part of the fabric and does count.
 pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
     match parse_for_member(member, text) {
+        // The `fabric.toml: ` prefix a config error carries is dropped here: the refusal names
+        // the file itself, and the outer error re-adds the prefix once.
+        Err(crate::Error::Config(msg)) => Reload::Invalid(format!("{config}: {msg}")),
         Err(e) => Reload::Invalid(format!("{config}: {e}")),
         Ok(next) if next == *current => Reload::Identical,
         Ok(_) => Reload::Changed,
