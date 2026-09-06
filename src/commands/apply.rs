@@ -1510,6 +1510,31 @@ mod tests {
         );
     }
 
+    /// The WHOLE recorded sequence of a from-scratch `apply`, argv by argv and write by write,
+    /// for a forwarding host and for a leaf. The per-leg builders below are shared with the
+    /// forwarding watchdog's rebuild step (`fwd_watchdog::restore_missing_legs`), which exists
+    /// precisely so the two spellings cannot drift — this pins the other half of that bargain:
+    /// factoring a builder out must not move one byte of what `apply` issues, in what order.
+    #[test]
+    fn the_whole_apply_sequence_is_pinned() {
+        for member in ["pve1-tb", "pve3-tb"] {
+            let f = fabric();
+            let view = View::new(&f, member).unwrap();
+            let mut sys = absent_fallback_netdevs(up_sys(&view), &view);
+            run(&mut sys, &view, &opts()).unwrap();
+            let got = format!("{}\n", sys.calls.join("\n"));
+            let path = format!(
+                "{}/tests/fixtures/apply-argv-{member}.txt",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let want = std::fs::read_to_string(&path).unwrap_or_default();
+            if got != want {
+                std::fs::write(format!("{path}.actual"), &got).unwrap();
+                panic!("the apply sequence for {member} changed; see {path}.actual");
+            }
+        }
+    }
+
     /// VRRP was deleted (the NAS is a fabric leaf, James 2026-09-02): a forwarding host's
     /// `up` must create no macvlan at all — the storage VIP netdev was the only one cfab ever
     /// made. The example fabric declares ``[forward] enabled`=1`, the case that used to build it.
