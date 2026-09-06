@@ -58,7 +58,10 @@ jobs:
       - name: Holo pin and feature guard
         run: bash scripts/holo-check.sh
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        # +stable: rustup otherwise warns that rust-toolchain.toml overrides the
+        # default toolchain for the install; the version is pinned so a
+        # cargo-deb release cannot change the package under us.
+        run: cargo +stable install --locked cargo-deb@3.8.0
       - name: Build Debian package
         # glibc deb for the bake-off; a static musl build is a post-decision
         # size measurement (spec §11).
