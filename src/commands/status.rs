@@ -187,7 +187,11 @@ pub fn run(
 /// `run_dir` lives *inside* the declaration, so finding the copy means knowing the run dir
 /// before parsing anything: read `config` for it, and fall back to the packaged default
 /// `/run/cfab` when that file is the very thing that will not parse. Both are tried, since a
-/// declaration whose `run_dir` was edited since the apply points at the wrong directory.
+/// declaration whose `run_dir` was edited since the apply points at the wrong directory. The
+/// one case this cannot cover is a member that both moved `run_dir` off the default AND has an
+/// unparseable file: nothing on disk can then say where the copy is, and status falls back to
+/// today's exit 1. No packaged deployment moves it (only `scripts/engine-oracle.sh`, a test
+/// harness, does).
 pub fn applied_fabric(sys: &dyn Sys, config: &std::path::Path) -> Option<Fabric> {
     let declared_run_dir = sys
         .read(&config.to_string_lossy())
