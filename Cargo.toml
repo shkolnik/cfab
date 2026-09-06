@@ -1,6 +1,6 @@
 [package]
 name = "cfab"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.toml declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
