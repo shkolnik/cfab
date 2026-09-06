@@ -1692,6 +1692,21 @@ mod tests {
         .to_string()
     }
 
+    /// The `components` document of a supervisor whose engine is down: it keeps failing to
+    /// start, which is the state every "provably not our socket" rule turns on.
+    fn engine_down_components() -> String {
+        serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 60, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 4, "last_exit": {"cause": "exit 1", "s_ago": 1}}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string()
+    }
+
     /// The healthy leaf, ready to run: every posture file, every route, every session up, and a
     /// supervisor answering the `components` query.
     fn healthy_leaf(view: &View) -> MockSys {
@@ -2708,13 +2723,37 @@ mod tests {
         );
     }
 
-    /// The port is one port across both families: a holder that bound only `[::]` still takes
-    /// every packet from the engine, so /proc/net/udp6 is read the same way.
+    /// The engine opens no IPv6 BFD socket (`bfd_socket_policy`, `ipv6: false`), so once its
+    /// IPv4 socket is bound a `[::]` holder can take nothing from it: while the engine runs, a
+    /// v6-only holder is not news.
     #[test]
-    fn a_holder_on_our_port_over_ipv6_only_is_a_reason_line() {
+    fn a_v6_only_holder_is_silent_while_the_engine_runs() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = frr_bfdd(healthy_leaf(&view), &[41232])
+            .file("/proc/net/udp", &proc_net_udp(&[(9000, 41240)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[(3784, 41232)]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report.output.contains("bfd udp/"),
+            "a v6-only holder takes nothing from a bound v4 socket:\n{}",
+            report.output
+        );
+    }
+
+    /// The other side of it: while the engine is NOT bound, a dual-stack holder on `[::]` is
+    /// exactly what keeps its IPv4 bind from succeeding, so the v6 table counts.
+    #[test]
+    fn a_v6_only_holder_is_reported_while_the_engine_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = frr_bfdd(leaf_env(&view), &[41232])
+            .socket_verb(
+                "/run/cfab/cfab.sock",
+                "components",
+                &engine_down_components(),
+            )
             .file("/proc/net/udp", &proc_net_udp(&[(9000, 41240)]))
             .file("/proc/net/udp6", &proc_net_udp6(&[(3784, 41232)]));
         let report = run(&mut sys, &view, 0, false, None).unwrap();
@@ -2724,6 +2763,73 @@ mod tests {
                  engine needs exclusively\n"
             ),
             "{}",
+            report.output
+        );
+    }
+
+    /// With both units enabled the remedy names the one that manages the process: stopping
+    /// bfdd.service is the narrower action, and frr.service may not even own this bfdd.
+    #[test]
+    fn the_remedy_prefers_the_bfdd_unit_when_both_are_enabled() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = frr_bfdd(healthy_leaf(&view), &[41231])
+            .on_stdout(&["systemctl", "is-enabled", "bfdd.service"], "enabled\n")
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  remedy: stop bfdd: systemctl disable --now bfdd; or declare a free [bfd] port \
+                 (now 3784) in fabric.toml on EVERY member — every peer of a session must use \
+                 the same port\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// One condition, one diagnosis. A holder we can see live AND a bind line the engine left in
+    /// its ring buffer are the same fact; the live custody read is the more specific of the two,
+    /// so the ring-buffer diagnosis stands down rather than saying it again in other words.
+    #[test]
+    fn a_live_holder_and_a_stale_bind_line_produce_one_diagnosis() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let log = serde_json::json!({
+            "lines": [
+                "ERROR bfd: cannot bind udp 0.0.0.0:3784: address in use (holder unknown)"
+            ]
+        })
+        .to_string();
+        let mut sys = frr_bfdd(leaf_env(&view), &[41231])
+            .socket_verb(
+                "/run/cfab/cfab.sock",
+                "components",
+                &engine_down_components(),
+            )
+            .socket_verb("/run/cfab/cfab.sock", "log", &log)
+            .file("/proc/net/udp", &proc_net_udp(&[(3784, 41231)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(
+            report.output.matches("bfd udp/3784:").count(),
+            1,
+            "one condition, one headline:\n{}",
+            report.output
+        );
+        assert_eq!(
+            report.output.matches("  remedy: ").count(),
+            1,
+            "one condition, one remedy:\n{}",
+            report.output
+        );
+        assert!(
+            report.output.contains(
+                "  bfd udp/3784: bfdd (pid 812, frr.service enabled) holds this port, which the \
+                 engine needs exclusively\n"
+            ),
+            "the live holder is the one that survives:\n{}",
             report.output
         );
     }
