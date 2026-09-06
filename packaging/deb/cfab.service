@@ -19,13 +19,22 @@ NotifyAccess=main
 # CFAB_HOST only, and only when this member's row is not named by the kernel hostname.
 EnvironmentFile=-/etc/default/cfab
 ExecStart=/usr/bin/cfab run
-# Re-apply in place: no teardown, no netdev churn. The engine and the shape daemon restart.
+# Reload re-reads /etc/cfab/fabric.toml. Unchanged declaration = re-apply in place: no
+# teardown, no netdev churn, the engine and the shape daemon restart. Changed declaration =
+# teardown + exit 6, and the restart below applies it (an in-place apply cannot: it creates and
+# repairs, it never removes what the old declaration had). Invalid or unreadable = refused, the
+# running fabric is kept and the reason shows up in `cfab status`.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 # 3 = the declaration or this host refused the apply; 4 = another supervisor holds the lock.
 # Neither is fixed by trying again.
 RestartPreventExitStatus=3 4
+# 6 = "the declaration changed, start me again on it". Both lines are needed: SuccessExitStatus
+# keeps the unit out of `failed` (the stop was clean and deliberate), and RestartForceExitStatus
+# then restarts it anyway, which Restart=on-failure alone would not do for a success status.
+SuccessExitStatus=6
+RestartForceExitStatus=6
 # The apply may take START_WAIT (30 s) + SETTLE (3 s) before READY=1.
 TimeoutStartSec=120
 # The stop sequence signals all children at once and gives each 10 s before SIGKILL, then

@@ -92,6 +92,12 @@ fn watchdog(w: &WatchdogInfo) -> String {
 pub fn render_line(c: &Components) -> String {
     let mut parts: Vec<String> = c.components.iter().map(component).collect();
     parts.push(watchdog(&c.watchdog));
+    // A refused reload leaves every component healthy — the running fabric is exactly the one
+    // that was up — so the only place an operator can learn that their edit did NOT take is
+    // here. It rides the always-printed line rather than a reason row for that reason.
+    if let Some(e) = &c.supervisor.last_apply_error {
+        parts.push(format!("last apply: {e}"));
+    }
     format!("components: {}", parts.join(" | "))
 }
 

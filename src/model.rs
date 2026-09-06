@@ -120,7 +120,7 @@ fn bond_ifname_too_long(ifname: &str) -> bool {
 }
 
 /// One `[[member]]` row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Member {
     pub name: String,
     /// Node id: the host octet of every address this member holds (identity 10.<id>.0.<node>).
@@ -186,7 +186,7 @@ impl fmt::Display for Dscp {
 
 /// Where the OUTSIDE enters a zone: a router-owned VLAN, distinct from every fabric segment,
 /// so the router never holds an address inside a segment and never sees the fabric's IGP.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ZoneGw {
     pub scope: SegScope,
     pub vid: u16,
@@ -224,7 +224,7 @@ impl ZoneGw {
 }
 
 /// A traffic class and the segments that carry it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Zone {
     pub name: String,
     /// The zone's number: OSPF instance, identity netdev cfab-id<id>, block 10.<id>.0.0/16.
@@ -257,7 +257,7 @@ impl Zone {
 
 /// One a zone's `segments` row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
 /// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Segment {
     pub ifname: String,
     pub scope: SegScope,
@@ -268,7 +268,7 @@ pub struct Segment {
 
 /// One a member's `prefs` row: this member's complete wire order for this zone, replacing the derived
 /// one. Complete or an error — an override is never blended with the default.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WirePref {
     pub member: String,
     pub zone: String,
@@ -276,7 +276,7 @@ pub struct WirePref {
 }
 
 /// The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Fabric {
     /// The declared switch domains, in declaration order.
     pub domains: Vec<DomainId>,

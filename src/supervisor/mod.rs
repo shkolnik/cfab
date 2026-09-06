@@ -4,8 +4,18 @@
 //! The lifecycle (spec §6): take the instance lock, apply the fabric, spawn the engine and wait
 //! for it to become ready, read the engine back, spawn the shape daemon and conf-sync where
 //! their predicates hold, then supervise — restart any child 2 s after it exits while it is
-//! wanted, re-apply on SIGHUP or a `reapply` request, and on SIGTERM/SIGINT tear the fabric
+//! wanted, reload on SIGHUP or a `reapply` request, and on SIGTERM/SIGINT tear the fabric
 //! down and exit 0.
+//!
+//! **A reload re-reads the declaration** (James's ruling, 2026-09-06). SIGHUP and the socket
+//! `reapply` are one path: read `--config` through `Sys`, derive the `Fabric` it now describes
+//! and compare it with the running one (`classify_reload`). The same fabric re-applies in place
+//! as before (a repair); a changed, valid one runs the stop sequence and exits `EXIT_RELOAD` so
+//! systemd starts a fresh supervisor on it — `apply::run` creates and repairs but never prunes
+//! what a declaration stopped declaring, so an in-place switch would leave the old fabric's
+//! netdevs, rules and tables resident; anything else (unreadable, invalid, or no longer naming
+//! this member) is refused, leaving the running fabric untouched and the reason in
+//! `last_apply_error`, where `cfab status` prints it.
 //!
 //! **The spawn-site invariant (spec §7) is structural, not a preference.** Every
 //! `Command::spawn` — the initial spawns, every backoff respawn, and the re-apply's restarts —
@@ -45,6 +55,12 @@ pub const EXIT_INTERNAL: u8 = 1;
 pub const EXIT_APPLY_REFUSED: u8 = 3;
 /// Another supervisor already holds `<run_dir>/cfab.lock` (spec §14).
 pub const EXIT_LOCK_HELD: u8 = 4;
+/// The declaration on disk changed under a reload: the fabric was torn down and this process
+/// exits so systemd starts a fresh one on the new file. NOT 5 — that status already means
+/// "a supervised child could not arm `PR_SET_PDEATHSIG`" in this same binary, and one number
+/// must not carry two meanings. The unit turns it into a restart with
+/// `RestartForceExitStatus=6` and `SuccessExitStatus=6`.
+pub const EXIT_RELOAD: u8 = 6;
 
 /// The engine's readiness poll — the same values `engine_ctl` uses privately (spec §4/§8): the
 /// state socket answers `"ready": true` within `START_WAIT_MS`, retried every `POLL_MS`.
@@ -69,7 +85,7 @@ pub(crate) enum Cmd {
     /// A `reapply` over `cfab.sock`: the reply carries the apply result back to the (blocked)
     /// socket connection thread, so `reapply` answers only after the re-apply finishes (§9).
     Reapply(std::sync::mpsc::Sender<crate::error::Result<()>>),
-    /// SIGHUP: re-apply in place, no reply.
+    /// SIGHUP: reload, no reply.
     Hangup,
     /// SIGTERM/SIGINT: begin the stop sequence and exit 0.
     Terminate,
@@ -570,6 +586,10 @@ pub(crate) async fn run_with(
         Duration::from_millis(POLL_MS),
     );
 
+    // Set by a reload that found a changed declaration: the stop sequence below runs unchanged,
+    // and the exit status asks systemd for the restart that applies the new file.
+    let mut reload = false;
+
     loop {
         let next_respawn = pending.iter().map(|(_, d)| *d).min();
         let respawn_sleep = async {
@@ -619,22 +639,46 @@ pub(crate) async fn run_with(
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
-                match cmd {
+                // SIGHUP and a socket `reapply` are the SAME path (James's ruling, 2026-09-06):
+                // re-read the declaration and act on what it says. The only difference is
+                // whether anybody is waiting for an answer.
+                let reply = match cmd {
                     Cmd::Terminate => break,
-                    Cmd::Hangup => {
-                        let _ = do_reapply(
-                            sys, view, &opts, &shared, spawner, exe, config, pid,
-                            &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
-                        )
-                        .await;
-                    }
-                    Cmd::Reapply(reply) => {
+                    Cmd::Hangup => None,
+                    Cmd::Reapply(tx) => Some(tx),
+                };
+                match read_reload(&*sys, view, config) {
+                    Reload::Identical => {
                         let r = do_reapply(
                             sys, view, &opts, &shared, spawner, exe, config, pid,
                             &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
                         )
                         .await;
-                        let _ = reply.send(r);
+                        if let Some(tx) = reply {
+                            let _ = tx.send(r);
+                        }
+                    }
+                    Reload::Changed => {
+                        eprintln!(
+                            "cfab: declaration changed, restarting to apply {config}"
+                        );
+                        // Answer the requester BEFORE the stop sequence: the restart takes the
+                        // socket with it, and a blocked `cfab reapply` must not hang for it.
+                        if let Some(tx) = reply {
+                            let _ = tx.send(Ok(()));
+                        }
+                        reload = true;
+                        break;
+                    }
+                    Reload::Invalid(why) => {
+                        let e = crate::error::Error::config(format!(
+                            "reload refused, keeping the running fabric: {why}"
+                        ));
+                        shared.lock().unwrap().last_apply_error = Some(e.to_string());
+                        eprintln!("cfab: {e}");
+                        if let Some(tx) = reply {
+                            let _ = tx.send(Err(e));
+                        }
                     }
                 }
             }
@@ -751,8 +795,9 @@ pub(crate) async fn run_with(
         Ok(msg) => print!("{msg}"),
         Err(e) => eprintln!("{e}"),
     }
-    // 6. Exit 0.
-    EXIT_OK
+    // 6. Exit 0 — or `EXIT_RELOAD`, which is the same clean stop plus "start me again on the
+    // declaration I just read".
+    if reload { EXIT_RELOAD } else { EXIT_OK }
 }
 
 /// Argv for a supervised child: exactly today's `<exe> --config <config> --host <member>
@@ -834,6 +879,59 @@ fn launch(
             pending.retain(|(n, _)| *n != name);
             pending.push((name, now + BACKOFF));
         }
+    }
+}
+
+/// What a reload (SIGHUP, or a `reapply` request — one code path) found in the declaration on
+/// disk. The supervisor runs on the `Fabric` it was started with, so "the file changed" is a
+/// question that can only be answered by re-reading it at reload time (finding F2: before this,
+/// `systemctl reload cfab` silently re-applied the declaration loaded at start).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reload {
+    /// The same fabric: re-apply in place (repair), exactly as every reload did before.
+    Identical,
+    /// A different, valid fabric that still declares this member. `apply::run` is
+    /// create-if-absent / refuse-foreign and prunes nothing a declaration stopped declaring, so
+    /// the only correct way to reach the new fabric is the full stop sequence plus a restart.
+    Changed,
+    /// Unreadable, unparseable, invalid, or no longer declaring this member: refuse and keep
+    /// running on the fabric that is already up. Carries the operator-facing reason.
+    Invalid(String),
+}
+
+/// The pure half of the reload decision: the running fabric plus the text now on disk. Equality
+/// is over the DERIVED `Fabric`, not the file bytes, so a comment, a reordered key or a
+/// whitespace edit re-applies in place instead of restarting the fabric.
+pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
+    let refuse = |e: crate::error::Error| Reload::Invalid(format!("{config}: {e}"));
+    let decl = match crate::decl::Declaration::parse(text) {
+        Ok(d) => d,
+        Err(e) => return refuse(e),
+    };
+    let next = match Fabric::from_decl(&decl) {
+        Ok(f) => f,
+        Err(e) => return refuse(e),
+    };
+    // A declaration that no longer names this host is invalid *for this supervisor*: applying it
+    // would be applying somebody else's fabric, and exiting on it would tear this one down for
+    // what is far more likely a typo than a decommission.
+    if let Err(e) = next.member(member) {
+        return refuse(e);
+    }
+    if next == *current {
+        Reload::Identical
+    } else {
+        Reload::Changed
+    }
+}
+
+/// The impure half: read `config` through `Sys` (never `std::fs`, so the mocks see it) and
+/// classify it. An unreadable or missing file is `Invalid` — never a reason to tear a running
+/// fabric down.
+fn read_reload(sys: &dyn Sys, view: &View, config: &str) -> Reload {
+    match sys.read(config) {
+        Ok(text) => classify_reload(view.fabric, &view.member.name, config, &text),
+        Err(e) => Reload::Invalid(format!("cannot read {config}: {e}")),
     }
 }
 
@@ -1136,13 +1234,23 @@ mod tests {
     const EXE: &str = "/usr/bin/cfab";
     const CONFIG: &str = "/etc/cfab/fabric.toml";
 
-    fn fabric_at(run_dir: &Path) -> Fabric {
+    /// The packaged example declaration with `[runtime] run_dir` moved into the test's tempdir.
+    /// It is the TEXT, not just the model: a reload re-reads `CONFIG`, so the fixture's file and
+    /// the fixture's fabric must be the same declaration or every reload would read "changed".
+    fn decl_text(run_dir: &Path) -> String {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
-        let mut f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
-        f.run_dir = run_dir.to_str().unwrap().to_string();
-        f
+        let out = text.replace(
+            "run_dir = \"/run/cfab\"",
+            &format!("run_dir = \"{}\"", run_dir.display()),
+        );
+        assert_ne!(out, text, "the example's run_dir line moved");
+        out
+    }
+
+    fn fabric_at(run_dir: &Path) -> Fabric {
+        Fabric::from_decl(&Declaration::parse(&decl_text(run_dir)).unwrap()).unwrap()
     }
 
     /// A pmxcfs root with no `.members` — `probe()` returns `None`, so conf-sync is stopped
@@ -1156,6 +1264,7 @@ mod tests {
     /// readable, and the engine socket answering a healthy state document for `view`.
     fn fresh_sys(view: &View, run_dir: &Path) -> MockSys {
         let mut sys = MockSys::default()
+            .file(CONFIG, &decl_text(run_dir))
             .file("/proc/sys/net/ipv4/conf/all/rp_filter", "1\n")
             .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
             .on_stdout(
