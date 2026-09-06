@@ -12,6 +12,7 @@ use crate::commands::common::{
 };
 use crate::derive::{GwRow, Slave, View};
 use crate::emit;
+use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::{MemberKind, Role};
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
@@ -36,6 +37,172 @@ fn absent_wire_warning(dev: &str) -> String {
         "wire {dev} absent (no such netdev) — its segments are not configured; the fabric is \
          up on the rest"
     )
+}
+
+/// The three legacy binaries, by name. `iptables-legacy-restore` loads the ceiling atomically,
+/// `iptables-legacy-save` is both readback halves (drift and counters), `iptables-legacy` adds
+/// the OUTPUT jump and sweeps stale chains.
+const IPT: [&str; 3] = [
+    "iptables-legacy",
+    "iptables-legacy-save",
+    "iptables-legacy-restore",
+];
+
+/// Which backend a leaf's mark state goes through, decided at `up` on the kernel's own
+/// refusal and never inferred from a distro, a kind or a knob.
+///
+/// The probe is a BARE table add, and must stay one forever: EOPNOTSUPP from a probe that grew
+/// a rule would mean "that expression is unsupported", not "this kernel has no nf_tables", and
+/// would route a perfectly capable member onto the ceiling-only backend.
+fn mark_backend_for_leaf(sys: &mut dyn Sys) -> Result<MarkBackend> {
+    let have_nft = have_tool(sys, "nft")?;
+    if !have_nft {
+        for t in IPT {
+            if !have_tool(sys, t)? {
+                return Err(Error::fatal(format!(
+                    "neither nft nor {t} is installed — a leaf needs one of them for the \
+                     fallback control-egress ceiling"
+                )));
+            }
+        }
+        return Ok(MarkBackend::IptablesLegacy);
+    }
+    // `LC_ALL=C`: strerror is localized, and the fallback is taken on this one exact text.
+    let probe = sys.run(&[
+        "/usr/bin/env",
+        "LC_ALL=C",
+        "nft",
+        "add",
+        "table",
+        "inet",
+        "cfabprobe",
+    ])?;
+    // Delete unconditionally, errors ignored: a failed delete must never strand the table.
+    run_ignore(sys, &["nft", "delete", "table", "inet", "cfabprobe"])?;
+    if probe.ok() {
+        return Ok(MarkBackend::Nft);
+    }
+    if !probe.stderr.contains("Operation not supported") {
+        // Any other failure — a broken nftables install, a seccomp/AppArmor EPERM, an
+        // nfnetlink init failure — is NOT "this kernel has no nf_tables". Refuse with the
+        // kernel's own words rather than silently policing with a weaker backend.
+        return Err(Error::fatal(format!(
+            "nft is installed but unusable here: {}",
+            probe.stderr.trim()
+        )));
+    }
+    for t in IPT {
+        if !have_tool(sys, t)? {
+            return Err(Error::fatal(format!(
+                "this kernel has no nf_tables (nft: Operation not supported) and {t} is not \
+                 installed — a leaf needs one of them for the fallback control-egress ceiling"
+            )));
+        }
+    }
+    Ok(MarkBackend::IptablesLegacy)
+}
+
+/// Remove whatever the OTHER backend left behind, before this one installs. A leaf that gains
+/// nf_tables (a DSM upgrade) or loses it must never end up policed by both, or by neither with
+/// stale chains still resident. Each half is `have_tool`-guarded, so a member that no longer
+/// has the other backend's binaries still applies.
+fn remove_other_mark_backend(
+    sys: &mut dyn Sys,
+    f: &crate::model::Fabric,
+    chosen: MarkBackend,
+) -> Result<()> {
+    match chosen {
+        MarkBackend::Nft => {
+            if have_tool(sys, "iptables-legacy")? && have_tool(sys, "iptables-legacy-save")? {
+                let save = sys.run(&["iptables-legacy-save", "-t", "mangle"])?;
+                for chain in emit::ceiling_ipt::chains_in(&save.stdout) {
+                    if chain == emit::ceiling_ipt::OUT_CHAIN {
+                        run_ignore(
+                            sys,
+                            &[
+                                "iptables-legacy",
+                                "-t",
+                                "mangle",
+                                "-D",
+                                "OUTPUT",
+                                "-j",
+                                &chain,
+                            ],
+                        )?;
+                    }
+                    run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-F", &chain])?;
+                }
+                for chain in emit::ceiling_ipt::chains_in(&save.stdout) {
+                    run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-X", &chain])?;
+                }
+            }
+            sys.remove(&format!("{}/mark.ipt", f.run_dir))?;
+        }
+        MarkBackend::IptablesLegacy => {
+            if have_tool(sys, "nft")? {
+                run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
+            }
+            sys.remove(&format!("{}/mark.nft", f.run_dir))?;
+        }
+    }
+    Ok(())
+}
+
+/// Install the mark state through the iptables-legacy backend: ceiling only, no bulk clamp
+/// (the kernel this runs on has no `-j DSCP` target at all — `status` says so).
+fn install_mark_ipt(sys: &mut dyn Sys, view: &View) -> Result<()> {
+    let f = view.fabric;
+    let path = format!("{}/mark.ipt", f.run_dir);
+    sys.write(&path, &emit::ceiling_ipt::generate(view)?)?;
+    // A filename argument, not stdin: `Sys` runs argv vectors, never a shell.
+    run_ok(sys, &["iptables-legacy-restore", "--noflush", &path])?;
+    // The jump, idempotently: `-C` is the only way to ask "is it already there?".
+    if !sys
+        .run(&[
+            "iptables-legacy",
+            "-t",
+            "mangle",
+            "-C",
+            "OUTPUT",
+            "-j",
+            emit::ceiling_ipt::OUT_CHAIN,
+        ])?
+        .ok()
+    {
+        run_ok(
+            sys,
+            &[
+                "iptables-legacy",
+                "-t",
+                "mangle",
+                "-A",
+                "OUTPUT",
+                "-j",
+                emit::ceiling_ipt::OUT_CHAIN,
+            ],
+        )?;
+    }
+    let mut save = run_ok(sys, &["iptables-legacy-save", "-t", "mangle"])?.stdout;
+    // A zone that lost its fallback row leaves an empty chain behind: the restore's `-F
+    // cfab-out` unhooked it, but the chain is still resident. Delete it by the exact name the
+    // readback gave us — never by pattern over chains that are not ours.
+    let wanted: Vec<String> = emit::ceiling_ipt::chains_in(&emit::ceiling_ipt::generate(view)?);
+    let stale: Vec<String> = emit::ceiling_ipt::chains_in(&save)
+        .into_iter()
+        .filter(|c| !wanted.contains(c))
+        .collect();
+    if !stale.is_empty() {
+        for chain in &stale {
+            run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-F", chain])?;
+            run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-X", chain])?;
+        }
+        save = run_ok(sys, &["iptables-legacy-save", "-t", "mangle"])?.stdout;
+    }
+    sys.write(
+        &format!("{}/mark.applied", f.run_dir),
+        &emit::ceiling_ipt::ours(&save),
+    )?;
+    Ok(())
 }
 
 /// Bring up every declared wire, releasing it from a manager it does not belong to. Absence
@@ -92,11 +259,13 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     let admin_if = view.admin_if();
 
     // ---- preconditions: fail loud, never degrade -------------------------------
-    // `nft` is uniform: every kind installs `table inet cfab` (marking + the fallback
-    // control-egress ceiling). `tc`/`ethtool` stay host-only — a leaf shapes nothing and its
-    // wires' qdiscs and offloads belong to its OS.
-    let mut tools: Vec<&str> = vec!["ip", "nft"];
+    // A host requires `nft`: it installs the whole `table inet cfab` (bulk DSCP clamp + the
+    // fallback control-egress ceiling), and a no-nft kernel is a hard refusal for that kind —
+    // there is no iptables path for a forwarding member. `tc`/`ethtool` stay host-only — a
+    // leaf shapes nothing and its wires' qdiscs and offloads belong to its OS.
+    let mut tools: Vec<&str> = vec!["ip"];
     if kind == MemberKind::Host {
+        tools.push("nft");
         tools.extend(["tc", "ethtool"]);
         if f.host_forward {
             tools.push("logger");
@@ -107,6 +276,15 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             return Err(Error::fatal(format!("{tool} not installed")));
         }
     }
+    // A leaf takes either backend: `nft`, or all three legacy binaries. ALWAYS the `-legacy`
+    // names — on trixie the unqualified `iptables`/`-save`/`-restore` are alternatives
+    // defaulting to the nft backend, which fails with the same EOPNOTSUPP on the one kernel
+    // this path exists for.
+    let mark_backend = if kind == MemberKind::Leaf {
+        mark_backend_for_leaf(sys)?
+    } else {
+        MarkBackend::Nft
+    };
     if f.fabric_mode != "tagged" {
         return Err(Error::fatal(format!(
             "FABRIC_MODE='{}' (expected tagged)",
@@ -385,12 +563,31 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // containment: a leaf sources a fallback-segment control storm at the same measured rate a
     // host does (149 k pkt/s and 3.5 cores, all three members alike), and the leaf is the
     // member most likely to be a 4-core NAS.
-    let mark = emit::mark::generate(view)?;
-    let mark_path = format!("{}/mark.nft", f.run_dir);
-    sys.write(&mark_path, &mark)?;
-    run_ok(sys, &["nft", "-f", &mark_path])?; // one transaction: atomic replace
-    let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab"])?;
-    sys.write(&format!("{}/mark.applied", f.run_dir), &applied.stdout)?;
+    //
+    // Which mechanism carries it is the kernel's call, not the declaration's: a leaf on a
+    // kernel without nf_tables (the NAS) gets the ceiling through iptables-legacy and no bulk
+    // DSCP clamp at all — that kernel has no `-j DSCP` target. The choice is recorded so
+    // `status` and `down` read it instead of re-probing, and so a member that GAINS nf_tables
+    // (or changes kind) does not leave the other backend's state resident.
+    sys.write(
+        &emit::ceiling_ipt::record_path(&f.run_dir),
+        &format!("{}\n", mark_backend.as_str()),
+    )?;
+    if kind == MemberKind::Leaf {
+        remove_other_mark_backend(sys, f, mark_backend)?;
+    }
+    match mark_backend {
+        MarkBackend::Nft => {
+            let mark = emit::mark::generate(view)?;
+            let mark_path = format!("{}/mark.nft", f.run_dir);
+            sys.write(&mark_path, &mark)?;
+            run_ok(sys, &["nft", "-f", &mark_path])?; // one transaction: atomic replace
+            let applied = run_ok(sys, &["nft", "-s", "list", "table", "inet", "cfab"])?;
+            sys.write(&format!("{}/mark.applied", f.run_dir), &applied.stdout)?;
+        }
+        MarkBackend::IptablesLegacy => install_mark_ipt(sys, view)?,
+    }
+    warnings.push(mark_backend.status_line().to_string());
 
     // ---- qos (host only: a leaf shapes nothing; its wires' qdiscs belong to its OS) ----------
     if kind == MemberKind::Host {
@@ -1503,20 +1700,30 @@ mod tests {
         assert!(calls_for(&sys, "policy.nft").is_empty(), "{:?}", sys.calls);
     }
 
-    /// `nft` is a uniform dependency, so a leaf without it is refused by name before anything
-    /// is applied — never a member silently running without the ceiling.
+    /// A leaf takes either backend, so it is refused only when it has NEITHER — by name,
+    /// before anything is applied. Never a member silently running without the ceiling.
     #[test]
-    fn a_leaf_without_nft_is_refused_by_name() {
+    fn a_leaf_with_neither_backend_is_refused_by_name() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        let mut sys = absent_fallback_netdevs(up_sys(&view), &view).on_fail(
-            &["/usr/bin/env", "sh", "-c", "command -v nft"],
-            1,
-            "",
-        );
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view)
+            .on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "")
+            .on_fail(
+                &[
+                    "/usr/bin/env",
+                    "sh",
+                    "-c",
+                    "command -v iptables-legacy-save",
+                ],
+                1,
+                "",
+            );
         let opts = opts();
         let err = run(&mut sys, &view, &opts).unwrap_err().to_string();
-        assert!(err.contains("nft not installed"), "{err}");
+        assert!(
+            err.contains("neither nft nor iptables-legacy-save is installed"),
+            "{err}"
+        );
         assert!(
             !sys.files.contains_key("/run/cfab/mark.nft"),
             "refused after applying: {:?}",

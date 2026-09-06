@@ -38,6 +38,18 @@ impl Backend {
         }
     }
 
+    /// The one spelling of this condition, shared by `up` and `status` (a `status` reason
+    /// line, never a state change: the ceiling is there either way, and the missing bulk clamp
+    /// is a known, printed degradation rather than a link-down).
+    pub fn status_line(self) -> &'static str {
+        match self {
+            Backend::Nft => "mark: nft",
+            Backend::IptablesLegacy => {
+                "mark: iptables-legacy (ceiling only; bulk DSCP clamp unavailable on this kernel)"
+            }
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "nft" => Some(Backend::Nft),
