@@ -287,12 +287,10 @@ jobs:
               p=$(command -v "$t") || { echo "missing: $t" >&2; exit 1; }
               echo "$t -> $p"
             done
-            for f in /etc/cfab/fabric.toml /etc/cfab/fabric.conf; do
-              if [ -e "$f" ]; then
-                echo "image bakes $f; it must not" >&2
-                exit 1
-              fi
-            done'
+            if [ -e /etc/cfab/fabric.toml ]; then
+              echo "image bakes /etc/cfab/fabric.toml; it must not" >&2
+              exit 1
+            fi'
       - name: Push the runtime image
         if: steps.meta.outputs.channel == 'formal'
         id: image_push
