@@ -444,7 +444,7 @@ mod tests {
             );
         }
         // The bonds are transit-eligible like a segment (a fallback leg for one zone can carry
-        // another zone's island-disjoint traffic on a forwarding host).
+        // another zone's domain-disjoint traffic on a forwarding host).
         for r in view.fallback_rows() {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname),
@@ -602,7 +602,7 @@ mod tests {
 
     /// PROVING existing behavior, not new logic: `owned_forwarding()` (Task 2) already flags
     /// the fallback bond `transit`-eligible like a class segment (a fallback leg for one zone can
-    /// carry another zone's island-disjoint traffic on a forwarding host) — this test exercises
+    /// carry another zone's domain-disjoint traffic on a forwarding host) — this test exercises
     /// that through the watchdog's own correction path rather than reading `owned_forwarding`
     /// directly, so a regression here fails where it would actually bite in production.
     #[test]

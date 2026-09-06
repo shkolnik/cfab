@@ -35,7 +35,7 @@ pub struct Ceiling {
     /// one of them also carries the zone's fallback row (the row needs a home wire, which is a
     /// class row in the zone), so this is the fallback LAN's membership too.
     pub members: u64,
-    /// Broadcast LANs in the zone = the zone's CLASS_TABLE rows, fallback row included: the
+    /// Broadcast LANs in the zone = the zone's SEGMENT_TABLE rows, universal row included: the
     /// network-LSA candidates.
     pub lans: u64,
     /// LSDB size for the zone: one router-LSA per member, one network-LSA per LAN.
@@ -104,7 +104,7 @@ pub fn ceilings(view: &View) -> Vec<Ceiling> {
                 .iter()
                 .filter(|m| class_rows_of(f, m).iter().any(|c| c.zone == r.zone))
                 .count() as u64;
-            let lans = f.class_table.iter().filter(|s| s.zone == r.zone).count() as u64;
+            let lans = f.segments.iter().filter(|s| s.zone == r.zone).count() as u64;
             let (peers, lsas, base_pps, rate_pps) = ceiling_pps(members, lans, f.ospf_hello);
             Ceiling {
                 zone: r.zone,
@@ -131,7 +131,7 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("    type filter hook output priority mangle;\n");
     // The fallback control-egress ceiling, FIRST: the guard rules below `return` on OSPF, so a
     // ceiling placed after them would never see the packets it exists to count. Containment, not
-    // policing: a fallback segment is one broadcast domain spanning every island, so a
+    // policing: a fallback segment is one broadcast domain spanning every domain, so a
     // control-plane loop on it reaches every switch port in the fabric. Over the derived rate the
     // packets are dropped and counted (`cfab status` reads the counter) — a member whose control
     // plane has gone mad stops shouting and at worst loses its own fallback adjacency, which is
@@ -140,7 +140,7 @@ pub fn generate(view: &View) -> Result<String> {
     // OSPF only, and only on the bond: a fallback leg carries NO BFD by construction (`emit/
     // engine.rs` gives the bond no `bfd` key at all, and `segments_of()` keeps it out of BFD
     // pairing), so `ip protocol 89` (OSPF) is the whole control class on this interface. Only the
-    // control class is policed — when a zone is island-disjoint the bond carries that zone's
+    // control class is policed — when a zone is domain-disjoint the bond carries that zone's
     // real traffic, which is exactly what the fallback exists for.
     for ce in ceilings(view) {
         out.push_str(&ce.comment());
@@ -212,22 +212,22 @@ mod tests {
     /// (< 50 members, most < 10) rather than only at the three-member testbed.
     fn fabric_with_members(n: u8) -> Fabric {
         let rows: String = (1..=n)
-            .map(|i| format!("pve{i}-tb {i} host eth9:5000 eth1:1000 eth0:1000\n"))
+            .map(|i| format!("pve{i}-tb {i} host eth9@a:5000 eth1@b:1000 eth0@c:1000\n"))
             .collect();
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
                 .replace(
-                    "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000\n\
-                     pve2-tb 2 host eth9:5000 eth1:1000 eth0:1000\n\
-                     pve3-tb 3 leaf eth9:10000 eth1:1000 eth0:1000\n",
+                    "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000\n\
+                     pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000\n\
+                     pve3-tb 3 leaf eth9@a:10000 eth1@b:1000 eth0@c:1000\n",
                     &rows,
                 );
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
     /// The threshold is a function of the declaration and of one measured number, at every size
-    /// the project designs for. Storage has 4 CLASS_TABLE rows (3 segments + the fallback), so
+    /// the project designs for. Storage has 4 SEGMENT_TABLE rows (3 segments + the universal), so
     /// the LSDB is `members + 4` and the peer count on the fallback LAN is `members - 1`.
     ///
     /// The two margins this has to keep, as numbers (fixture measurements,
@@ -272,7 +272,7 @@ mod tests {
     }
 
     /// The rule is emitted with its arithmetic beside it, and it is OSPF on the bond and
-    /// nothing else: never a slave (the bond is the L3 interface), never the zone's island
+    /// nothing else: never a slave (the bond is the L3 interface), never the zone's domain
     /// segments (policing those would police the fabric it is protecting), never BFD (a
     /// fallback leg carries none — `emit/engine.rs` gives the bond no `bfd` key at all).
     #[test]
@@ -304,7 +304,7 @@ mod tests {
                 "\"cfab-cl\"",
                 "\"cfab-mg\"",
             ] {
-                assert!(!r.contains(seg), "the ceiling names an island segment: {r}");
+                assert!(!r.contains(seg), "the ceiling names an domain segment: {r}");
             }
         }
         // Ahead of the guard rules: they `return` on OSPF, so a ceiling behind them would never
@@ -446,9 +446,9 @@ mod tests {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
-                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
+                .replace("cfab-st-fb  any storage 9 300\n", "")
+                .replace("cfab-cl-fb  any cluster 9 301\n", "")
+                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
         let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert!(v.fallback_rows().is_empty());

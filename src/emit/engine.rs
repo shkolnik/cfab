@@ -190,9 +190,9 @@ fn export_policy(zone: &str) -> String {
 /// (`holo-bgp/src/ibus/rx.rs`), so a dangling name is a panic in the engine, not a warning.
 fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>> {
     let f = view.fabric;
-    let Some(first) = gw_rows.first() else {
+    if gw_rows.is_empty() {
         return Ok(None);
-    };
+    }
 
     let mut prefix_sets: Vec<Value> = Vec::new();
     let mut policies: Vec<Value> = Vec::new();
@@ -287,8 +287,18 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
     }
 
     // The BGP router-id. `/routing/router-id` is deviated `not-supported` in holo, so
-    // per-instance is the only place it can go; the first gw zone in ZONE_TABLE order owns it.
-    let identifier = view.identity_addr(f.zone(&first.zone)?);
+    // per-instance is the only place it can go, and ONE instance spans every gw zone — so the
+    // id needs a total order over the gw zones that survives a second one appearing. Table
+    // order does not (inserting a row above would move the id); the LOWEST zone id does, and
+    // costs no config surface (spec §6 C, option 3).
+    let owner = gw_rows
+        .iter()
+        .map(|r| f.zone(&r.zone))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|z| z.id)
+        .expect("gw_rows is non-empty");
+    let identifier = view.identity_addr(owner);
     let bgp = json!({
         "type": "ietf-bgp:bgp",
         // One instance per member spanning every gw zone, so a zone name would be wrong the
@@ -525,8 +535,9 @@ mod tests {
             ("storage", "cfab-st-bk", 100),
             ("cluster", "cfab-cl", 10),
             ("mgmt", "cfab-mg", 10),
-            // The fallback bond is a transit link too: offset with the rest.
-            ("storage", "cfab-st-fb", 5000),
+            // The universal bond is a transit link too: offset with the rest. Its cost is
+            // derived: storage's segments sum to 10 + 100 + 200, plus one ladder step.
+            ("storage", "cfab-st-fb", 410),
         ] {
             assert_eq!(ospf_if(instance(&normal, zone), ifn)["cost"], declared);
             assert_eq!(
@@ -580,7 +591,7 @@ mod tests {
     /// must be absent, so holo never builds a session for it.
     #[test]
     fn fallback_interface_carries_a_cost_and_no_bfd_after_the_segments() {
-        for (member, cost) in [("pve1-tb", 5000), ("pve3-tb", 35000)] {
+        for (member, cost) in [("pve1-tb", 410), ("pve3-tb", 30410)] {
             let t = tree(member);
             for (zone, bond) in [
                 ("storage", "cfab-st-fb"),
@@ -623,7 +634,7 @@ mod tests {
                 assert!(ifs.contains(&bond.to_string()), "{member}: {ifs:?}");
             }
             let s = serde_json::to_string(&t).unwrap();
-            for slave in ["cfab-st-fb-st", "cfab-st-fb-cl", "cfab-st-fb-mg"] {
+            for slave in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
                 assert!(!s.contains(slave), "{member} carries slave {slave}");
             }
         }
@@ -684,8 +695,8 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
                 .replace(
-                    "cluster 199 6 cs6  200 0 1 -",
-                    "cluster 199 6 cs6  200 0 1 cl:199:192.168.199.254/24",
+                    "cluster 199 6 cs6  200 0 1 b -",
+                    "cluster 199 6 cs6  200 0 1 b b:199:192.168.199.254/24",
                 );
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
@@ -696,8 +707,8 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
                 .replace(
-                    "mgmt    249 2 cs2  100 1 1 mg:249:192.168.249.254/24",
-                    "mgmt    249 2 cs2  100 1 1 -",
+                    "mgmt    249 2 cs2  100 1 1 c c:249:192.168.249.254/24",
+                    "mgmt    249 2 cs2  100 1 1 c -",
                 );
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }

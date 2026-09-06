@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use cfab::derive::View;
-use cfab::model::{MemberKind, Role};
+use cfab::model::MemberKind;
 use cfab::sys::RealSys;
 use cfab::{Error, commands, emit, load_fabric};
 
@@ -71,7 +71,7 @@ enum Command {
     ConfSync,
     /// Flood a fabric peer on one NIC and record the wire's measured capacity
     MeasureCap {
-        /// The physical NIC (a CLASS_TABLE wire)
+        /// The physical NIC (a MEMBER_TABLE wire)
         dev: String,
         /// Peer address to flood (a fabric segment address on that wire)
         peer: String,
@@ -138,9 +138,11 @@ enum GenArtifact {
     },
     /// This member's routing-engine configuration tree (JSON)
     Engine,
+    /// Every member's per-zone wire order, derived or overridden
+    Prefs,
     /// The floor+borrow HTB derivation for one physical NIC
     Shape {
-        /// The physical NIC (a CLASS_TABLE wire)
+        /// The physical NIC (a MEMBER_TABLE wire)
         dev: String,
         /// Print the tc program instead of the derivation
         #[arg(long, conflicts_with = "expect")]
@@ -331,6 +333,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                         print!("{}", emit::ceiling_ipt::generate(&view)?)
                     }
                 },
+                GenArtifact::Prefs => print!("{}", cfab::derive::render_prefs(&fabric)),
                 GenArtifact::Engine => {
                     let tree = emit::engine::generate(&view)?;
                     println!(
@@ -472,16 +475,16 @@ fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
         MemberKind::Leaf => "leaf",
     };
     let fallback_legs = fabric
-        .class_table
+        .segments
         .iter()
-        .filter(|r| r.role == Role::Fallback)
+        .filter(|r| r.scope.is_universal())
         .count();
     format!(
         "fabric.conf OK: {} zones, {} segments, {} fallback legs, {} members\n\
          this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
          {} ingress leg(s)\n",
         fabric.zones.len(),
-        fabric.class_table.len() - fallback_legs,
+        fabric.segments.len() - fallback_legs,
         fallback_legs,
         fabric.members.len(),
         view.member.name,
@@ -576,12 +579,14 @@ mod tests {
         );
     }
 
-    /// A fabric declaring no fallback row: one spelling, counted zero, never absent.
+    /// A fabric declaring no universal segment: one spelling, counted zero, never absent.
     #[test]
     fn check_on_a_fallback_free_fabric_counts_zero() {
         let text = example()
             .lines()
-            .filter(|l| !l.contains(" fallback "))
+            .filter(|l| {
+                !l.starts_with("cfab-") || !l.split_whitespace().nth(1).is_some_and(|d| d == "any")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let f = fabric_from(&text);

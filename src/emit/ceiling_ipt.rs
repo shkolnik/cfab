@@ -98,7 +98,7 @@ pub fn generate(view: &View) -> Result<String> {
     // this member sends into a drop chain — measured live on pve3 at gate G3 (2026-09-06):
     // the leaf came up FAILED 0/18 with 746 drops and the engine logging EPERM on every
     // interface. OSPF (protocol 89) on the bond only, exactly as the nft render selects: a
-    // fallback leg carries no BFD by construction, and policing the zone's island segments
+    // fallback leg carries no BFD by construction, and policing the zone's domain segments
     // would police the fabric this protects.
     for ce in &ceilings {
         out.push_str(&format!(
@@ -244,9 +244,9 @@ mod tests {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
-                .replace("cfab-st-fb  any storage 9 300 fallback 5000\n", "")
-                .replace("cfab-cl-fb  any cluster 9 301 fallback 5000\n", "")
-                .replace("cfab-mg-fb  any mgmt    9 302 fallback 5000\n", "");
+                .replace("cfab-st-fb  any storage 9 300\n", "")
+                .replace("cfab-cl-fb  any cluster 9 301\n", "")
+                .replace("cfab-mg-fb  any mgmt    9 302\n", "");
         let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
         let view = View::new(&f, "pve3-tb").unwrap();
         assert_eq!(

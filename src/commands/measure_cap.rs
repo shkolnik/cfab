@@ -41,12 +41,12 @@ pub fn run(
         .collect();
     if sub_ifs.is_empty() {
         return Err(Error::fatal(format!(
-            "measure-cap: '{dev}' is not a wire in CLASS_TABLE — refusing to measure"
+            "measure-cap: '{dev}' is not a wire in SEGMENT_TABLE — refusing to measure"
         )));
     }
-    if view.admin_if() == Some(dev) {
+    if view.is_admin_if(dev) {
         out.push_str(&format!(
-            "measure-cap: '{dev}' is the admin NIC (ADMIN_IF): the admin session shares it for the next {secs}s (paced flood)\n"
+            "measure-cap: '{dev}' carries an untagged admin path: an admin session shares it for the next {secs}s (paced flood)\n"
         ));
     }
 
@@ -295,7 +295,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("not a wire in CLASS_TABLE"),
+            err.to_string().contains("not a wire in SEGMENT_TABLE"),
             "{err}"
         );
     }

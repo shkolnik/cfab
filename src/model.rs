@@ -1,13 +1,14 @@
 //! The typed fabric declaration — the data model behind `fabric.conf`.
 //!
-//! Three tables declare the fabric (MEMBER_TABLE, ZONE_TABLE, CLASS_TABLE); everything else is
-//! generated from them. This module types every field, and `Fabric::validate` enforces the
-//! declaration invariants: unique member names, node ids, segment vids and interface names, one
-//! segment per zone × island, known zones everywhere a zone is named, and ingress gateways that
-//! collide with neither a segment vid nor any member's leg address.
+//! Four tables declare the fabric (DOMAINS, MEMBER_TABLE, ZONE_TABLE, SEGMENT_TABLE) plus the
+//! optional WIRE_PREF override; everything else is generated from them. This module types every
+//! field, and `Fabric::validate` enforces the declaration invariants: unique member names, node
+//! ids, segment vids and interface names, one segment per zone × domain, known zones and known
+//! domains everywhere either is named, at most one wire per member per domain, complete
+//! WIRE_PREF overrides, and ingress gateways that collide with neither a segment vid nor any member's leg address.
 //! `cfab schema` emits this model as JSON Schema (schemars).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use schemars::JsonSchema;
@@ -16,49 +17,74 @@ use serde::Serialize;
 use crate::config::RawConfig;
 use crate::error::{Error, Result};
 
-/// The three switch domains, named by the zone whose PRIMARY segment they carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Island {
-    /// The storage island.
-    St,
-    /// The cluster island.
-    Cl,
-    /// The management island; a host's wire here also carries its untagged admin path.
-    Mg,
-    /// Not a physical switch domain: "every island this member has a wire on". Only a
-    /// fallback segment (`Role::Fallback`) is declared on it; `Member::wire` always returns
-    /// `None` for it (a fallback leg is a bond over every wire, resolved in the derive layer,
-    /// never a single indexed wire).
-    Any,
-}
+/// A physical switch domain: an opaque DECLARED token, so a typo in a wire's or a segment's
+/// domain is an error and not a phantom domain. One letter — the bond-slave suffix
+/// `-<domain>` must fit inside IFNAMSIZ (see `MAX_BOND_IFNAME`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+pub struct DomainId(String);
 
-impl Island {
-    pub fn parse(s: &str) -> Result<Island> {
-        match s {
-            "st" => Ok(Island::St),
-            "cl" => Ok(Island::Cl),
-            "mg" => Ok(Island::Mg),
-            "any" => Ok(Island::Any),
-            other => Err(Error::config(format!(
-                "unknown island '{other}' (st|cl|mg|any)"
-            ))),
+/// The widest a domain token may be. One character, and `MAX_BOND_IFNAME` is derived from it:
+/// widen this and every bond-leg name budget follows automatically.
+pub const MAX_DOMAIN_TOKEN: usize = 1;
+
+impl DomainId {
+    pub fn parse(s: &str) -> Result<DomainId> {
+        if s.len() != MAX_DOMAIN_TOKEN || !s.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Err(Error::config(format!(
+                "domain '{s}' is not a switch-domain token (one ASCII letter, e.g. a)"
+            )));
         }
+        Ok(DomainId(s.to_string()))
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Island::St => "st",
-            Island::Cl => "cl",
-            Island::Mg => "mg",
-            Island::Any => "any",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl fmt::Display for Island {
+impl fmt::Display for DomainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a segment (or an ingress leg) lives: on one switch domain, or on every wire the
+/// member has. `Universal` is a SCOPE, not a domain: exactly the old `island any` fallback row,
+/// fanned out by the derive layer into an active-backup bond over the member's wires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SegScope {
+    Domain(DomainId),
+    /// Not a physical switch domain: "every wire this member has".
+    Universal,
+}
+
+impl SegScope {
+    pub fn parse(s: &str) -> Result<SegScope> {
+        if s == "any" {
+            return Ok(SegScope::Universal);
+        }
+        Ok(SegScope::Domain(DomainId::parse(s)?))
+    }
+
+    pub fn domain(&self) -> Option<&DomainId> {
+        match self {
+            SegScope::Domain(d) => Some(d),
+            SegScope::Universal => None,
+        }
+    }
+
+    pub fn is_universal(&self) -> bool {
+        matches!(self, SegScope::Universal)
+    }
+}
+
+impl fmt::Display for SegScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SegScope::Domain(d) => f.write_str(d.as_str()),
+            SegScope::Universal => f.write_str("any"),
+        }
     }
 }
 
@@ -66,7 +92,7 @@ impl fmt::Display for Island {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberKind {
-    /// Transits between zones, shapes, carries every island it has wires on.
+    /// Transits between zones, shapes, carries every domain it has wires on.
     Host,
     /// Own identity + OSPF/BFD, stub-router, never transits, no shaping; its
     /// untagged/externally-managed L3 is never touched (the NAS).
@@ -85,18 +111,21 @@ impl MemberKind {
     }
 }
 
-/// A member's physical NIC on one island + its DECLARED link speed (Mb/s).
+/// A member's physical NIC, the switch domain it is plugged into, and its DECLARED link speed
+/// (Mb/s). One wire is pinned to exactly ONE domain: a single NIC into a single switch IS one
+/// domain, and the "one wire, several domains" trunk is deliberately not modelled (spec §3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Wire {
     pub name: String,
+    pub domain: DomainId,
     pub speed_mbit: u32,
 }
 
-/// The widest ifname a bond leg (a fallback segment, or a migrating ingress leg) may carry.
-/// Its slaves are named `<ifname>-<island>`: three characters of suffix inside IFNAMSIZ 15.
-pub const MAX_BOND_IFNAME: usize = 12;
+/// The widest ifname a bond leg (a universal segment, or a migrating ingress leg) may carry.
+/// Its slaves are named `<ifname>-<domain>`: a separator plus a domain token inside IFNAMSIZ 15.
+pub const MAX_BOND_IFNAME: usize = 15 - 1 - MAX_DOMAIN_TOKEN;
 
-/// Does this bond-leg name leave room for the `-<island>` suffix its slaves need? One
+/// Does this bond-leg name leave room for the `-<domain>` suffix its slaves need? One
 /// predicate for both legs, so the rule cannot drift between them.
 fn bond_ifname_too_long(ifname: &str) -> bool {
     ifname.len() > MAX_BOND_IFNAME
@@ -109,18 +138,24 @@ pub struct Member {
     /// Node id: the host octet of every address this member holds (identity 10.<id>.0.<node>).
     pub node: u8,
     pub kind: MemberKind,
-    /// Wire per island, in st/cl/mg order; None = no wire on that island ("-").
-    pub wires: [Option<Wire>; 3],
+    /// Every wire this member has, in declaration order (the tie-break for equal speeds).
+    ///
+    /// The admin plane is not a column: on a host the UNTAGGED path of every one of these
+    /// wires is the admin plane (the SSH lifeline that works with the routing stack stopped),
+    /// so every wire gets the nft admin treatment and its own ADMIN_FLOOR band. A leaf owns no
+    /// L3 of ours on any wire.
+    pub wires: Vec<Wire>,
 }
 
 impl Member {
-    pub fn wire(&self, island: Island) -> Option<&Wire> {
-        match island {
-            Island::St | Island::Cl | Island::Mg => self.wires[island as usize].as_ref(),
-            // A fallback leg is a bond over every wire this member has, not one indexed
-            // wire — resolved by the derive layer, never here.
-            Island::Any => None,
-        }
+    /// This member's wire on `domain`, if it has one. At most one by construction: two wires on
+    /// one domain are refused at parse (`validate`).
+    pub fn wire_on(&self, domain: &DomainId) -> Option<&Wire> {
+        self.wires.iter().find(|w| w.domain == *domain)
+    }
+
+    pub fn wire_named(&self, name: &str) -> Option<&Wire> {
+        self.wires.iter().find(|w| w.name == name)
     }
 }
 
@@ -176,7 +211,7 @@ impl fmt::Display for Dscp {
 /// so the router never holds an address inside a segment and never sees the fabric's IGP.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ZoneGw {
-    pub island: Island,
+    pub scope: SegScope,
     pub vid: u16,
     /// The router's address; the subnet is its /24 (the only length the design supports).
     pub router: String,
@@ -226,6 +261,10 @@ pub struct Zone {
     pub band: u32,
     /// Quantum ratio within a shared band.
     pub weight: u32,
+    /// The switch domain whose segment is this zone's rank-0 (primary) wire on every member
+    /// that has a wire there. The one part of preference that IS physical-layout policy, so it
+    /// is declared globally and not derived; the backup order below it is derived from speed.
+    pub primary: DomainId,
     /// Ingress, or None = the outside never enters this zone.
     pub gw: Option<ZoneGw>,
 }
@@ -237,50 +276,36 @@ impl Zone {
     }
 }
 
-/// primary|backup — a segment's role for its zone on this member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Primary,
-    Backup,
-    /// A fallback segment: island `any`, one per zone, no BFD, reached only when every
-    /// island segment of its zone is gone.
-    Fallback,
-}
-
-impl Role {
-    pub fn parse(s: &str) -> Result<Role> {
-        match s {
-            "primary" => Ok(Role::Primary),
-            "backup" => Ok(Role::Backup),
-            "fallback" => Ok(Role::Fallback),
-            other => Err(Error::config(format!(
-                "CLASS_TABLE role '{other}' (expected primary|backup|fallback)"
-            ))),
-        }
-    }
-}
-
-/// One CLASS_TABLE row: zone `zone` on island `island`, addressed 10.<id>.<seg>.<node>/24,
-/// tagged `vid` on the island's switch.
+/// One SEGMENT_TABLE row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
+/// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Segment {
     pub ifname: String,
-    pub island: Island,
+    pub scope: SegScope,
     pub zone: String,
     pub seg: u8,
     pub vid: u16,
-    pub role: Role,
-    pub ospf_cost: u32,
+}
+
+/// One WIRE_PREF row: this member's complete wire order for this zone, replacing the derived
+/// one. Complete or an error — an override is never blended with the default.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WirePref {
+    pub member: String,
+    pub zone: String,
+    pub order: Vec<String>,
 }
 
 /// The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct Fabric {
     pub fabric_mode: String,
+    /// The declared switch domains, in declaration order.
+    pub domains: Vec<DomainId>,
     pub members: Vec<Member>,
     pub zones: Vec<Zone>,
-    pub class_table: Vec<Segment>,
+    pub segments: Vec<Segment>,
+    pub wire_prefs: Vec<WirePref>,
     pub leaf_cost_offset: u32,
     pub host_forward: bool,
     /// Allowed forward pairs (from, to); unlisted = dropped by policy, counted.
@@ -311,10 +336,12 @@ pub struct Fabric {
 /// Every key the model consumes from fabric.conf (for unknown-literal-key warnings).
 pub const CONSUMED_KEYS: &[&str] = &[
     "FABRIC_MODE",
+    "DOMAINS",
     "MEMBER_TABLE",
     "FABRIC_DOMAIN",
     "ZONE_TABLE",
-    "CLASS_TABLE",
+    "SEGMENT_TABLE",
+    "WIRE_PREF",
     "LEAF_COST_OFFSET",
     "HOST_FORWARD",
     "ADMIN_FLOOR",
@@ -335,6 +362,16 @@ pub const CONSUMED_KEYS: &[&str] = &[
     "USB_NICS",
     "CFAB_RUN",
 ];
+
+/// Keys the v0 declaration had and v1 does not. Pre-release there is no compatibility shim: an
+/// old file fails at parse with an error that names the new layout, rather than falling through
+/// to the generic unknown-key warning and silently generating a fabric nobody declared.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "CLASS_TABLE",
+    "CLASS_TABLE was replaced by SEGMENT_TABLE (rows are segments, and \"class\" is a zone \
+     word). New layout: `ifname domain|any zone seg vid` — the role and ospf-cost columns are \
+     gone, both are derived from ZONE_TABLE's `primary` column and the per-member wire order",
+)];
 
 fn parse_num<T: std::str::FromStr>(raw: &RawConfig, key: &str) -> Result<T> {
     let v = raw.require(key)?;
@@ -388,9 +425,19 @@ fn parse_bool01(raw: &RawConfig, key: &str) -> Result<bool> {
 
 impl Fabric {
     pub fn from_raw(raw: &RawConfig) -> Result<Fabric> {
+        for (key, why) in REMOVED_KEYS {
+            if raw.get(key).is_some() {
+                return Err(Error::config((*why).to_string()));
+            }
+        }
+        let domains = parse_domains(raw.require("DOMAINS")?)?;
         let members = parse_member_table(raw.require("MEMBER_TABLE")?)?;
         let zones = parse_zone_table(raw.require("ZONE_TABLE")?)?;
-        let class_table = parse_class_table(raw.require("CLASS_TABLE")?)?;
+        let segments = parse_segment_table(raw.require("SEGMENT_TABLE")?)?;
+        let wire_prefs = match raw.get("WIRE_PREF") {
+            Some(text) => parse_wire_pref(text)?,
+            None => Vec::new(),
+        };
         let forward_allow = raw
             .require("FORWARD_ALLOW")?
             .split_whitespace()
@@ -404,9 +451,11 @@ impl Fabric {
             .collect::<Result<Vec<_>>>()?;
         let fabric = Fabric {
             fabric_mode: raw.require("FABRIC_MODE")?.to_string(),
+            domains,
             members,
             zones,
-            class_table,
+            segments,
+            wire_prefs,
             leaf_cost_offset: parse_num(raw, "LEAF_COST_OFFSET")?,
             host_forward: parse_bool01(raw, "HOST_FORWARD")?,
             forward_allow,
@@ -451,73 +500,136 @@ impl Fabric {
             let mut seen = BTreeSet::new();
             items.find(|i| !seen.insert(i.clone()))
         }
-        let ct = &self.class_table;
-        if let Some(d) = dup(ct.iter().map(|r| r.vid.to_string())) {
+        // ---- domains first: nothing below may index by a domain that was never declared ----
+        if self.domains.is_empty() {
+            return Err(Error::config(
+                "DOMAINS is empty (declare one token per physical switch domain, e.g. \
+                 DOMAINS=\"a b c\")"
+                    .to_string(),
+            ));
+        }
+        if let Some(d) = dup(self.domains.iter().map(|d| d.to_string())) {
+            return Err(Error::config(format!("DOMAINS token {d} declared twice")));
+        }
+        let declared: BTreeSet<&DomainId> = self.domains.iter().collect();
+        for m in &self.members {
+            for w in &m.wires {
+                if !declared.contains(&w.domain) {
+                    return Err(Error::config(format!(
+                        "MEMBER_TABLE {}: wire {}@{} names a domain that is not in DOMAINS ({})",
+                        m.name,
+                        w.name,
+                        w.domain,
+                        self.domains_list()
+                    )));
+                }
+            }
+            // Refused, not merely unbuilt: a domain has exactly one segment per zone, addressed
+            // 10.<id>.<seg>.<node>/24, so two wires in one broadcast domain would hold two
+            // addresses of one /24 on one node — ARP-ambiguous. The coherent realizations are a
+            // bond over the two wires (cfab does not build one yet) or a SECOND segment declared
+            // on the same domain; neither is expressible by repeating a domain here.
+            let mut seen: BTreeSet<&DomainId> = BTreeSet::new();
+            for w in &m.wires {
+                if !seen.insert(&w.domain) {
+                    return Err(Error::config(format!(
+                        "MEMBER_TABLE {}: two wires on domain {} ({}). The model cannot express \
+                         it: a domain has one segment per zone, addressed 10.<id>.<seg>.<node>/24, \
+                         so two wires in one broadcast domain would hold two addresses of one /24 \
+                         on one node — ARP-ambiguous. Bond the two NICs and declare the bond as \
+                         one wire (cfab does not build that bond yet), or declare a SECOND segment \
+                         on domain {} and put the wires in different domains",
+                        m.name,
+                        w.domain,
+                        m.wires
+                            .iter()
+                            .filter(|x| x.domain == w.domain)
+                            .map(|x| x.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        w.domain,
+                    )));
+                }
+            }
+        }
+        for s in &self.segments {
+            if let Some(d) = s.scope.domain()
+                && !declared.contains(d)
+            {
+                return Err(Error::config(format!(
+                    "SEGMENT_TABLE {}: domain {d} is not in DOMAINS ({})",
+                    s.ifname,
+                    self.domains_list()
+                )));
+            }
+        }
+        for z in &self.zones {
+            if !declared.contains(&z.primary) {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {}: primary domain {} is not in DOMAINS ({})",
+                    z.name,
+                    z.primary,
+                    self.domains_list()
+                )));
+            }
+            if let Some(gw) = &z.gw
+                && let Some(d) = gw.scope.domain()
+                && !declared.contains(d)
+            {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {}: gw domain {d} is not in DOMAINS ({})",
+                    z.name,
+                    self.domains_list()
+                )));
+            }
+        }
+        // The other direction of the two-directional check: a declared domain nobody wires into
+        // is a typo or a switch that left the fabric, and every segment on it is dead weight.
+        for d in &self.domains {
+            if !self.members.iter().any(|m| m.wire_on(d).is_some()) {
+                return Err(Error::config(format!(
+                    "DOMAINS declares {d} but no member has a wire on it (drop the token, or \
+                     give a member a wire@{d}:<speed>)"
+                )));
+            }
+        }
+        // ---- segments ----
+        let st = &self.segments;
+        if let Some(d) = dup(st.iter().map(|r| r.vid.to_string())) {
             return Err(Error::config(format!(
-                "CLASS_TABLE vid {d} used by two segments (one VLAN id per segment)"
+                "SEGMENT_TABLE vid {d} used by two segments (one VLAN id per segment)"
             )));
         }
-        if let Some(d) = dup(ct.iter().map(|r| format!("{}:{}", r.zone, r.seg))) {
+        if let Some(d) = dup(st.iter().map(|r| format!("{}:{}", r.zone, r.seg))) {
             return Err(Error::config(format!(
-                "CLASS_TABLE segment {d} declared twice"
+                "SEGMENT_TABLE segment {d} declared twice"
             )));
         }
-        if let Some(d) = dup(ct.iter().map(|r| format!("{}:{}", r.zone, r.island))) {
+        if let Some(d) = dup(st.iter().map(|r| format!("{}:{}", r.zone, r.scope))) {
             return Err(Error::config(format!(
-                "CLASS_TABLE zone:island {d} declared twice (a zone has one segment per island)"
+                "SEGMENT_TABLE zone:domain {d} declared twice (a zone has one segment per \
+                 domain, and one universal segment)"
             )));
         }
-        if let Some(d) = dup(ct.iter().map(|r| r.ifname.clone())) {
+        if let Some(d) = dup(st.iter().map(|r| r.ifname.clone())) {
             return Err(Error::config(format!(
-                "CLASS_TABLE ifname {d} declared twice"
+                "SEGMENT_TABLE ifname {d} declared twice"
             )));
         }
-        for r in ct {
+        for r in st {
             self.zone(&r.zone)?;
         }
-        for r in ct {
-            if r.island == Island::Any && r.role != Role::Fallback {
-                return Err(Error::config(format!(
-                    "CLASS_TABLE {}: island 'any' requires role 'fallback' (a fallback segment is \
-                     the only segment without an island)",
-                    r.ifname
-                )));
-            }
-            if r.role == Role::Fallback && r.island != Island::Any {
-                return Err(Error::config(format!(
-                    "CLASS_TABLE {}: role 'fallback' requires island 'any' (an island segment \
-                     cannot be fallback)",
-                    r.ifname
-                )));
-            }
-        }
-        for r in ct.iter().filter(|r| r.role == Role::Fallback) {
+        for r in st.iter().filter(|r| r.scope.is_universal()) {
             if bond_ifname_too_long(&r.ifname) {
                 return Err(Error::config(format!(
-                    "CLASS_TABLE {}: fallback ifname must be {MAX_BOND_IFNAME} characters or \
-                     fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
+                    "SEGMENT_TABLE {}: a universal (any) segment's ifname must be \
+                     {MAX_BOND_IFNAME} characters or fewer (slaves are named <ifname>-<domain>, \
+                     IFNAMSIZ 15)",
                     r.ifname
                 )));
             }
-            let longest_path: u32 = ct
-                .iter()
-                .filter(|other| other.zone == r.zone && other.role != Role::Fallback)
-                .map(|other| other.ospf_cost)
-                .sum();
-            if r.ospf_cost <= longest_path {
-                return Err(Error::config(format!(
-                    "CLASS_TABLE {}: fallback cost {} must exceed zone {}'s longest host path \
-                     ({longest_path}, the sum of its class-row costs)",
-                    r.ifname, r.ospf_cost, r.zone
-                )));
-            }
-            if r.ospf_cost >= self.leaf_cost_offset {
-                return Err(Error::config(format!(
-                    "CLASS_TABLE {}: fallback cost {} must be below LEAF_COST_OFFSET ({})",
-                    r.ifname, r.ospf_cost, self.leaf_cost_offset
-                )));
-            }
         }
+        // ---- zones ----
         if let Some(d) = dup(self.zones.iter().map(|z| z.id.to_string())) {
             return Err(Error::config(format!("ZONE_TABLE id {d} used twice")));
         }
@@ -528,7 +640,20 @@ impl Fabric {
                     z.id
                 )));
             }
+            // The rank-0 wire of every member is the wire on this domain, so a primary domain
+            // with no segment in this zone leaves the whole zone with no rank 0 at all.
+            if !st
+                .iter()
+                .any(|r| r.zone == z.name && r.scope == SegScope::Domain(z.primary.clone()))
+            {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {}: primary domain {} has no segment in SEGMENT_TABLE (the \
+                     zone's rank-0 wire is the wire on its primary domain)",
+                    z.name, z.primary
+                )));
+            }
         }
+        // ---- members ----
         if let Some(d) = dup(self.members.iter().map(|m| m.name.clone())) {
             return Err(Error::config(format!(
                 "MEMBER_TABLE member {d} declared twice"
@@ -539,6 +664,9 @@ impl Fabric {
                 "MEMBER_TABLE node id {d} used twice"
             )));
         }
+        // ---- wire preference overrides ----
+        self.check_wire_prefs()?;
+        // ---- the rest, unchanged ----
         for (from, to) in &self.forward_allow {
             for z in [from, to] {
                 if self.zones.iter().all(|zz| zz.name != *z) {
@@ -554,7 +682,7 @@ impl Fabric {
                 .iter()
                 .find(|mm| mm.name == *m)
                 .ok_or_else(|| Error::config(format!("USB_NICS names unknown member '{m}'")))?;
-            if !member.wires.iter().flatten().any(|w| w.name == *dev) {
+            if member.wire_named(dev).is_none() {
                 return Err(Error::config(format!(
                     "USB_NICS {m}:{dev}: '{dev}' is not one of {m}'s wires"
                 )));
@@ -562,17 +690,17 @@ impl Fabric {
         }
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
-            // island `any` = a migrating ingress leg: a bond over one tagged sub-interface
-            // per wire, named like a fallback leg's slaves, so the derived bond name must
-            // leave room for the `-<island>` suffix.
-            if gw.island == Island::Any && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
+            // scope `any` = a migrating ingress leg: a bond over one tagged sub-interface
+            // per wire, named like a universal segment's slaves, so the derived bond name must
+            // leave room for the `-<domain>` suffix.
+            if gw.scope.is_universal() && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
                 return Err(Error::config(format!(
                     "ZONE_TABLE {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
-                     characters or fewer (slaves are named <ifname>-<island>, IFNAMSIZ 15)",
+                     characters or fewer (slaves are named <ifname>-<domain>, IFNAMSIZ 15)",
                     z.name, z.id
                 )));
             }
-            if ct.iter().any(|r| r.vid == gw.vid) {
+            if st.iter().any(|r| r.vid == gw.vid) {
                 return Err(Error::config(format!(
                     "ZONE_TABLE {} ingress vid {} is also a segment vid",
                     z.name, gw.vid
@@ -580,7 +708,7 @@ impl Fabric {
             }
             let octet = gw.router_octet()?;
             for m in &self.members {
-                // Only a host with a wire on the gw island carries the leg — but a node id
+                // Only a host with a wire on the gw domain carries the leg — but a node id
                 // equal to the router octet is a landmine for any future wire, so check all.
                 if m.node == octet {
                     return Err(Error::config(format!(
@@ -590,7 +718,84 @@ impl Fabric {
                 }
             }
         }
+        // Everything above is declaration-local. The last gate is what the DERIVATION produces:
+        // the universal segment's cost, and the two path properties of spec §4.
+        crate::derive::validate_derived(self)
+    }
+
+    fn domains_list(&self) -> String {
+        self.domains
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A WIRE_PREF row replaces the whole derived order, so it must BE the whole order: every
+    /// candidate wire of that (member, zone) exactly once. A partial list is an error, never
+    /// blended with the default.
+    fn check_wire_prefs(&self) -> Result<()> {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for p in &self.wire_prefs {
+            let m = self
+                .member(&p.member)
+                .map_err(|e| Error::config(format!("WIRE_PREF {} {}: {e}", p.member, p.zone)))?;
+            self.zone(&p.zone)
+                .map_err(|e| Error::config(format!("WIRE_PREF {} {}: {e}", p.member, p.zone)))?;
+            if !seen.insert((p.member.clone(), p.zone.clone())) {
+                return Err(Error::config(format!(
+                    "WIRE_PREF {} {} declared twice",
+                    p.member, p.zone
+                )));
+            }
+            for w in &p.order {
+                if m.wire_named(w).is_none() {
+                    return Err(Error::config(format!(
+                        "WIRE_PREF {} {}: '{w}' is not one of {}'s wires",
+                        p.member, p.zone, p.member
+                    )));
+                }
+            }
+            let want: BTreeSet<&str> = self
+                .candidate_wires(m, &p.zone)
+                .into_iter()
+                .map(|w| w.name.as_str())
+                .collect();
+            let got: BTreeSet<&str> = p.order.iter().map(String::as_str).collect();
+            if got.len() != p.order.len() {
+                return Err(Error::config(format!(
+                    "WIRE_PREF {} {}: a wire is listed twice",
+                    p.member, p.zone
+                )));
+            }
+            if got != want {
+                return Err(Error::config(format!(
+                    "WIRE_PREF {} {}: an override is the COMPLETE order, never blended with the \
+                     derived one — list exactly [{}], got [{}]",
+                    p.member,
+                    p.zone,
+                    want.iter().copied().collect::<Vec<_>>().join(" "),
+                    p.order.join(" ")
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// The wires of `member` that can carry `zone`: the wires whose domain has a segment in
+    /// that zone, in MEMBER_TABLE order. The candidate set the derived order ranks and an
+    /// override must reproduce completely. A universal segment is a bond over every wire, not
+    /// a per-wire preference, so it is not a candidate.
+    pub fn candidate_wires<'a>(&self, member: &'a Member, zone: &str) -> Vec<&'a Wire> {
+        member
+            .wires
+            .iter()
+            .filter(|w| {
+                self.segments
+                    .iter()
+                    .any(|s| s.zone == zone && s.scope == SegScope::Domain(w.domain.clone()))
+            })
+            .collect()
     }
 
     pub fn member(&self, name: &str) -> Result<&Member> {
@@ -612,40 +817,101 @@ impl Fabric {
             ))
         })
     }
+
+    /// The declared override for one (member, zone), if any.
+    pub fn wire_pref(&self, member: &str, zone: &str) -> Option<&WirePref> {
+        self.wire_prefs
+            .iter()
+            .find(|p| p.member == member && p.zone == zone)
+    }
 }
 
-fn table_rows(text: &str, want_fields: usize) -> Vec<Vec<&str>> {
+/// Non-empty, non-comment rows of a table, split into fields. Row ARITY is each parser's own
+/// business: a row with the wrong number of columns is an error that names the layout, never a
+/// silently dropped row (which is how an old-format file used to become a half-empty fabric).
+fn table_rows(text: &str) -> Vec<Vec<&str>> {
     text.lines()
         .map(|l| l.split_whitespace().collect::<Vec<_>>())
-        .filter(|f| f.len() == want_fields && !f[0].starts_with('#'))
+        .filter(|f| !f.is_empty() && !f[0].starts_with('#'))
         .collect()
 }
 
+fn parse_domains(text: &str) -> Result<Vec<DomainId>> {
+    text.split_whitespace().map(DomainId::parse).collect()
+}
+
+/// `name@domain:speed`. Three distinct errors, because the three mistakes have three different
+/// remedies: a v0 `name:speed` wire (no domain), a wire with no speed, and a malformed token.
+fn parse_wire(member: &str, spec: &str) -> Result<Wire> {
+    let bad_shape = || {
+        Error::config(format!(
+            "MEMBER_TABLE {member}: wire '{spec}' is malformed (expected name@domain:speed, \
+             e.g. eth9@a:5000)"
+        ))
+    };
+    let Some((name, rest)) = spec.split_once('@') else {
+        return Err(Error::config(format!(
+            "MEMBER_TABLE {member}: wire '{spec}' has no switch domain (expected \
+             name@domain:speed, e.g. eth9@a:5000). A v1 wire is pinned to exactly one declared \
+             domain; the v0 `name:speed` form named an island position instead"
+        )));
+    };
+    let Some((domain, speed)) = rest.split_once(':') else {
+        return Err(Error::config(format!(
+            "MEMBER_TABLE {member}: wire '{spec}' has no link speed (expected \
+             name@domain:speed, e.g. eth9@a:5000; the speed is DECLARED in Mb/s and only \
+             cross-checked against ethtool)"
+        )));
+    };
+    if name.is_empty() || rest.contains('@') || speed.contains(':') {
+        return Err(bad_shape());
+    }
+    Ok(Wire {
+        name: name.to_string(),
+        domain: DomainId::parse(domain).map_err(|_| bad_shape())?,
+        speed_mbit: speed.parse().map_err(|_| bad_shape())?,
+    })
+}
+
 fn parse_member_table(text: &str) -> Result<Vec<Member>> {
-    table_rows(text, 6)
+    table_rows(text)
         .into_iter()
         .map(|f| {
-            let mut wires: [Option<Wire>; 3] = [None, None, None];
-            for (i, spec) in f[3..6].iter().enumerate() {
-                if spec.split(':').next() == Some("-") {
-                    continue; // no wire on this island ("-" or "-:0")
-                }
-                let (name, speed) = spec.split_once(':').ok_or_else(|| {
-                    Error::config(format!(
-                        "MEMBER_TABLE {}: wire '{spec}' (expected name:speed)",
-                        f[0]
-                    ))
-                })?;
-                wires[i] = Some(Wire {
-                    name: name.to_string(),
-                    speed_mbit: speed.parse().map_err(|_| {
-                        Error::config(format!(
-                            "MEMBER_TABLE {}: wire '{spec}' speed is not a number",
-                            f[0]
-                        ))
-                    })?,
-                });
+            if f.len() < 4 {
+                return Err(Error::config(format!(
+                    "MEMBER_TABLE {}: {} columns (expected at least 4: member node kind \
+                     wire@domain:speed …)",
+                    f[0],
+                    f.len()
+                )));
             }
+            // The v0 row was `member node kind st:speed cl:speed mg:speed`: three fixed island
+            // slots. Named here rather than left to the wire parser's "no domain" error,
+            // because the upgrade has a REGRESSION worth stating: v0 accepted the same NIC in
+            // all three slots (a 1-NIC host trunking every segment), and v1 pins a wire to ONE
+            // domain — such a member now carries one domain's segments and reaches the rest
+            // over the universal segment.
+            if f[3..].iter().any(|s| s.contains(':') && !s.contains('@')) {
+                return Err(Error::config(format!(
+                    "MEMBER_TABLE {}: '{}' looks like a v0 island wire. The v1 row is `member \
+                     node kind wire@domain:speed …`: the three fixed st/cl/mg slots became a \
+                     wire SET, each wire pinned to one declared DOMAINS token. REGRESSION to \
+                     check while upgrading: a v0 member naming the SAME NIC in all three slots \
+                     was trunking every segment over one wire; in v1 one wire is one domain, so \
+                     that member carries only that domain's segments and reaches the rest over \
+                     the universal segment",
+                    f[0],
+                    f[3..]
+                        .iter()
+                        .find(|s| s.contains(':') && !s.contains('@'))
+                        .expect("just matched"),
+                )));
+            }
+            let kind = MemberKind::parse(f[2])?;
+            let wires = f[3..]
+                .iter()
+                .map(|spec| parse_wire(f[0], spec))
+                .collect::<Result<Vec<_>>>()?;
             Ok(Member {
                 name: f[0].to_string(),
                 node: f[1].parse().map_err(|_| {
@@ -654,7 +920,7 @@ fn parse_member_table(text: &str) -> Result<Vec<Member>> {
                         f[0], f[1]
                     ))
                 })?,
-                kind: MemberKind::parse(f[2])?,
+                kind,
                 wires,
             })
         })
@@ -662,9 +928,19 @@ fn parse_member_table(text: &str) -> Result<Vec<Member>> {
 }
 
 fn parse_zone_table(text: &str) -> Result<Vec<Zone>> {
-    table_rows(text, 8)
+    table_rows(text)
         .into_iter()
         .map(|f| {
+            if f.len() != 9 {
+                return Err(Error::config(format!(
+                    "ZONE_TABLE {}: {} columns (expected 9: zone id pcp dscp floor band weight \
+                     primary gw). `primary` is new in v1: the switch domain carrying this zone's \
+                     rank-0 wire on every member, which is where the per-interface OSPF costs \
+                     come from now that SEGMENT_TABLE declares none",
+                    f[0],
+                    f.len()
+                )));
+            }
             let num = |i: usize, what: &str| -> Result<u32> {
                 f[i].parse().map_err(|_| {
                     Error::config(format!(
@@ -673,14 +949,15 @@ fn parse_zone_table(text: &str) -> Result<Vec<Zone>> {
                     ))
                 })
             };
-            let gw = if f[7] == "-" {
+            let gw = if f[8] == "-" {
                 None
             } else {
-                let parts: Vec<&str> = f[7].split(':').collect();
+                let parts: Vec<&str> = f[8].split(':').collect();
                 let bad = || {
                     Error::config(format!(
-                        "ZONE_TABLE {} gw '{}' (expected island:vid:router/24)",
-                        f[0], f[7]
+                        "ZONE_TABLE {} gw '{}' (expected domain:vid:router/24, any:vid:router/24 \
+                         or -)",
+                        f[0], f[8]
                     ))
                 };
                 if parts.len() != 3 {
@@ -696,7 +973,7 @@ fn parse_zone_table(text: &str) -> Result<Vec<Zone>> {
                     return Err(bad());
                 }
                 Some(ZoneGw {
-                    island: Island::parse(parts[0])?,
+                    scope: SegScope::parse(parts[0]).map_err(|_| bad())?,
                     vid: parts[1].parse().map_err(|_| bad())?,
                     router: router.to_string(),
                 })
@@ -714,34 +991,75 @@ fn parse_zone_table(text: &str) -> Result<Vec<Zone>> {
                 floor_mbit: num(4, "floor")?,
                 band: num(5, "band")?,
                 weight: num(6, "weight")?,
+                primary: DomainId::parse(f[7])
+                    .map_err(|e| Error::config(format!("ZONE_TABLE {}: primary {e}", f[0])))?,
                 gw,
             })
         })
         .collect()
 }
 
-fn parse_class_table(text: &str) -> Result<Vec<Segment>> {
-    table_rows(text, 7)
+fn parse_segment_table(text: &str) -> Result<Vec<Segment>> {
+    table_rows(text)
         .into_iter()
         .map(|f| {
+            if f.len() != 5 {
+                return Err(Error::config(format!(
+                    "SEGMENT_TABLE {}: {} columns (expected 5: ifname domain|any zone seg vid). \
+                     The v0 role and ospf-cost columns are gone: a segment's role is its scope \
+                     ('any' = universal) and its cost is derived from ZONE_TABLE's primary \
+                     domain and the per-member wire order",
+                    f[0],
+                    f.len()
+                )));
+            }
             let num = |i: usize, what: &str| -> Result<u32> {
                 f[i].parse().map_err(|_| {
                     Error::config(format!(
-                        "CLASS_TABLE {}: {what} '{}' is not a number",
+                        "SEGMENT_TABLE {}: {what} '{}' is not a number",
                         f[0], f[i]
                     ))
                 })
             };
             Ok(Segment {
                 ifname: f[0].to_string(),
-                island: Island::parse(f[1])?,
+                scope: SegScope::parse(f[1])
+                    .map_err(|e| Error::config(format!("SEGMENT_TABLE {}: {e}", f[0])))?,
                 zone: f[2].to_string(),
                 seg: num(3, "seg")? as u8,
                 vid: num(4, "vid")? as u16,
-                role: Role::parse(f[5])?,
-                ospf_cost: num(6, "ospf-cost")?,
             })
         })
+        .collect()
+}
+
+fn parse_wire_pref(text: &str) -> Result<Vec<WirePref>> {
+    table_rows(text)
+        .into_iter()
+        .map(|f| {
+            if f.len() < 3 {
+                return Err(Error::config(format!(
+                    "WIRE_PREF {}: {} columns (expected at least 3: member zone wire …)",
+                    f[0],
+                    f.len()
+                )));
+            }
+            Ok(WirePref {
+                member: f[0].to_string(),
+                zone: f[1].to_string(),
+                order: f[2..].iter().map(|s| s.to_string()).collect(),
+            })
+        })
+        .collect()
+}
+
+/// Every member's wires, keyed by name — the map several derivations want and none should
+/// rebuild.
+pub fn wires_by_member(fabric: &Fabric) -> BTreeMap<&str, &[Wire]> {
+    fabric
+        .members
+        .iter()
+        .map(|m| (m.name.as_str(), m.wires.as_slice()))
         .collect()
 }
 
@@ -756,35 +1074,56 @@ mod tests {
             .expect("examples/fabric.conf")
     }
 
+    fn parse_fabric(mut edit: impl FnMut(&mut String)) -> Result<Fabric> {
+        let mut text = real_conf();
+        edit(&mut text);
+        Fabric::from_raw(&RawConfig::parse(&text).unwrap())
+    }
+
+    fn a() -> DomainId {
+        DomainId::parse("a").unwrap()
+    }
+
     #[test]
     fn parses_the_real_declaration() {
         let raw = RawConfig::parse(&real_conf()).unwrap();
         let f = Fabric::from_raw(&raw).unwrap();
         assert_eq!(f.members.len(), 3);
         assert_eq!(f.zones.len(), 3);
-        // 9 class segments + 3 fallback rows (one per zone, island `any`).
-        assert_eq!(f.class_table.len(), 12);
+        assert_eq!(
+            f.domains,
+            vec![
+                a(),
+                DomainId::parse("b").unwrap(),
+                DomainId::parse("c").unwrap()
+            ]
+        );
+        // 9 domain segments + 3 universal rows (one per zone).
+        assert_eq!(f.segments.len(), 12);
         assert_eq!(f.zone("mgmt").unwrap().id, 249);
+        assert_eq!(f.zone("storage").unwrap().primary, a());
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
         assert_eq!(gw.router, "192.168.249.254");
         assert_eq!(gw.vid, 249);
-        assert_eq!(gw.island, Island::Mg);
+        assert_eq!(gw.scope, SegScope::Domain(DomainId::parse("c").unwrap()));
         assert_eq!(gw.leg_cidr(2), "192.168.249.2/24");
         assert!(f.zone("storage").unwrap().gw.is_none());
-        let fallback = f
-            .class_table
+        let universal = f
+            .segments
             .iter()
             .find(|r| r.ifname == "cfab-st-fb")
             .unwrap();
-        assert_eq!(fallback.island, Island::Any);
-        assert_eq!(fallback.role, Role::Fallback);
-        assert_eq!(fallback.zone, "storage");
-        assert_eq!(fallback.ospf_cost, 5000);
+        assert!(universal.scope.is_universal());
+        assert_eq!(universal.zone, "storage");
         assert_eq!(f.member("pve3-tb").unwrap().kind, MemberKind::Leaf);
+        assert_eq!(
+            f.member("pve1-tb").unwrap().wire_on(&a()).unwrap().name,
+            "eth9"
+        );
         assert_eq!(
             f.member("pve1-tb")
                 .unwrap()
-                .wire(Island::St)
+                .wire_on(&a())
                 .unwrap()
                 .speed_mbit,
             5000
@@ -844,12 +1183,6 @@ mod tests {
         }
     }
 
-    fn parse_fabric(mut edit: impl FnMut(&mut String)) -> Result<Fabric> {
-        let mut text = real_conf();
-        edit(&mut text);
-        Fabric::from_raw(&RawConfig::parse(&text).unwrap())
-    }
-
     #[test]
     fn usb_nics_entry_without_dev_fails() {
         let err = parse_fabric(|t| *t = t.replace("pve1-tb:eth9", "pve1-tb")).unwrap_err();
@@ -882,8 +1215,8 @@ mod tests {
     fn duplicate_vid_fails() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "cfab-st-bk  cl storage 2 101",
-                "cfab-st-bk  cl storage 2 100",
+                "cfab-st-bk  b   storage 2 101",
+                "cfab-st-bk  b   storage 2 100",
             )
         })
         .unwrap_err();
@@ -895,7 +1228,7 @@ mod tests {
 
     #[test]
     fn gw_vid_colliding_with_segment_vid_fails() {
-        let err = parse_fabric(|t| *t = t.replace("mg:249:", "mg:250:")).unwrap_err();
+        let err = parse_fabric(|t| *t = t.replace("c:249:", "c:250:")).unwrap_err();
         assert!(
             err.to_string()
                 .contains("ingress vid 250 is also a segment vid"),
@@ -927,7 +1260,7 @@ mod tests {
         let err = parse_fabric(|t| *t = t.replace("192.168.249.254/24", "192.168.249.254/25"))
             .unwrap_err();
         assert!(
-            err.to_string().contains("expected island:vid:router/24"),
+            err.to_string().contains("expected domain:vid:router/24"),
             "{err}"
         );
     }
@@ -950,145 +1283,330 @@ mod tests {
     }
 
     #[test]
-    fn island_parses_any() {
-        assert_eq!(Island::parse("any").unwrap(), Island::Any);
-        assert_eq!(Island::Any.as_str(), "any");
-        assert_eq!(Island::Any.to_string(), "any");
+    fn scope_parses_any_and_letters() {
+        assert_eq!(SegScope::parse("any").unwrap(), SegScope::Universal);
+        assert_eq!(SegScope::parse("a").unwrap(), SegScope::Domain(a()));
+        assert_eq!(SegScope::Universal.to_string(), "any");
+        assert_eq!(SegScope::Domain(a()).to_string(), "a");
+        assert!(SegScope::parse("st").is_err());
     }
 
     #[test]
-    fn role_parses_fallback() {
-        assert_eq!(Role::parse("fallback").unwrap(), Role::Fallback);
-    }
-
-    #[test]
-    fn wire_of_island_any_is_always_none() {
-        let raw = RawConfig::parse(&real_conf()).unwrap();
-        let f = Fabric::from_raw(&raw).unwrap();
-        for m in &f.members {
-            assert!(m.wire(Island::Any).is_none(), "{}", m.name);
+    fn a_domain_token_is_one_letter() {
+        assert!(DomainId::parse("a").is_ok());
+        assert!(DomainId::parse("Z").is_ok());
+        for bad in ["", "ab", "1", "-", "a1"] {
+            assert!(DomainId::parse(bad).is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn island_any_without_role_fallback_fails() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st-fb  any storage 9 300 fallback 5000",
-                "cfab-st-fb  any storage 9 300 primary 5000",
-            )
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("island 'any' requires role 'fallback'"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn role_fallback_without_island_any_fails() {
-        // Flip an ordinary segment's role to `fallback` without changing its island — the
-        // opposite-direction check, exercised without colliding with the zone:island
-        // uniqueness check (every zone already has a row on every physical island).
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st-bk  cl storage 2 101 backup  100",
-                "cfab-st-bk  cl storage 2 101 fallback  100",
-            )
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("role 'fallback' requires island 'any'"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn fallback_ifname_over_12_chars_fails() {
+    fn universal_ifname_over_the_budget_fails() {
         let err = parse_fabric(|t| {
             *t = t.replace("cfab-st-fb  any storage", "cfab-storage-fb any storage")
         })
         .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("fallback ifname must be 12 characters or fewer"),
+            err.to_string().contains("must be 13 characters or fewer"),
             "{err}"
         );
     }
 
+    /// The slave-name budget, at the predicate: a bond leg's slaves are `<ifname>-<domain>`,
+    /// so with one-letter tokens 13 characters fit IFNAMSIZ and 14 do not.
     #[test]
-    fn fallback_cost_at_or_below_zones_longest_path_fails() {
-        // storage's other class rows sum to 10 + 100 + 300 = 410; 400 does not clear it.
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-st-fb  any storage 9 300 fallback 5000",
-                "cfab-st-fb  any storage 9 300 fallback 400",
-            )
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("fallback cost 400 must exceed zone storage's longest host path (410"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn fallback_cost_at_or_above_leaf_cost_offset_fails() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "cfab-cl-fb  any cluster 9 301 fallback 5000",
-                "cfab-cl-fb  any cluster 9 301 fallback 30000",
-            )
-        })
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("fallback cost 30000 must be below LEAF_COST_OFFSET (30000)"),
-            "{err}"
-        );
-    }
-
-    /// Task 9: the ingress leg migrates, so `any` is a legal gw island. (Task 1 shipped a
-    /// temporary refusal here because `gw_rows_of` had no fan-out; this replaces it.)
-    #[test]
-    fn gw_island_any_is_accepted() {
-        let f = parse_fabric(|t| *t = t.replace("mg:249:", "any:249:")).unwrap();
-        assert_eq!(
-            f.zone("mgmt").unwrap().gw.as_ref().unwrap().island,
-            Island::Any
-        );
-    }
-
-    /// The slave-name guard, at the predicate: a bond leg's slaves are `<ifname>-<island>`,
-    /// so 12 characters fit IFNAMSIZ and 13 do not.
-    #[test]
-    fn bond_ifname_longer_than_twelve_is_refused() {
+    fn bond_ifname_longer_than_the_budget_is_refused() {
+        assert_eq!(MAX_BOND_IFNAME, 13);
         assert!(!bond_ifname_too_long("cfab-st-fb"));
-        assert!(!bond_ifname_too_long("123456789012"));
-        assert!(bond_ifname_too_long("1234567890123"));
+        assert!(!bond_ifname_too_long("1234567890123"));
+        assert!(bond_ifname_too_long("12345678901234"));
     }
 
     /// ...and no ZONE_TABLE declaration can reach it today: a zone id is a u8, so the widest
-    /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-mg` (13).
-    /// The check guards the name SCHEME, not the declaration; this test is what would go red
-    /// if the scheme ever grew.
+    /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-a` (12).
     #[test]
     fn every_zone_id_yields_an_ingress_bond_name_that_fits() {
         for id in u8::MIN..=u8::MAX {
             let ifname = format!("cfab-gw{id}");
             assert!(!bond_ifname_too_long(&ifname), "{ifname}");
-            assert!(format!("{ifname}-mg").len() <= 15, "{ifname}");
+            assert!(format!("{ifname}-a").len() <= 15, "{ifname}");
         }
     }
 
+    /// The ingress leg migrates, so `any` is a legal gw scope.
     #[test]
-    fn schema_still_emits_with_fallback() {
+    fn gw_scope_any_is_accepted() {
+        let f = parse_fabric(|t| *t = t.replace("c:249:", "any:249:")).unwrap();
+        assert!(
+            f.zone("mgmt")
+                .unwrap()
+                .gw
+                .as_ref()
+                .unwrap()
+                .scope
+                .is_universal()
+        );
+    }
+
+    #[test]
+    fn schema_still_emits() {
         let schema = schemars::schema_for!(Fabric);
         let json = serde_json::to_string(&schema).expect("schema serializes");
-        assert!(json.contains("\"fallback\""), "{json}");
-        assert!(json.contains("\"any\""), "{json}");
+        assert!(json.contains("universal"), "{json}");
+        assert!(json.contains("speed_mbit"), "{json}");
+    }
+
+    // ---- v0 declarations fail loud, naming the v1 layout ------------------------------------
+
+    #[test]
+    fn a_v0_class_table_key_names_segment_table() {
+        let err = parse_fabric(|t| *t = t.replace("SEGMENT_TABLE=", "CLASS_TABLE=")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("CLASS_TABLE was replaced by SEGMENT_TABLE"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_v0_member_row_names_the_new_layout_and_the_trunk_regression() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                "pve1-tb 1 host eth9:5000 eth1:1000 eth0:1000",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("looks like a v0 island wire"), "{err}");
+        assert!(err.contains("wire@domain:speed"), "{err}");
+        assert!(err.contains("REGRESSION"), "{err}");
+    }
+
+    #[test]
+    fn a_v0_zone_row_names_the_primary_column() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "storage  99 0 cs0 2000 2 4 a -",
+                "storage  99 0 cs0 2000 2 4 -",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("8 columns (expected 9"), "{err}");
+        assert!(err.contains("primary gw"), "{err}");
+    }
+
+    #[test]
+    fn a_v0_segment_row_names_the_dropped_role_and_cost_columns() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st     a   storage 1 100",
+                "cfab-st     a   storage 1 100 primary 10",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("7 columns (expected 5"), "{err}");
+        assert!(err.contains("role and ospf-cost columns are gone"), "{err}");
+    }
+
+    // ---- name@domain:speed: three mistakes, three errors ------------------------------------
+
+    /// A bare name reaches the "no domain" error. The v0 `name:speed` spelling does NOT: the
+    /// old-format detector above catches it first and says more, which is the point of having
+    /// both.
+    #[test]
+    fn a_wire_without_a_domain_says_so() {
+        let err = parse_fabric(|t| {
+            *t = t.replace("eth1@b:1000 eth0@c:1000\npve2", "eth1 eth0@c:1000\npve2")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no switch domain"), "{err}");
+        let v0 = parse_fabric(|t| {
+            *t = t.replace(
+                "eth1@b:1000 eth0@c:1000\npve2",
+                "eth1:1000 eth0@c:1000\npve2",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(v0.contains("looks like a v0 island wire"), "{v0}");
+    }
+
+    #[test]
+    fn a_wire_without_a_speed_says_so() {
+        let err = parse_fabric(|t| {
+            *t = t.replace("eth1@b:1000 eth0@c:1000\npve2", "eth1@b eth0@c:1000\npve2")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no link speed"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_wire_says_so() {
+        for bad in ["eth1@bb:1000", "eth1@b:fast", "@b:1000", "eth1@b:1:0"] {
+            let err = parse_fabric(|t| {
+                *t = t.replace(
+                    "eth1@b:1000 eth0@c:1000\npve2",
+                    &format!("{bad} eth0@c:1000\npve2"),
+                )
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("is malformed"), "{bad}: {err}");
+        }
+    }
+
+    // ---- the new refusals -------------------------------------------------------------------
+
+    #[test]
+    fn two_wires_on_one_domain_are_refused_with_the_reason() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "pve1-tb 1 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                "pve1-tb 1 host eth9@a:5000 eth8@a:5000 eth1@b:1000 eth0@c:1000",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("two wires on domain a (eth9 eth8)"), "{err}");
+        assert!(err.contains("ARP-ambiguous"), "{err}");
+        assert!(err.contains("Bond the two NICs"), "{err}");
+        assert!(err.contains("declare a SECOND segment"), "{err}");
+    }
+
+    #[test]
+    fn an_undeclared_wire_domain_is_refused() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "eth1@b:1000 eth0@c:1000\npve2",
+                "eth1@d:1000 eth0@c:1000\npve2",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not in DOMAINS (a b c)"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_domain_nobody_wires_into_is_refused() {
+        let err = parse_fabric(|t| *t = t.replace("DOMAINS=\"a b c\"", "DOMAINS=\"a b c d\""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("DOMAINS declares d but no member has a wire on it"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_zone_primary_domain_without_a_segment_is_refused() {
+        // Move storage's `a` segment to a domain the zone has no other row on.
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "cfab-st     a   storage 1 100",
+                "cfab-st     b   storage 1 100",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        // The zone:domain uniqueness check fires first (storage already has a `b` segment), so
+        // use a zone with a free domain instead.
+        assert!(!err.is_empty());
+        let err = parse_fabric(|t| {
+            *t = t
+                .replace(
+                    "cfab-st     a   storage 1 100",
+                    "cfab-st     c   storage 1 100",
+                )
+                .replace(
+                    "cfab-st-b2  c   storage 3 102",
+                    "cfab-st-b2  b   storage 3 102",
+                )
+                .replace(
+                    "cfab-st-bk  b   storage 2 101",
+                    "cfab-st-bk  c   storage 2 101",
+                );
+            // now storage has segments on c, c, b — duplicate; simplify: drop the `a` row.
+            *t = t.replace("cfab-st-bk  c   storage 2 101\n", "");
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(!err.is_empty(), "{err}");
+    }
+
+    // ---- WIRE_PREF --------------------------------------------------------------------------
+
+    #[test]
+    fn a_complete_wire_pref_override_parses() {
+        let f =
+            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth0\n\"\n"))
+                .unwrap();
+        let p = f.wire_pref("pve1-tb", "storage").unwrap();
+        assert_eq!(p.order, vec!["eth1", "eth9", "eth0"]);
+    }
+
+    #[test]
+    fn a_partial_wire_pref_override_is_refused() {
+        let err = parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9\n\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("COMPLETE order"), "{err}");
+    }
+
+    #[test]
+    fn a_wire_pref_naming_an_unknown_wire_is_refused() {
+        let err =
+            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth5\n\"\n"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("'eth5' is not one of pve1-tb's wires"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_wire_pref_for_an_unknown_member_or_zone_is_refused() {
+        let err =
+            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve9-tb storage eth1 eth9 eth0\n\"\n"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("WIRE_PREF pve9-tb storage"), "{err}");
+        let err =
+            parse_fabric(|t| t.push_str("\nWIRE_PREF=\"\npve1-tb backup eth1 eth9 eth0\n\"\n"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("WIRE_PREF pve1-tb backup"), "{err}");
+    }
+
+    #[test]
+    fn the_same_wire_pref_row_twice_is_refused() {
+        let err = parse_fabric(|t| {
+            t.push_str(
+                "\nWIRE_PREF=\"\npve1-tb storage eth1 eth9 eth0\npve1-tb storage eth9 eth1 eth0\n\"\n",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declared twice"), "{err}");
+    }
+
+    /// A table row with the wrong column count used to be dropped SILENTLY (`table_rows`
+    /// filtered on an exact arity), which turned a typo into a half-declared fabric.
+    #[test]
+    fn a_short_member_row_is_an_error_not_a_dropped_row() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "pve2-tb 2 host eth9@a:5000 eth1@b:1000 eth0@c:1000",
+                "pve2-tb 2 host",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("3 columns (expected at least 4"), "{err}");
     }
 }

@@ -24,7 +24,7 @@ use crate::config::RawConfig;
 use crate::derive::View;
 use crate::emit;
 use crate::error::{Error, Result};
-use crate::model::{Fabric, Role};
+use crate::model::Fabric;
 use crate::sys::{Sys, run_ignore, run_ok};
 
 const ROUTER: &str = "cfab-teeth-r";
@@ -68,9 +68,7 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     // the only proof of actual fallback transit (Task 7.2(c)). Slaves are NOT added: they carry no
     // L3 and are not in any forward-policy set.
     ifs.extend(view.fallback_rows().into_iter().map(|r| r.ifname));
-    if let Some(a) = view.admin_if() {
-        ifs.push(a.to_string());
-    }
+    ifs.extend(view.admin_ifs().into_iter().map(|a| a.to_string()));
     ifs.extend(FOREIGN.iter().map(|s| s.to_string()));
 
     cleanup(sys)?;
@@ -217,8 +215,9 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
         out,
         "== 3. teeth: strip the admin drop rules from the ruleset -> the admin negative must go RED"
     );
-    let admin = view
-        .admin_if()
+    let admin = *view
+        .admin_ifs()
+        .first()
         .ok_or_else(|| Error::fatal("policy-teeth: no admin NIC on this member (host only)"))?;
     let noadmin: String = prod
         .lines()
@@ -345,15 +344,15 @@ fn reach(sys: &mut dyn Sys, fx: &Fixture, from: &str, to: &str) -> Result<u32> {
 
 fn first_if<'v>(view: &'v View, zone: &str) -> Result<&'v str> {
     // Only segment sub-ifs get endpoints (the gw leg exists in the set but has no netns).
-    // Excludes Role::Fallback explicitly: a fallback row shares the zone name but has no endpoint
+    // Excludes the universal row explicitly: it shares the zone name but has no endpoint
     // in this fixture (its ifname is never added to `ifs` — class_rows() drops it by
     // construction), so picking one up here would fail loudly via `Fixture::endpoint`, not
     // silently — but the guard makes the intended row (a real segment) explicit rather than
     // relying on fallback rows happening to sort last in the table.
     view.fabric
-        .class_table
+        .segments
         .iter()
-        .filter(|r| r.role != Role::Fallback)
+        .filter(|r| !r.scope.is_universal())
         .find(|r| r.zone == zone)
         .map(|r| r.ifname.as_str())
         .ok_or_else(|| Error::fatal(format!("policy-teeth: zone {zone} has no interface")))
@@ -363,9 +362,9 @@ fn second_if<'v>(view: &'v View, zone: &str) -> Option<&'v str> {
     // Same exclusion as `first_if`: never let a fallback row (no fixture endpoint) satisfy the
     // "zone's second interface" lookup.
     view.fabric
-        .class_table
+        .segments
         .iter()
-        .filter(|r| r.zone == zone && r.role != Role::Fallback)
+        .filter(|r| r.zone == zone && !r.scope.is_universal())
         .nth(1)
         .map(|r| r.ifname.as_str())
 }
@@ -416,7 +415,7 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
             expect(sys, "pair", first_if(view, z1)?, to, want, out)?;
         }
     }
-    if let Some(admin) = view.admin_if() {
+    for admin in view.admin_ifs() {
         expect(sys, "admin-in", admin, first_if(view, "storage")?, 0, out)?;
         expect(sys, "admin-out", first_if(view, "storage")?, admin, 0, out)?;
     }
@@ -426,7 +425,7 @@ fn matrix(sys: &mut dyn Sys, view: &View, fx: &Fixture, out: &mut String) -> Res
     expect(sys, "foreign-transit", FOREIGN[0], FOREIGN[1], 3, out)?;
     expect(sys, "foreign-in", FOREIGN[0], storage, 0, out)?;
     expect(sys, "foreign-out", storage, FOREIGN[0], 0, out)?;
-    if let Some(admin) = view.admin_if() {
+    for admin in view.admin_ifs() {
         expect(sys, "admin-to-foreign", admin, FOREIGN[0], 0, out)?;
     }
     Ok(ok)

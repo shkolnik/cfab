@@ -14,7 +14,7 @@ use crate::derive::{GwRow, Slave, View};
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
-use crate::model::{MemberKind, Role};
+use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 
 pub struct ApplyOpts {
@@ -236,7 +236,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     let class_rows = view.class_rows();
     let gw_rows = view.gw_rows();
     let wires = view.wires();
-    let admin_if = view.admin_if();
+    let admin_ifs = view.admin_ifs();
 
     // ---- preconditions: fail loud, never degrade -------------------------------
     // A host requires `nft`: it installs the whole `table inet cfab` (bulk DSCP clamp + the
@@ -271,18 +271,26 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             f.fabric_mode
         )));
     }
-    // Lockout guard: the admin NIC must carry an IPv4 address BEFORE we touch anything — the
-    // admin session rides it untagged, and bringup deliberately never assigns or flushes it.
-    if let Some(admin) = admin_if {
-        let out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", admin])?;
-        let has_v4 = out.stdout.lines().any(|l| {
-            l.split_whitespace()
-                .skip(2)
-                .any(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        });
-        if !has_v4 {
+    // Lockout guard: at least one wire must carry an untagged IPv4 address BEFORE we touch
+    // anything — the admin session rides the untagged path of some wire, and bringup
+    // deliberately never assigns or flushes any of them. Every wire is an admin wire on a
+    // host, so the bar is "one of them is reachable", not "all of them are addressed".
+    if !admin_ifs.is_empty() {
+        let mut addressed: Vec<&str> = Vec::new();
+        for admin in &admin_ifs {
+            let out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", admin])?;
+            if out.stdout.lines().any(|l| {
+                l.split_whitespace()
+                    .skip(2)
+                    .any(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            }) {
+                addressed.push(admin);
+            }
+        }
+        if addressed.is_empty() {
             return Err(Error::fatal(format!(
-                "admin NIC '{admin}' (ADMIN_IF) has no IPv4 address — admin path would be unreachable"
+                "no wire ({}) has an untagged IPv4 address — the admin path would be unreachable",
+                admin_ifs.join(" ")
             )));
         }
     }
@@ -303,60 +311,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // refused: `own_wires` decides membership once, here, and nothing below re-derives it.
     let absent = own_wires(sys, view)?;
     let mut warnings: Vec<String> = absent.iter().map(|dev| absent_wire_warning(dev)).collect();
-    for dev in wires.iter().filter(|d| !absent.contains(d.as_str())) {
-        if kind != MemberKind::Host {
-            continue; // a leaf never owns a wire's L3 (DSM does)
-        }
-        if admin_if == Some(dev.as_str()) {
-            continue;
-        }
-        if sys.run(&["pgrep", "-f", &format!("dhcpcd.*{dev}")])?.ok() {
-            run_ignore(sys, &["dhcpcd", "-k", dev])?;
-        }
-        // Review finding 3 (2026-09-05): the predicate that used to gate this was "is
-        // NetworkManager RUNNING" (`systemctl is-active`), which Task 5 had to drop (no
-        // systemd probe in apply); "is nmcli INSTALLED" is a different, weaker condition —
-        // a host with NM installed but masked would now run a command that fails every
-        // apply. Ask NM itself instead of systemd or the binary's mere presence.
-        //
-        // Round 2 (RULED, 2026-09-05): a refusal here strands an unattended host with NO
-        // supervisor at all — strictly worse than a wire NM keeps fighting us for. ALWAYS
-        // attempt the release when nmcli is installed; the RUNNING probe words the warning
-        // only (not-running vs. running-but-refused), it never gates the attempt, and a
-        // failure is a WARNING, never a refusal.
-        if have_tool(sys, "nmcli")? {
-            let nm = sys.run(&["nmcli", "-t", "-f", "RUNNING", "general"])?;
-            let out = sys.run(&["nmcli", "device", "set", dev, "managed", "no"])?;
-            if !out.ok() {
-                warnings.push(if nm.stdout.trim() == "running" {
-                    format!(
-                        "WARNING: NetworkManager is running and refused to release {dev} \
-                         ({}) — it may keep fighting cfab for this wire's addresses; check \
-                         `nmcli device show {dev}`",
-                        out.stderr.trim()
-                    )
-                } else {
-                    format!(
-                        "WARNING: nmcli is installed but NetworkManager is not running, and \
-                         releasing {dev} still failed ({}) — check `nmcli device show {dev}`",
-                        out.stderr.trim()
-                    )
-                });
-            }
-        }
-        let dhcp = sys.run(&["pgrep", "-af", "dhclient|udhcpc"])?;
-        if dhcp
-            .stdout
-            .lines()
-            .any(|l| l.split_whitespace().any(|w| w == dev.as_str()))
-        {
-            return Err(Error::fatal(format!(
-                "a dhcp client holds fabric NIC {dev} — investigate before bringup"
-            )));
-        }
-        run_ok(sys, &["ip", "addr", "flush", "dev", dev])?;
-    }
-
+    // Nothing is taken over here any more. Until 2026-09-06 `up` released each non-admin wire
+    // from NetworkManager, refused a wire a dhcp client held, and flushed its addresses. Under
+    // the ruling that the UNTAGGED path of EVERY host wire is the admin plane, there is no
+    // non-admin wire left to take: cfab adds tagged sub-interfaces and never touches a wire's
+    // own L3, so NM and DHCP keep every wire they had. `up` proves it by never running those
+    // commands (`up_never_takes_a_wire_from_its_manager`).
     // ---- NIC safe mode ---------------------------------------------------------
     for (_, dev) in f
         .usb_nics
@@ -441,12 +401,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 &format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
             ],
         )?;
-        class_sysctls(sys, &r.ifname, r.role)?;
+        class_sysctls(sys, &r.ifname)?;
     }
     // The ingress leg: the router's VLAN, this node's address in the router's /24. Same
-    // sysctls as a backup segment; nothing else about it is a segment. On a gw island of
+    // sysctls as a backup segment; nothing else about it is a segment. On a gw domain of
     // `any` the leg is the same bond a fallback segment is, so it migrates between wires
-    // instead of dying with its island — one leg, one BGP session (James 2026-09-04).
+    // instead of dying with its domain — one leg, one BGP session (James 2026-09-04).
     for r in &gw_rows {
         let z = f.zone(&r.zone)?;
         let gw = z.gw.as_ref().expect("gw_rows lists gw zones");
@@ -468,13 +428,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                     home: &home,
                     slaves: &slaves,
                     cidr: &cidr,
-                    role: Role::Backup,
                 },
                 &qos_map,
             )?;
         } else if !absent.contains(&r.home) {
             mk_vlan(sys, &r.ifname, &r.home, r.vid, Some(&cidr), true, &qos_map)?;
-            class_sysctls(sys, &r.ifname, Role::Backup)?;
+            class_sysctls(sys, &r.ifname)?;
         }
         // cfab's own return-path default: a reply sourced from an identity address must leave
         // through the ingress leg (proto 205, this member's own id), never untagged out of the
@@ -493,7 +452,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         .install(sys)?;
     }
     // The fallback leg: one active-backup bond per zone over a tagged sub-interface of every
-    // wire, so the member keeps a path in the zone when the physical islands are disjointly
+    // wire, so the member keeps a path in the zone when the physical domains are disjointly
     // isolated. Not a class row and not a wire: nothing that treats a segment as a wire (the
     // shaper, the qdisc sweep, status's link-speed checks) ever sees it.
     for r in &view.fallback_rows() {
@@ -509,7 +468,6 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 home: &home,
                 slaves: &slaves,
                 cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
-                role: Role::Fallback,
             },
             &[
                 &format!("0:{}", z.pcp),
@@ -698,9 +656,8 @@ const FALLBACK_NUM_GRAT_ARP: &str = "3";
 /// expect. The return migration is lossless (measured), so it costs nothing.
 const FALLBACK_PRIMARY_RESELECT: &str = "always";
 
-/// A migrating leg to build: a fallback segment, or an ingress leg on gw island `any`. The two
-/// are the same netdev shape, so they are the same code — only the address and the (unused)
-/// role differ.
+/// A migrating leg to build: a universal segment, or an ingress leg on gw scope `any`. The two
+/// are the same netdev shape, so they are the same code — only the address differs.
 struct BondLeg<'a> {
     ifname: &'a str,
     vid: u16,
@@ -709,7 +666,6 @@ struct BondLeg<'a> {
     slaves: &'a [Slave],
     /// The bond is the L3 interface; its slaves carry no address.
     cidr: &'a str,
-    role: Role,
 }
 
 /// Every bond parameter this build creates a leg with, in `bonding/` sysfs spelling: the file
@@ -851,7 +807,7 @@ fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> Result<()> {
     )?;
     // (5) the bond is the segment: address, segment sysctls, up.
     run_ok(sys, &["ip", "addr", "replace", r.cidr, "dev", r.ifname])?;
-    class_sysctls(sys, r.ifname, r.role)?;
+    class_sysctls(sys, r.ifname)?;
     run_ok(sys, &["ip", "link", "set", r.ifname, "up"])?;
     Ok(())
 }
@@ -883,9 +839,9 @@ pub fn describe_down(view: &View, down: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Measured live: arp_ignore=1 (NOT arp_filter — it flaps BFD); rp_filter LOOSE on every role
-/// (strict on a primary black-holed control for ~5 s when all links returned at once).
-fn class_sysctls(sys: &mut dyn Sys, ifname: &str, _role: Role) -> Result<()> {
+/// Measured live: arp_ignore=1 (NOT arp_filter — it flaps BFD); rp_filter LOOSE on every
+/// segment (strict on a primary black-holed control for ~5 s when all links returned at once).
+fn class_sysctls(sys: &mut dyn Sys, ifname: &str) -> Result<()> {
     proc_sysctl(sys, ifname, "arp_ignore", "1")?;
     proc_sysctl(sys, ifname, "rp_filter", "2")?;
     proc_sysctl(sys, ifname, "send_redirects", "0")?;
@@ -951,7 +907,7 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Re
     {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
-    if let Some(admin) = view.admin_if() {
+    for admin in view.admin_ifs() {
         proc_sysctl(sys, admin, "forwarding", "0")?; // belt (the policy's admin rules = braces)
     }
     // A foreign stack's forward-hook policy drop kills transit that cfab accepts, and cfab
@@ -1029,9 +985,9 @@ mod tests {
             "{warnings:?}"
         );
         // Nothing else may touch it: no sub-if, no bond slave, no sysctl, no forwarding write —
-        // checked by exact ifname token, not substring (CLASS_TABLE reuses "cfab-st" as a
-        // PREFIX for segments that live on other wires entirely: cfab-st-bk is island cl,
-        // cfab-st-b2 is island mg — only cfab-st itself is eth9's segment).
+        // checked by exact ifname token, not substring (SEGMENT_TABLE reuses "cfab-st" as a
+        // PREFIX for segments that live on other wires entirely: cfab-st-bk is domain cl,
+        // cfab-st-b2 is domain mg — only cfab-st itself is eth9's segment).
         for c in sys
             .calls
             .iter()
@@ -1064,51 +1020,30 @@ mod tests {
         assert!(!err.contains("absent (no such netdev)"), "{err}");
     }
 
-    /// Round 2 (RULED, 2026-09-05): a refusal here would strand an unattended host with no
-    /// supervisor at all — strictly worse than a wire NM keeps fighting us for. A running NM
-    /// that refuses to release the wire is a WARNING, never a refusal, and the apply succeeds;
-    /// the release is still ATTEMPTED (the reviewer's real point: the condition is no longer
-    /// silent).
+    /// The untagged path of every host wire is the admin plane (James 2026-09-06), so `up`
+    /// must never take a wire from whatever manages it: no NetworkManager release, no dhcp
+    /// client kill, and above all no `ip addr flush` — that address IS the admin session. This
+    /// replaces the two NetworkManager-release tests: the code they covered is gone, and this
+    /// is the invariant that made it go.
     #[test]
-    fn a_running_nm_that_refuses_to_release_a_wire_warns_and_the_apply_still_succeeds() {
-        let (mut sys, view) = up_sys_and_view();
-        sys = sys
-            .on_stdout(
-                &["/usr/bin/env", "sh", "-c", "command -v nmcli"],
-                "/usr/bin/nmcli\n",
-            )
-            .on_stdout(&["nmcli", "-t", "-f", "RUNNING", "general"], "running\n")
-            .on_fail(
-                &["nmcli", "device", "set", "eth1", "managed", "no"],
-                1,
-                "Error: Device 'eth0' not managed.",
-            );
-        let warnings = run(&mut sys, &view, &opts()).unwrap();
-        assert!(sys.ran("nmcli device set eth1 managed no"));
-        assert!(
-            warnings.iter().any(|w| w
-                .contains("NetworkManager is running and refused to release eth1")
-                && w.contains("Error: Device 'eth0' not managed.")),
-            "{warnings:?}"
-        );
-    }
-
-    /// nmcli installed but NetworkManager not running (masked, stopped): the release is still
-    /// attempted (round 2 drops the RUNNING probe as a gate on whether to try), it succeeds
-    /// (nmcli manages the release fine with NM down), and no warning is raised.
-    #[test]
-    fn an_installed_but_not_running_networkmanager_release_is_attempted_and_clean() {
+    fn up_never_takes_a_wire_from_its_manager() {
         let (mut sys, view) = up_sys_and_view();
         sys = sys.on_stdout(
             &["/usr/bin/env", "sh", "-c", "command -v nmcli"],
             "/usr/bin/nmcli\n",
         );
-        let warnings = run(&mut sys, &view, &opts()).unwrap();
-        assert!(sys.ran("nmcli device set eth1 managed no"));
-        assert!(
-            !warnings.iter().any(|w| w.contains("NetworkManager")),
-            "{warnings:?}"
-        );
+        run(&mut sys, &view, &opts()).unwrap();
+        for wire in ["eth9", "eth1", "eth0"] {
+            assert!(
+                !sys.ran(&format!("nmcli device set {wire} managed no")),
+                "{wire} was released from NetworkManager"
+            );
+            assert!(
+                !sys.ran(&format!("ip addr flush dev {wire}")),
+                "{wire}'s untagged admin address was flushed"
+            );
+            assert!(!sys.ran(&format!("dhcpcd -k {wire}")), "{wire}");
+        }
     }
 
     /// Every netdev absent but the three wires (the from-scratch `up`), the admin NIC
@@ -1180,7 +1115,7 @@ mod tests {
     /// first, each slave created DOWN and address-less then enslaved and brought up, `primary`
     /// only AFTER the slaves exist (at `add` time it is a silent no-op), then the address,
     /// the segment sysctls and the bond up. storage's home wire is eth9 (its cheapest class
-    /// row is on the st island), so `primary` names the st SLAVE, never the wire.
+    /// row is on the st domain), so `primary` names the st SLAVE, never the wire.
     #[test]
     fn a_fallback_leg_is_built_bond_slaves_primary_address() {
         let f = fabric();
@@ -1193,28 +1128,28 @@ mod tests {
             [
                 "ip link show cfab-st-fb",
                 "ip link add cfab-st-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
-                "ip link show cfab-st-fb-st",
+                "ip link show cfab-st-fb-a",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-fb-st",
-                "ip link add link eth9 name cfab-st-fb-st type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-fb-st master cfab-st-fb",
-                "ip link set cfab-st-fb-st up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-fb-st/forwarding",
-                "ip link show cfab-st-fb-cl",
+                "ip link show cfab-st-fb-a",
+                "ip link add link eth9 name cfab-st-fb-a type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-a master cfab-st-fb",
+                "ip link set cfab-st-fb-a up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-a/forwarding",
+                "ip link show cfab-st-fb-b",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-fb-cl",
-                "ip link add link eth1 name cfab-st-fb-cl type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-fb-cl master cfab-st-fb",
-                "ip link set cfab-st-fb-cl up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-fb-cl/forwarding",
-                "ip link show cfab-st-fb-mg",
+                "ip link show cfab-st-fb-b",
+                "ip link add link eth1 name cfab-st-fb-b type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-b master cfab-st-fb",
+                "ip link set cfab-st-fb-b up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-b/forwarding",
+                "ip link show cfab-st-fb-c",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-st-fb-mg",
-                "ip link add link eth0 name cfab-st-fb-mg type vlan id 300 egress-qos-map 0:0 6:6",
-                "ip link set cfab-st-fb-mg master cfab-st-fb",
-                "ip link set cfab-st-fb-mg up",
-                "write /proc/sys/net/ipv4/conf/cfab-st-fb-mg/forwarding",
-                "ip link set cfab-st-fb type bond primary cfab-st-fb-st primary_reselect always",
+                "ip link show cfab-st-fb-c",
+                "ip link add link eth0 name cfab-st-fb-c type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-c master cfab-st-fb",
+                "ip link set cfab-st-fb-c up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-c/forwarding",
+                "ip link set cfab-st-fb type bond primary cfab-st-fb-a primary_reselect always",
                 "ip addr replace 10.99.9.1/24 dev cfab-st-fb",
                 "write /proc/sys/net/ipv4/conf/cfab-st-fb/arp_ignore",
                 "write /proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter",
@@ -1238,29 +1173,29 @@ mod tests {
         // before it touches a bond it did not just create.
         let sys = bond_sysfs(up_sys(&view), "cfab-st-fb", &healthy_bond_params());
         let mut sys = sys
-            .file("/sys/class/net/cfab-st-fb-st/master", "")
+            .file("/sys/class/net/cfab-st-fb-a/master", "")
             .on_stdout(&["ip", "link", "show", "cfab-st-fb"], "9: cfab-st-fb\n")
             .on_stdout(
                 &["ip", "-d", "link", "show", "cfab-st-fb"],
                 "9: cfab-st-fb: bond \n",
             )
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st\n",
+                &["ip", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st@eth9: master cfab-st-fb state UP vlan protocol 802.1Q id 300 \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a@eth9: master cfab-st-fb state UP vlan protocol 802.1Q id 300 \n",
             );
         run(&mut sys, &view, &o).unwrap();
         assert!(
-            !sys.ran("ip link set cfab-st-fb-st master"),
+            !sys.ran("ip link set cfab-st-fb-a master"),
             "{:?}",
-            calls_for(&sys, "cfab-st-fb-st")
+            calls_for(&sys, "cfab-st-fb-a")
         );
         assert!(!sys.ran("ip link add cfab-st-fb type bond"), "bond kept");
         // and the ones that are not enslaved still are
-        assert!(sys.ran("ip link set cfab-st-fb-cl master cfab-st-fb"));
+        assert!(sys.ran("ip link set cfab-st-fb-b master cfab-st-fb"));
     }
 
     /// A slave name that is already enslaved SOMEWHERE ELSE: the kernel would answer the
@@ -1271,22 +1206,22 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
         let mut sys = up_sys(&view)
-            .file("/sys/class/net/cfab-st-fb-st/master", "")
+            .file("/sys/class/net/cfab-st-fb-a/master", "")
             .on_stdout(
-                &["ip", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st\n",
+                &["ip", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a\n",
             )
             .on_stdout(
-                &["ip", "-d", "link", "show", "cfab-st-fb-st"],
-                "10: cfab-st-fb-st@eth9: master br0 state UP vlan protocol 802.1Q id 300 \n",
+                &["ip", "-d", "link", "show", "cfab-st-fb-a"],
+                "10: cfab-st-fb-a@eth9: master br0 state UP vlan protocol 802.1Q id 300 \n",
             );
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         assert!(
-            e.contains("REFUSING: cfab-st-fb-st is enslaved to another bond"),
+            e.contains("REFUSING: cfab-st-fb-a is enslaved to another bond"),
             "{e}"
         );
         assert!(
-            !sys.ran("ip link set cfab-st-fb-st master"),
+            !sys.ran("ip link set cfab-st-fb-a master"),
             "never fights the kernel for it"
         );
     }
@@ -1414,7 +1349,7 @@ mod tests {
             !sys.ran("ip link add cfab-st-fb type bond"),
             "an existing bond is never recreated"
         );
-        assert!(sys.ran("ip link set cfab-st-fb-st master cfab-st-fb"));
+        assert!(sys.ran("ip link set cfab-st-fb-a master cfab-st-fb"));
         assert!(sys.ran("ip link set cfab-st-fb up"));
     }
 
@@ -1457,7 +1392,7 @@ mod tests {
                 "{zone_if}"
             );
         }
-        for slave in ["cfab-st-fb-st", "cfab-st-fb-cl", "cfab-st-fb-mg"] {
+        for slave in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
             assert_eq!(
                 sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
                 Some("0"),
@@ -1466,19 +1401,19 @@ mod tests {
         }
     }
 
-    /// The same declaration with the ingress leg on island `any`.
+    /// The same declaration with the ingress leg on domain `any`.
     fn fabric_with_a_migrating_gw() -> Fabric {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.conf"))
                 .unwrap()
-                .replace("mg:249:", "any:249:");
+                .replace("c:249:", "any:249:");
         Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap()
     }
 
-    /// Task 9: a gw island of `any` builds the ingress leg as the very same bond a fallback
+    /// Task 9: a gw domain of `any` builds the ingress leg as the very same bond a fallback
     /// leg is — same parameters, same slave-then-enslave order, same `primary`-after-slaves
     /// rule — addressed with the router's /24 leg address, not a segment address. mgmt's
-    /// cheapest segment is on the mg island, so `primary` names the mg SLAVE.
+    /// cheapest segment is on the mg domain, so `primary` names the mg SLAVE.
     #[test]
     fn a_migrating_gw_leg_is_built_as_a_bond() {
         let f = fabric_with_a_migrating_gw();
@@ -1491,26 +1426,26 @@ mod tests {
             [
                 "ip link show cfab-gw249",
                 "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
-                "ip link show cfab-gw249-st",
+                "ip link show cfab-gw249-a",
                 // mk_vlan probes twice: kind-check, then create (unchanged, pre-existing)
-                "ip link show cfab-gw249-st",
-                "ip link add link eth9 name cfab-gw249-st type vlan id 249 egress-qos-map 0:2 6:6",
-                "ip link set cfab-gw249-st master cfab-gw249",
-                "ip link set cfab-gw249-st up",
-                "write /proc/sys/net/ipv4/conf/cfab-gw249-st/forwarding",
-                "ip link show cfab-gw249-cl",
-                "ip link show cfab-gw249-cl",
-                "ip link add link eth1 name cfab-gw249-cl type vlan id 249 egress-qos-map 0:2 6:6",
-                "ip link set cfab-gw249-cl master cfab-gw249",
-                "ip link set cfab-gw249-cl up",
-                "write /proc/sys/net/ipv4/conf/cfab-gw249-cl/forwarding",
-                "ip link show cfab-gw249-mg",
-                "ip link show cfab-gw249-mg",
-                "ip link add link eth0 name cfab-gw249-mg type vlan id 249 egress-qos-map 0:2 6:6",
-                "ip link set cfab-gw249-mg master cfab-gw249",
-                "ip link set cfab-gw249-mg up",
-                "write /proc/sys/net/ipv4/conf/cfab-gw249-mg/forwarding",
-                "ip link set cfab-gw249 type bond primary cfab-gw249-mg primary_reselect always",
+                "ip link show cfab-gw249-a",
+                "ip link add link eth9 name cfab-gw249-a type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-a master cfab-gw249",
+                "ip link set cfab-gw249-a up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-a/forwarding",
+                "ip link show cfab-gw249-b",
+                "ip link show cfab-gw249-b",
+                "ip link add link eth1 name cfab-gw249-b type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-b master cfab-gw249",
+                "ip link set cfab-gw249-b up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-b/forwarding",
+                "ip link show cfab-gw249-c",
+                "ip link show cfab-gw249-c",
+                "ip link add link eth0 name cfab-gw249-c type vlan id 249 egress-qos-map 0:2 6:6",
+                "ip link set cfab-gw249-c master cfab-gw249",
+                "ip link set cfab-gw249-c up",
+                "write /proc/sys/net/ipv4/conf/cfab-gw249-c/forwarding",
+                "ip link set cfab-gw249 type bond primary cfab-gw249-c primary_reselect always",
                 "ip addr replace 192.168.249.1/24 dev cfab-gw249",
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/arp_ignore",
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/rp_filter",
@@ -1556,7 +1491,7 @@ mod tests {
             sys.writes_to("/proc/sys/net/ipv4/conf/cfab-gw249/forwarding"),
             Some("1")
         );
-        for slave in ["cfab-gw249-st", "cfab-gw249-cl", "cfab-gw249-mg"] {
+        for slave in ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"] {
             assert_eq!(
                 sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
                 Some("0"),

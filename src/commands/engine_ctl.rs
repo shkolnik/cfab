@@ -726,11 +726,11 @@ pub(crate) mod tests {
     fn readback_leaf_checks_the_fallback_interface_and_its_transit_link() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
-        // The healthy leaf document advertises it: 5000 + 30000.
+        // The healthy leaf document advertises it: the derived 410 + 30000.
         let doc = healthy_doc(&view);
         assert_eq!(
             doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["cost"],
-            json!(35000)
+            json!(30410)
         );
         assert!(
             doc["ospf"]["storage"]["self_lsa_links"]
@@ -747,7 +747,7 @@ pub(crate) mod tests {
         doc["ospf"]["storage"]["interfaces"]["cfab-st-fb"]["cost"] = json!(5000);
         let e = readback(&view, &doc).unwrap_err().to_string();
         assert!(
-            e.contains("ospf 'storage' cfab-st-fb cost is 5000 (want 35000"),
+            e.contains("ospf 'storage' cfab-st-fb cost is 5000 (want 30410"),
             "{e}"
         );
 
@@ -762,7 +762,7 @@ pub(crate) mod tests {
         rs["metric"] = json!(5000);
         let e = readback(&view, &doc).unwrap_err().to_string();
         assert!(
-            e.contains("transit link cfab-st-fb (10.99.9.3) advertised at 5000 (want 35000"),
+            e.contains("transit link cfab-st-fb (10.99.9.3) advertised at 5000 (want 30410"),
             "{e}"
         );
     }

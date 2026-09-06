@@ -13,11 +13,20 @@ pub fn generate(view: &View) -> Result<String> {
     out.push_str("table inet cfab-fwd\n");
     out.push_str("delete table inet cfab-fwd\n");
     out.push_str("table inet cfab-fwd {\n");
-    match view.admin_if() {
-        Some(a) => out.push_str(&format!(
-            "  set admin {{ type ifname; elements = {{ \"{a}\" }} }}\n"
-        )),
-        None => out.push_str("  set admin { type ifname; }\n"),
+    // Every wire of a host: the untagged path of each NIC is the admin plane, so each is
+    // fenced out of transit. A leaf owns no L3 of ours on any wire, and its set is empty.
+    let admin: Vec<String> = view
+        .admin_ifs()
+        .into_iter()
+        .map(|a| format!("\"{a}\""))
+        .collect();
+    if admin.is_empty() {
+        out.push_str("  set admin { type ifname; }\n");
+    } else {
+        out.push_str(&format!(
+            "  set admin {{ type ifname; elements = {{ {} }} }}\n",
+            admin.join(",")
+        ));
     }
     for z in &f.zones {
         let ifs: Vec<String> = view
@@ -79,7 +88,7 @@ mod tests {
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
     /// fallback bond after a zone's segments, and this generator just emits whatever `zone_ifs`
     /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
-    /// (so `FORWARD_ALLOW storage>storage` covers island-disjoint transit through it) and in
+    /// (so `FORWARD_ALLOW storage>storage` covers domain-disjoint transit through it) and in
     /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
     /// A slave is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
     /// own — the bond does), but it IS in `owned_forwarding()` (Task 2, `false`/never-transit)
