@@ -276,6 +276,11 @@ pub struct WirePref {
 }
 
 /// The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.
+///
+/// `PartialEq` is the derived, ORDER-SENSITIVE comparison: `[[member]]` / `[[zone]]` / segment
+/// row order feeds the derived wire preferences and leg naming, so reordering rows IS a
+/// different fabric. Only TOML key order inside a table, comments and whitespace are invisible.
+/// The supervisor's reload decision (`classify_reload`) relies on exactly this.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Fabric {
     /// The declared switch domains, in declaration order.

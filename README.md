@@ -93,6 +93,8 @@ the next engine under the previous supervisor.
 - **Changed and valid**: the fabric is torn down and the unit restarted onto the new declaration.
   An in-place apply cannot do this — it creates and repairs, it never removes what the previous
   declaration had — so the whole fabric is down for the restart, as on a package upgrade.
+- Reloads never overlap: a second SIGHUP or `reapply` that arrives during a reload queues and
+  runs after it, never concurrently and never lost.
 - **Invalid, unreadable, or no longer declaring this host**: refused. The running fabric is kept
   exactly as it was and `cfab status` names the refusal on its `components:` line.
 

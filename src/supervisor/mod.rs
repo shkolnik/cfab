@@ -648,6 +648,10 @@ pub(crate) async fn run_with(
                     Cmd::Reapply(tx) => Some(tx),
                 };
                 match read_reload(&*sys, view, config) {
+                    // `Identical` means the re-read fabric is `Eq` to `view.fabric`, so the
+                    // repair applies the view built at start: it IS the file's fabric. The
+                    // freshly parsed one is dropped, never applied — if this equality is ever
+                    // loosened, thread the parsed fabric through instead.
                     Reload::Identical => {
                         let r = do_reapply(
                             sys, view, &opts, &shared, spawner, exe, config, pid,
@@ -900,8 +904,9 @@ pub(crate) enum Reload {
 }
 
 /// The pure half of the reload decision: the running fabric plus the text now on disk. Equality
-/// is over the DERIVED `Fabric`, not the file bytes, so a comment, a reordered key or a
-/// whitespace edit re-applies in place instead of restarting the fabric.
+/// is over the DERIVED `Fabric`, not the file bytes, so a comment, a reordered key inside a
+/// table, or a whitespace edit re-applies in place instead of restarting the fabric. Row order
+/// (`[[member]]`, `[[zone]]`, segments) is part of the fabric and does count.
 pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
     let refuse = |e: crate::error::Error| Reload::Invalid(format!("{config}: {e}"));
     let decl = match crate::decl::Declaration::parse(text) {
@@ -1792,6 +1797,59 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with("tc qdisc del")),
             "an in-place re-apply tears nothing down"
+        );
+    }
+
+    /// SIGHUP itself (not the socket verb) reaches the same decision: a changed declaration makes
+    /// the supervisor tear down and exit `EXIT_RELOAD` with nobody waiting for an answer. Guarded
+    /// by a timeout so a regression that turns `Hangup` into a no-op fails instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sighup_on_a_changed_declaration_stops_and_asks_for_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut mock = fresh_sys(&view, tmp.path());
+        let text = decl_text(tmp.path()).replace("leaf_offset = 30000", "leaf_offset = 30001");
+        assert!(
+            text.contains("30001"),
+            "the fixture must carry the tunable this test edits"
+        );
+        mock.files.insert(CONFIG.to_string(), text);
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sys = TestSys::new(mock, calls.clone());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx.send(Cmd::Hangup).ok();
+        });
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_with(
+                &mut sys,
+                &view,
+                &mut spawner,
+                EXE,
+                CONFIG,
+                &no_pmx(tmp.path()),
+                cmd_tx,
+                cmd_rx,
+                quiet_hooks(shared.clone(), ready_tx),
+            ),
+        )
+        .await
+        .expect("SIGHUP on a changed declaration must end the supervisor");
+        assert_eq!(code, EXIT_RELOAD);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("tc qdisc del")),
+            "the stop sequence tears the fabric down before the restart"
         );
     }
 

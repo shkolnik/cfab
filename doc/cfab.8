@@ -310,7 +310,8 @@ Standard help and version output.
 request on the supervisor socket \(em one code path) re\-reads
 .I /etc/cfab/fabric.toml
 and compares the fabric it derives with the running one. Comments and whitespace do
-not count: the comparison is of the derived fabric, not the file bytes.
+not count: the comparison is of the derived fabric, not the file bytes. Reloads never
+overlap: one arriving during another queues behind it.
 .TP
 .B unchanged
 Re\-applied in place: no teardown, no netdev churn, but the engine and the shape
