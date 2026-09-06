@@ -35,10 +35,13 @@ tempfile = "3"
 [package.metadata.deb]
 maintainer = "James Shkolnik <jshkolnik@gmail.com>"
 copyright = "2026 James Shkolnik"
-extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables, and iptables for the ceiling-only fallback a leaf takes on a kernel without nf_tables)."
+extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables; iptables is recommended, not required: only the ceiling-only fallback a leaf takes on a kernel without nf_tables uses it)."
 section = "net"
 priority = "optional"
-depends = "nftables, iptables, iproute2, ethtool"
+depends = "nftables, iproute2, ethtool"
+# Only a leaf on a kernel without nf_tables uses iptables-legacy; a host never does, so its
+# absence must not block the install (James 2026-09-06). apt installs Recommends by default.
+recommends = "iptables"
 assets = [
     ["target/release/cfab", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/cfab/", "644"],

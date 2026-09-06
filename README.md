@@ -83,7 +83,8 @@ member's row is not named by the kernel hostname.
 A package upgrade neither stops nor restarts the unit: stopping it tears the fabric down, an
 outage for every identity on the host. The supervisor already running keeps the old binary's
 inode, so the new binary takes effect at the next `systemctl restart cfab`. `systemctl reload
-cfab` re-applies the declaration in place without restarting the daemons. `apt remove` stops the
+cfab` re-applies the declaration in place (no teardown, no netdev churn) but restarts the engine and
+the shape daemon: measured 2026-09-06 on the testbed, 6–10 s of loss on every zone while OSPF re-converges. `apt remove` stops the
 unit (correct: the binary is going away) and disables it; `apt purge` also removes
 `/etc/default/cfab`.
 
