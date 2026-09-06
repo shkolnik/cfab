@@ -174,7 +174,7 @@ jobs:
           debrev="${base#cfab_}"
           debrev="${debrev%%_*}"
           case "$debrev" in
-            *-*) debrev="${debrev#*-}" ;;
+            *-*) debrev="${debrev##*-}" ;;   # last hyphen: a prerelease upstream (0.4.0-rc1) has its own
             *)   debrev="" ;;
           esac
           if [ -z "$debrev" ]; then
@@ -218,8 +218,10 @@ jobs:
                      "cannot decide whether $VER supersedes it" >&2
                 exit 1
               fi
-              if [ "$cur" != "$VER" ] && \
-                 [ "$(printf '%s\n%s\n' "$cur" "$VER" | sort -V | tail -1)" = "$VER" ]; then
+              # >= not >: a re-run of this same tag (after a transient failure
+              # downstream) rebuilds the version tags to a fresh digest and must
+              # re-point :latest with them, or the two tags name different images.
+              if [ "$(printf '%s\n%s\n' "$cur" "$VER" | sort -V | tail -1)" = "$VER" ]; then
                 take_latest=yes
               else
                 echo "not taking :latest — current :latest is $cur, this release is $VER"
@@ -243,6 +245,7 @@ jobs:
           echo "tags: $tags"
       - name: Build the runtime image
         if: steps.meta.outputs.channel == 'formal'
+        id: image_build
         uses: docker/build-push-action@v6
         with:
           context: packaging/docker
@@ -302,6 +305,20 @@ jobs:
             org.opencontainers.image.source=https://github.com/shkolnik/cfab
             org.opencontainers.image.version=${{ steps.meta.outputs.ver }}
             org.opencontainers.image.revision=${{ github.sha }}
+      - name: Pushed image is the smoke-tested image
+        # Two builds of one context on one builder are a cache hit in practice,
+        # never a guarantee: a miss would push and attest an image nobody tested.
+        if: steps.meta.outputs.channel == 'formal'
+        env:
+          BUILT: ${{ steps.image_build.outputs.imageid }}
+          PUSHED: ${{ steps.image_push.outputs.imageid }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUILT" ] || [ "$BUILT" != "$PUSHED" ]; then
+            echo "pushed image id '$PUSHED' differs from the smoke-tested '$BUILT'" >&2
+            exit 1
+          fi
+          echo "image id $BUILT smoke-tested and pushed"
       - name: Attest image build provenance
         if: steps.meta.outputs.channel == 'formal'
         uses: actions/attest-build-provenance@v4
