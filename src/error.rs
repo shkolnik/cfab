@@ -38,6 +38,19 @@ impl Error {
     pub fn fatal(msg: impl fmt::Display) -> Self {
         Error::Fatal(msg.to_string())
     }
+
+    /// Wrap a config error in more context. The `fabric.toml: ` prefix belongs to the
+    /// OUTERMOST error only — formatting an `Error` into another error's message would
+    /// print it twice, which is how "fabric.toml: zone mgmt: gw fabric.toml: domain ..."
+    /// happens.
+    pub fn context(prefix: impl fmt::Display, inner: Error) -> Self {
+        match inner {
+            Error::Config(msg) => Error::Config(format!("{prefix}{msg}")),
+            other @ (Error::Fatal(_) | Error::Cmd { .. } | Error::Io(_)) => {
+                Error::Config(format!("{prefix}{other}"))
+            }
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

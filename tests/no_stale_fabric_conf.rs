@@ -2,7 +2,7 @@
 //! `fabric.conf` in a message, a path, a doc or a packaging asset is enough to send an
 //! operator to a file that does not exist, so the whole tree is grepped here.
 //!
-//! Four exclusions, each deliberate:
+//! Six exclusions, each deliberate:
 //!   * `docs/bakeoff-shared-fixes.md` — frozen history of a bake-off that ran against the
 //!     shell format; renaming the file it actually used would falsify the record.
 //!   * `tests/fixtures/model-v0/` and `tests/fixtures/model-v1-2eaf191/` — outputs CAPTURED
@@ -11,15 +11,18 @@
 //!   * `src/lib.rs` — home of `retired_format_error`, the one place that must still SAY
 //!     `fabric.conf`, to tell an operator holding the old file what happened to it.
 //!   * this file — it names what it forbids.
+//!   * `tests/toml_equivalence.rs` — it APPLIES the rename to the capture, so it must spell
+//!     both names.
 
 use std::path::{Path, PathBuf};
 
-const ALLOWED: [&str; 5] = [
+const ALLOWED: [&str; 6] = [
     "docs/bakeoff-shared-fixes.md",
     "tests/fixtures/model-v0",
     "tests/fixtures/model-v1-2eaf191",
     "src/lib.rs",
     "tests/no_stale_fabric_conf.rs",
+    "tests/toml_equivalence.rs",
 ];
 
 const SKIP_DIRS: [&str; 4] = [".git", "target", ".worktrees", "node_modules"];

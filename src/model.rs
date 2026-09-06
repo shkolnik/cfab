@@ -208,15 +208,17 @@ impl ZoneGw {
         format!("{}.{node}/24", self.subnet_prefix())
     }
 
-    pub fn router_octet(&self) -> Result<u8> {
+    /// The router's host octet. Infallible: `resolve_gw` proved the address is four u8
+    /// octets before this type existed, and nothing else constructs a `ZoneGw`.
+    pub fn router_octet(&self) -> u8 {
         self.router
             .rsplit_once('.')
             .and_then(|(_, o)| o.parse().ok())
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "gw router '{}' is not an IPv4 address",
+            .unwrap_or_else(|| {
+                panic!(
+                    "gw router '{}' is not an IPv4 address, which resolve_gw refuses",
                     self.router
-                ))
+                )
             })
     }
 }
@@ -336,7 +338,7 @@ fn resolve_gw(zone: &str, g: &crate::decl::GwDecl) -> Result<ZoneGw> {
     }
     Ok(ZoneGw {
         scope: SegScope::parse(&g.domain)
-            .map_err(|e| Error::config(format!("zone {zone}: gw {e}")))?,
+            .map_err(|e| Error::context(format!("zone {zone}: gw "), e))?,
         vid: g.vid,
         router: router.to_string(),
     })
@@ -358,7 +360,7 @@ impl Fabric {
             let mut wires = Vec::new();
             for w in &m.wires {
                 let domain = DomainId::parse(&w.domain).map_err(|e| {
-                    Error::config(format!("member {}: wire {}: {e}", m.name, w.nic))
+                    Error::context(format!("member {}: wire {}: ", m.name, w.nic), e)
                 })?;
                 if w.usb {
                     usb_nics.push((m.name.clone(), w.nic.clone()));
@@ -392,7 +394,7 @@ impl Fabric {
             // derived per-member row list inherits.
             for s in &z.segments {
                 let domain = DomainId::parse(&s.domain).map_err(|e| {
-                    Error::config(format!("zone {}: segment {}: {e}", z.name, s.ifname))
+                    Error::context(format!("zone {}: segment {}: ", z.name, s.ifname), e)
                 })?;
                 segments.push(Segment {
                     ifname: s.ifname.clone(),
@@ -424,7 +426,7 @@ impl Fabric {
                 band: z.band,
                 weight: z.weight,
                 primary: DomainId::parse(&z.primary)
-                    .map_err(|e| Error::config(format!("zone {}: primary {e}", z.name)))?,
+                    .map_err(|e| Error::context(format!("zone {}: primary ", z.name), e))?,
                 gw,
             });
         }
@@ -508,9 +510,6 @@ impl Fabric {
                  switch\")"
                     .to_string(),
             ));
-        }
-        if let Some(d) = dup(self.domains.iter().map(|d| d.to_string())) {
-            return Err(Error::config(format!("[domains] token {d} declared twice")));
         }
         let declared: BTreeSet<&DomainId> = self.domains.iter().collect();
         for m in &self.members {
@@ -694,7 +693,7 @@ impl Fabric {
                     z.name, gw.vid
                 )));
             }
-            let octet = gw.router_octet()?;
+            let octet = gw.router_octet();
             for m in &self.members {
                 // Only a host with a wire on the gw domain carries the leg — but a node id
                 // equal to the router octet is a landmine for any future wire, so check all.
@@ -723,19 +722,16 @@ impl Fabric {
     /// candidate wire of that (member, zone) exactly once. A partial list is an error, never
     /// blended with the default.
     fn check_wire_prefs(&self) -> Result<()> {
-        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         for p in &self.wire_prefs {
-            let m = self
-                .member(&p.member)
-                .map_err(|e| Error::config(format!("member {} prefs {}: {e}", p.member, p.zone)))?;
-            self.zone(&p.zone)
-                .map_err(|e| Error::config(format!("member {} prefs {}: {e}", p.member, p.zone)))?;
-            if !seen.insert((p.member.clone(), p.zone.clone())) {
-                return Err(Error::config(format!(
-                    "member {} prefs {} declared twice",
-                    p.member, p.zone
-                )));
-            }
+            // The member exists by construction (a prefs table is declared INSIDE its member)
+            // and holds each zone at most once (one key per TOML table); the ZONE, however, is
+            // a name the operator typed.
+            let m = self.member(&p.member).unwrap_or_else(|e| {
+                panic!("prefs for a member that is not in the declaration: {e}")
+            });
+            self.zone(&p.zone).map_err(|e| {
+                Error::context(format!("member {} prefs {}: ", p.member, p.zone), e)
+            })?;
             for w in &p.order {
                 if m.wire_named(w).is_none() {
                     return Err(Error::config(format!(
