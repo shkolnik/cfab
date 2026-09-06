@@ -126,22 +126,47 @@ pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
         .find(|l| l.contains(&format!(":{port}:")))
 }
 
-/// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
-/// cfab knows the remedy: the port is declared in fabric.toml, and it is a fabric-wide
-/// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
-/// Used by `status`, which diagnoses the failure from the engine's ring buffer.
-pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
-    let stop = if line.contains("bfdd") || line.contains("frr") {
-        "stop FRR, which owns bfdd: systemctl disable --now frr".to_string()
-    } else if line.contains("holder unknown") {
-        format!("find the holder (ss -ulpn | grep ':{port}') and stop it")
-    } else {
-        "stop the daemon named in the line above".to_string()
+/// Who holds udp/`[bfd] port`, as far as the caller could resolve it. The variants differ only in
+/// the handle the operator has on the holder, which is what the remedy's first clause needs.
+pub enum BfdHolder {
+    /// A systemd unit owns it; the unit base name (`frr`, `bfdd`) is the handle.
+    Unit(String),
+    /// A bfdd process with no unit found: the pid is the handle.
+    Pid(String),
+    /// The engine's own log line already named the daemon.
+    NamedInLog,
+    /// Unresolved — the operator has to look the socket up.
+    Unknown,
+}
+
+/// The one spelling of the BFD-port remedy. Only cfab knows it: the port is declared in
+/// fabric.toml, and it is a fabric-wide contract — both ends of a BFD session must agree on it,
+/// so it is never a per-host fix.
+pub fn bfd_port_remedy(holder: &BfdHolder, port: u16) -> String {
+    let stop = match holder {
+        BfdHolder::Unit(u) if u == "bfdd" => "stop bfdd: systemctl disable --now bfdd".to_string(),
+        BfdHolder::Unit(u) => format!("stop FRR, which owns bfdd: systemctl disable --now {u}"),
+        BfdHolder::Pid(pid) => format!("stop bfdd (pid {pid})"),
+        BfdHolder::NamedInLog => "stop the daemon named in the line above".to_string(),
+        BfdHolder::Unknown => format!("find the holder (ss -ulpn | grep ':{port}') and stop it"),
     };
     format!(
-        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.toml on EVERY member — \
+        "{stop}; or declare a free [bfd] port (now {port}) in fabric.toml on EVERY member — \
          every peer of a session must use the same port"
     )
+}
+
+/// holo names the port and, when it can read the holder's fds, the daemon holding it. Used by
+/// `status`, which diagnoses the failure from the engine's ring buffer.
+pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
+    let holder = if line.contains("bfdd") || line.contains("frr") {
+        BfdHolder::Unit("frr".to_string())
+    } else if line.contains("holder unknown") {
+        BfdHolder::Unknown
+    } else {
+        BfdHolder::NamedInLog
+    };
+    bfd_port_remedy(&holder, port)
 }
 
 /// The OSPF interfaces cfab configures per zone, in the order `emit::engine` writes them:

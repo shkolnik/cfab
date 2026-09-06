@@ -23,7 +23,7 @@ use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
 use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
-use crate::supervisor::report::{Components, render_line};
+use crate::supervisor::report::{Component, Components, render_line};
 use crate::sys::{Output, Sys, run_optional};
 
 /// The re-read cadence of `--wait`.
@@ -440,54 +440,27 @@ fn read(
 }
 
 /// BFD port custody, and the one diagnosis that must run before anything else: the engine binds
-/// udp/BFD_PORT exclusively (no SO_REUSEADDR), so a daemon holding the port makes the engine exit
-/// at the first session instead of stealing our packets. A second BFD daemon that is present is a
-/// reason line: it takes the port at our next restart. Measured 2026-09-05: with SO_REUSEADDR on
-/// both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder silently took every
-/// packet, either order.
+/// udp/`[bfd] port` exclusively (no SO_REUSEADDR), so a daemon holding the port makes the engine
+/// exit at the first session instead of stealing our packets. Measured 2026-09-05: with
+/// SO_REUSEADDR on both sides FRR's bfdd and holo both bound 0.0.0.0:3784 and the last binder
+/// silently took every packet, either order.
+///
+/// The question is custody of OUR port, never presence on the host: cfab is designed to run beside
+/// FRR by declaring a different `[bfd] port`, and F13 (VERIFIED pve1-tb 2026-09-06, 0.4.1) was
+/// this probe calling that supported layout a conflict. So the reason line fires only when a
+/// socket is bound on our port and is provably not the engine's own.
 fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Components>) -> Result<()> {
     let f = view.fabric;
     let port = f.bfd_port;
-    let mut found: Vec<String> = Vec::new();
-    for unit in ["frr", "bfdd"] {
-        let unit = format!("{unit}.service");
-        if let Some(out) = run_optional(sys, &["systemctl", "is-enabled", &unit])
-            && out.stdout.trim() == "enabled"
-        {
-            found.push(format!("{unit} enabled"));
-        }
-    }
-    for pid in sys.list_dir("/proc").unwrap_or_default() {
-        if !pid.chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
-        // A reaped-but-not-waited bfdd keeps its /proc entry and its name (seen in the
-        // container fixture, whose init reaps nothing): a zombie holds no socket.
-        if let Ok(comm) = sys.read(&format!("/proc/{pid}/comm"))
-            && comm.trim() == "bfdd"
-            && !sys
-                .read(&format!("/proc/{pid}/status"))
-                .unwrap_or_default()
-                .contains("State:\tZ")
-        {
-            found.push(format!("bfdd running (pid {pid})"));
-        }
-    }
-    if !found.is_empty() {
-        c.note(format!(
-            "bfd udp/{port}: another BFD daemon is on this host ({}) — it takes the port at our \
-             next engine restart; stop it (systemctl disable --now frr), or declare a free \
-             BFD_PORT on EVERY member",
-            found.join(", ")
-        ));
-    }
+    let engine = comps.and_then(|c| c.components.iter().find(|k| k.name == "engine"));
+    port_custody(sys, port, c, engine);
     // A bind failure in the ring buffer is only news while the engine is gone. The supervisor is
     // the authority on that: no engine component (no supervisor answering — the frr/bfdd probe
     // above already ran and we cannot read the ring) means no scan, and a `running` engine holds
     // the port (nothing else can), so any bind line it left is history. Only an engine the
     // supervisor reports down earns the diagnosis, read from its child ring buffer over cfab.sock
     // (spec §3/§9) — best effort, a silent or unparseable socket just leaves the generic reason.
-    let Some(engine) = comps.and_then(|c| c.components.iter().find(|k| k.name == "engine")) else {
+    let Some(engine) = engine else {
         return Ok(());
     };
     if engine.state == CompState::Running {
@@ -518,6 +491,131 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Componen
 #[derive(serde::Deserialize)]
 struct LogReply {
     lines: Vec<String>,
+}
+
+/// Who holds udp/`port` right now, and the reason line if that is not us. Two notes or none:
+/// what holds it, then the one spelling of the remedy (`engine_ctl::bfd_port_remedy`).
+///
+/// Ownership is decided by the least-assuming evidence available, in this order:
+///   * a socket on the port whose inode is in a live bfdd's fd table — a named foreign holder,
+///     whatever the engine is doing (we are up only until our next restart);
+///   * otherwise a socket on the port while the supervisor reports the engine NOT running — the
+///     engine cannot be holding a socket it does not have, so it is somebody's, unidentified;
+///   * otherwise silence. A running engine binds the port itself, and an engine we cannot ask
+///     about (no supervisor answering) leaves us unable to tell its socket from a stranger's —
+///     a false conflict is worse than a missed one, because the supported layout produces it.
+fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Component>) {
+    let bound = udp_inodes_on(sys, port);
+    if bound.is_empty() {
+        return;
+    }
+    let units = bfd_units(sys);
+    let pids = bfdd_pids(sys);
+    let holder = pids
+        .iter()
+        .find(|pid| socket_inodes(sys, pid).iter().any(|i| bound.contains(i)));
+    let (what, remedy) = match holder {
+        Some(pid) => {
+            let mut bits = vec![format!("pid {pid}")];
+            bits.extend(units.iter().map(|u| format!("{u}.service enabled")));
+            let handle = match units.first() {
+                Some(u) => engine_ctl::BfdHolder::Unit(u.clone()),
+                None => engine_ctl::BfdHolder::Pid(pid.clone()),
+            };
+            (format!("bfdd ({})", bits.join(", ")), handle)
+        }
+        // Not bfdd's, and only provably not ours while the engine is down.
+        None if engine.is_some_and(|e| e.state != CompState::Running) => (
+            "another process".to_string(),
+            engine_ctl::BfdHolder::Unknown,
+        ),
+        None => return,
+    };
+    c.note(format!(
+        "bfd udp/{port}: {what} holds this port, which the engine needs exclusively"
+    ));
+    c.note(format!(
+        "remedy: {}",
+        engine_ctl::bfd_port_remedy(&remedy, port)
+    ));
+}
+
+/// The BFD-capable systemd units enabled here, by base name (`frr`, `bfdd`) — context for a
+/// holder we identify, and the handle its remedy names.
+fn bfd_units(sys: &mut dyn Sys) -> Vec<String> {
+    ["frr", "bfdd"]
+        .into_iter()
+        .filter(|unit| {
+            run_optional(
+                sys,
+                &["systemctl", "is-enabled", &format!("{unit}.service")],
+            )
+            .is_some_and(|out| out.stdout.trim() == "enabled")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every live bfdd on this host. A reaped-but-not-waited bfdd keeps its /proc entry and its name
+/// (seen in the container fixture, whose init reaps nothing): a zombie holds no socket.
+fn bfdd_pids(sys: &mut dyn Sys) -> Vec<String> {
+    sys.list_dir("/proc")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| pid.chars().all(|ch| ch.is_ascii_digit()))
+        .filter(|pid| {
+            sys.read(&format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim() == "bfdd")
+                && !sys
+                    .read(&format!("/proc/{pid}/status"))
+                    .unwrap_or_default()
+                    .contains("State:\tZ")
+        })
+        .collect()
+}
+
+/// The inodes of every UDP socket bound to `port`, over both families — one port number covers
+/// IPv4 and IPv6, and a holder that took only `[::]` still takes our packets.
+fn udp_inodes_on(sys: &dyn Sys, port: u16) -> Vec<u64> {
+    ["/proc/net/udp", "/proc/net/udp6"]
+        .into_iter()
+        .filter_map(|path| sys.read(path).ok())
+        .flat_map(|table| udp_table_inodes(&table, port))
+        .collect()
+}
+
+/// Parse one `/proc/net/udp{,6}` table: the port half of the `local_address` column (hex, after
+/// the `:`, whatever the address width) and the `inode` column. Anything that does not parse —
+/// the header line, a short line — is skipped rather than guessed at.
+fn udp_table_inodes(table: &str, port: u16) -> Vec<u64> {
+    const INODE_COL: usize = 9;
+    table
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let local = f.get(1)?.rsplit_once(':')?.1;
+            (u16::from_str_radix(local, 16).ok()? == port)
+                .then(|| f.get(INODE_COL)?.parse::<u64>().ok())?
+        })
+        .collect()
+}
+
+/// The socket inodes a process holds, from its fd table (`/proc/<pid>/fd/<n>` →
+/// `socket:[<inode>]`). Unreadable (the process exited, or we are not root) is an empty list:
+/// an unidentified holder, never a wrong accusation.
+fn socket_inodes(sys: &dyn Sys, pid: &str) -> Vec<u64> {
+    sys.list_dir(&format!("/proc/{pid}/fd"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|fd| sys.read_link(&format!("/proc/{pid}/fd/{fd}")).ok())
+        .filter_map(|target| {
+            target
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 fn posture(
@@ -2683,6 +2781,31 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    /// The other half of the ownership rule: a down engine is not evidence of a thief. Nothing
+    /// is bound on the port, so there is nobody to blame — an engine that is down for its own
+    /// reasons must not be told a phantom holds the port.
+    #[test]
+    fn a_free_port_is_not_blamed_when_the_engine_is_down() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let comps = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 60, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "restarting", "pid": null, "uptime_s": null,
+                 "restarts": 4, "last_exit": {"cause": "exit 1", "s_ago": 1}}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+        })
+        .to_string();
+        let mut sys = leaf_env(&view)
+            .socket_verb("/run/cfab/cfab.sock", "components", &comps)
+            .file("/proc/net/udp", &proc_net_udp(&[(9000, 41240)]))
+            .file("/proc/net/udp6", &proc_net_udp6(&[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(!report.output.contains("bfd udp/"), "{}", report.output);
     }
 
     /// Teeth for the ownership rule: a socket on our port while the supervisor reports the
