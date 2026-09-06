@@ -81,39 +81,6 @@ fn supervisor_refusal(pid: &str) -> Error {
     ))
 }
 
-/// The iptables-legacy half of the mark teardown: the OUTPUT jump, then every `cfab-*` mangle
-/// chain the live readback names — flushed first (a chain `cfab-out` still jumps to cannot be
-/// deleted), then deleted. Exact names from the readback, never a pattern: the mangle table is
-/// shared with Docker, the NAS's own rules and anything else the operator runs.
-fn remove_mark_ipt(sys: &mut dyn Sys) -> Result<()> {
-    if !(have_tool(sys, "iptables-legacy")? && have_tool(sys, "iptables-legacy-save")?) {
-        return Ok(());
-    }
-    let save = sys.run(&["iptables-legacy-save", "-t", "mangle"])?;
-    let chains = crate::emit::ceiling_ipt::chains_in(&save.stdout);
-    for chain in &chains {
-        if chain == crate::emit::ceiling_ipt::OUT_CHAIN {
-            run_ignore(
-                sys,
-                &[
-                    "iptables-legacy",
-                    "-t",
-                    "mangle",
-                    "-D",
-                    "OUTPUT",
-                    "-j",
-                    chain,
-                ],
-            )?;
-        }
-        run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-F", chain])?;
-    }
-    for chain in &chains {
-        run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-X", chain])?;
-    }
-    Ok(())
-}
-
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     let f = view.fabric;
     let mut notes = Vec::new();
@@ -131,7 +98,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         run_ignore(sys, &["nft", "delete", "table", "inet", "cfab"])?;
     }
     if backend != Some(MarkBackend::Nft) {
-        remove_mark_ipt(sys)?;
+        crate::commands::common::remove_mark_ipt(sys)?;
     }
     // The engine stops (and its routes are swept) before any interface goes away, so it never
     // acts on vanished links. A zone's table now holds two things cfab owns: the engine's

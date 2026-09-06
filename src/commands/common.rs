@@ -2,7 +2,7 @@
 
 use crate::derive::View;
 use crate::error::Result;
-use crate::sys::{Sys, run_ok, run_optional};
+use crate::sys::{Sys, have_tool, run_ignore, run_ok, run_optional};
 
 /// One `ip rule` cfab owns: the pref it lives at, the substring that proves it is present, and
 /// the `ip rule add` tail that creates it. One definition, two consumers — `up` installs them
@@ -389,6 +389,43 @@ fn foreign_accept_argv(op: &str) -> [&str; 13] {
         "-j",
         "ACCEPT",
     ]
+}
+
+/// Remove the iptables-legacy mark state: the OUTPUT jump, then every `cfab-*` mangle chain the
+/// live readback names — flushed first (a chain `cfab-out` still jumps to cannot be deleted),
+/// then deleted. Exact names from the readback, never a pattern: the mangle table is shared with
+/// Docker, the NAS's own rules and anything else the operator runs.
+///
+/// One helper, two callers: `down` on this backend, and `up` on the OTHER backend, where a leaf
+/// that has gained nf_tables must not leave its old chains resident. `have_tool`-guarded, so a
+/// member that no longer has the binaries still applies and still tears down.
+pub fn remove_mark_ipt(sys: &mut dyn Sys) -> Result<()> {
+    if !(have_tool(sys, "iptables-legacy")? && have_tool(sys, "iptables-legacy-save")?) {
+        return Ok(());
+    }
+    let save = sys.run(&["iptables-legacy-save", "-t", "mangle"])?;
+    let chains = crate::emit::ceiling_ipt::chains_in(&save.stdout);
+    for chain in &chains {
+        if chain == crate::emit::ceiling_ipt::OUT_CHAIN {
+            run_ignore(
+                sys,
+                &[
+                    "iptables-legacy",
+                    "-t",
+                    "mangle",
+                    "-D",
+                    "OUTPUT",
+                    "-j",
+                    chain,
+                ],
+            )?;
+        }
+        run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-F", chain])?;
+    }
+    for chain in &chains {
+        run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-X", chain])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

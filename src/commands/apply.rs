@@ -113,29 +113,7 @@ fn remove_other_mark_backend(
 ) -> Result<()> {
     match chosen {
         MarkBackend::Nft => {
-            if have_tool(sys, "iptables-legacy")? && have_tool(sys, "iptables-legacy-save")? {
-                let save = sys.run(&["iptables-legacy-save", "-t", "mangle"])?;
-                for chain in emit::ceiling_ipt::chains_in(&save.stdout) {
-                    if chain == emit::ceiling_ipt::OUT_CHAIN {
-                        run_ignore(
-                            sys,
-                            &[
-                                "iptables-legacy",
-                                "-t",
-                                "mangle",
-                                "-D",
-                                "OUTPUT",
-                                "-j",
-                                &chain,
-                            ],
-                        )?;
-                    }
-                    run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-F", &chain])?;
-                }
-                for chain in emit::ceiling_ipt::chains_in(&save.stdout) {
-                    run_ignore(sys, &["iptables-legacy", "-t", "mangle", "-X", &chain])?;
-                }
-            }
+            common::remove_mark_ipt(sys)?;
             sys.remove(&format!("{}/mark.ipt", f.run_dir))?;
         }
         MarkBackend::IptablesLegacy => {
@@ -1910,7 +1888,8 @@ mod tests {
     /// `iptables-restore --noflush` does not flush an existing user chain, so a second `up`
     /// would append a second copy of every rule if the render did not carry its own `-F`
     /// lines. Twice through: identical input, identical readback, and the OUTPUT jump added
-    /// once (the second `up` finds it with `-C`).
+    /// exactly once — the first `up` finds no jump (`-C` fails), the second finds the one it
+    /// installed (`-C` succeeds), which is the live sequence this claim rests on.
     #[test]
     fn a_second_up_on_the_iptables_backend_renders_and_applies_the_same_thing() {
         let f = fabric();
@@ -1929,22 +1908,88 @@ mod tests {
                 1,
                 "Operation not supported",
             )
-            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], &ipt_save(&view));
+            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], &ipt_save(&view))
+            // First `up`: nothing is hooked from OUTPUT yet.
+            .on_fail(
+                &["iptables-legacy", "-t", "mangle", "-C", "OUTPUT"],
+                1,
+                "iptables: Bad rule (does a matching rule exist in that chain?).",
+            );
         let opts = opts();
         run(&mut sys, &view, &opts).unwrap();
         let first = sys.files.get("/run/cfab/mark.ipt").cloned().unwrap();
         let applied = sys.files.get("/run/cfab/mark.applied").cloned().unwrap();
-        sys.calls.clear();
+        assert!(first.contains("-F cfab-out\n"), "{first}");
+        // Second `up`: the jump the first one installed is now there (a later mock rule wins).
+        sys = sys.on_stdout(&["iptables-legacy", "-t", "mangle", "-C", "OUTPUT"], "");
         run(&mut sys, &view, &opts).unwrap();
         assert_eq!(sys.files.get("/run/cfab/mark.ipt"), Some(&first));
         assert_eq!(sys.files.get("/run/cfab/mark.applied"), Some(&applied));
-        assert!(first.contains("-F cfab-out\n"), "{first}");
         assert_eq!(
             calls_for(&sys, "-A OUTPUT"),
-            Vec::<String>::new(),
-            "the jump was added twice: {:?}",
+            vec!["iptables-legacy -t mangle -A OUTPUT -j cfab-out"],
+            "the jump must be installed once across both runs: {:?}",
             sys.calls
         );
+    }
+
+    /// The mirror case: a leaf whose kernel HAS nf_tables (a DSM upgrade, a kind change) but
+    /// whose run dir records the ceiling-only backend. `up` takes nft and must leave no
+    /// iptables state behind — the chains are swept by the exact names the readback gives,
+    /// the foreign chain beside them is untouched, and the record is rewritten.
+    #[test]
+    fn a_leaf_that_gains_nf_tables_sweeps_the_iptables_chains_it_used_to_have() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view)
+            // The probe succeeds: this kernel has nf_tables now.
+            .file("/run/cfab/mark.backend", "iptables-legacy\n")
+            .file("/run/cfab/mark.ipt", "*mangle\nCOMMIT\n")
+            .on_stdout(&["iptables-legacy-save", "-t", "mangle"], &ipt_save(&view))
+            .on_stdout(
+                &["nft", "-s", "list", "table", "inet", "cfab"],
+                "table inet cfab\n",
+            );
+        let opts = opts();
+        let warnings = run(&mut sys, &view, &opts).unwrap();
+
+        let ipt: Vec<String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("iptables-legacy"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ipt,
+            vec![
+                "iptables-legacy-save -t mangle",
+                "iptables-legacy -t mangle -D OUTPUT -j cfab-out",
+                "iptables-legacy -t mangle -F cfab-out",
+                "iptables-legacy -t mangle -F cfab-ceil-storage",
+                "iptables-legacy -t mangle -F cfab-ceil-cluster",
+                "iptables-legacy -t mangle -F cfab-ceil-mgmt",
+                "iptables-legacy -t mangle -X cfab-out",
+                "iptables-legacy -t mangle -X cfab-ceil-storage",
+                "iptables-legacy -t mangle -X cfab-ceil-cluster",
+                "iptables-legacy -t mangle -X cfab-ceil-mgmt",
+            ],
+            "{:?}",
+            sys.calls
+        );
+        // Nothing foreign in the same table was touched.
+        assert!(!sys.ran("DOCKER-USER"), "{:?}", sys.calls);
+        // The record now says nft, the stale restore input is gone, and the nft table is in.
+        assert_eq!(
+            sys.files.get("/run/cfab/mark.backend"),
+            Some(&"nft\n".to_string())
+        );
+        assert!(!sys.files.contains_key("/run/cfab/mark.ipt"));
+        assert_eq!(
+            sys.files.get("/run/cfab/mark.nft"),
+            Some(&emit::mark::generate(&view).unwrap())
+        );
+        assert!(sys.ran("nft -f /run/cfab/mark.nft"), "{:?}", sys.calls);
+        assert!(warnings.iter().any(|w| w == "mark: nft"), "{warnings:?}");
     }
 
     /// A zone that lost its fallback row leaves an unhooked but resident chain behind. It is
