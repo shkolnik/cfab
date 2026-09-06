@@ -50,9 +50,10 @@ routing-policy names live in one flat, fabric-wide namespace:
 |---|---|---|
 | BGP instance (`control-plane-protocol/name`) | `cfab` | `cfab` |
 | identity prefix set | `cfab-<zone>-id` | `cfab-mgmt-id` |
+| leaf-identity prefix set, only when the fabric declares a leaf | `cfab-<zone>-leaf` | `cfab-mgmt-leaf` |
 | global import policy, per gw zone | `cfab-<zone>-import` | `cfab-mgmt-import` |
 | neighbor export policy, per gw zone | `cfab-<zone>-export` | `cfab-mgmt-export` |
-| policy statement | `1` | `1` |
+| policy statement | `0` = the leaf reject, `1` = the accept | `0`, `1` |
 
 The BGP instance is **not** named after a zone: there is exactly one per member and it carries a
 neighbor per gw zone, so a zone name would be a lie the moment a second zone declares a `gw`. `cfab`
@@ -198,6 +199,22 @@ node in a different module** and is supported.
   (`ietf-routing-policy@2021-10-11.yang:520`) and every redistributed route is dropped with no error.
   The policy sets `set-med igp`, which this fork wires to the IGP metric carried from the
   redistribution message (`holo-bgp/src/ibus/rx.rs:138` → `holo-bgp/src/policy.rs:472-478`).
+- **R8 — leaf identities are never offered to the router.** A leaf carries no ingress leg, so a
+  packet the router sent to a leaf's fabric identity would arrive with no return path: reaching a
+  leaf from outside at a fabric identity is unsupported by design (James 2026-09-06). So each gw
+  zone gets a second prefix set, `cfab-<zone>-leaf`, holding the identity /32 of every `kind = leaf`
+  member (`10.249.0.3/32` for `pve3-tb`), and statement `0` of **both** the import and the export
+  policy matches it with `policy-result: reject-route`. Two gates because either alone leaves a way
+  through: the import policy runs on REDISTRIBUTION (a host learns the leaf's /32 by OSPF and would
+  otherwise inject it into BGP), the export policy runs on what is offered to the neighbor. Ordering
+  is by statement name — holo keys statements in a `BTreeMap<String, PolicyStmt>`
+  (`holo-utils/src/policy.rs:210`) and iterates them in that order, and an `accept-route` terminates
+  the chain (`holo-bgp/src/policy.rs::process_policies`), so the reject must sort before the accept:
+  `"0"` < `"1"`. `reject-route` is parsed to `PolicyAction::Accept(false)`
+  (`holo-policy/src/northbound/configuration.rs:503-506`) and returns `PolicyResult::Reject` from the
+  same `process_policies` used for `PolicyType::Import` and `PolicyType::Export`. When the fabric
+  declares no leaf, neither the set nor the statements are emitted at all — the policy tree is
+  byte-identical to the one before this rule existed.
 - **R7 — an absence, deliberately.** There is **no** neighbor-level deny-all *import* policy in the
   fixture and there must not be one. The neighbor afi-safi's `apply-policy` carries only
   `export-policy`; `default-import-policy` is left unset and therefore `reject-route`

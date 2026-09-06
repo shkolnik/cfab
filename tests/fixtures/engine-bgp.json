@@ -15,6 +15,19 @@
                 }
               ]
             }
+          },
+          {
+            "name": "cfab-mgmt-leaf",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "10.249.0.3/32",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
           }
         ]
       }
@@ -25,6 +38,17 @@
           "name": "cfab-mgmt-import",
           "statements": {
             "statement": [
+              {
+                "name": "0",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-leaf"
+                  }
+                },
+                "actions": {
+                  "policy-result": "reject-route"
+                }
+              },
               {
                 "name": "1",
                 "conditions": {
@@ -46,6 +70,17 @@
           "name": "cfab-mgmt-export",
           "statements": {
             "statement": [
+              {
+                "name": "0",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-leaf"
+                  }
+                },
+                "actions": {
+                  "policy-result": "reject-route"
+                }
+              },
               {
                 "name": "1",
                 "conditions": {

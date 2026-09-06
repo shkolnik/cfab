@@ -21,6 +21,12 @@
 //!      behavior change, NOT a cosmetic diff, and it contradicts spec §4's claim that option
 //!      (c) "derives EXACTLY today's order for every (member, zone)". It is pinned here so it
 //!      cannot change silently while James rules on it.
+//!   6. The leaf-identity filter in every gw zone's BGP policy — the `cfab-<zone>-leaf` prefix
+//!      set and the `reject-route` statement that names it. v0 offered every OSPF-learned
+//!      identity /32 of a gw zone to the router, the leaf's included, and a leaf cannot answer
+//!      a packet sent to its fabric identity (James 2026-09-06: unsupported by design). The
+//!      shape is pinned by `emit::engine`'s own tests; here it is only subtracted, so the rest
+//!      of the policy tree stays under byte comparison.
 
 use std::collections::BTreeMap;
 
@@ -206,15 +212,43 @@ fn the_engine_tree_differs_from_v0_only_in_cost_values() {
             }
             assert_eq!(rank(w), rank(g), "{member} {zone}: preference rank order");
         }
-        // Now blank every cost and demand byte identity of everything else.
+        // Now blank every cost, subtract allowed diff 6, and demand byte identity of the rest.
         blank_costs(&mut got);
         blank_costs(&mut want);
+        strip_leaf_filter(&mut got);
         if let Some(d) = diff(
             &format!("{member}: engine tree outside the cost leaves"),
             &serde_json::to_string_pretty(&want).unwrap(),
             &serde_json::to_string_pretty(&got).unwrap(),
         ) {
             panic!("{d}");
+        }
+    }
+}
+
+/// Allowed diff 6: drop the leaf-identity filter — the `cfab-<zone>-leaf` prefix sets and the
+/// statements that name them — so everything else in the policy tree stays byte-compared.
+/// Fails loudly (leaving the nodes in place, so the diff shows them) if the shape it subtracts
+/// is not the shape the emitter writes.
+fn strip_leaf_filter(v: &mut Value) {
+    let Some(pol) = v.get_mut("ietf-routing-policy:routing-policy") else {
+        return;
+    };
+    if let Some(sets) = pol["defined-sets"]["prefix-sets"]["prefix-set"].as_array_mut() {
+        sets.retain(|s| !s["name"].as_str().unwrap().ends_with("-leaf"));
+    }
+    for p in pol["policy-definitions"]["policy-definition"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(stmts) = p["statements"]["statement"].as_array_mut() {
+            stmts.retain(|s| {
+                let leaf_set = s["conditions"]["match-prefix-set"]["prefix-set"]
+                    .as_str()
+                    .is_some_and(|n| n.ends_with("-leaf"));
+                !(leaf_set && s["actions"]["policy-result"] == "reject-route")
+            });
         }
     }
 }
