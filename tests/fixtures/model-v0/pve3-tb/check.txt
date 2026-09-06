@@ -1,0 +1,2 @@
+fabric.conf OK: 3 zones, 9 segments, 3 fallback legs, 3 members
+this member: pve3-tb (node 3, leaf); 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 0 ingress leg(s)
