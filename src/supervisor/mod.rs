@@ -1693,6 +1693,203 @@ mod tests {
         );
     }
 
+    // ---- reload: SIGHUP / `reapply` re-reads the declaration (ruling (b), 2026-09-06) -------
+
+    /// What one reload did. `Cmd::Reapply` is the driven verb because it carries a reply
+    /// channel; `Cmd::Hangup` reaches the identical decision through the identical arm.
+    struct ReloadOutcome {
+        code: u8,
+        res: crate::error::Result<()>,
+        applies: u64,
+        engine_spawns: usize,
+        /// Every `Sys` call the whole run made, including the stop sequence.
+        calls: Vec<String>,
+        /// The calls at the moment the reload answered — before any stop sequence, so "an
+        /// in-place re-apply tore nothing down" is a claim about the re-apply alone.
+        calls_at_reload: Vec<String>,
+        last_apply_error: Option<String>,
+    }
+
+    /// Bring a supervisor up on the example declaration, let `edit` rewrite what is on disk at
+    /// `CONFIG` (the file the reload re-reads), then reload and stop.
+    async fn reload_with(edit: impl FnOnce(&mut MockSys, &Path)) -> ReloadOutcome {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut mock = fresh_sys(&view, tmp.path());
+        edit(&mut mock, tmp.path());
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sys = TestSys::new(mock, calls.clone());
+        let (mut spawner, recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let calls_c = calls.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            driver_tx.send(Cmd::Reapply(rtx)).ok();
+            let res = tokio::task::spawn_blocking(move || rrx.recv().unwrap())
+                .await
+                .unwrap();
+            let at_reload = calls_c.lock().unwrap().clone();
+            // A reload that restarts has already left the loop; this is then a no-op.
+            driver_tx.send(Cmd::Terminate).ok();
+            (res, at_reload)
+        });
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            quiet_hooks(shared.clone(), ready_tx),
+        )
+        .await;
+        let (res, calls_at_reload) = driver.await.unwrap();
+        let st = shared.lock().unwrap();
+        ReloadOutcome {
+            code,
+            res,
+            applies: st.applies,
+            engine_spawns: recs
+                .lock()
+                .unwrap()
+                .spawned
+                .iter()
+                .filter(|n| *n == "engine")
+                .count(),
+            calls: calls.lock().unwrap().clone(),
+            calls_at_reload,
+            last_apply_error: st.last_apply_error.clone(),
+        }
+    }
+
+    /// A declaration that gained a comment is the SAME fabric: the reload repairs in place —
+    /// the engine restarts, the apply count rises, nothing is torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_an_unchanged_declaration_re_applies_in_place() {
+        let o = reload_with(|m, dir| {
+            let text = format!("# an operator's note, not a change\n{}", decl_text(dir));
+            m.files.insert(CONFIG.to_string(), text);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        assert!(
+            o.res.is_ok(),
+            "an unchanged declaration re-applies: {:?}",
+            o.res
+        );
+        assert_eq!(o.applies, 2, "the initial apply plus the re-apply");
+        assert_eq!(o.engine_spawns, 2, "the re-apply restarts the engine");
+        assert_eq!(o.last_apply_error, None);
+        assert!(
+            !o.calls_at_reload
+                .iter()
+                .any(|c| c.starts_with("tc qdisc del")),
+            "an in-place re-apply tears nothing down"
+        );
+    }
+
+    /// A changed, valid declaration cannot be applied in place — `apply::run` never removes what
+    /// the previous declaration had — so the reload tears the fabric down and exits `EXIT_RELOAD`
+    /// for systemd to start a supervisor on the new file. Nothing is applied in-process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_a_changed_declaration_stops_and_asks_for_a_restart() {
+        let o = reload_with(|m, dir| {
+            let text = decl_text(dir).replace("fabric.example", "fabric.changed");
+            m.files.insert(CONFIG.to_string(), text);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_RELOAD, "the exit status asks for the restart");
+        assert!(o.res.is_ok(), "the requester is answered, not left hanging");
+        assert_eq!(
+            o.applies, 1,
+            "the new declaration is NOT applied in-process"
+        );
+        assert_eq!(
+            o.engine_spawns, 1,
+            "no engine restart: the process is going away"
+        );
+        assert!(
+            o.calls.iter().any(|c| c.starts_with("tc qdisc del")),
+            "the full stop sequence ran (spec §13 teardown)"
+        );
+        assert_eq!(o.last_apply_error, None);
+    }
+
+    /// An invalid declaration is refused: the running fabric is kept, no child is touched, and
+    /// the reason reaches both the requester and `cfab status`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_of_an_invalid_declaration_is_refused_and_says_why() {
+        let o = reload_with(|m, _| {
+            m.files.insert(
+                CONFIG.to_string(),
+                "dns_domain = \"x\"\nnot_a_key = 1\n".to_string(),
+            );
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK, "a refusal never restarts anything");
+        let err = o.res.unwrap_err().to_string();
+        assert!(err.contains("reload refused"), "{err}");
+        assert!(err.contains(CONFIG), "the refusal names the file: {err}");
+        assert_eq!(o.applies, 1, "nothing was applied");
+        assert_eq!(o.engine_spawns, 1, "no child is restarted");
+        let recorded = o
+            .last_apply_error
+            .expect("the refusal is on the status surface");
+        assert!(recorded.contains("reload refused"), "{recorded}");
+        assert!(recorded.contains(CONFIG), "{recorded}");
+    }
+
+    /// The declaration is gone. Same answer as invalid — a file an operator (or a package) is
+    /// mid-edit on must never take a running fabric down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_with_the_declaration_missing_is_refused() {
+        let o = reload_with(|m, _| {
+            m.files.remove(CONFIG);
+        })
+        .await;
+        assert_eq!(o.code, EXIT_OK);
+        let err = o.res.unwrap_err().to_string();
+        assert!(err.contains("reload refused"), "{err}");
+        assert!(err.contains("cannot read"), "{err}");
+        assert_eq!(o.applies, 1);
+        assert_eq!(o.engine_spawns, 1);
+        assert!(o.last_apply_error.is_some());
+    }
+
+    /// The decision itself, without a supervisor around it: the four answers, including the one
+    /// a live host cares most about — a valid fabric that no longer names this member is a
+    /// refusal, not a teardown.
+    #[test]
+    fn classify_reload_answers_the_four_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let text = decl_text(tmp.path());
+        let c = |t: &str| classify_reload(&f, "pve1-tb", CONFIG, t);
+        assert_eq!(c(&text), Reload::Identical);
+        assert_eq!(
+            c(&format!("# comment\n{text}")),
+            Reload::Identical,
+            "equality is over the derived fabric, not the bytes"
+        );
+        assert_eq!(
+            c(&text.replace("fabric.example", "fabric.changed")),
+            Reload::Changed
+        );
+        assert!(matches!(c("nonsense = ["), Reload::Invalid(_)));
+        // Valid, but this member is gone from it.
+        assert!(matches!(
+            classify_reload(&f, "pve9-tb", CONFIG, &text),
+            Reload::Invalid(_)
+        ));
+    }
+
     /// Spec §7: `PR_SET_PDEATHSIG` follows the parent thread, and tokio retires idle blocking
     /// workers — so every `Command::spawn` (initial, backoff respawn, re-apply restart) must be
     /// executed by the supervisor's main thread. Driven through one child crash and one

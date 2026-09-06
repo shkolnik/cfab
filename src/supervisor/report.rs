@@ -129,6 +129,25 @@ mod tests {
         );
     }
 
+    /// A refused reload leaves every component healthy, so the components line is the only
+    /// place `cfab status` can say the operator's edit did not take.
+    #[test]
+    fn a_refused_reload_is_named_on_the_components_line() {
+        let mut c: Components = serde_json::from_str(FIXTURE).unwrap();
+        c.supervisor.last_apply_error = Some(
+            "reload refused, keeping the running fabric: /etc/cfab/fabric.toml: unknown key"
+                .to_string(),
+        );
+        let line = render_line(&c);
+        assert!(
+            line.ends_with(
+                "| last apply: reload refused, keeping the running fabric: \
+                 /etc/cfab/fabric.toml: unknown key"
+            ),
+            "{line}"
+        );
+    }
+
     /// `cfab status` deserializes what the supervisor serializes: the document must survive
     /// the round trip unchanged, `why` included.
     #[test]

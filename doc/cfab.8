@@ -107,7 +107,9 @@ cluster) conf-sync as direct child processes. This is the long-lived
 service and the container PID 1; it is not run by hand. The apply is
 idempotent.
 .B SIGHUP
-re-applies the declaration in place \(em no teardown, no netdev churn \(em while
+re\-reads the declaration and acts on it (see
+.B RELOAD
+below), while
 .B SIGTERM
 runs the stop sequence: forwarding off first, then each child is signalled and
 given 10 s before SIGKILL, then the fabric is torn down. Only one supervisor
@@ -301,16 +303,45 @@ else the kernel hostname.
 .TP
 .BR \-h ", " \-\-help ", " \-V ", " \-\-version
 Standard help and version output.
+.SH RELOAD
+.B "systemctl reload cfab"
+(SIGHUP, or a
+.B reapply
+request on the supervisor socket \(em one code path) re\-reads
+.I /etc/cfab/fabric.toml
+and compares the fabric it derives with the running one. Comments and whitespace do
+not count: the comparison is of the derived fabric, not the file bytes.
+.TP
+.B unchanged
+Re\-applied in place: no teardown, no netdev churn, but the engine and the shape
+daemon restart \(em measured 2026\-09\-06 on the testbed, 6\(en10 s of loss on every
+zone while OSPF re\-converges.
+.TP
+.B "changed and valid"
+The fabric is torn down and the unit restarted onto the new declaration (exit 6). An
+in\-place apply cannot reach it: the apply creates and repairs, it never removes what
+the previous declaration had. The whole fabric is down for the restart, as on a
+package upgrade.
+.TP
+.B "invalid, unreadable, or no longer declaring this host"
+Refused. The running fabric is kept exactly as it was, and
+.B "cfab status"
+names the refusal on its
+.B components:
+line.
 .SH EXIT STATUS
 .B status
 maps its state to the exit code, Nagios\-style (0/1/2/3).
 .B run
-uses 0/1/3/4: 0 on a clean stop, 1 on a runtime failure, 3 when the apply is
-refused, 4 when another supervisor already holds the lock. 3 and 4 are the
-unit's
+uses 0/1/3/4/6: 0 on a clean stop, 1 on a runtime failure, 3 when the apply is
+refused, 4 when another supervisor already holds the lock, 6 when a reload found a
+changed declaration. 3 and 4 are the unit's
 .BR RestartPreventExitStatus ,
-neither fixed by trying again. Every other subcommand uses 0 for success and 1
-for failure.
+neither fixed by trying again; 6 is its
+.B SuccessExitStatus
+and
+.BR RestartForceExitStatus .
+Every other subcommand uses 0 for success and 1 for failure.
 .TP
 .B 0
 .B status
@@ -367,6 +398,13 @@ the declaration or this host refused the apply; retrying will not help.
 .B run
 only: another supervisor already holds the lock on the run dir. Retrying will
 not help.
+.TP
+.B 6
+.B run
+only: a reload found a changed declaration. The stop sequence completed \(em this is
+a clean stop, not a failure \(em and the unit is restarted to apply the new file. Note
+that 5 belongs to a supervised child that could not arm its parent\-death signal, not
+to this.
 .SH ENVIRONMENT
 .TP
 .B CFAB_HOST
@@ -459,22 +497,24 @@ the long-lived supervisor.
 .B ExecReload
 is
 .BR "kill \-HUP $MAINPID" ,
-which re\-applies the declaration in place \(em no teardown, no netdev churn.
+which re\-reads the declaration (see
+.B RELOAD
+below).
 .B ConditionPathExists=/etc/cfab/fabric.toml
 skips it on a host that has the package but no declaration, so that host boots clean
 instead of failing.
 .B RestartPreventExitStatus=3\ 4
-stops systemd from retrying a refused apply or a lost lock.
+stops systemd from retrying a refused apply or a lost lock, while
+.B SuccessExitStatus=6
+and
+.B RestartForceExitStatus=6
+turn a changed\-declaration reload into a clean restart rather than a failure.
 .PP
 A package upgrade restarts the unit once the new files are in place (teardown and
 re\-apply: every identity on the host is down for the restart). It is not left running
 on the old binary: the supervisor respawns its children from
 .IR /usr/bin/cfab ,
 so an un\-restarted upgrade would run the next engine under the previous supervisor.
-.RB ( "systemctl reload cfab" )
-re\-applies the declaration in place (no teardown, no netdev churn) but restarts the
-engine and the shape daemon: measured 2026\-09\-06 on the testbed, 6\(en10 s of loss on
-every zone while OSPF re\-converges.
 .PP
 .B "apt remove"
 stops the unit (correct: the binary is going away) and disables it;

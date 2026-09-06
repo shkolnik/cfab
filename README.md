@@ -75,7 +75,7 @@ systemctl enable --now cfab
 
 The unit is `Type=notify`; `ExecStart` is `cfab run`, the long-lived supervisor that applies the
 fabric and keeps the engine, shape daemon, and conf-sync alive. `ExecReload` is
-`kill -HUP $MAINPID`, which re-applies the declaration in place — no teardown, no netdev churn.
+`kill -HUP $MAINPID`, which re-reads `/etc/cfab/fabric.toml` and acts on what it finds (below).
 `ConditionPathExists=/etc/cfab/fabric.toml` means a host with the package but no declaration is
 skipped at boot rather than failed. Set `CFAB_HOST` in `/etc/default/cfab` only when this
 member's row is not named by the kernel hostname.
@@ -83,9 +83,19 @@ member's row is not named by the kernel hostname.
 A package upgrade restarts the unit once the new files are in place (teardown and re-apply:
 every identity on the host is down for the restart). It is not left running on the old binary:
 the supervisor respawns its children from `/usr/bin/cfab`, so an un-restarted upgrade would run
-the next engine under the previous supervisor. `systemctl reload cfab` re-applies the
-declaration in place (no teardown, no netdev churn) but restarts the engine and the shape
-daemon: measured 2026-09-06 on the testbed, 6–10 s of loss on every zone while OSPF re-converges.
+the next engine under the previous supervisor.
+
+`systemctl reload cfab` re-reads the declaration:
+
+- **Unchanged** (comments and whitespace do not count — the comparison is of the derived fabric):
+  re-applied in place, no teardown, no netdev churn, but the engine and the shape daemon restart.
+  Measured 2026-09-06 on the testbed: 6–10 s of loss on every zone while OSPF re-converges.
+- **Changed and valid**: the fabric is torn down and the unit restarted onto the new declaration.
+  An in-place apply cannot do this — it creates and repairs, it never removes what the previous
+  declaration had — so the whole fabric is down for the restart, as on a package upgrade.
+- **Invalid, unreadable, or no longer declaring this host**: refused. The running fabric is kept
+  exactly as it was and `cfab status` names the refusal on its `components:` line.
+
 `apt remove` stops the
 unit (correct: the binary is going away) and disables it; `apt purge` also removes
 `/etc/default/cfab`.
