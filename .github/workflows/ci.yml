@@ -25,7 +25,9 @@ jobs:
       - name: Holo pin and feature guard
         run: bash scripts/holo-check.sh
       - name: Fork socket tests (control-mark order is a fork invariant cfab depends on)
-        run: cargo test --manifest-path ../holo/Cargo.toml -p holo-utils --lib socket
+        # yang5/bundled: the holo workspace links the system libyang by default, which the
+        # runner (and any dev box without it) lacks; cfab itself always builds it bundled.
+        run: cargo test --manifest-path ../holo/Cargo.toml -p holo-utils --lib --features yang5/bundled socket
       - name: Format
         run: cargo fmt --check
       - name: Clippy
