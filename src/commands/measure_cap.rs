@@ -41,7 +41,7 @@ pub fn run(
         .collect();
     if sub_ifs.is_empty() {
         return Err(Error::fatal(format!(
-            "measure-cap: '{dev}' is not a wire in SEGMENT_TABLE — refusing to measure"
+            "measure-cap: '{dev}' is not a wire in a zone's `segments` — refusing to measure"
         )));
     }
     if view.is_admin_if(dev) {
@@ -295,7 +295,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("not a wire in SEGMENT_TABLE"),
+            err.to_string()
+                .contains("not a wire in a zone's `segments`"),
             "{err}"
         );
     }

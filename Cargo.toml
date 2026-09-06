@@ -3,7 +3,7 @@ name = "cfab"
 version = "0.3.2"
 edition = "2024"
 rust-version = "1.98"
-description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.conf declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
+description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.toml declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shkolnik/cfab"
 
@@ -36,7 +36,7 @@ tempfile = "3"
 [package.metadata.deb]
 maintainer = "James Shkolnik <jshkolnik@gmail.com>"
 copyright = "2026 James Shkolnik"
-extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.conf declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables; iptables is recommended, not required: only the ceiling-only fallback a leaf takes on a kernel without nf_tables uses it)."
+extended-description = "Per-host runtime of the resilient converged fabric for small clusters: validates the fabric.toml declaration, generates the nft forward policy / traffic-class marking / HTB shaping / routing-engine configuration from it, applies and verifies the fabric on this member, and tears it down. The routing engine (OSPF, BFD, FIB) is embedded in the binary; installing this package pulls in the rest of the runtime chain (nftables; iptables is recommended, not required: only the ceiling-only fallback a leaf takes on a kernel without nf_tables uses it)."
 section = "net"
 priority = "optional"
 depends = "nftables, iproute2, ethtool"
@@ -47,7 +47,7 @@ assets = [
     ["target/release/cfab", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/cfab/", "644"],
     ["doc/cfab.8", "usr/share/man/man8/", "644"],
-    ["examples/fabric.conf", "usr/share/doc/cfab/examples/fabric.conf.example", "644"],
+    ["examples/fabric.toml", "usr/share/doc/cfab/examples/fabric.toml.example", "644"],
     ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
     ["packaging/deb/rt_protos.d/cfab.conf", "etc/iproute2/rt_protos.d/cfab.conf", "644"],
 ]
@@ -58,7 +58,7 @@ assets = [
 maintainer-scripts = "packaging/deb"
 
 # cfab.service, installed disabled and never started by the package: installing
-# cfab must not change the network. The operator writes /etc/cfab/fabric.conf and runs
+# cfab must not change the network. The operator writes /etc/cfab/fabric.toml and runs
 # `systemctl enable --now cfab`.
 [package.metadata.deb.systemd-units]
 unit-scripts = "packaging/deb"

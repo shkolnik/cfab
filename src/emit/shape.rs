@@ -105,7 +105,7 @@ pub fn derive(
     zones.dedup();
     if zones.is_empty() {
         return Err(Error::config(format!(
-            "gen-shape: no SEGMENT_TABLE zone on wire '{dev}'"
+            "gen-shape: no a zone's `segments` zone on wire '{dev}'"
         )));
     }
 
@@ -466,7 +466,7 @@ mod tests {
     }
 
     /// The untagged path of EVERY host wire is the admin plane (James 2026-09-06), so every
-    /// wire of a host gets the untagged ADMIN_FLOOR band — not just one nominated NIC. A leaf
+    /// wire of a host gets the untagged `[admin] floor_mbps` band — not just one nominated NIC. A leaf
     /// owns no wire's L3 and gets none.
     #[test]
     fn every_host_wire_gets_the_admin_band_and_no_leaf_wire_does() {
@@ -499,11 +499,11 @@ mod tests {
                 .contains("no declared link speed for pve1-tb:eth5"),
             "{err}"
         );
-        // A wire with a measured cap but no SEGMENT_TABLE rows hits the no-zone error.
+        // A wire with a measured cap but no a zone's `segments` rows hits the no-zone error.
         let err = derive(&v, "eth5", Some(1000), &|_| true).unwrap_err();
         assert!(
             err.to_string()
-                .contains("no SEGMENT_TABLE zone on wire 'eth5'"),
+                .contains("no a zone's `segments` zone on wire 'eth5'"),
             "{err}"
         );
     }

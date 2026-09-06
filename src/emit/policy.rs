@@ -1,5 +1,5 @@
 //! The nft forward policy (table inet cfab-fwd) derived from the class table. Default-deny for
-//! everything that touches a cfab interface: only FORWARD_ALLOW pairs pass, the admin interface
+//! everything that touches a cfab interface: only `[forward] allow` pairs pass, the admin interface
 //! never transits, every drop is counted. A packet that touches no cfab interface on either
 //! side is another stack's business and is accepted here (nft forward hooks are cumulative, so
 //! that stack's own policy still applies) — scoped posture. Pure text out.
@@ -88,7 +88,7 @@ mod tests {
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
     /// fallback bond after a zone's segments, and this generator just emits whatever `zone_ifs`
     /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
-    /// (so `FORWARD_ALLOW storage>storage` covers domain-disjoint transit through it) and in
+    /// (so ``[forward] allow` storage>storage` covers domain-disjoint transit through it) and in
     /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
     /// A slave is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
     /// own — the bond does), but it IS in `owned_forwarding()` (Task 2, `false`/never-transit)

@@ -41,7 +41,7 @@ const SPF_HOLD_DOWN_MS: u32 = 3000;
 pub enum TransitCost {
     /// The cost the declaration asks for.
     Declared,
-    /// The declared cost plus `LEAF_COST_OFFSET`: reachable, never chosen as a path through.
+    /// The declared cost plus ``[cost] leaf_offset``: reachable, never chosen as a path through.
     LeafOffset,
 }
 
@@ -95,10 +95,10 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
     let mut protocols: Vec<Value> = Vec::new();
     for z in &f.zones {
         let mut ospf_ifs: Vec<Value> = Vec::new();
-        // Segments: a leaf's transit links carry cost + LEAF_COST_OFFSET (never a transit).
+        // Segments: a leaf's transit links carry cost + `[cost] leaf_offset` (never a transit).
         for r in class_rows.iter().filter(|r| r.zone == z.name) {
             let cost = link_cost(view, transit, r.ospf_cost);
-            // ietf-bfd intervals are microseconds; fabric.conf declares milliseconds.
+            // ietf-bfd intervals are microseconds; fabric.toml declares milliseconds.
             ospf_ifs.push(json!({
                 "name": r.ifname,
                 "interface-type": "broadcast",
@@ -345,7 +345,7 @@ fn link_cost(view: &View, transit: TransitCost, declared: u32) -> u32 {
     }
 }
 
-/// Source pinning, one rule per zone in ZONE_TABLE order: a route inside the zone's `/16`
+/// Source pinning, one rule per zone in `[[zone]]` order: a route inside the zone's `/16`
 /// block is installed with this member's identity as its preferred source, so identities are
 /// the addresses on the wire (the embedded engine's stand-in for FRR's `set src` route-map).
 pub fn prefsrc_rules(view: &View) -> Vec<(String, String)> {
@@ -516,7 +516,7 @@ mod tests {
     }
 
     /// Spec §12 (b): a fail-closed transit host advertises every transit link at the declared
-    /// cost + LEAF_COST_OFFSET, so no peer keeps choosing it as a path through — and back at
+    /// cost + `[cost] leaf_offset`, so no peer keeps choosing it as a path through — and back at
     /// the declared cost when the policy is restored. Asserted on the candidate the engine
     /// commits, which is the only thing the peers ever see.
     #[test]

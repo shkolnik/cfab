@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{Error, Result};
 use crate::model::{Fabric, Member, MemberKind, SegScope, Zone};
 
-/// A SEGMENT_TABLE row resolved for one member: domain → that member's wire. A member with no
+/// A a zone's `segments` row resolved for one member: domain → that member's wire. A member with no
 /// wire on a row's domain simply has no such row (heterogeneity is generated, not branched).
 #[derive(Debug, Clone)]
 pub struct ClassRow {
@@ -63,7 +63,7 @@ pub struct FallbackRow {
     pub slaves: Vec<Slave>,
 }
 
-/// Where a (member, zone) wire order came from: the default producer, or a WIRE_PREF row.
+/// Where a (member, zone) wire order came from: the default producer, or a a member's `prefs` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefSource {
     Derived,
@@ -141,7 +141,7 @@ impl<'a> View<'a> {
         class_rows_of(self.fabric, self.member)
     }
 
-    /// The ingress legs this member carries, in ZONE_TABLE order.
+    /// The ingress legs this member carries, in `[[zone]]` order.
     pub fn gw_rows(&self) -> Vec<GwRow> {
         gw_rows_of(self.fabric, self.member)
     }
@@ -152,7 +152,7 @@ impl<'a> View<'a> {
         fallback_rows_of(self.fabric, self.member)
     }
 
-    /// This member's wire order per zone, marked derived or overridden (ZONE_TABLE order).
+    /// This member's wire order per zone, marked derived or overridden (`[[zone]]` order).
     pub fn prefs(&self) -> Vec<HostZonePref> {
         prefs_of(self.fabric, self.member)
     }
@@ -189,8 +189,8 @@ impl<'a> View<'a> {
 
     /// The admin interfaces: on a host, EVERY declared wire — the untagged path of each wire is
     /// the routing-stack-independent lifeline, so each one is kept out of transit and each one
-    /// gets its own untagged ADMIN_FLOOR band. A leaf has none of ours to guard (it never owns
-    /// any wire's L3). Declaration order, which is MEMBER_TABLE order.
+    /// gets its own untagged `[admin] floor_mbps` band. A leaf has none of ours to guard (it never owns
+    /// any wire's L3). Declaration order, which is `[[member]]` order.
     pub fn admin_ifs(&self) -> Vec<&'a str> {
         match self.member.kind {
             MemberKind::Host => self.member.wires.iter().map(|w| w.name.as_str()).collect(),
@@ -259,7 +259,7 @@ impl<'a> View<'a> {
             .map(|w| w.speed_mbps)
             .ok_or_else(|| {
                 Error::config(format!(
-                    "no declared link speed for {}:{wire} in MEMBER_TABLE",
+                    "no declared link speed for {}:{wire} in `[[member]]`",
                     self.member.name
                 ))
             })
@@ -283,7 +283,7 @@ impl<'a> View<'a> {
 
 /// The default producer (spec §4, option (c)): rank 0 is the wire on the zone's DECLARED
 /// primary domain when this member has one, and the remaining candidates follow by declared
-/// speed descending, ties keeping MEMBER_TABLE order. A `WIRE_PREF` row replaces the WHOLE
+/// speed descending, ties keeping `[[member]]` order. A `a member's `prefs`` row replaces the WHOLE
 /// order — never blended, and `Fabric::validate` has already proven it complete.
 pub fn prefs_of(fabric: &Fabric, member: &Member) -> Vec<HostZonePref> {
     fabric
@@ -304,7 +304,7 @@ pub fn prefs_of(fabric: &Fabric, member: &Member) -> Vec<HostZonePref> {
                 .enumerate()
                 .filter(|(_, w)| w.domain != z.primary)
                 .collect();
-            // Speed descending; the enumerate index keeps MEMBER_TABLE order on a tie, which is
+            // Speed descending; the enumerate index keeps `[[member]]` order on a tie, which is
             // the only tie-break the operator can see in the declaration.
             rest.sort_by(|a, b| b.1.speed_mbps.cmp(&a.1.speed_mbps).then(a.0.cmp(&b.0)));
             let mut order: Vec<String> = Vec::new();
@@ -366,7 +366,7 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
 }
 
 /// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member
-/// has, in MEMBER_TABLE order, named `<ifname>-<domain>`. Shared by the universal segment and a
+/// has, in `[[member]]` order, named `<ifname>-<domain>`. Shared by the universal segment and a
 /// migrating ingress leg — one fan-out, so the two legs cannot drift apart.
 fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
     member
@@ -380,7 +380,7 @@ fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
 }
 
 /// The wire carrying this member's cheapest segment of `zone` — the bond leg's home, derived
-/// (never declared). Ties keep the first row in SEGMENT_TABLE order.
+/// (never declared). Ties keep the first row in a zone's `segments` order.
 fn home_wire(fabric: &Fabric, member: &Member, zone: &str) -> Option<String> {
     let mut best: Option<(u32, String)> = None;
     for r in class_rows_of(fabric, member) {
@@ -420,7 +420,7 @@ pub fn universal_cost(fabric: &Fabric, zone: &str) -> u32 {
 }
 
 /// This member's universal segments (table order): each `any` row fanned out over the member's
-/// wires in MEMBER_TABLE order, one slave per wire, homed on the zone's cheapest wire this
+/// wires in `[[member]]` order, one slave per wire, homed on the zone's cheapest wire this
 /// member has. A member with no wires at all has no such row (it has no fabric).
 pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
     if member.wires.is_empty() {
@@ -754,7 +754,7 @@ mod tests {
     }
 
     /// The default producer (spec §4 option (c)) on the reference declaration: rank 0 is the
-    /// zone's declared primary domain, then speed descending with MEMBER_TABLE order on a tie.
+    /// zone's declared primary domain, then speed descending with `[[member]]` order on a tie.
     #[test]
     fn the_derived_order_is_primary_then_speed() {
         let f = fabric();
@@ -998,7 +998,7 @@ mod tests {
 
     /// The admin plane is every wire on a host (James 2026-09-06): the untagged path of each
     /// NIC is a lifeline, so all of them are guarded, none of them transits, and each gets its
-    /// own ADMIN_FLOOR band. A leaf has none of ours.
+    /// own `[admin] floor_mbps` band. A leaf has none of ours.
     #[test]
     fn admin_ifs_are_every_wire_on_a_host_and_none_on_a_leaf() {
         let f = fabric();
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(
             order_of(&f, "pve1-tb", "storage"),
             vec!["eth9", "eth2", "eth1", "eth0"],
-            "primary a, then 2500, then the two 1000s in MEMBER_TABLE order"
+            "primary a, then 2500, then the two 1000s in `[[member]]` order"
         );
         assert_eq!(
             order_of(&f, "pve1-tb", "cluster"),
@@ -1292,7 +1292,7 @@ mod tests {
     }
 
     /// The same fabric is fine once the two transits are distinguishable. Cost is a function
-    /// of RANK, not of speed, so the fix is the one the error names: a WIRE_PREF row that
+    /// of RANK, not of speed, so the fix is the one the error names: a a member's `prefs` row that
     /// re-ranks one transit's wires.
     #[test]
     fn the_same_fabric_passes_once_a_wire_pref_distinguishes_the_transits() {

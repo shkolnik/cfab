@@ -32,11 +32,11 @@ set -euo pipefail
 set +m
 
 ORACLE_BIN=${ORACLE_BIN:-/oracle/cfab}
-# Writable state (fabric.conf, run dir, logs). /oracle is mounted read-only by the gate-0
+# Writable state (fabric.toml, run dir, logs). /oracle is mounted read-only by the gate-0
 # container, so the working files live on the container's own tmpfs.
 WORK=${ORACLE_WORK:-/run/cfab-oracle}
 RUN=$WORK/run
-CONF=$WORK/fabric.conf
+CONF=$WORK/fabric.toml
 SOCK=$RUN/engine.sock
 LOCKFILE=$RUN/engine.lock         # Task 9: replaces engine.pid (flock, spec §14); the engine
                                    # writes its own pid into it AFTER taking the lock
@@ -86,52 +86,76 @@ preflight() {
 }
 
 # ---------------------------------------------------------------------------------------
-# fabric.conf: two hosts, two zones, three segments; no gw row, no VRRP, no forwarding.
-# Wire names are placeholders: the oracle creates the segment interfaces itself and never
-# runs `up`, so FABRIC_MODE=tagged only has to parse.
+# fabric.toml: two hosts, two zones, three segments; no gw, no forwarding. Wire names are
+# placeholders: the oracle creates the segment interfaces itself and never runs `up`, so the
+# declaration only has to parse and validate.
 # ---------------------------------------------------------------------------------------
 write_conf() {
-    local extra_row=${1:-}
+    local extra_segment=${1:-}
     mkdir -p "$WORK" "$RUN"
     cat > "$CONF" <<EOF
-FABRIC_MODE=tagged
-MEMBER_TABLE="
-h 1 host h-st:1000 h-cl:1000 -
-f 2 host f-st-w:1000 f-cl-w:1000 -
-"
-FABRIC_DOMAIN=oracle.example
-ZONE_TABLE="
-storage  99 0 cs0 2000 2 4 -
-cluster 199 6 cs6  200 0 1 -
-"
-CLASS_TABLE="
-cfab-st     st storage 1 100 primary 10
-cfab-st-bk  cl storage 2 101 backup  10
-cfab-cl     cl cluster 1 200 primary 10
-${extra_row}
-"
-LEAF_COST_OFFSET=30000
-HOST_FORWARD=0
-ADMIN_FLOOR=100
-ADMIN_BAND=1
-FORWARD_ALLOW=""
-VRRP_GW=0
-VRRP_VRID=99
-VRRP_IF=cfab-st-vr
-VRRP_ADVERT_MS=100
-PCP_CTRL=6
-DSCP_MARK=1
-BFD_RX_MS=300
-BFD_TX_MS=300
-BFD_MULT=3
-OSPF_HELLO=1
-OSPF_DEAD=3
-BGP_AS=65000
-BGP_KEEPALIVE_S=1
-BGP_HOLD_S=3
-BGP_CONNECT_S=3
-USB_NICS=""
-CFAB_RUN=$RUN
+dns_domain = "oracle.example"
+
+[domains]
+a = "the storage switch"
+b = "the cluster switch"
+
+[[member]]
+name = "h"
+node = 1
+kind = "host"
+wires = [
+  { nic = "h-st", domain = "a", speed_mbps = 1000 },
+  { nic = "h-cl", domain = "b", speed_mbps = 1000 },
+]
+
+[[member]]
+name = "f"
+node = 2
+kind = "host"
+wires = [
+  { nic = "f-st-w", domain = "a", speed_mbps = 1000 },
+  { nic = "f-cl-w", domain = "b", speed_mbps = 1000 },
+]
+
+[[zone]]
+name = "storage"
+id = 99
+pcp = 0
+dscp = "cs0"
+floor_mbps = 2000
+band = 2
+weight = 4
+primary = "a"
+segments = [
+  { ifname = "cfab-st",    domain = "a", seg = 1, vid = 100 },
+  { ifname = "cfab-st-bk", domain = "b", seg = 2, vid = 101 },
+]
+
+[[zone]]
+name = "cluster"
+id = 199
+pcp = 6
+dscp = "cs6"
+floor_mbps = 200
+band = 0
+weight = 1
+primary = "b"
+segments = [
+  { ifname = "cfab-cl", domain = "b", seg = 1, vid = 200 },${extra_segment}
+]
+
+[forward]
+enabled = false
+allow = []
+
+[bfd]
+rx_ms = 300
+tx_ms = 300
+mult = 3
+
+[runtime]
+run_dir = "$RUN"
 EOF
 }
 
@@ -624,7 +648,7 @@ a7_teeth_no_prefsrc() {
 }
 
 # A configured segment interface that does not exist in the kernel. The leafref is
-# config->config (the interfaces tree is emitted from fabric.conf), so libyang validates;
+# config->config (the interfaces tree is emitted from fabric.toml), so libyang validates;
 # what must NOT happen is silence. Accepted outcomes, each recorded: the engine exits
 # nonzero naming the interface; or it comes up and the state document / log shows the
 # interface as `down` by name (ietf-ospf interface states: down loopback waiting
@@ -636,7 +660,7 @@ a7_teeth_no_prefsrc() {
 # A refusal to start counts only when the log NAMES cfab-ghost: any other startup error
 # (busy run dir, bind failure) is a failure for an unrelated reason, so it goes RED.
 a8_missing_interface() {
-    write_conf "cfab-ghost  st cluster 2 201 backup  10"
+    write_conf '  { ifname = "cfab-ghost", domain = "a", seg = 2, vid = 201 },'
     start_engine "$RUN/engine-a8.log"
     local doc ghost_state logline
     if wait_ready "$RUN/engine-a8.log"; then

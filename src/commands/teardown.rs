@@ -658,7 +658,7 @@ mod tests {
     /// refuses, names the running pid and the remedy, and changes nothing (no `ip link del`).
     #[test]
     fn down_refuses_while_a_supervisor_answers() {
-        let f = fabric(); // CFAB_RUN=/run/cfab
+        let f = fabric(); // `[runtime] run_dir`=/run/cfab
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = MockSys::default()
             .socket(

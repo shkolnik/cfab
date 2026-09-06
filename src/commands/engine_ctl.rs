@@ -127,7 +127,7 @@ pub fn bfd_bind_error_line(log: &str, port: u16) -> Option<&str> {
 }
 
 /// holo names the port and, when it can read the holder's fds, the daemon holding it. Only
-/// cfab knows the remedy: the port is declared in fabric.conf, and it is a fabric-wide
+/// cfab knows the remedy: the port is declared in fabric.toml, and it is a fabric-wide
 /// contract — both ends of a BFD session must agree on it, so it is never a per-host fix.
 /// Used by `status`, which diagnoses the failure from the engine's ring buffer.
 pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
@@ -139,7 +139,7 @@ pub fn bfd_bind_remedy(line: &str, port: u16) -> String {
         "stop the daemon named in the line above".to_string()
     };
     format!(
-        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.conf on EVERY member — \
+        "{stop}; or declare a free BFD_PORT (now {port}) in fabric.toml on EVERY member — \
          every peer of a session must use the same port"
     )
 }
@@ -236,7 +236,7 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             if got != Some(want) {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' {ifname} cost is {} (want {want} = cost + \
-                     LEAF_COST_OFFSET)",
+                     `[cost] leaf_offset`)",
                     z.name, inst["interfaces"][ifname]["cost"]
                 )));
             }
@@ -262,7 +262,7 @@ pub fn readback(view: &View, doc: &Value) -> Result<()> {
             if link["metric"].as_u64() != Some(want) {
                 return Err(Error::fatal(format!(
                     "engine readback: ospf '{}' transit link {ifname} ({addr}) advertised at {} \
-                     (want {want} = cost + LEAF_COST_OFFSET)",
+                     (want {want} = cost + `[cost] leaf_offset`)",
                     z.name, link["metric"]
                 )));
             }
@@ -553,7 +553,7 @@ pub(crate) mod tests {
     }
 
     /// Gate-0 evidence §8.4: an interface the engine reports `down` — a wire with no carrier
-    /// at `up` time, or one `fabric.conf` names that the kernel does not have — is named, not
+    /// at `up` time, or one `fabric.toml` names that the kernel does not have — is named, not
     /// silently accepted. Only after the settle, and only as a list for the caller to warn
     /// about: `settled_down_ifs` never errors.
     #[test]
@@ -924,7 +924,7 @@ pub(crate) mod tests {
         // Every branch carries the fabric-wide-port caveat.
         assert!(
             r.contains(
-                "or declare a free BFD_PORT (now 3784) in fabric.conf on EVERY member — \
+                "or declare a free BFD_PORT (now 3784) in fabric.toml on EVERY member — \
                  every peer of a session must use the same port"
             ),
             "{r}"

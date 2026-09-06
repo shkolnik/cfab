@@ -1127,7 +1127,7 @@ mod tests {
     use std::path::Path;
 
     const EXE: &str = "/usr/bin/cfab";
-    const CONFIG: &str = "/etc/cfab/fabric.conf";
+    const CONFIG: &str = "/etc/cfab/fabric.toml";
 
     fn fabric_at(run_dir: &Path) -> Fabric {
         let text =

@@ -7,7 +7,7 @@ After=network-online.target networking.service
 Wants=network-online.target
 # Installed but unconfigured is a clean boot, not a failure: with no declaration there is
 # nothing to apply, so the unit is skipped rather than started and failed.
-ConditionPathExists=/etc/cfab/fabric.conf
+ConditionPathExists=/etc/cfab/fabric.toml
 # Never give up on a member whose absence is "no fabric" on an unattended host. Measured
 # 2026-09-05 on pve1-tb: the default 5-starts-in-10-s limit turned a crash loop into a
 # permanent silent outage.

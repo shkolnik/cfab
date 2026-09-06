@@ -146,7 +146,7 @@ impl Pmxcfs {
         self.root.join("cfab")
     }
     pub fn conf_path(&self) -> PathBuf {
-        self.cfab_dir().join("fabric.conf")
+        self.cfab_dir().join("fabric.toml")
     }
     pub fn gen_path(&self) -> PathBuf {
         self.cfab_dir().join("gen")
@@ -369,17 +369,17 @@ mod tests {
     #[test]
     fn size_guard() {
         check_size(MAX_FILE_SIZE, "x").unwrap();
-        let err = check_size(MAX_FILE_SIZE + 1, "fabric.conf")
+        let err = check_size(MAX_FILE_SIZE + 1, "fabric.toml")
             .unwrap_err()
             .to_string();
         assert!(err.contains("1 MiB"), "{err}");
-        assert!(err.contains("fabric.conf"), "{err}");
+        assert!(err.contains("fabric.toml"), "{err}");
     }
 
     #[test]
     fn path_helpers() {
         let p = Pmxcfs::at("/etc/pve");
-        assert_eq!(p.conf_path(), Path::new("/etc/pve/cfab/fabric.conf"));
+        assert_eq!(p.conf_path(), Path::new("/etc/pve/cfab/fabric.toml"));
         assert_eq!(p.gen_path(), Path::new("/etc/pve/cfab/gen"));
         assert_eq!(
             p.ack_path(7, "pve2-tb"),
@@ -406,7 +406,7 @@ mod tests {
         std::fs::create_dir_all(p.cfab_dir()).unwrap();
         p.publish(&p.conf_path(), "A=1\n").unwrap();
         assert_eq!(std::fs::read_to_string(p.conf_path()).unwrap(), "A=1\n");
-        assert!(!dir.path().join("cfab/.fabric.conf.tmp").exists());
+        assert!(!dir.path().join("cfab/.fabric.toml.tmp").exists());
         p.write_gen(5).unwrap();
         assert_eq!(p.read_gen().unwrap(), 5);
     }

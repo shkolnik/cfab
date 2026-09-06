@@ -2,9 +2,9 @@
 
 A generic runtime image for hosts whose OS cannot run cfab natively (e.g. a NAS), or for
 `cfab check`-only validation of a declaration. It bakes nothing member-specific: no
-`fabric.conf`, no hostname, no fixture files. Everything a specific deployment needs — the
+`fabric.toml`, no hostname, no fixture files. Everything a specific deployment needs — the
 declaration and, when it differs from the container's own hostname, which row in
-`MEMBER_TABLE` this container is — is supplied at `docker run`/compose time.
+``[[member]]`` this container is — is supplied at `docker run`/compose time.
 
 ## Build
 
@@ -26,12 +26,12 @@ No network privilege is needed to lint a declaration:
 
 ```
 docker run --rm --network none \
-    -v /path/to/fabric.conf:/etc/cfab/fabric.conf:ro \
+    -v /path/to/fabric.toml:/etc/cfab/fabric.toml:ro \
     -e CFAB_HOST=pve1-tb \
     cfab cfab check
 ```
 
-`CFAB_HOST` selects which `MEMBER_TABLE` row this container is; leave it unset to fall back to
+`CFAB_HOST` selects which ``[[member]]`` row this container is; leave it unset to fall back to
 the container's own hostname (`docker run --hostname`).
 
 ## Run — as a fabric member (leaf or transiting host)
@@ -52,7 +52,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     volumes:
-      - /etc/cfab/fabric.conf:/etc/cfab/fabric.conf:ro
+      - /etc/cfab/fabric.toml:/etc/cfab/fabric.toml:ro
     environment:
       CFAB_HOST: ${CFAB_HOST:-}
 ```
@@ -64,19 +64,19 @@ up -d` starts the supervisor, which applies the fabric and keeps its children al
 
 The declaration's fallback segment (active-backup bond leg over every wire's fallback VLAN,
 role `fallback`, no BFD, cost 5000) reaches this container the same way any other segment
-does — through the mounted `fabric.conf` and the host network namespace; nothing about the
+does — through the mounted `fabric.toml` and the host network namespace; nothing about the
 fallback segment is container-specific.
 
 ## What was left out, and why
 
 Studied on pve3 before writing this: `/root/fallback-rename/ctx/` (a test **fixture** image —
-bakes a fixture `fabric.conf`, `systemctl`/`systemd-run` shims so SDD tests can run without a
+bakes a fixture `fabric.toml`, `systemctl`/`systemd-run` shims so SDD tests can run without a
 real systemd, and diagnostic tools `python3-minimal jq bsdextrautils netbase tcpdump
 iputils-ping`) and `/root/leaf-cfab/` (the **reference deployment** for the NAS: same deb, but
-bakes its own `fabric.conf` and a leaf-specific entrypoint, and is the thing actually running as
+bakes its own `fabric.toml` and a leaf-specific entrypoint, and is the thing actually running as
 `cfab-leaf`).
 
-- **No baked `fabric.conf` or hostname** — the whole point of "generic": one image, any member,
+- **No baked `fabric.toml` or hostname** — the whole point of "generic": one image, any member,
   by bind-mount + `CFAB_HOST`, per the backlog decision that the image stays generic.
 - **No systemd shims** — those exist only so a *test fixture* can assert `systemctl is-active`
   without a real init system; they are not part of running cfab and would be actively

@@ -35,7 +35,7 @@ pub struct Ceiling {
     /// one of them also carries the zone's fallback row (the row needs a home wire, which is a
     /// class row in the zone), so this is the fallback LAN's membership too.
     pub members: u64,
-    /// Broadcast LANs in the zone = the zone's SEGMENT_TABLE rows, universal row included: the
+    /// Broadcast LANs in the zone = the zone's a zone's `segments` rows, universal row included: the
     /// network-LSA candidates.
     pub lans: u64,
     /// LSDB size for the zone: one router-LSA per member, one network-LSA per LAN.
@@ -76,11 +76,11 @@ impl Ceiling {
 }
 
 /// The arithmetic, separated from the declaration so the three design-bound sizes can be tested
-/// as numbers. `hello_s` is OSPF_HELLO in whole seconds.
+/// as numbers. `hello_s` is `[ospf] hello_s` in whole seconds.
 fn ceiling_pps(members: u64, lans: u64, hello_s: u32) -> (u64, u64, u64, u64) {
     let peers = members.saturating_sub(1);
     let lsas = members + lans;
-    // At most one hello per second: OSPF_HELLO is whole seconds and never below 1.
+    // At most one hello per second: `[ospf] hello_s` is whole seconds and never below 1.
     let hello = 1u64.div_ceil(u64::from(hello_s).max(1));
     // A full convergence, compressed into a single second: every LSA flooded once (multicast)
     // and acknowledged once.
@@ -226,7 +226,7 @@ mod tests {
     }
 
     /// The threshold is a function of the declaration and of one measured number, at every size
-    /// the project designs for. Storage has 4 SEGMENT_TABLE rows (3 segments + the universal), so
+    /// the project designs for. Storage has 4 a zone's `segments` rows (3 segments + the universal), so
     /// the LSDB is `members + 4` and the peer count on the fallback LAN is `members - 1`.
     ///
     /// The two margins this has to keep, as numbers (fixture measurements,

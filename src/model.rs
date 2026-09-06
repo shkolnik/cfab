@@ -119,7 +119,7 @@ fn bond_ifname_too_long(ifname: &str) -> bool {
     ifname.len() > MAX_BOND_IFNAME
 }
 
-/// One MEMBER_TABLE row.
+/// One `[[member]]` row.
 #[derive(Debug, Clone, Serialize)]
 pub struct Member {
     pub name: String,
@@ -130,7 +130,7 @@ pub struct Member {
     ///
     /// The admin plane is not a column: on a host the UNTAGGED path of every one of these
     /// wires is the admin plane (the SSH lifeline that works with the routing stack stopped),
-    /// so every wire gets the nft admin treatment and its own ADMIN_FLOOR band. A leaf owns no
+    /// so every wire gets the nft admin treatment and its own `[admin] floor_mbps` band. A leaf owns no
     /// L3 of ours on any wire.
     pub wires: Vec<Wire>,
 }
@@ -253,7 +253,7 @@ impl Zone {
     }
 }
 
-/// One SEGMENT_TABLE row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
+/// One a zone's `segments` row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
 /// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
 #[derive(Debug, Clone, Serialize)]
 pub struct Segment {
@@ -264,7 +264,7 @@ pub struct Segment {
     pub vid: u16,
 }
 
-/// One WIRE_PREF row: this member's complete wire order for this zone, replacing the derived
+/// One a member's `prefs` row: this member's complete wire order for this zone, replacing the derived
 /// one. Complete or an error — an override is never blended with the default.
 #[derive(Debug, Clone, Serialize)]
 pub struct WirePref {
@@ -302,9 +302,9 @@ pub struct Fabric {
     pub bgp_keepalive_s: u32,
     pub bgp_hold_s: u32,
     pub bgp_connect_s: u32,
-    /// `(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.
+    /// `(member, dev)` pairs from the `usb` wire flag: USB NICs that get offload safe mode on `up`.
     pub usb_nics: Vec<(String, String)>,
-    /// Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).
+    /// Runtime state dir written by `up`, read by `status` and the daemons (`[runtime] run_dir`).
     pub run_dir: String,
     pub dns_domain: String,
 }
@@ -719,7 +719,7 @@ impl Fabric {
             .join(" ")
     }
 
-    /// A WIRE_PREF row replaces the whole derived order, so it must BE the whole order: every
+    /// A a member's `prefs` row replaces the whole derived order, so it must BE the whole order: every
     /// candidate wire of that (member, zone) exactly once. A partial list is an error, never
     /// blended with the default.
     fn check_wire_prefs(&self) -> Result<()> {
@@ -771,7 +771,7 @@ impl Fabric {
     }
 
     /// The wires of `member` that can carry `zone`: the wires whose domain has a segment in
-    /// that zone, in MEMBER_TABLE order. The candidate set the derived order ranks and an
+    /// that zone, in `[[member]]` order. The candidate set the derived order ranks and an
     /// override must reproduce completely. A universal segment is a bond over every wire, not
     /// a per-wire preference, so it is not a candidate.
     pub fn candidate_wires<'a>(&self, member: &'a Member, zone: &str) -> Vec<&'a Wire> {

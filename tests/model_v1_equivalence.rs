@@ -37,7 +37,7 @@ const RENAME: [(&str, &str); 3] = [("st", "a"), ("cl", "b"), ("mg", "c")];
 fn fabric() -> Fabric {
     let text =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-            .expect("examples/fabric.conf");
+            .expect("examples/fabric.toml");
     Fabric::from_decl(&Declaration::parse(&text).unwrap()).expect("the v1 example parses")
 }
 
@@ -95,8 +95,8 @@ fn ospf_costs(tree: &Value) -> BTreeMap<String, Vec<(String, u64)>> {
 /// (a segment's vid, and the island whose wire carries it):
 ///
 /// ```text
-/// MEMBER_TABLE (all three members, st/cl/mg): eth9 eth1 eth0
-/// CLASS_TABLE:  ifname      island zone    seg vid  role     cost
+/// `[[member]]` (all three members, st/cl/mg): eth9 eth1 eth0
+/// a zone's `segments`:  ifname      island zone    seg vid  role     cost
 ///               cfab-st     st     storage 1   100  primary  10
 ///               cfab-st-bk  cl     storage 2   101  backup   100
 ///               cfab-st-b2  mg     storage 3   102  backup   300
@@ -306,7 +306,7 @@ fn the_preference_order_per_zone_reproduces_v0_except_mgmt() {
 ///
 /// That is a real change of failure behavior, not a cosmetic one: after eth0 dies, mgmt lands
 /// on the wire that carries storage bulk instead of the wire that carries cluster control. It
-/// is reversible with three WIRE_PREF rows. James's call; until then the derived order stands
+/// is reversible with three a member's `prefs` rows. James's call; until then the derived order stands
 /// and this test states it.
 #[test]
 fn the_mgmt_backup_order_is_the_one_real_behavior_change() {

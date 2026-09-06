@@ -536,7 +536,7 @@ fn posture(
                 if below {
                     c.note(format!(
                         "ospf {}: a transit link in our router LSA is advertised below \
-                         LEAF_COST_OFFSET={} (we could be chosen as a transit) — re-run cfab up",
+                         `[cost] leaf_offset`={} (we could be chosen as a transit) — re-run cfab up",
                         z.id, f.leaf_cost_offset
                     ));
                 }
@@ -635,7 +635,7 @@ fn posture(
         }
         MemberKind::Host => {
             if sys.run(&["nft", "list", "table", "inet", "cfab-fwd"])?.ok() {
-                c.note("HOST_FORWARD=0 but table inet cfab-fwd is loaded");
+                c.note("`[forward] enabled`=0 but table inet cfab-fwd is loaded");
             }
             for ifn in conf_interfaces(sys)? {
                 if !view.owns_if(&ifn) {
@@ -643,7 +643,7 @@ fn posture(
                 }
                 let path = format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding");
                 if sys.read(&path)?.trim() != "0" {
-                    c.note(format!("{path} = 1 with HOST_FORWARD=0"));
+                    c.note(format!("{path} = 1 with `[forward] enabled`=0"));
                 }
             }
         }
@@ -2820,7 +2820,7 @@ mod tests {
             .iter_mut()
             .find(|l| l["if"] == fallback_addr.as_str())
             .expect("the fallback bond advertises a transit link");
-        // Above LEAF_COST_OFFSET, so the weak arm accepts it; not cost + offset, so the
+        // Above `[cost] leaf_offset`, so the weak arm accepts it; not cost + offset, so the
         // exact arm must not.
         link["metric"] = serde_json::json!(31000);
         let mut sys = primary_routes(leaf_env(&view), &view)
@@ -2830,7 +2830,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  ospf 99: a transit link in our router LSA is advertised below \
-                 LEAF_COST_OFFSET=30000"
+                 `[cost] leaf_offset`=30000"
             ),
             "{}",
             report.output
@@ -3395,7 +3395,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  remedy: find the holder (ss -ulpn | grep ':3784') and stop it; or declare a \
-                 free BFD_PORT (now 3784) in fabric.conf on EVERY member — every peer of a \
+                 free BFD_PORT (now 3784) in fabric.toml on EVERY member — every peer of a \
                  session must use the same port\n"
             ),
             "{}",

@@ -27,7 +27,53 @@ pub use error::{Error, Result};
 /// Load + type + validate the declaration. An unknown key is an ERROR from the parser, not a
 /// warning: the declaration is the whole input, so a key nothing consumes is a mistake.
 pub fn load_fabric(path: &Path) -> Result<model::Fabric> {
+    if let Some(e) = retired_format_error(path) {
+        return Err(e);
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
     model::Fabric::from_decl(&decl::Declaration::parse(&text)?)
+}
+
+/// The declaration is missing but the RETIRED shell-format file sits beside it: say what
+/// happened, because "cannot read fabric.toml" on a host that has a `fabric.conf` sends the
+/// operator looking for a lost file instead of a replaced format. Pre-user: no shim, no
+/// migration — the file is rewritten by hand from the packaged example.
+pub fn retired_format_error(path: &Path) -> Option<Error> {
+    let retired = path.with_file_name("fabric.conf");
+    if path.exists() || !retired.exists() {
+        return None;
+    }
+    Some(Error::config(format!(
+        "{} does not exist, but {} does. fabric.conf is the retired shell format; the \
+         declaration is now TOML in fabric.toml — rewrite it from the packaged example \
+         (/usr/share/doc/cfab/examples/fabric.toml.example). There is no automatic migration",
+        path.display(),
+        retired.display()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retired file next to the missing one: the error names the format change, not a
+    /// missing file.
+    #[test]
+    fn a_retired_fabric_conf_beside_the_declaration_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fabric.conf"), "FABRIC_MODE=tagged\n").unwrap();
+        let err = load_fabric(&dir.path().join("fabric.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retired shell format"), "{err}");
+        assert!(err.contains("fabric.toml.example"), "{err}");
+        // ...and with no retired file, the plain "cannot read" error stands.
+        std::fs::remove_file(dir.path().join("fabric.conf")).unwrap();
+        let err = load_fabric(&dir.path().join("fabric.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot read"), "{err}");
+        assert!(!err.contains("retired"), "{err}");
+    }
 }

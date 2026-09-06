@@ -31,7 +31,7 @@ where `bgp_instance()` picks the single `control-plane-protocol` element whose `
 `ietf-bgp:bgp`.
 
 Order matters for `assert_eq!` on `Value`: arrays are compared element-wise. The fixture's order is
-the emitter's contract — neighbors in gw-row order (`View::gw_rows()`, ZONE_TABLE order), prefix
+the emitter's contract — neighbors in gw-row order (`View::gw_rows()`, declaration order), prefix
 sets and policy definitions in gw-zone order, and within a zone the import policy before the export
 policy.
 
@@ -59,7 +59,7 @@ neighbor per gw zone, so a zone name would be a lie the moment a second zone dec
 matches the main nft table. Statement names follow holo's own convention (`"1"`), leaving room for
 ordered numbering — holo keys statements in a `BTreeMap` by name, so the name *is* the order.
 
-## 3. Derived values (member `pve1-tb` of `examples/fabric.conf`)
+## 3. Derived values (member `pve1-tb` of `examples/fabric.toml`)
 
 Printed by a throwaway `cargo test` against the real parser, not inferred:
 
@@ -77,8 +77,8 @@ nothing here (`derive.rs:305` — `gw_rows_of` returns empty for a non-host).
 
 | value | source |
 |---|---|
-| `as: 65000` | `BGP_AS=65000` in `examples/fabric.conf`, parsed to `Fabric::bgp_as` |
-| `identifier: "10.249.0.1"` | `View::identity_addr(mgmt)` = `10.<id>.0.<node>` (`src/derive.rs:214`), first gw zone in ZONE_TABLE order |
+| `as: 65000` | `[bgp] asn = 65000` in `examples/fabric.toml`, parsed to `Fabric::bgp_as` |
+| `identifier: "10.249.0.1"` | `View::identity_addr(mgmt)` = `10.<id>.0.<node>` (`src/derive.rs:214`), first gw zone in declaration order |
 | `remote-address: "192.168.249.254"` | `ZoneGw::router` (`src/model.rs:182`) |
 | `peer-as: 65000` | same AS = iBGP |
 | `transport/local-address: "192.168.249.1"` | `ZoneGw::leg_cidr(1)` (`src/model.rs:195`) minus `/24` |

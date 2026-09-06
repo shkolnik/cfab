@@ -10,18 +10,18 @@ use cfab::{Error, commands, emit, load_fabric};
 
 /// cfab — the per-host runtime of the resilient converged fabric.
 ///
-/// fabric.conf declares the fabric; this tool validates it, generates every artifact from it
+/// fabric.toml declares the fabric; this tool validates it, generates every artifact from it
 /// (nft policy/marking, HTB trees, the routing engine's config tree), applies and verifies the fabric on this
 /// member, and tears it down.
 #[derive(Parser)]
 #[command(version, about, max_term_width = 100)]
 struct Cli {
-    /// Path to fabric.conf (default: next to the binary, else /etc/cfab/fabric.conf, else
-    /// ./fabric.conf)
+    /// Path to fabric.toml (default: next to the binary, else /etc/cfab/fabric.toml, else
+    /// ./fabric.toml)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// The MEMBER_TABLE row to run as (default: $CFAB_HOST, else this kernel's hostname)
+    /// The `[[member]]` row to run as (default: $CFAB_HOST, else this kernel's hostname)
     #[arg(long, global = true)]
     host: Option<String>,
 
@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and validate fabric.conf; print the resolved view for this member
+    /// Parse and validate fabric.toml; print the resolved view for this member
     Check,
     /// Print the fabric.toml declaration schema as JSON Schema
     Schema,
@@ -71,7 +71,7 @@ enum Command {
     ConfSync,
     /// Flood a fabric peer on one NIC and record the wire's measured capacity
     MeasureCap {
-        /// The physical NIC (a MEMBER_TABLE wire)
+        /// The physical NIC (a `[[member]]` wire)
         dev: String,
         /// Peer address to flood (a fabric segment address on that wire)
         peer: String,
@@ -86,7 +86,7 @@ enum Command {
         #[command(subcommand)]
         action: ClusterAction,
     },
-    /// Cluster-wide fabric.conf distribution
+    /// Cluster-wide fabric.toml distribution
     Conf {
         #[command(subcommand)]
         action: ConfAction,
@@ -113,7 +113,7 @@ enum ClusterAction {
 
 #[derive(Subcommand)]
 enum ConfAction {
-    /// Validate the local fabric.conf and publish it to /etc/pve/cfab/ (lock + gen bump)
+    /// Validate the local fabric.toml and publish it to /etc/pve/cfab/ (lock + gen bump)
     Publish,
 }
 
@@ -142,7 +142,7 @@ enum GenArtifact {
     Prefs,
     /// The floor+borrow HTB derivation for one physical NIC
     Shape {
-        /// The physical NIC (a MEMBER_TABLE wire)
+        /// The physical NIC (a `[[member]]` wire)
         dev: String,
         /// Print the tc program instead of the derivation
         #[arg(long, conflicts_with = "expect")]
@@ -164,8 +164,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.conf.
-const INSTALLED_CONFIG: &str = "/etc/cfab/fabric.conf";
+/// The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.toml.
+const INSTALLED_CONFIG: &str = "/etc/cfab/fabric.toml";
 
 fn config_path(cli_config: &Option<PathBuf>) -> PathBuf {
     if let Some(p) = cli_config {
@@ -174,25 +174,25 @@ fn config_path(cli_config: &Option<PathBuf>) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let beside = dir.join("fabric.conf");
+        let beside = dir.join("fabric.toml");
         if beside.exists() {
             return beside;
         }
     }
-    // The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.conf.
+    // The installed (deb) layout: /usr/bin/cfab + /etc/cfab/fabric.toml.
     let etc = PathBuf::from(INSTALLED_CONFIG);
     if etc.exists() {
         return etc;
     }
-    PathBuf::from("fabric.conf")
+    PathBuf::from("fabric.toml")
 }
 
 /// The DOWN line for a member with no declaration. `config_path`'s last resort is the bare
-/// relative `fabric.conf` (the from-a-checkout convenience), and on a host that never joined
-/// "no fabric.conf" says nothing about where a declaration belongs — so when nothing was asked
+/// relative `fabric.toml` (the from-a-checkout convenience), and on a host that never joined
+/// "no fabric.toml" says nothing about where a declaration belongs — so when nothing was asked
 /// for explicitly and nothing was found, name the installed location instead.
 fn no_config_line(cli_config: &Option<PathBuf>, resolved: &std::path::Path) -> String {
-    let named = if cli_config.is_none() && resolved == std::path::Path::new("fabric.conf") {
+    let named = if cli_config.is_none() && resolved == std::path::Path::new("fabric.toml") {
         std::path::Path::new(INSTALLED_CONFIG)
     } else {
         resolved
@@ -290,11 +290,15 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     }
     // A member with no declaration cannot desire the fabric to be up: that is DOWN, not a
-    // failure. (A fabric.conf that is PRESENT but unparseable keeps its loud parse error and
+    // failure. (A fabric.toml that is PRESENT but unparseable keeps its loud parse error and
     // exit 1 below — we cannot know what was desired.)
     if let Command::Status { .. } = cli.command
         && !path.exists()
     {
+        // ...unless the RETIRED shell file is sitting there: that member wanted a fabric.
+        if let Some(e) = cfab::retired_format_error(&path) {
+            return Err(e);
+        }
         println!("{}", no_config_line(&cli.config, &path));
         return Ok(ExitCode::from(3));
     }
@@ -480,7 +484,7 @@ fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
         .filter(|r| r.scope.is_universal())
         .count();
     format!(
-        "fabric.conf OK: {} zones, {} segments, {} fallback legs, {} members\n\
+        "fabric.toml OK: {} zones, {} segments, {} fallback legs, {} members\n\
          this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
          {} ingress leg(s)\n",
         fabric.zones.len(),
@@ -497,7 +501,7 @@ fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
 }
 
 /// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
-/// CFAB_RUN cap files with the cluster-published cap as the absent-local fallback, and
+/// `[runtime] run_dir` cap files with the cluster-published cap as the absent-local fallback, and
 /// CFAB_UP_IFS as the authoritative up-set, else sysfs carrier, else assume up (never demote
 /// on missing information).
 fn shape_for<'a>(
@@ -549,7 +553,7 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             check_report(&f, &view),
-            "fabric.conf OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
+            "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n"
         );
@@ -561,8 +565,8 @@ mod tests {
     #[test]
     fn the_no_config_down_line_names_the_installed_path() {
         assert_eq!(
-            no_config_line(&None, &PathBuf::from("fabric.conf")),
-            "DOWN (no /etc/cfab/fabric.conf)"
+            no_config_line(&None, &PathBuf::from("fabric.toml")),
+            "DOWN (no /etc/cfab/fabric.toml)"
         );
         // An explicitly asked-for path is quoted back exactly, wherever it is.
         assert_eq!(
@@ -574,8 +578,8 @@ mod tests {
         );
         // So is a resolved absolute path with no --config (the beside-binary / /etc arms).
         assert_eq!(
-            no_config_line(&None, &PathBuf::from("/etc/cfab/fabric.conf")),
-            "DOWN (no /etc/cfab/fabric.conf)"
+            no_config_line(&None, &PathBuf::from("/etc/cfab/fabric.toml")),
+            "DOWN (no /etc/cfab/fabric.toml)"
         );
     }
 
@@ -591,7 +595,7 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             check_report(&f, &view),
-            "fabric.conf OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
+            "fabric.toml OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              0 fallback leg(s), 1 ingress leg(s)\n"
         );

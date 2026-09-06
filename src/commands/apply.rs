@@ -470,7 +470,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         )?;
     }
 
-    // ---- return path (ZONE_TABLE gw): identity-sourced traffic never leaves untagged ---------
+    // ---- return path (`[[zone]]` gw): identity-sourced traffic never leaves untagged ---------
     for r in common::return_path_rules(view) {
         common::ensure_fabric_rule(sys, &r)?;
     }
@@ -965,9 +965,12 @@ mod tests {
         let (mut sys, view) = up_sys_and_view();
         // Genuine absence per `link_exists`: `ip link show eth9` itself reports no such
         // device (the last-added `on_fail` rule wins over `up_sys`'s default success).
-        // `fabric()` (examples/fabric.conf) already declares HOST_FORWARD=1 for pve1-tb, so
+        // `fabric()` (examples/fabric.toml) already declares `[forward] enabled`=1 for pve1-tb, so
         // this exercises the exact motivating scenario: a forwarding host with an absent wire.
-        assert!(view.fabric.host_forward, "test assumes HOST_FORWARD=1");
+        assert!(
+            view.fabric.host_forward,
+            "test assumes `[forward] enabled`=1"
+        );
         sys = sys
             .on_fail(&["ip", "link", "show", "eth9"], 1, "Device does not exist")
             .write_fail("/proc/sys/net/ipv4/conf/cfab-st/forwarding");
@@ -979,7 +982,7 @@ mod tests {
             "{warnings:?}"
         );
         // Nothing else may touch it: no sub-if, no bond slave, no sysctl, no forwarding write —
-        // checked by exact ifname token, not substring (SEGMENT_TABLE reuses "cfab-st" as a
+        // checked by exact ifname token, not substring (a zone's `segments` reuses "cfab-st" as a
         // PREFIX for segments that live on other wires entirely: cfab-st-bk is domain cl,
         // cfab-st-b2 is domain mg — only cfab-st itself is eth9's segment).
         for c in sys
@@ -1509,7 +1512,7 @@ mod tests {
 
     /// VRRP was deleted (the NAS is a fabric leaf, James 2026-09-02): a forwarding host's
     /// `up` must create no macvlan at all — the storage VIP netdev was the only one cfab ever
-    /// made. The example fabric declares `HOST_FORWARD=1`, the case that used to build it.
+    /// made. The example fabric declares ``[forward] enabled`=1`, the case that used to build it.
     #[test]
     fn a_forwarding_host_creates_no_macvlan() {
         let f = fabric();

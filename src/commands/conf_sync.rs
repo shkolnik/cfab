@@ -1,15 +1,15 @@
 //! `cfab conf-sync` — the cluster config-sync daemon (a supervised child of `cfab run`, spawned
 //! only when the pmxcfs probe reports clustered). Watches
 //! `/etc/pve/cfab/gen` on a 1 s stat-poll; on a new generation it validates the published
-//! fabric.conf with the full typed gate, applies it by asking its supervisor to re-apply over
+//! fabric.toml with the full typed gate, applies it by asking its supervisor to re-apply over
 //! `cfab.sock` (one source of truth — the daemon never applies anything itself), verifies, then runs the
 //! peer-witness protocol: write an ack file, wait for at least one ack from a DIFFERENT
 //! member, and REVERT to the previous conf when no witness appears. The pmxcfs channel's own
 //! failure is the revert signal: a severed member cannot write or see acks, so it cannot keep
 //! a conf nobody witnessed — fail-safe by construction.
 //!
-//! Local cache chain: `/etc/cfab/fabric.conf` (last-known-good, the apply target) and
-//! `/etc/cfab/fabric.conf.prev` (revert target). Daemon state lives in the declaration's
+//! Local cache chain: `/etc/cfab/fabric.toml` (last-known-good, the apply target) and
+//! `/etc/cfab/fabric.toml.prev` (revert target). Daemon state lives in the declaration's
 //! run_dir: `conf-sync-attempted` / `conf-sync-committed`, each one decimal generation.
 //! `attempted` is written BEFORE any apply (crash-safe ordering) and a generation is never
 //! re-attempted — a reverted or refused generation stays refused until the next publish.
@@ -444,7 +444,7 @@ fn write_state(path: &Path, generation: u64) -> Result<()> {
 
 /// The real daemon: tick every second until SIGTERM/SIGINT, log outcomes, exit cleanly.
 pub fn run(sys: &mut dyn Sys, member: &str, run_dir: &str, exe: &str) -> Result<()> {
-    let mut cs = ConfSync::new(Pmxcfs::new(), exe, member, "/etc/cfab/fabric.conf", run_dir)?;
+    let mut cs = ConfSync::new(Pmxcfs::new(), exe, member, "/etc/cfab/fabric.toml", run_dir)?;
     let mut applier = SocketApplier::new(run_dir);
     println!(
         "conf-sync: start member={member} attempted={} committed={}",
@@ -516,7 +516,7 @@ mod tests {
             std::fs::write(pmx.conf_path(), text).unwrap();
         }
         std::fs::write(pmx.gen_path(), format_gen(generation)).unwrap();
-        let local_conf = local_dir.path().join("fabric.conf");
+        let local_conf = local_dir.path().join("fabric.toml");
         std::fs::write(&local_conf, local).unwrap();
         let run_dir = local_dir.path().join("run");
         let cs = ConfSync::new(Pmxcfs::at(pve.path()), EXE, MEMBER, &local_conf, &run_dir).unwrap();
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn valid_conf_for_wrong_member_is_refused() {
-        // Validation runs against THIS member's view: a conf whose MEMBER_TABLE lacks us
+        // Validation runs against THIS member's view: a conf whose `[[member]]` lacks us
         // is refused even though it parses.
         let conf = valid_conf().replace("pve1-tb", "pve9-tb");
         let mut f = fixture(MEMBERS_3, Some(&conf), 1, "OLD\n");

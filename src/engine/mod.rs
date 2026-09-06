@@ -1,6 +1,6 @@
 //! The resident routing engine (`cfab engine`, spec §4): holo-interface + holo-routing
 //! (OSPF instances, BFD, FIB) in this process, driven by cfab's own northbound. No config
-//! file: (re)start rebuilds everything from fabric.conf; `up` restarts it, `down` stops it.
+//! file: (re)start rebuilds everything from fabric.toml; `up` restarts it, `down` stops it.
 
 pub mod northbound;
 pub mod sock;
