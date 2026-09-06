@@ -1,0 +1,447 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fabric",
+  "description": "The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.",
+  "type": "object",
+  "properties": {
+    "fabric_mode": {
+      "type": "string"
+    },
+    "domains": {
+      "description": "The declared switch domains, in declaration order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DomainId"
+      }
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Member"
+      }
+    },
+    "zones": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Zone"
+      }
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Segment"
+      }
+    },
+    "wire_prefs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WirePref"
+      }
+    },
+    "leaf_cost_offset": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "host_forward": {
+      "type": "boolean"
+    },
+    "forward_allow": {
+      "description": "Allowed forward pairs (from, to); unlisted = dropped by policy, counted.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "admin_floor_mbit": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "admin_band": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "pcp_ctrl": {
+      "type": "integer",
+      "format": "uint8",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "dscp_mark": {
+      "type": "boolean"
+    },
+    "bfd_rx_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_tx_ms": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_mult": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bfd_port": {
+      "description": "UDP port for single-hop BFD (RFC 5881: 3784). A port is an external contract — every\nmember and every peer must agree — so it is a declared key, not a derived threshold.",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "ospf_hello": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "ospf_dead": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_as": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_keepalive_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_hold_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "bgp_connect_s": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "usb_nics": {
+      "description": "`(member, dev)` pairs from USB_NICS: USB NICs that get offload safe mode on `up`.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "run_dir": {
+      "description": "Runtime state dir written by `up`, read by `status` and the daemons (CFAB_RUN).",
+      "type": "string"
+    },
+    "fabric_domain": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fabric_mode",
+    "domains",
+    "members",
+    "zones",
+    "segments",
+    "wire_prefs",
+    "leaf_cost_offset",
+    "host_forward",
+    "forward_allow",
+    "admin_floor_mbit",
+    "admin_band",
+    "pcp_ctrl",
+    "dscp_mark",
+    "bfd_rx_ms",
+    "bfd_tx_ms",
+    "bfd_mult",
+    "bfd_port",
+    "ospf_hello",
+    "ospf_dead",
+    "bgp_as",
+    "bgp_keepalive_s",
+    "bgp_hold_s",
+    "bgp_connect_s",
+    "usb_nics",
+    "run_dir",
+    "fabric_domain"
+  ],
+  "$defs": {
+    "DomainId": {
+      "description": "A physical switch domain: an opaque DECLARED token, so a typo in a wire's or a segment's\ndomain is an error and not a phantom domain. One letter — the bond-slave suffix\n`-<domain>` must fit inside IFNAMSIZ (see `MAX_BOND_IFNAME`).",
+      "type": "string"
+    },
+    "Member": {
+      "description": "One MEMBER_TABLE row.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "node": {
+          "description": "Node id: the host octet of every address this member holds (identity 10.<id>.0.<node>).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "kind": {
+          "$ref": "#/$defs/MemberKind"
+        },
+        "wires": {
+          "description": "Every wire this member has, in declaration order (the tie-break for equal speeds).\n\nThe admin plane is not a column: on a host the UNTAGGED path of every one of these\nwires is the admin plane (the SSH lifeline that works with the routing stack stopped),\nso every wire gets the nft admin treatment and its own ADMIN_FLOOR band. A leaf owns no\nL3 of ours on any wire.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Wire"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "node",
+        "kind",
+        "wires"
+      ]
+    },
+    "MemberKind": {
+      "description": "Membership taxonomy.",
+      "oneOf": [
+        {
+          "description": "Transits between zones, shapes, carries every domain it has wires on.",
+          "type": "string",
+          "const": "host"
+        },
+        {
+          "description": "Own identity + OSPF/BFD, stub-router, never transits, no shaping; its\nuntagged/externally-managed L3 is never touched (the NAS).",
+          "type": "string",
+          "const": "leaf"
+        }
+      ]
+    },
+    "Wire": {
+      "description": "A member's physical NIC, the switch domain it is plugged into, and its DECLARED link speed\n(Mb/s). One wire is pinned to exactly ONE domain: a single NIC into a single switch IS one\ndomain, and the \"one wire, several domains\" trunk is deliberately not modelled (spec §3.4).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "domain": {
+          "$ref": "#/$defs/DomainId"
+        },
+        "speed_mbit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "domain",
+        "speed_mbit"
+      ]
+    },
+    "Zone": {
+      "description": "One ZONE_TABLE row: a traffic class.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "id": {
+          "description": "The zone's number: OSPF instance, identity netdev cfab-id<id>, block 10.<id>.0.0/16.\nNOT a VLAN id (segments carry those).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "pcp": {
+          "description": "802.1p for the zone's traffic (sub-if egress-qos-map 0:pcp).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "dscp": {
+          "description": "The plane a DSCP-trusting switch queues the zone's traffic on.",
+          "$ref": "#/$defs/Dscp"
+        },
+        "floor_mbit": {
+          "description": "MINIMUM Mb/s guarantee for the zone's HTB band.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "band": {
+          "description": "HTB prio band (0 = control … 2 = bulk).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "weight": {
+          "description": "Quantum ratio within a shared band.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "primary": {
+          "description": "The switch domain whose segment is this zone's rank-0 (primary) wire on every member\nthat has a wire there. The one part of preference that IS physical-layout policy, so it\nis declared globally and not derived; the backup order below it is derived from speed.",
+          "$ref": "#/$defs/DomainId"
+        },
+        "gw": {
+          "description": "Ingress, or None = the outside never enters this zone.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ZoneGw"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "id",
+        "pcp",
+        "dscp",
+        "floor_mbit",
+        "band",
+        "weight",
+        "primary"
+      ]
+    },
+    "Dscp": {
+      "description": "DSCP class selectors the fabric uses. A closed set on purpose: the shaper must know each\nvalue's tos byte, and each value needs measured switch-queue behavior behind it — extend\nhere, with both, when a new band appears.",
+      "type": "string",
+      "enum": [
+        "cs0",
+        "cs2",
+        "cs6"
+      ]
+    },
+    "ZoneGw": {
+      "description": "Where the OUTSIDE enters a zone: a router-owned VLAN, distinct from every fabric segment,\nso the router never holds an address inside a segment and never sees the fabric's IGP.",
+      "type": "object",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/SegScope"
+        },
+        "vid": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "router": {
+          "description": "The router's address; the subnet is its /24 (the only length the design supports).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "vid",
+        "router"
+      ]
+    },
+    "SegScope": {
+      "description": "Where a segment (or an ingress leg) lives: on one switch domain, or on every wire the\nmember has. `Universal` is a SCOPE, not a domain: exactly the old `island any` fallback row,\nfanned out by the derive layer into an active-backup bond over the member's wires.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "domain": {
+              "$ref": "#/$defs/DomainId"
+            }
+          },
+          "required": [
+            "domain"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Not a physical switch domain: \"every wire this member has\".",
+          "type": "string",
+          "const": "universal"
+        }
+      ]
+    },
+    "Segment": {
+      "description": "One SEGMENT_TABLE row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,\ntagged `vid`. A segment carries no role and no cost: both are derived (spec §4).",
+      "type": "object",
+      "properties": {
+        "ifname": {
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/SegScope"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "seg": {
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "vid": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "ifname",
+        "scope",
+        "zone",
+        "seg",
+        "vid"
+      ]
+    },
+    "WirePref": {
+      "description": "One WIRE_PREF row: this member's complete wire order for this zone, replacing the derived\none. Complete or an error — an override is never blended with the default.",
+      "type": "object",
+      "properties": {
+        "member": {
+          "type": "string"
+        },
+        "zone": {
+          "type": "string"
+        },
+        "order": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "member",
+        "zone",
+        "order"
+      ]
+    }
+  }
+}

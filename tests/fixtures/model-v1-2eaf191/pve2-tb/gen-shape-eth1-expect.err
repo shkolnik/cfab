@@ -1,0 +1,1 @@
+gen-shape: WARNING dev 'eth1' using DECLARED link_speed 1000 Mb/s (UNMEASURED — run `cfab measure-cap`; H may be wrong)

@@ -1,0 +1,19 @@
+*mangle
+:cfab-out - [0:0]
+:cfab-ceil-storage - [0:0]
+:cfab-ceil-cluster - [0:0]
+:cfab-ceil-mgmt - [0:0]
+-F cfab-out
+-F cfab-ceil-storage
+-F cfab-ceil-cluster
+-F cfab-ceil-mgmt
+-A cfab-out -o cfab-st-fb -p 89 -j cfab-ceil-storage
+-A cfab-out -o cfab-cl-fb -p 89 -j cfab-ceil-cluster
+-A cfab-out -o cfab-mg-fb -p 89 -j cfab-ceil-mgmt
+-A cfab-ceil-storage -m limit --limit 80/second --limit-burst 160 -j RETURN
+-A cfab-ceil-storage -j DROP
+-A cfab-ceil-cluster -m limit --limit 80/second --limit-burst 160 -j RETURN
+-A cfab-ceil-cluster -j DROP
+-A cfab-ceil-mgmt -m limit --limit 80/second --limit-burst 160 -j RETURN
+-A cfab-ceil-mgmt -j DROP
+COMMIT
