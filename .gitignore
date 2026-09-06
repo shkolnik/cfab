@@ -20,3 +20,6 @@ Thumbs.db
 
 # Deb staged into the image build context (CI does this too)
 /packaging/docker/*.deb
+
+# Per-track git worktrees
+/.worktrees/
