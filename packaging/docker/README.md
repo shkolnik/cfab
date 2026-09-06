@@ -12,7 +12,7 @@ Formal releases are built and pushed by CI to `ghcr.io/shkolnik/cfab` (public, `
 tagged `:X.Y.Z`, `:X.Y.Z-<deb revision>`, and `:latest`. Prefer the published image:
 
 ```
-docker pull ghcr.io/shkolnik/cfab:0.3.2
+docker pull ghcr.io/shkolnik/cfab:0.4.0
 ```
 
 ## Build it yourself
@@ -20,14 +20,14 @@ docker pull ghcr.io/shkolnik/cfab:0.3.2
 The deb goes beside the Dockerfile — that is the default `CFAB_DEB` and the path CI uses:
 
 ```
-cp /path/to/cfab_0.3.2-1_amd64.deb packaging/docker/cfab.deb
+cp /path/to/cfab_0.4.0-1_amd64.deb packaging/docker/cfab.deb
 docker build -t cfab packaging/docker
 ```
 
 A differently named deb in the same directory works with a build-arg:
 
 ```
-docker build --build-arg CFAB_DEB=cfab_0.3.2-1_amd64.deb -t cfab packaging/docker
+docker build --build-arg CFAB_DEB=cfab_0.4.0-1_amd64.deb -t cfab packaging/docker
 ```
 
 ## Run — validate only (`cfab check`)
@@ -38,7 +38,7 @@ No network privilege is needed to lint a declaration:
 docker run --rm --network none \
     -v /path/to/fabric.toml:/etc/cfab/fabric.toml:ro \
     -e CFAB_HOST=pve1-tb \
-    ghcr.io/shkolnik/cfab:0.3.2 check
+    ghcr.io/shkolnik/cfab:0.4.0 check
 ```
 
 The entrypoint is `/usr/bin/cfab`, so the argv after the image name is the subcommand only —
@@ -59,7 +59,7 @@ multicast, so this is `network_mode: host`, not a published-ports bridge:
 ```yaml
 services:
   cfab:
-    image: ghcr.io/shkolnik/cfab:0.3.2
+    image: ghcr.io/shkolnik/cfab:0.4.0
     network_mode: host
     privileged: true
     restart: unless-stopped

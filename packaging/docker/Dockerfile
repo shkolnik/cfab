@@ -6,10 +6,10 @@ FROM debian:trixie-slim
 
 # Path to the cfab .deb, relative to the build context. The default expects the deb copied
 # beside this Dockerfile, which is also what CI does:
-#   cp /path/to/cfab_0.3.2-1_amd64.deb packaging/docker/cfab.deb
+#   cp /path/to/cfab_0.4.0-1_amd64.deb packaging/docker/cfab.deb
 #   docker build -t cfab packaging/docker
 # A differently named deb in the same context works with a build-arg:
-#   docker build --build-arg CFAB_DEB=cfab_0.3.2-1_amd64.deb -t cfab packaging/docker
+#   docker build --build-arg CFAB_DEB=cfab_0.4.0-1_amd64.deb -t cfab packaging/docker
 ARG CFAB_DEB=cfab.deb
 COPY ${CFAB_DEB} /tmp/cfab.deb
 
