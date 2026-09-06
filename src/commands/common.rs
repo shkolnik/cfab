@@ -45,7 +45,11 @@ pub fn leak_guard_rules(view: &View) -> Vec<FabricRule> {
     out
 }
 
-/// Return path per zone: identity-sourced traffic never leaves untagged.
+/// Return path per zone: identity-sourced traffic never leaves untagged. Uniform on both kinds:
+/// on a leaf (and for any zone without a gw) no table-<id> exists, so 2001 matches nothing and
+/// 2002 answers a reply bound off-fabric with a local `unreachable`. That is the intended end of
+/// the unsupported path "reach a leaf from outside at a fabric identity" (James 2026-09-06): the
+/// outside reaches a leaf at the leaf's own addresses; only members use its identities.
 pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
     let mut out = Vec::new();
     for z in &view.fabric.zones {
