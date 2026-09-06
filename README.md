@@ -51,7 +51,7 @@ Both member kinds need `ip` (iproute2) and `nft` (nftables): every member instal
 `table inet cfab`, the per-zone bulk DSCP clamp plus one derived control-egress ceiling per
 fallback bond — a leaf sources a fallback-segment control storm exactly as a host does, so a
 containment it escaped would be half a containment. (This member's OWN control marking is not
-in that table: the engine sets DSCP_CTRL and skb-priority PCP_CTRL on its OSPF and BFD
+in that table: the engine sets DSCP CS6 and skb-priority PCP_CTRL on its OSPF and BFD
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
 The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc` and
 `ethtool` for its shaping trees and per-NIC offload posture; a **leaf** shapes nothing, its

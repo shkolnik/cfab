@@ -27,7 +27,7 @@ every member installs
 .BR "table inet cfab" ,
 which carries the per-zone bulk DSCP clamp and the fallback control-egress
 ceiling. This member's own OSPF and BFD are marked by the engine itself
-(DSCP_CTRL, and skb-priority PCP_CTRL onto the wire through the segment
+(DSCP CS6, and skb-priority PCP_CTRL onto the wire through the segment
 sub-interface's egress-qos-map), not by that table, which lets them past the
 clamp untouched. A
 .B host

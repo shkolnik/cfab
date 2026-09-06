@@ -1,7 +1,7 @@
 //! Traffic-class marking (table inet cfab) derived from the class table: the per-zone bulk DSCP
 //! clamp (the plane a DSCP-trusting switch queues on) and the fallback control-egress ceiling
 //! (below). Control marking is NOT here — the engine sets it on its own OSPF/BFD sockets
-//! (IP_TOS = DSCP_CTRL, then SO_PRIORITY = PCP_CTRL), and the VLAN sub-interface
+//! (IP_TOS = CS6, then SO_PRIORITY = PCP_CTRL), and the VLAN sub-interface
 //! egress-qos-map turns that skb-priority into the 802.1p PCP on the wire. Because the clamp
 //! rewrites the whole zone, guard rules let control past it untouched.
 //! Pure text out.
