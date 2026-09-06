@@ -164,9 +164,13 @@ pub fn generate(view: &View) -> Result<String> {
             // Order matters: control leaves the chain BEFORE the bulk clamp can rewrite the DSCP the
             // engine's socket already set, so bulk-in-the-control-queue stays unrepresentable while
             // the clamp itself stays unqualified. The exclusion is a `return` guard, never a negated
-            // match inside the clamp: `udp dport != 3784-3785` carries nft's implicit
+            // match inside the clamp: a `udp dport != <port>` carries nft's implicit
             // `meta l4proto udp` dependency and would stop clamping TCP and ICMP — the very
             // iSCSI/NFS/migration bulk the clamp exists for.
+            //
+            // One BFD port, the declared one: the engine's Tx socket is single-hop only
+            // (`engine/mod.rs` gives it `single_hop_port = BFD_PORT`) and holo has no echo
+            // session, so nothing of ours ever leaves on 3785.
             //
             // OSPF is matched by number: nft resolves `ip protocol ospf` through /etc/protocols
             // (package netbase), which a slim container image does not have, and `nft -f` then
@@ -177,8 +181,8 @@ pub fn generate(view: &View) -> Result<String> {
                 z.name
             ));
             out.push_str(&format!(
-                "    oifname {{ {ifs} }} udp dport 3784-3785 return comment \"guard-{}-bfd\"\n",
-                z.name
+                "    oifname {{ {ifs} }} udp dport {} return comment \"guard-{}-bfd\"\n",
+                f.bfd_port, z.name
             ));
             out.push_str(&format!(
                 "    oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-bulk\"\n",
@@ -332,7 +336,7 @@ mod tests {
         let zone = |zone: &str, ifs: &str, dscp: &str| {
             format!(
                 "    oifname {{ {ifs} }} ip protocol 89 return comment \"guard-{zone}-ospf\"\n    \
-                 oifname {{ {ifs} }} udp dport 3784-3785 return comment \"guard-{zone}-bfd\"\n    \
+                 oifname {{ {ifs} }} udp dport 3784 return comment \"guard-{zone}-bfd\"\n    \
                  oifname {{ {ifs} }} ip dscp set {dscp} comment \"dscp-{zone}-bulk\"\n"
             )
         };
@@ -363,47 +367,58 @@ mod tests {
 
     /// The table never rewrites the DSCP of OSPF or BFD: the engine's socket set it, and every
     /// rule that could overwrite it is preceded, on the same interface set, by a `return` for
-    /// `ip protocol 89` and one for the BFD ports.
+    /// `ip protocol 89` and one for the DECLARED BFD port — a member that moved BFD off 3784 is
+    /// guarded on the port it actually sends from, not on the default.
     #[test]
     fn the_clamp_never_rewrites_control_dscp() {
-        for member in ["pve1-tb", "pve3-tb"] {
-            let f = fabric();
-            let v = View::new(&f, member).unwrap();
-            let out = generate(&v).unwrap();
-            let rules: Vec<&str> = out
-                .lines()
-                .map(str::trim)
-                .filter(|l| l.starts_with("oifname"))
-                .collect();
-            let clamps: Vec<&&str> = rules.iter().filter(|l| l.contains("ip dscp set")).collect();
-            assert!(!clamps.is_empty(), "{member}: nothing clamped: {out}");
-            for clamp in clamps {
-                // No rule sets a DSCP on a control match — the lift is gone with the engine.
-                assert!(
-                    !clamp.contains("protocol 89") && !clamp.contains("3784"),
-                    "{member}: a clamp rule matches control: {clamp}"
-                );
-                let ifs = clamp.split(" ip dscp set ").next().unwrap();
-                let at = rules.iter().position(|r| r == clamp).unwrap();
-                for guard in [
-                    format!("{ifs} ip protocol 89 return"),
-                    format!("{ifs} udp dport 3784-3785 return"),
-                ] {
-                    let g = rules
-                        .iter()
-                        .position(|r| r.starts_with(&guard))
-                        .unwrap_or_else(|| panic!("{member}: no guard `{guard}` in: {out}"));
+        for port in [3784u16, 9784] {
+            let text = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/fabric.conf"
+            ))
+            .unwrap()
+            .replace("BFD_PORT=3784", &format!("BFD_PORT={port}"));
+            let f = Fabric::from_raw(&RawConfig::parse(&text).unwrap()).unwrap();
+            assert_eq!(f.bfd_port, port);
+            for member in ["pve1-tb", "pve3-tb"] {
+                let v = View::new(&f, member).unwrap();
+                let out = generate(&v).unwrap();
+                let rules: Vec<&str> = out
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with("oifname"))
+                    .collect();
+                let clamps: Vec<&&str> =
+                    rules.iter().filter(|l| l.contains("ip dscp set")).collect();
+                assert!(!clamps.is_empty(), "{member}: nothing clamped: {out}");
+                for clamp in clamps {
+                    // No rule sets a DSCP on a control match — the lift is gone with the engine.
                     assert!(
-                        g < at,
-                        "{member}: guard `{guard}` is behind its clamp: {out}"
+                        !clamp.contains("protocol 89") && !clamp.contains("dport"),
+                        "{member}: a clamp rule matches control: {clamp}"
                     );
+                    let ifs = clamp.split(" ip dscp set ").next().unwrap();
+                    let at = rules.iter().position(|r| r == clamp).unwrap();
+                    for guard in [
+                        format!("{ifs} ip protocol 89 return"),
+                        format!("{ifs} udp dport {port} return"),
+                    ] {
+                        let g = rules
+                            .iter()
+                            .position(|r| r.starts_with(&guard))
+                            .unwrap_or_else(|| panic!("{member}: no guard `{guard}` in: {out}"));
+                        assert!(
+                            g < at,
+                            "{member}: guard `{guard}` is behind its clamp: {out}"
+                        );
+                    }
                 }
             }
         }
     }
 
     /// The clamp itself stays unqualified, so it still clamps TCP and ICMP — the iSCSI/NFS/
-    /// migration bulk it exists for. A `udp dport != 3784-3785` exclusion inside the rule would
+    /// migration bulk it exists for. A `udp dport != <port>` exclusion inside the rule would
     /// carry nft's implicit `meta l4proto udp` dependency and silently stop clamping them (the
     /// wire proof is the fixture capture, this is the text half).
     #[test]
