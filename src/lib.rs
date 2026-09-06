@@ -24,15 +24,32 @@ use std::path::Path;
 
 pub use error::{Error, Result};
 
+/// The copy of the declaration the supervisor actually applied, kept in the run dir. `cfab
+/// status` reads it so it can describe the RUNNING fabric while the file on disk is mid-edit or
+/// refused — exactly when the operator needs status to work (finding F9).
+pub const APPLIED_DECL_NAME: &str = "fabric.toml.applied";
+
+pub fn applied_decl_path(run_dir: &str) -> String {
+    format!("{}/{APPLIED_DECL_NAME}", run_dir.trim_end_matches('/'))
+}
+
 /// Load + type + validate the declaration. An unknown key is an ERROR from the parser, not a
 /// warning: the declaration is the whole input, so a key nothing consumes is a mistake.
 pub fn load_fabric(path: &Path) -> Result<model::Fabric> {
+    Ok(load_fabric_text(path)?.0)
+}
+
+/// `load_fabric`, plus the exact text it parsed — the supervisor keeps that text beside the
+/// running fabric (`applied_decl_path`), so re-reading the file later cannot substitute a
+/// different declaration for the one that was applied.
+pub fn load_fabric_text(path: &Path) -> Result<(model::Fabric, String)> {
     if let Some(e) = retired_format_error(path) {
         return Err(e);
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
-    model::Fabric::from_decl(&decl::Declaration::parse(&text)?)
+    let fabric = model::Fabric::from_decl(&decl::Declaration::parse(&text)?)?;
+    Ok((fabric, text))
 }
 
 /// The declaration is missing but the RETIRED shell-format file sits beside it: say what

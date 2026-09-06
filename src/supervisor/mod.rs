@@ -298,7 +298,13 @@ fn trace_mark(trace: &Option<Arc<Mutex<Vec<String>>>>, s: String) {
 
 /// The public entry point (`cfab run`): build the multi-thread runtime and drive the whole
 /// lifecycle on its `block_on` future — the main thread every child is forked from.
-pub fn run(_fabric: &Fabric, view: &View, exe: &str, config: &str) -> crate::error::Result<u8> {
+pub fn run(
+    _fabric: &Fabric,
+    view: &View,
+    exe: &str,
+    config: &str,
+    decl_text: &str,
+) -> crate::error::Result<u8> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -316,6 +322,7 @@ pub fn run(_fabric: &Fabric, view: &View, exe: &str, config: &str) -> crate::err
             &mut spawner,
             exe,
             config,
+            decl_text,
             "/etc/pve",
             cmd_tx,
             cmd_rx,
@@ -357,6 +364,7 @@ pub(crate) async fn run_with(
     spawner: &mut dyn Spawner,
     exe: &str,
     config: &str,
+    decl_text: &str,
     pmxcfs_root: &str,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -418,6 +426,22 @@ pub(crate) async fn run_with(
     let opts = apply::ApplyOpts {
         pmxcfs_root: pmxcfs_root.to_string(),
     };
+
+    // 1c. The declaration we are about to apply, kept beside the fabric it produces (finding F9).
+    // `cfab status` reads it so it can describe the RUNNING fabric while the file on disk is
+    // mid-edit or refused. Written after the two refusals above, so a supervisor that never
+    // starts never overwrites the live one's copy, and before the apply, so the copy exists for
+    // every apply attempted (a refused apply leaves it behind; status still reads the run dir,
+    // engine and socket, so it reports the refusal, not the copy). `cfab down` removes the run
+    // dir whole, so it goes with the fabric. A write failure is a warning, not a refusal: it costs status a diagnostic, not the
+    // fabric.
+    let applied_decl = crate::applied_decl_path(&run_dir);
+    if let Err(e) = sys.write(&applied_decl, decl_text) {
+        eprintln!(
+            "cfab: warn: cannot write {applied_decl}: {e} — cfab status will fall back to \
+             {config} and fail while that file is invalid"
+        );
+    }
 
     // 2. The initial apply. A refusal is terminal (§10) and has started no child — the whole
     // point of exit 3.
@@ -908,26 +932,21 @@ pub(crate) enum Reload {
 /// table, or a whitespace edit re-applies in place instead of restarting the fabric. Row order
 /// (`[[member]]`, `[[zone]]`, segments) is part of the fabric and does count.
 pub(crate) fn classify_reload(current: &Fabric, member: &str, config: &str, text: &str) -> Reload {
-    let refuse = |e: crate::error::Error| Reload::Invalid(format!("{config}: {e}"));
-    let decl = match crate::decl::Declaration::parse(text) {
-        Ok(d) => d,
-        Err(e) => return refuse(e),
-    };
-    let next = match Fabric::from_decl(&decl) {
-        Ok(f) => f,
-        Err(e) => return refuse(e),
-    };
-    // A declaration that no longer names this host is invalid *for this supervisor*: applying it
-    // would be applying somebody else's fabric, and exiting on it would tear this one down for
-    // what is far more likely a typo than a decommission.
-    if let Err(e) = next.member(member) {
-        return refuse(e);
+    match parse_for_member(member, text) {
+        Err(e) => Reload::Invalid(format!("{config}: {e}")),
+        Ok(next) if next == *current => Reload::Identical,
+        Ok(_) => Reload::Changed,
     }
-    if next == *current {
-        Reload::Identical
-    } else {
-        Reload::Changed
-    }
+}
+
+/// Parse a declaration and require that it still names `member`. A declaration that no longer
+/// names this host is invalid *for this supervisor*: applying it would be applying somebody
+/// else's fabric, and exiting on it would tear this one down for what is far more likely a typo
+/// than a decommission. `cfab status` asks the same question of the file on disk.
+pub(crate) fn parse_for_member(member: &str, text: &str) -> crate::error::Result<Fabric> {
+    let next = Fabric::from_decl(&crate::decl::Declaration::parse(text)?)?;
+    next.member(member)?;
+    Ok(next)
 }
 
 /// The impure half: read `config` through `Sys` (never `std::fs`, so the mocks see it) and
@@ -1479,6 +1498,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1528,6 +1548,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1553,6 +1574,102 @@ mod tests {
         assert_eq!(comp("shape-daemon").state, child::State::Stopped);
         assert_eq!(comp("conf-sync").state, child::State::Stopped);
         assert_eq!(comp("conf-sync").why.as_deref(), Some("not clustered"));
+    }
+
+    /// F9: the supervisor keeps the declaration it applied beside the fabric, so `cfab status`
+    /// can describe the running fabric while the file on disk is mid-edit. It is the TEXT the
+    /// supervisor was handed — not a re-read of `CONFIG`, which is what a later edit changes —
+    /// and it is written BEFORE the apply, so no fabric ever exists without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_supervisor_keeps_the_declaration_it_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // Same fabric, distinguishable bytes: only the text handed to `run_with` carries the
+        // marker, so a re-read of CONFIG would produce a copy without it.
+        let handed = format!(
+            "# the text the supervisor loaded\n{}",
+            decl_text(tmp.path())
+        );
+        // MockSys::default() refuses the apply (as `the_initial_apply_refusal_is_terminal`
+        // does), which is exactly what pins the write to BEFORE it: nothing is torn down, so
+        // whatever is in the run dir is what the apply would have found. CONFIG is present
+        // only so `applied_fabric` below can learn the run dir the way production does.
+        let mut sys = MockSys::default().file(CONFIG, &decl_text(tmp.path()));
+        let (mut spawner, _recs) = rec();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &handed,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            Hooks {
+                on_ready: None,
+                run_watchdog: false,
+                serve_socket: false,
+                shared: None,
+                trace: None,
+                stop_grace: CHILD_STOP_GRACE,
+                feed: Arc::new(|| {}),
+            },
+        )
+        .await;
+        assert_eq!(code, EXIT_APPLY_REFUSED);
+        let applied = crate::applied_decl_path(tmp.path().to_str().unwrap());
+        assert_eq!(
+            sys.writes_to(&applied),
+            Some(handed.as_str()),
+            "the applied copy must be the exact text that was applied, written before the apply"
+        );
+        // ...and it is what `cfab status` resolves to, at the run dir the declaration names.
+        let got = crate::commands::status::applied_fabric(&sys, Path::new(CONFIG))
+            .expect("status finds the applied copy");
+        assert_eq!(got, f);
+    }
+
+    /// The copy is state of the fabric, not of the host: the teardown that removes the run dir
+    /// takes it with it, so `cfab status` on a torn-down member reads the file again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_applied_declaration_goes_with_the_run_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            quiet_hooks(shared, ready_tx),
+        )
+        .await;
+        driver.await.unwrap();
+        assert_eq!(code, 0);
+        let applied = crate::applied_decl_path(tmp.path().to_str().unwrap());
+        assert_eq!(
+            sys.writes_to(&applied),
+            None,
+            "the teardown removes the run dir whole; the applied copy must not survive it"
+        );
     }
 
     /// SIGHUP-equivalent re-apply restarts the engine and the shape daemon, never tears down
@@ -1589,6 +1706,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1665,6 +1783,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1749,6 +1868,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -1834,6 +1954,7 @@ mod tests {
                 &mut spawner,
                 EXE,
                 CONFIG,
+                &decl_text(tmp.path()),
                 &no_pmx(tmp.path()),
                 cmd_tx,
                 cmd_rx,
@@ -1985,6 +2106,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2058,6 +2180,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2345,6 +2468,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &clustered_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2473,6 +2597,7 @@ mod tests {
             &mut spawner,
             EXE,
             CONFIG,
+            &decl_text(tmp.path()),
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,

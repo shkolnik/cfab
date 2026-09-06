@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use cfab::derive::View;
 use cfab::model::MemberKind;
 use cfab::sys::RealSys;
-use cfab::{Error, commands, emit, load_fabric};
+use cfab::{Error, commands, emit, load_fabric_text};
 
 /// cfab — the per-host runtime of the resilient converged fabric.
 ///
@@ -290,10 +290,22 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    // `cfab status` describes the RUNNING fabric, so it prefers the declaration the supervisor
+    // applied (kept in the run dir) over the one on disk (finding F9, ruled by James
+    // 2026-09-06): an operator editing fabric.toml, or one whose bad edit the supervisor just
+    // refused, is exactly the operator who needs status to work. Every other command keeps
+    // reading the file — they act on what is DECLARED, not on what is running.
+    let applied = if let Command::Status { .. } = cli.command {
+        commands::status::applied_fabric(&RealSys, &path)
+    } else {
+        None
+    };
     // A member with no declaration cannot desire the fabric to be up: that is DOWN, not a
     // failure. (A fabric.toml that is PRESENT but unparseable keeps its loud parse error and
-    // exit 1 below — we cannot know what was desired.)
+    // exit 1 below — we cannot know what was desired, and with no applied copy there is nothing
+    // running to describe either.)
     if let Command::Status { .. } = cli.command
+        && applied.is_none()
         && !path.exists()
     {
         // ...unless the RETIRED shell file is sitting there: that member wanted a fabric.
@@ -303,7 +315,11 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         println!("{}", no_config_line(&cli.config, &path));
         return Ok(ExitCode::from(3));
     }
-    let fabric = load_fabric(&path)?;
+    let describing_applied = applied.is_some();
+    let (fabric, decl_text) = match applied {
+        Some(f) => (f, String::new()),
+        None => load_fabric_text(&path)?,
+    };
     let member = member_name(&cli.host)?;
     let view = View::new(&fabric, &member)?;
 
@@ -372,7 +388,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 .unwrap_or_else(|_| path.clone())
                 .to_string_lossy()
                 .into_owned();
-            let code = cfab::supervisor::run(&fabric, &view, &exe, &config)?;
+            let code = cfab::supervisor::run(&fabric, &view, &exe, &config, &decl_text)?;
             Ok(ExitCode::from(code))
         }
         Command::Down => {
@@ -382,7 +398,11 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::Status { wait, permissive } => {
             let mut sys = RealSys;
-            let report = commands::status::run(&mut sys, &view, wait, permissive)?;
+            // The on-disk declaration is compared to the running one only when we are
+            // describing the applied copy — otherwise the view IS the file and there is
+            // nothing to compare it with.
+            let declared = describing_applied.then_some(path.as_path());
+            let report = commands::status::run(&mut sys, &view, wait, permissive, declared)?;
             print!("{}", report.output);
             Ok(ExitCode::from(report.code))
         }
