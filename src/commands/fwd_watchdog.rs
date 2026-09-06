@@ -18,8 +18,9 @@ use crate::commands::common::{
     self, conf_interfaces, ensure_foreign_transit_accept, foreign_forward_remedy,
     unresolved_forward_drops,
 };
-use crate::commands::engine_ctl;
-use crate::derive::View;
+use crate::commands::common::{link_exists, link_kind_is};
+use crate::commands::{apply, engine_ctl};
+use crate::derive::{Slave, View};
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
@@ -50,6 +51,12 @@ pub struct WatchdogReport {
     /// Restores that failed where there is nothing to actuate on — the drift stands, loudly,
     /// and `status` keeps reporting it. Never silent, never an outage.
     pub unrestored: Vec<String>,
+    /// Legs of a PRESENT wire that had no netdev and were built back exactly as `apply` builds
+    /// them: `rebuilt <zone>/<ifname> on <wire>`, one line per leg. The motivating case is a USB
+    /// NIC that re-enumerates with a new ifindex — every sub-interface, bond slave and ingress
+    /// leg on that wire dies with the old netdev and nothing ever re-created them, so the member
+    /// sat UP-DEGRADED until an operator reloaded cfab (measured on the testbed, 2026-09-06).
+    pub rebuilt: Vec<String>,
 }
 
 pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
@@ -109,15 +116,23 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
     // Narrowest hazard first, and the one that can amputate LAST: a leg-wide sysctl, then one
     // bond's membership, then the member-wide rules. Running the rules first would down every
     // fabric leg — the bonds included — under a bond restore that had not been tried yet.
+    //
+    // The missing legs come FIRST, before any of them: a leg that has no netdev has no
+    // rp_filter to restore, no bond membership to police and no return-path default to re-add,
+    // so rebuilding it first lets the same tick finish the job instead of leaving three ticks
+    // of half-configured leg behind it.
     let mut restored: Vec<String> = Vec::new();
     let mut downed: Vec<String> = Vec::new();
     let mut unrestored: Vec<String> = Vec::new();
+    let mut rebuilt: Vec<String> = Vec::new();
+    restore_missing_legs(sys, view, &mut rebuilt, &mut unrestored)?;
     restore_rp_filter(sys, view, &mut restored, &mut unrestored)?;
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
     restore_rules(sys, view, &mut restored, &mut downed)?;
     restore_gw_return_defaults(sys, view, &mut restored)?;
     for line in restored
         .iter()
+        .chain(rebuilt.iter())
         .chain(downed.iter())
         .chain(unrestored.iter())
     {
@@ -133,6 +148,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
             restored,
             downed,
             unrestored,
+            rebuilt,
             transit_cost_error,
         });
     }
@@ -181,6 +197,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
         restored,
         downed,
         unrestored,
+        rebuilt,
         transit_cost_error,
     })
 }
@@ -291,6 +308,192 @@ fn restore_gw_return_defaults(
     Ok(())
 }
 
+/// Rebuild the legs of a PRESENT wire that have no netdev at all.
+///
+/// A wire's netdev can vanish and come back with a new ifindex — a USB NIC re-enumerated by an
+/// unplug/replug or a driver reload, measured on the testbed 2026-09-06. Everything stacked on
+/// it dies with the old netdev: the class-segment sub-interfaces, the fallback bond's slave, the
+/// ingress leg. Nothing re-created them, so the member sat `UP-DEGRADED 12/18` until an operator
+/// ran `systemctl reload cfab`. The routing engine already rebinds to a re-created netdev
+/// (holo fork `ifindex-rebind`), so a leg put back here is picked up without restarting the
+/// engine or any other child — and this restore never touches one.
+///
+/// The invariant restored is "every leg apply would have built on a present wire exists". So:
+///   - an ABSENT wire is skipped in silence — `apply` and `status` already say
+///     `wire <dev> absent (no such netdev) …`, and its legs are not supposed to exist;
+///   - a leg netdev that EXISTS is left alone, whatever state it is in: the other restores own
+///     its sysctls, its membership and its route. Only total absence is this one's business;
+///   - a leg netdev of the WRONG KIND is reported and never deleted. `apply` deletes a stray
+///     vlan and refuses a stray bond; a three-second tick has no business deleting a live
+///     netdev, so both conditions land in `unrestored` and `status` keeps saying so.
+///
+/// Cheap by construction: on the ordinary tick this is one `ip link show` per wire plus one per
+/// leg, and not a single `ip link add` or sysctl write.
+fn restore_missing_legs(
+    sys: &mut dyn Sys,
+    view: &View,
+    rebuilt: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
+    let f = view.fabric;
+    for wire in view.wires() {
+        if !link_exists(sys, &wire)? {
+            continue; // an absent wire's legs are not supposed to exist
+        }
+        for r in view.class_rows().iter().filter(|r| r.wire == wire) {
+            if !leg_absent(sys, &r.ifname, &r.wire, r.vid, unrestored)? {
+                continue;
+            }
+            apply::build_class_leg(sys, view, r)?;
+            set_leg_forwarding(sys, view, &r.ifname)?;
+            rebuilt.push(rebuilt_line(&r.zone, &r.ifname, &wire));
+        }
+        for r in &view.gw_rows() {
+            if r.migrates() {
+                let z = f.zone(&r.zone)?;
+                let qos = apply::qos_map(f, z);
+                rebuild_bond_slaves(
+                    sys,
+                    view,
+                    &wire,
+                    &r.zone,
+                    &r.ifname,
+                    r.vid,
+                    &r.slaves,
+                    &r.home,
+                    &qos,
+                    &gw_bond_leg_cidr(view, r)?,
+                    rebuilt,
+                    unrestored,
+                )?;
+            } else if r.home == wire {
+                if !leg_absent(sys, &r.ifname, &r.home, r.vid, unrestored)? {
+                    continue;
+                }
+                apply::build_gw_vlan_leg(sys, view, r)?;
+                set_leg_forwarding(sys, view, &r.ifname)?;
+                // The kernel drops the dev-scoped return-path default with its device;
+                // `restore_gw_return_defaults` runs later in this same tick and re-adds it.
+                rebuilt.push(rebuilt_line(&r.zone, &r.ifname, &wire));
+            }
+        }
+        for r in &view.fallback_rows() {
+            let z = f.zone(&r.zone)?;
+            let qos = apply::qos_map(f, z);
+            let cidr = format!("{}/24", view.segment_addr(z, r.seg));
+            rebuild_bond_slaves(
+                sys, view, &wire, &r.zone, &r.ifname, r.vid, &r.slaves, &r.home, &qos, &cidr,
+                rebuilt, unrestored,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn rebuilt_line(zone: &str, ifname: &str, wire: &str) -> String {
+    format!("rebuilt {zone}/{ifname} on {wire}")
+}
+
+/// The address a migrating ingress leg's bond carries — the same `leg_cidr` `apply` gives it.
+fn gw_bond_leg_cidr(view: &View, r: &crate::derive::GwRow) -> Result<String> {
+    let z = view.fabric.zone(&r.zone)?;
+    let gw = z.gw.as_ref().expect("gw_rows lists gw zones");
+    Ok(gw.leg_cidr(view.node()))
+}
+
+/// Whether a leg's netdev is genuinely missing (so it must be rebuilt). A netdev that exists
+/// with the wrong kind is NOT missing: it is reported and left exactly where it is.
+fn leg_absent(
+    sys: &mut dyn Sys,
+    ifname: &str,
+    lower: &str,
+    vid: u16,
+    unrestored: &mut Vec<String>,
+) -> Result<bool> {
+    if !link_exists(sys, ifname)? {
+        return Ok(true);
+    }
+    if !link_kind_is(sys, ifname, &apply::vlan_marker(vid))? {
+        unrestored.push(apply::not_our_vlan(ifname, lower, vid));
+    }
+    Ok(false)
+}
+
+/// The declared forwarding flag for one rebuilt leg. `owned_forwarding` is the single place
+/// that decides it (a leaf never transits; a host does only under `[forward] enabled`), so a
+/// rebuilt leg cannot end up disagreeing with what `apply`'s `enable_forwarding` set. The leg
+/// builders leave `forwarding=0` behind them, so this only ever writes on a transiting host.
+fn set_leg_forwarding(sys: &mut dyn Sys, view: &View, ifname: &str) -> Result<()> {
+    if view
+        .owned_forwarding()
+        .iter()
+        .any(|(n, fwd)| n == ifname && *fwd)
+    {
+        common::proc_sysctl(sys, ifname, "forwarding", "1")?;
+    }
+    Ok(())
+}
+
+/// The slaves of one bond leg that live on `wire`. The bond itself is rebuilt whole when it is
+/// the thing that is missing — that should not happen when only a wire re-enumerated, but the
+/// invariant is "the declared leg set exists", not "the case we expected".
+#[allow(clippy::too_many_arguments)]
+fn rebuild_bond_slaves(
+    sys: &mut dyn Sys,
+    view: &View,
+    wire: &str,
+    zone: &str,
+    bond: &str,
+    vid: u16,
+    slaves: &[Slave],
+    home: &str,
+    qos: &[String; 2],
+    cidr: &str,
+    rebuilt: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
+    if !slaves.iter().any(|s| s.wire == wire) {
+        return Ok(());
+    }
+    let qos: Vec<&str> = qos.iter().map(String::as_str).collect();
+    if !link_exists(sys, bond)? {
+        // The whole leg is gone: rebuild it through the same builder `apply` uses, which puts
+        // every slave, the primary, the address and the sysctls back in one go.
+        apply::mk_bond_leg(
+            sys,
+            &apply::BondLeg {
+                ifname: bond,
+                vid,
+                home,
+                slaves,
+                cidr,
+            },
+            &qos,
+        )?;
+        set_leg_forwarding(sys, view, bond)?;
+        rebuilt.push(rebuilt_line(zone, bond, wire));
+        return Ok(());
+    }
+    if !link_kind_is(sys, bond, " bond ")? {
+        unrestored.push(apply::not_a_bond(bond));
+        return Ok(());
+    }
+    for s in slaves.iter().filter(|s| s.wire == wire) {
+        if !leg_absent(sys, &s.ifname, &s.wire, vid, unrestored)? {
+            continue;
+        }
+        apply::add_bond_slave(sys, bond, s, vid, &qos)?;
+        // `primary` names a slave, so the kernel dropped it with the netdev: re-assert it when
+        // the slave we just put back is the leg's home (`primary_reselect` is already on the
+        // bond, and `ip link set … type bond` carries both in one command).
+        if s.wire == home {
+            apply::set_bond_primary(sys, bond, &s.ifname)?;
+        }
+        rebuilt.push(rebuilt_line(zone, &s.ifname, wire));
+    }
+    Ok(())
+}
+
 /// Row 19. The hazard is the FOREIGN slave, not the bond: something else enslaved a netdev into
 /// a bond cfab created, and traffic cfab believes is on its own wire is on somebody else's. So
 /// release the intruder and keep ours running; the bond goes down only if the release fails.
@@ -376,12 +579,13 @@ fn fail_closed(sys: &mut dyn Sys, view: &View, reason: &str) -> Result<WatchdogR
         restored: Vec::new(),
         downed: Vec::new(),
         unrestored: Vec::new(),
+        rebuilt: Vec::new(),
         transit_cost_error,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::decl::Declaration;
     use crate::model::Fabric;
@@ -459,7 +663,45 @@ mod tests {
                 &format!("default via {} dev {} proto cfab-return\n", d.via, d.dev),
             );
         }
-        rules_present(sys, view)
+        legs_present(rules_present(sys, view), view)
+    }
+
+    /// Every declared leg of every declared wire present and of the kind cfab created it with —
+    /// the shape a healthy member has, and the baseline the rebuild step must find nothing to do
+    /// in. Wires answer `ip link show`; each class leg, gw leg and bond slave answers `ip -d link
+    /// show` with its vlan marker, each bond with " bond ".
+    pub(crate) fn legs_present(mut sys: MockSys, view: &View) -> MockSys {
+        let mut vlans: Vec<(String, u16)> = view
+            .class_rows()
+            .into_iter()
+            .map(|r| (r.ifname, r.vid))
+            .collect();
+        for r in view.gw_rows() {
+            if r.migrates() {
+                sys = bond_kind(sys, &r.ifname);
+                vlans.extend(r.slaves.into_iter().map(|s| (s.ifname, r.vid)));
+            } else {
+                vlans.push((r.ifname, r.vid));
+            }
+        }
+        for r in view.fallback_rows() {
+            sys = bond_kind(sys, &r.ifname);
+            vlans.extend(r.slaves.into_iter().map(|s| (s.ifname, r.vid)));
+        }
+        for (ifname, vid) in vlans {
+            sys = sys.on_stdout(
+                &["ip", "-d", "link", "show", &ifname],
+                &format!("9: {ifname}: <UP> {} \n", apply::vlan_marker(vid)),
+            );
+        }
+        sys
+    }
+
+    fn bond_kind(sys: MockSys, ifname: &str) -> MockSys {
+        sys.on_stdout(
+            &["ip", "-d", "link", "show", ifname],
+            &format!("9: {ifname}: <UP> bond \n"),
+        )
     }
 
     /// `ip rule show pref <p>` answering with every rule cfab declared at that pref.
@@ -675,7 +917,8 @@ mod tests {
         }
     }
 
-    /// A leaf environment for the leak guard (row 5): pve3-tb, every rule present.
+    /// A leaf environment for the leak guard (row 5) and the rebuild step: pve3-tb, every rule
+    /// present and every declared leg present and of cfab's own kind.
     fn healthy_leaf_sys(view: &View) -> MockSys {
         let mut sys = MockSys::default();
         for ifname in fabric_legs(view) {
@@ -689,7 +932,7 @@ mod tests {
                     "0\n",
                 );
         }
-        rules_present(sys, view)
+        legs_present(rules_present(sys, view), view)
     }
 
     /// Spec §12 (b). Failing closed turns forwarding off, which black-holes anything a peer
@@ -1121,6 +1364,222 @@ mod tests {
             "a leaf's posture is not a transit posture: {:?}",
             sys.calls
         );
+    }
+
+    /// The wire `eth9` present but every leg on it gone — a USB NIC that re-enumerated with a
+    /// new ifindex, which takes every sub-interface and bond slave stacked on it with it. The
+    /// watchdog must put back exactly what `apply` built: three class legs (created with the
+    /// egress-qos map, addressed, up, segment sysctls, then forwarding=1 because this host
+    /// transits) and three fallback-bond slaves (created DOWN and address-less, enslaved,
+    /// brought up, forwarding=0) — with `primary` re-asserted on the ONE bond whose home wire
+    /// is eth9. Argv by argv, so it cannot drift from `apply`'s pinned sequence.
+    #[test]
+    fn a_re_enumerated_wires_legs_are_rebuilt_exactly_as_apply_built_them() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9");
+        let report = run(&mut sys, &view).unwrap();
+        assert_eq!(
+            calls_naming(&sys, &["cfab-st", "cfab-st-fb-a"]),
+            [
+                // `leg_absent` probes once, then mk_vlan twice (kind-check, then create)
+                "ip link show cfab-st",
+                "ip link show cfab-st",
+                "ip link show cfab-st",
+                "ip link add link eth9 name cfab-st type vlan id 100 egress-qos-map 0:0 6:6",
+                "ip addr replace 10.99.1.1/24 dev cfab-st",
+                "ip link set cfab-st up",
+                "write /proc/sys/net/ipv4/conf/cfab-st/arp_ignore",
+                "write /proc/sys/net/ipv4/conf/cfab-st/rp_filter",
+                "write /proc/sys/net/ipv4/conf/cfab-st/send_redirects",
+                "write /proc/sys/net/ipv4/conf/cfab-st/forwarding",
+                // ...then forwarding=1, because `[forward] enabled`=1 on this member
+                "write /proc/sys/net/ipv4/conf/cfab-st/forwarding",
+                // the storage fallback bond's slave on eth9, which is that bond's home wire
+                "ip link show cfab-st-fb-a",
+                "ip link show cfab-st-fb-a",
+                "ip link show cfab-st-fb-a",
+                "ip link add link eth9 name cfab-st-fb-a type vlan id 300 egress-qos-map 0:0 6:6",
+                "ip link set cfab-st-fb-a master cfab-st-fb",
+                "ip link set cfab-st-fb-a up",
+                "write /proc/sys/net/ipv4/conf/cfab-st-fb-a/forwarding",
+                "ip link set cfab-st-fb type bond primary cfab-st-fb-a primary_reselect always",
+            ]
+        );
+        assert_eq!(
+            report.rebuilt,
+            [
+                "rebuilt storage/cfab-st on eth9",
+                "rebuilt cluster/cfab-cl-bk on eth9",
+                "rebuilt mgmt/cfab-mg-b2 on eth9",
+                "rebuilt storage/cfab-st-fb-a on eth9",
+                "rebuilt cluster/cfab-cl-fb-a on eth9",
+                "rebuilt mgmt/cfab-mg-fb-a on eth9",
+            ]
+        );
+        assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
+        // Only eth9's bond takes a new primary: cl and mg are homed on other wires and their
+        // slave there never went away.
+        assert_eq!(
+            calls_for(&sys, "primary"),
+            ["ip link set cfab-st-fb type bond primary cfab-st-fb-a primary_reselect always"]
+        );
+    }
+
+    /// A leaf rebuilds the same legs, and `forwarding` stays 0 on every one of them: a leaf
+    /// never transits, so `owned_forwarding` says false and the leg builders' own zero is the
+    /// last word. The one write per class leg is `class_sysctls`'s.
+    #[test]
+    fn a_leaf_rebuilds_its_legs_and_never_raises_forwarding() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = wire_legs_missing(healthy_leaf_sys(&view), &view, "eth9");
+        let report = run(&mut sys, &view).unwrap();
+        assert_eq!(
+            calls_naming(&sys, &["cfab-st"]),
+            [
+                "ip link show cfab-st",
+                "ip link show cfab-st",
+                "ip link show cfab-st",
+                "ip link add link eth9 name cfab-st type vlan id 100 egress-qos-map 0:0 6:6",
+                "ip addr replace 10.99.1.3/24 dev cfab-st",
+                "ip link set cfab-st up",
+                "write /proc/sys/net/ipv4/conf/cfab-st/arp_ignore",
+                "write /proc/sys/net/ipv4/conf/cfab-st/rp_filter",
+                "write /proc/sys/net/ipv4/conf/cfab-st/send_redirects",
+                "write /proc/sys/net/ipv4/conf/cfab-st/forwarding",
+            ]
+        );
+        assert_eq!(report.rebuilt.len(), 6, "{:?}", report.rebuilt);
+        for r in view.class_rows() {
+            let path = format!("/proc/sys/net/ipv4/conf/{}/forwarding", r.ifname);
+            assert_eq!(
+                sys.writes_to(&path).map(str::trim),
+                Some("0"),
+                "{} forwards on a leaf",
+                r.ifname
+            );
+        }
+    }
+
+    /// The ordinary tick — the one that runs every few seconds on every member. Nothing is
+    /// missing, so the rebuild step must create NO netdev and write NO leg sysctl at all: it
+    /// is one `ip link show` per wire and per leg and nothing else.
+    #[test]
+    fn a_tick_with_nothing_missing_creates_nothing() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view);
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.rebuilt.is_empty(), "{:?}", report.rebuilt);
+        assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
+        for c in &sys.calls {
+            assert!(!c.starts_with("ip link add"), "{c}");
+            assert!(!c.starts_with("ip link set"), "{c}");
+            assert!(!c.starts_with("ip addr"), "{c}");
+            assert!(!c.starts_with("write /proc/sys"), "{c}");
+        }
+    }
+
+    /// A netdev holding a leg's name but of another kind: the watchdog reports it in cfab's own
+    /// wording and does not delete it. `apply` deletes a stray vlan and refuses a stray bond,
+    /// but a three-second tick has no business destroying a live netdev — so the leg stays
+    /// unbuilt, loudly, and `status` keeps saying so.
+    #[test]
+    fn a_leg_of_the_wrong_kind_is_reported_and_never_deleted() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_sys(&view)
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-st"],
+                "9: cfab-st: bridge \n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-cl-fb"],
+                "9: cfab-cl-fb: bridge \n",
+            );
+        let report = run(&mut sys, &view).unwrap();
+        assert!(report.rebuilt.is_empty(), "{:?}", report.rebuilt);
+        assert!(
+            report
+                .unrestored
+                .contains(&apply::not_our_vlan("cfab-st", "eth9", 100)),
+            "{:?}",
+            report.unrestored
+        );
+        assert!(
+            report.unrestored.contains(&apply::not_a_bond("cfab-cl-fb")),
+            "{:?}",
+            report.unrestored
+        );
+        for c in &sys.calls {
+            assert!(!c.starts_with("ip link del"), "{c}");
+            assert!(!c.starts_with("ip link add"), "{c}");
+        }
+    }
+
+    /// Every declared leg of `wire` absent, the wire itself still present: the exact shape a
+    /// re-enumerated NIC leaves behind. Legs on the other wires are untouched.
+    fn wire_legs_missing(mut sys: MockSys, view: &View, wire: &str) -> MockSys {
+        for ifname in legs_on(view, wire) {
+            sys = sys.on_fail(&["ip", "link", "show", &ifname], 1, "Device does not exist");
+        }
+        sys
+    }
+
+    /// The leg netdevs `apply` builds on one wire: its class segments, its bond slaves, and a
+    /// non-migrating ingress leg homed there.
+    fn legs_on(view: &View, wire: &str) -> Vec<String> {
+        let mut out: Vec<String> = view
+            .class_rows()
+            .into_iter()
+            .filter(|r| r.wire == wire)
+            .map(|r| r.ifname)
+            .collect();
+        for r in view.gw_rows() {
+            if r.migrates() {
+                out.extend(
+                    r.slaves
+                        .into_iter()
+                        .filter(|s| s.wire == wire)
+                        .map(|s| s.ifname),
+                );
+            } else if r.home == wire {
+                out.push(r.ifname);
+            }
+        }
+        for r in view.fallback_rows() {
+            out.extend(
+                r.slaves
+                    .into_iter()
+                    .filter(|s| s.wire == wire)
+                    .map(|s| s.ifname),
+            );
+        }
+        out
+    }
+
+    fn calls_for(sys: &MockSys, needle: &str) -> Vec<String> {
+        sys.calls
+            .iter()
+            .filter(|c| c.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// Calls naming exactly one of these devices (token equality: `cfab-st` never matches
+    /// `cfab-st-fb-a`), and writes to their `/proc/sys/net/ipv4/conf/<dev>/…`. The journal lines
+    /// are left out — the report's own `rebuilt` list is what pins those.
+    fn calls_naming(sys: &MockSys, devs: &[&str]) -> Vec<String> {
+        sys.calls
+            .iter()
+            .filter(|c| !c.starts_with("logger"))
+            .filter(|c| {
+                c.split(|ch: char| ch.is_whitespace() || ch == '/')
+                    .any(|t| devs.contains(&t))
+            })
+            .cloned()
+            .collect()
     }
 
     #[test]

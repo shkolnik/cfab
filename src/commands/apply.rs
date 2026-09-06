@@ -690,13 +690,13 @@ const FALLBACK_PRIMARY_RESELECT: &str = "always";
 /// A migrating leg to build: a universal segment, or an ingress leg on gw scope `any`. The two
 /// are the same netdev shape, so they are the same code — only the address differs.
 pub(crate) struct BondLeg<'a> {
-    ifname: &'a str,
-    vid: u16,
+    pub(crate) ifname: &'a str,
+    pub(crate) vid: u16,
     /// The wire whose slave the bond takes as `primary`.
-    home: &'a str,
-    slaves: &'a [Slave],
+    pub(crate) home: &'a str,
+    pub(crate) slaves: &'a [Slave],
     /// The bond is the L3 interface; its slaves carry no address.
-    cidr: &'a str,
+    pub(crate) cidr: &'a str,
 }
 
 /// Every bond parameter this build creates a leg with, in `bonding/` sysfs spelling: the file
