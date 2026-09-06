@@ -91,18 +91,30 @@ pub fn generate(view: &View) -> Result<String> {
     for ce in &ceilings {
         out.push_str(&format!("-F {}\n", ceil_chain(&ce.zone)));
     }
+    // THE JUMP CARRIES THE MATCH. A `cfab-ceil-*` chain ends in an unconditional `-j DROP`
+    // (the canonical iptables rate-limit shape: under the limit the packet RETURNs, over it
+    // the last rule drops it), so anything that ENTERS the chain and is not passed by the
+    // limit is dropped. A bare `-A cfab-out -j cfab-ceil-<zone>` therefore sends every packet
+    // this member sends into a drop chain — measured live on pve3 at gate G3 (2026-09-06):
+    // the leaf came up FAILED 0/18 with 746 drops and the engine logging EPERM on every
+    // interface. OSPF (protocol 89) on the bond only, exactly as the nft render selects: a
+    // fallback leg carries no BFD by construction, and policing the zone's island segments
+    // would police the fabric this protects.
     for ce in &ceilings {
-        out.push_str(&format!("-A {OUT_CHAIN} -j {}\n", ceil_chain(&ce.zone)));
+        out.push_str(&format!(
+            "-A {OUT_CHAIN} -o {} -p 89 -j {}\n",
+            ce.ifname,
+            ceil_chain(&ce.zone)
+        ));
     }
     for ce in &ceilings {
         let chain = ceil_chain(&ce.zone);
-        // OSPF (protocol 89) on the bond only, exactly as the nft render: a fallback leg
-        // carries no BFD by construction, and policing the zone's island segments would
-        // police the fabric this protects. Under the rate the packet RETURNs to `cfab-out`;
-        // over it the chain's final DROP counts it — that counter is what `status` reads.
+        // A packet in this chain is by construction OSPF on that bond. Under the rate it
+        // RETURNs to `cfab-out`; over it the chain's final DROP counts it — that counter is
+        // what `status` reads.
         out.push_str(&format!(
-            "-A {chain} -o {} -p 89 -m limit --limit {}/second --limit-burst {} -j RETURN\n",
-            ce.ifname, ce.rate_pps, ce.burst_pkts
+            "-A {chain} -m limit --limit {}/second --limit-burst {} -j RETURN\n",
+            ce.rate_pps, ce.burst_pkts
         ));
         out.push_str(&format!("-A {chain} -j DROP\n"));
     }
@@ -181,17 +193,14 @@ mod tests {
              -F cfab-ceil-storage\n\
              -F cfab-ceil-cluster\n\
              -F cfab-ceil-mgmt\n\
-             -A cfab-out -j cfab-ceil-storage\n\
-             -A cfab-out -j cfab-ceil-cluster\n\
-             -A cfab-out -j cfab-ceil-mgmt\n\
-             -A cfab-ceil-storage -o cfab-st-fb -p 89 -m limit --limit 80/second \
-             --limit-burst 160 -j RETURN\n\
+             -A cfab-out -o cfab-st-fb -p 89 -j cfab-ceil-storage\n\
+             -A cfab-out -o cfab-cl-fb -p 89 -j cfab-ceil-cluster\n\
+             -A cfab-out -o cfab-mg-fb -p 89 -j cfab-ceil-mgmt\n\
+             -A cfab-ceil-storage -m limit --limit 80/second --limit-burst 160 -j RETURN\n\
              -A cfab-ceil-storage -j DROP\n\
-             -A cfab-ceil-cluster -o cfab-cl-fb -p 89 -m limit --limit 80/second \
-             --limit-burst 160 -j RETURN\n\
+             -A cfab-ceil-cluster -m limit --limit 80/second --limit-burst 160 -j RETURN\n\
              -A cfab-ceil-cluster -j DROP\n\
-             -A cfab-ceil-mgmt -o cfab-mg-fb -p 89 -m limit --limit 80/second \
-             --limit-burst 160 -j RETURN\n\
+             -A cfab-ceil-mgmt -m limit --limit 80/second --limit-burst 160 -j RETURN\n\
              -A cfab-ceil-mgmt -j DROP\n\
              COMMIT\n"
         );
@@ -207,9 +216,12 @@ mod tests {
         for c in mark::ceilings(&view) {
             assert!(
                 ipt.contains(&format!(
-                    "-A cfab-ceil-{} -o {} -p 89 -m limit --limit {}/second --limit-burst {} \
-                     -j RETURN\n",
-                    c.zone, c.ifname, c.rate_pps, c.burst_pkts
+                    "-A cfab-out -o {} -p 89 -j cfab-ceil-{}\n",
+                    c.ifname, c.zone
+                )) && ipt.contains(&format!(
+                    "-A cfab-ceil-{} -m limit --limit {}/second --limit-burst {} -j RETURN\n\
+                     -A cfab-ceil-{} -j DROP\n",
+                    c.zone, c.rate_pps, c.burst_pkts, c.zone
                 )),
                 "{ipt}"
             );
@@ -244,6 +256,43 @@ mod tests {
         let out = generate(&view).unwrap();
         for absent in ["DSCP", "CLASSIFY", "-m comment", "TOS", "--set-"] {
             assert!(!out.contains(absent), "{absent} in the render: {out}");
+        }
+    }
+
+    /// The class of defect measured live at G3 (2026-09-06, pve3): a `cfab-ceil-*` chain ends
+    /// in an unconditional DROP, so whatever ENTERS it and is not passed by the limit is
+    /// dropped. Every jump into one must therefore be selective, and the only unconditional
+    /// rule anywhere in these chains is that final DROP. Asserted on the rendered text of a
+    /// declaration with three ceilings, and on a leaf and a host alike.
+    #[test]
+    fn every_jump_into_a_ceiling_chain_is_selective_and_only_the_final_drop_is_unconditional() {
+        let f = fabric();
+        for member in ["pve1-tb", "pve3-tb"] {
+            let view = View::new(&f, member).unwrap();
+            let out = generate(&view).unwrap();
+            let jumps: Vec<&str> = out
+                .lines()
+                .filter(|l| l.starts_with("-A cfab-out "))
+                .collect();
+            assert_eq!(jumps.len(), mark::ceilings(&view).len(), "{out}");
+            for j in &jumps {
+                let w: Vec<&str> = j.split_whitespace().collect();
+                // `-A cfab-out -o <bond> -p 89 -j cfab-ceil-<zone>` — never a bare jump.
+                assert!(
+                    w.contains(&"-o") && w.contains(&"-p") && w.contains(&"89"),
+                    "{member}: an unconditional jump into a drop chain: {j}"
+                );
+            }
+            for l in out.lines().filter(|l| l.starts_with("-A cfab-ceil-")) {
+                let unconditional =
+                    !l.contains(" -m ") && !l.contains(" -o ") && !l.contains(" -p ");
+                assert_eq!(
+                    unconditional,
+                    l.ends_with(" -j DROP"),
+                    "{member}: the only unconditional rule in a ceiling chain is its final \
+                     DROP: {l}"
+                );
+            }
         }
     }
 
