@@ -127,18 +127,18 @@ pub fn skipped_for_carrier<'a>(
 /// "Usable" is reachable AND with carrier: a wire the kernel would refuse is not a target, so
 /// the prober never asks for a move it knows will fail.
 pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Option<String> {
-    let rank = |wire: &str| rank(prefs, wire);
+    let rank_of = |wire: &str| rank(prefs, wire);
     // Ties (two wires outside the preference order) keep enslave order, which is `[[member]]`
     // order: a deterministic answer, so two consecutive ticks never disagree and flap.
     let best = cands
         .iter()
         .enumerate()
         .filter(|(_, c)| c.usable())
-        .min_by_key(|(i, c)| (rank(&c.wire), *i))
+        .min_by_key(|(i, c)| (rank_of(&c.wire), *i))
         .map(|(_, c)| c)?;
     match active.and_then(|a| cands.iter().find(|c| c.ifname == a)) {
         // Already where we want it, or already on an equally preferred live wire.
-        Some(c) if c.usable() && rank(&c.wire) <= rank(&best.wire) => None,
+        Some(c) if c.usable() && rank_of(&c.wire) <= rank_of(&best.wire) => None,
         // Dead, or worse-preferred than a live wire — and the `None` arm also covers an
         // active_slave that is not a slave of ours at all (or none at all), which is a bond we
         // should own and do not.

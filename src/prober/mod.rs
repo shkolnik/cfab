@@ -395,6 +395,14 @@ impl Leg {
         self.held = target.clone();
         self.active_now = Some(target);
         match from {
+            // Carrier is tested FIRST, and not only because it is the actionable end of a wire
+            // that has both faults: the carrier fast path moves the bond while the hysteresis
+            // still calls the wire reachable, so keying on `reachable()` alone would announce a
+            // move AWAY from a dead wire as a move back to a live one.
+            Some(f) if !f.carrier => log.push(format!(
+                "cfab: {} ingress: {} lost carrier, moved {} to {to}",
+                self.zone, f.wire, self.bond
+            )),
             Some(f) if !f.state.reachable() => log.push(format!(
                 "cfab: {} ingress: router unreachable on {}, moved {} to {to}",
                 self.zone, f.wire, self.bond
@@ -866,6 +874,40 @@ mod tests {
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
             "{:?}",
             sys.calls
+        );
+    }
+
+    /// The carrier fast path moves the bond while the hysteresis still calls the wire we are
+    /// leaving reachable — that is the whole point of not waiting three ticks. The line must
+    /// then say what actually happened: keyed on reachability alone it announced a flight from
+    /// a dead wire as a return to a live one, which is the opposite of the truth and sends an
+    /// operator looking at the wrong end of the fabric.
+    #[test]
+    fn a_move_off_a_wire_that_just_lost_carrier_says_so() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        // Every wire answers throughout, so every wire stays `reachable`: only the carrier goes.
+        run_ticks(&mut p, &mut sys, &mut io, 2);
+        assert!(p.drain_log().is_empty(), "nothing has happened yet");
+        sys.files
+            .insert(format!("/sys/class/net/{HOME}/carrier"), "0\n".to_string());
+        run_ticks(&mut p, &mut sys, &mut io, 1);
+        let log = p.drain_log();
+        assert_eq!(
+            log.first().map(String::as_str),
+            Some("cfab: mgmt ingress: eth0 lost carrier, moved cfab-gw249 to eth9"),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("reachable")),
+            "the router never stopped answering: {log:?}"
+        );
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/active_slave")),
+            Some(BACKUP)
         );
     }
 
