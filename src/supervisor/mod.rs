@@ -41,6 +41,8 @@ use tokio::sync::mpsc;
 use crate::commands::{apply, engine_ctl, fwd_watchdog, teardown};
 use crate::derive::View;
 use crate::model::{Fabric, MemberKind};
+use crate::prober::io::{PacketIo, ProbeIo};
+use crate::prober::{PROBE_INTERVAL, Prober};
 use crate::sys::{RealSys, Sys};
 
 use child::{BACKOFF, Child, RealSpawner, Spawned, Spawner, tag_lines};
@@ -245,6 +247,9 @@ impl sock::ComponentsSource for SockSource {
 pub(crate) struct Hooks {
     pub on_ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub run_watchdog: bool,
+    /// The ingress-prober tick. Off in the unit tests, which have no netdevs to probe and drive
+    /// the prober directly instead.
+    pub run_prober: bool,
     pub serve_socket: bool,
     pub shared: Option<Arc<Mutex<Shared>>>,
     /// A test recorder the stop sequence appends its signal/wait/kill markers to, in order, so
@@ -265,6 +270,7 @@ impl Hooks {
         Hooks {
             on_ready: None,
             run_watchdog: true,
+            run_prober: true,
             serve_socket: true,
             shared: None,
             trace: None,
@@ -1188,6 +1194,21 @@ fn feed_period() -> Option<Duration> {
     sd_notify::watchdog_enabled().map(|d| d / 3)
 }
 
+/// One ingress-prober tick: ask every wire whether the router still answers over it, move the
+/// bond if ingress belongs on a different wire, and publish what was learned into `components`.
+///
+/// No `block_in_place`, unlike the forwarding watchdog: a tick is a handful of non-blocking
+/// socket calls and at most two sysfs writes, sub-millisecond by construction, and the `recv`
+/// contract forbids blocking precisely so this arm cannot stall the watchdog feed or the
+/// `cfab.sock` accept loop on a silent wire.
+fn prober_tick(
+    _sys: &mut dyn Sys,
+    _prober: &mut Prober,
+    _io: &mut dyn ProbeIo,
+    _shared: &Arc<Mutex<Shared>>,
+) {
+}
+
 /// One forwarding-watchdog tick (spec §5): run the synchronous check with `block_in_place` — on
 /// this same thread, never `spawn_blocking`, whose pool retires idle threads and would SIGTERM a
 /// child a future spawn forked from it (§7) — and record its outcome into `components`. Runs on
@@ -1290,6 +1311,14 @@ mod tests {
 
     fn fabric_at(run_dir: &Path) -> Fabric {
         Fabric::from_decl(&Declaration::parse(&decl_text(run_dir)).unwrap()).unwrap()
+    }
+
+    /// The packaged example as shipped, for the passes that touch no run dir.
+    fn example_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+                .unwrap();
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// A pmxcfs root with no `.members` — `probe()` returns `None`, so conf-sync is stopped
@@ -1490,6 +1519,7 @@ mod tests {
         Hooks {
             on_ready: Some(ready),
             run_watchdog: false,
+            run_prober: false,
             serve_socket: false,
             shared: Some(shared),
             trace: None,
@@ -1523,6 +1553,7 @@ mod tests {
             Hooks {
                 on_ready: None,
                 run_watchdog: false,
+                run_prober: false,
                 serve_socket: false,
                 shared: None,
                 trace: None,
@@ -1629,6 +1660,7 @@ mod tests {
             Hooks {
                 on_ready: None,
                 run_watchdog: false,
+                run_prober: false,
                 serve_socket: false,
                 shared: None,
                 trace: None,
@@ -2294,6 +2326,59 @@ mod tests {
         );
     }
 
+    /// The prober tick publishes both things the rest of the supervisor reads from it: the rows
+    /// `cfab status` renders, and the slave the forwarding watchdog must put `primary` back on.
+    #[test]
+    fn the_prober_tick_publishes_its_rows_and_the_primary_it_holds() {
+        let f = example_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut prober = Prober::from_view(&view);
+        let mut io = crate::prober::io::mock::ScriptedIo::answering_on(
+            "192.168.249.254",
+            &["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"],
+        );
+        let mut sys = crate::sys::mock::MockSys::default()
+            .file(
+                "/sys/class/net/cfab-gw249/bonding/active_slave",
+                "cfab-gw249-c",
+            )
+            .file("/sys/class/net/cfab-gw249/bonding/primary", "cfab-gw249-c");
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        prober_tick(&mut sys, &mut prober, &mut io, &shared);
+        let snap = shared.lock().unwrap().components(Instant::now());
+        assert_eq!(snap.ingress.len(), 1, "{:?}", snap.ingress);
+        assert_eq!(snap.ingress[0].zone, "mgmt");
+        assert_eq!(snap.ingress[0].slaves.len(), 3);
+        assert_eq!(
+            shared.lock().unwrap().held.slave_for("cfab-gw249"),
+            Some("cfab-gw249-c"),
+            "the watchdog must be told what the prober holds"
+        );
+    }
+
+    /// A leaf carries no ingress leg, so the tick has nothing to probe and publishes no rows —
+    /// no branch, just an empty prober.
+    #[test]
+    fn the_prober_tick_is_a_no_op_on_a_leaf() {
+        let f = example_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut prober = Prober::from_view(&view);
+        let mut io = crate::prober::io::mock::ScriptedIo::answering_on("192.168.249.254", &[]);
+        let mut sys = crate::sys::mock::MockSys::default();
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        prober_tick(&mut sys, &mut prober, &mut io, &shared);
+        assert!(prober.is_empty());
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .components(Instant::now())
+                .ingress
+                .is_empty()
+        );
+        assert!(io.sent.is_empty(), "{:?}", io.sent);
+    }
+
     /// A6 + the container path: with no systemd watchdog, `feed_period` is derived from
     /// `watchdog_enabled()` (never a duplicated constant) and is `None`, so no feed task is ever
     /// started, and `sd_notify::notify` is a no-op that returns `Ok` with no `NOTIFY_SOCKET`.
@@ -2555,6 +2640,7 @@ mod tests {
         let hooks = Hooks {
             on_ready: Some(ready_tx),
             run_watchdog: false,
+            run_prober: false,
             serve_socket: false,
             shared: Some(shared),
             trace: Some(calls.clone()),
@@ -2684,6 +2770,7 @@ mod tests {
         let hooks = Hooks {
             on_ready: Some(ready_tx),
             run_watchdog: false,
+            run_prober: false,
             serve_socket: false,
             shared: Some(shared.clone()),
             trace: None,
