@@ -399,6 +399,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         let cidr = gw.leg_cidr(n);
         let qos_map = qos_map(f, z);
         let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
+        gw_leg_shape_ok(sys, r)?;
         if r.migrates() {
             let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
                 continue; // every wire under this leg is absent; already warned above
@@ -865,6 +866,46 @@ pub(crate) fn home_slave<'a>(bond: &str, slaves: &'a [Slave], home: &str) -> Res
             "{bond}: home wire {home} carries no slave of this bond"
         ))
     })
+}
+
+/// The ingress leg's two shapes wear ONE name: `cfab-gw<id>` is a plain tagged sub-interface on
+/// a single gw domain and an active-backup bond over every wire on scope `any`. Refuse before
+/// either builder touches a leg in the other shape — `mk_bond_leg` would refuse without naming
+/// a remedy, and `mk_vlan` would delete the bond, which RELEASES its slaves rather than deleting
+/// them and orphans one tagged sub-interface per wire.
+///
+/// Only the other CFAB shape is refused here. A netdev of neither shape is a stranger wearing
+/// the name and keeps the builders' own refusals: `cfab down` cannot clear a stranger, so
+/// offering that remedy for one would be a lie.
+fn gw_leg_shape_ok(sys: &mut dyn Sys, r: &GwRow) -> Result<()> {
+    if !link_exists(sys, &r.ifname)? {
+        return Ok(());
+    }
+    let wrong_shape = if r.migrates() {
+        link_kind_is(sys, &r.ifname, " vlan ")?
+    } else {
+        link_kind_is(sys, &r.ifname, " bond ")?
+    };
+    if wrong_shape {
+        return Err(Error::fatal(gw_leg_shape_changed(&r.ifname, r.migrates())));
+    }
+    Ok(())
+}
+
+/// One spelling for the condition in both directions: the leg on the box was built by a
+/// declaration whose `gw` domain differed from this one's. The remedy is the one `down` really
+/// performs — it removes the leg in whatever shape it finds, slaves included.
+pub(crate) fn gw_leg_shape_changed(ifname: &str, migrates: bool) -> String {
+    let (found, declared) = if migrates {
+        ("a sub-interface", "scope `any`")
+    } else {
+        ("a bond", "one domain")
+    };
+    format!(
+        "REFUSING: {ifname} exists as {found} but this declaration puts the ingress leg on \
+         {declared}; the gw domain changed between `any` and a domain since the leg was built, \
+         so run `cfab down` then `cfab up` to rebuild it"
+    )
 }
 
 /// One spelling per condition (spec §9 string table), shared by `apply` and the forwarding
@@ -1589,6 +1630,8 @@ mod tests {
         assert_eq!(
             calls_for(&sys, "cfab-gw249"),
             [
+                // the shape guard's own probe (`gw_leg_shape_ok`), then mk_bond_leg's
+                "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
                 "ip link show cfab-gw249-a",
@@ -1804,6 +1847,8 @@ mod tests {
         assert_eq!(
             calls_for_dev(&sys, "cfab-gw249"),
             [
+                // the shape guard's own probe (`gw_leg_shape_ok`), then mk_vlan's two
+                "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6",

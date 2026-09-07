@@ -138,6 +138,7 @@ write /proc/sys/net/ipv4/conf/cfab-mg-b2/send_redirects
 write /proc/sys/net/ipv4/conf/cfab-mg-b2/forwarding
 ip link show cfab-gw249
 ip link show cfab-gw249
+ip link show cfab-gw249
 ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6
 ip addr replace 192.168.249.1/24 dev cfab-gw249
 ip link set cfab-gw249 up

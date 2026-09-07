@@ -194,15 +194,33 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     // routes swept above, so this order is ownership-proof clarity, nothing more.
     let fallback_rows = view.fallback_rows();
     let gw_rows = view.gw_rows();
-    // An ingress leg on gw domain `any` is the same bond and is torn down the same way.
+    // An ingress leg on gw domain `any` is the same bond and is torn down the same way — but
+    // WHICH shape it is in is read from the box, not from the declaration. The leg's two shapes
+    // share one name, so an operator who flipped `gw` between `any` and a domain and then ran
+    // `cfab down` used to be refused in either direction ("not a bond" / "not a vlan") and left
+    // with a leg (and, one way round, three slaves) nothing would ever remove: the file says one
+    // shape, the running fabric wears the other. Both shapes are cfab's own, and the slave names
+    // are derived from this member's wires rather than from the declaration for the same reason.
+    // A netdev of neither shape is still refused below.
+    let mut gw_bond_slaves: Vec<(&str, Vec<Slave>)> = Vec::new();
+    let mut gw_sub_interfaces: Vec<String> = Vec::new();
+    for r in &gw_rows {
+        if link_exists(sys, &r.ifname)? && link_kind_is(sys, &r.ifname, " bond ")? {
+            gw_bond_slaves.push((
+                r.ifname.as_str(),
+                crate::derive::slaves_of(view.member, &r.ifname),
+            ));
+        } else {
+            gw_sub_interfaces.push(r.ifname.clone());
+        }
+    }
     let bond_legs: Vec<(&str, &[Slave])> = fallback_rows
         .iter()
         .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
         .chain(
-            gw_rows
+            gw_bond_slaves
                 .iter()
-                .filter(|r| r.migrates())
-                .map(|r| (r.ifname.as_str(), r.slaves.as_slice())),
+                .map(|(ifname, slaves)| (*ifname, slaves.as_slice())),
         )
         .collect();
     for (ifname, _) in &bond_legs {
@@ -227,13 +245,8 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
     }
     let mut ifnames: Vec<String> = view.class_rows().into_iter().map(|r| r.ifname).collect();
-    // A migrating leg was deleted above as a bond; the rest are plain sub-interfaces.
-    ifnames.extend(
-        gw_rows
-            .iter()
-            .filter(|r| !r.migrates())
-            .map(|r| r.ifname.clone()),
-    );
+    // A leg that was live as a bond has been deleted above; the rest are plain sub-interfaces.
+    ifnames.extend(gw_sub_interfaces);
     for dev in &ifnames {
         if link_exists(sys, dev)? {
             if !link_kind_is(sys, dev, " vlan ")? {

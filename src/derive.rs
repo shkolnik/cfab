@@ -375,7 +375,12 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
 /// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member
 /// has, in `[[member]]` order, named `<ifname>-<domain>`. Shared by the universal segment and a
 /// migrating ingress leg — one fan-out, so the two legs cannot drift apart.
-fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
+/// Every slave name a bond leg called `ifname` has on this member — one tagged sub-interface
+/// per wire, in `[[member]]` order. Public because `up` and `down` need the names for a leg the
+/// CURRENT declaration does not describe as a bond at all: an ingress leg whose `gw` domain was
+/// flipped from `any` to a single domain is still a bond, with these slaves, until it is
+/// removed.
+pub fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
     member
         .wires
         .iter()
