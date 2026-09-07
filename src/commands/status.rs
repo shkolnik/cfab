@@ -1630,6 +1630,11 @@ fn shape_posture(
             sd.state.as_str(),
             sd.restarts
         ));
+        // No expectation to check, exactly as for an absent record: a daemon that is not
+        // running maintains nothing, so after a crash its record can describe floors the
+        // kernel no longer holds. Calling that standing drift would say waiting changes
+        // nothing, when the daemon coming back is the whole remedy.
+        return Ok(());
     }
     let path = crate::shape_applied_path(&view.fabric.run_dir);
     // Absent and unparseable are one condition — no expectation to compare against — and a
@@ -5482,5 +5487,37 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(!report.output.contains("eth1: class"), "{}", report.output);
         assert!(!report.output.contains("shape drift"), "{}", report.output);
+    }
+
+    /// A shape-daemon that is not running leaves a record no one is maintaining: after a crash
+    /// it describes floors the kernel may no longer hold. That is not standing drift — the
+    /// daemon coming back IS the remedy — so the shaping-down line is the whole story and the
+    /// record is not diffed at all.
+    #[test]
+    fn a_shape_daemon_that_is_down_earns_one_line_and_no_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).on_stdout(
+            &["tc", "class", "show", "dev", "eth9"],
+            "class htb 1:40 parent 1:1 leaf 40: prio 2 rate 3Mbit ceil 5Gbit burst 64Kb\n",
+        );
+        let comps: Components = serde_json::from_str(&healthy_components(&view)).unwrap();
+        let mut cc = comps;
+        for k in &mut cc.components {
+            if k.name == "shape-daemon" {
+                k.state = CompState::Restarting;
+                k.restarts = 2;
+            }
+        }
+        let mut c = Ctx::default();
+        shape_posture(&mut sys, &view, Some(&cc), &mut c).unwrap();
+        assert_eq!(
+            c.reasons,
+            vec![(
+                Class::Settling,
+                "shaping down: shape-daemon is restarting, 2 restart(s)".to_string()
+            )],
+            "the record of a daemon that is not running is not an expectation"
+        );
     }
 }

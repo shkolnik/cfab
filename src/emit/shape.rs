@@ -664,6 +664,9 @@ mod tests {
     fn rate_tokens_are_spelled_the_way_tc_prints_them() {
         // `tc class show` capitalizes the unit and folds whole thousands to Gbit; a floor of
         // 0 is installed as the 1Kbit token. These strings are matched against kernel output.
+        // MEASURED on pve1 2026-09-08: tc prints 999Mbit, 1001Mbit, 1200Mbit, 1999Mbit and
+        // 4850Mbit as written and folds ONLY exact thousands (2000 -> 2Gbit). Do not "fix"
+        // this into a general Gbit threshold.
         assert_eq!(rate_token(2000), "2Gbit");
         assert_eq!(rate_token(4850), "4850Mbit");
         assert_eq!(rate_token(1), "1Mbit");
