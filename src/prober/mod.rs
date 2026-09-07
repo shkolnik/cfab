@@ -22,16 +22,17 @@ pub mod frame;
 pub mod io;
 pub mod passive;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use crate::derive::View;
-use crate::supervisor::report::{IngressLeg, IngressSlave};
+use crate::supervisor::report::{ProbedLeg, ProbedSlave};
 use crate::sys::Sys;
 
 use decide::{Candidate, Hysteresis, decide};
 use io::ProbeIo;
+use passive::{Evidence, Verdict, Windows};
 
 /// How often every slave is asked. Half the 3.3 s BGP hold floor the router's session runs on,
 /// divided again by the 3-observation hysteresis: 1.5 s to call a wire dead, 1.5 s to call it
@@ -39,25 +40,57 @@ use io::ProbeIo;
 /// say about it.
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One ingress leg's probe state.
+/// What one leg asks, and of whom.
+enum Kind {
+    /// The migrating ingress leg: ask the router, over every wire, twice a second.
+    Ingress { router: Ipv4Addr },
+    /// A zone's universal (fallback) segment: hear the peers' own OSPF, and only ask when a
+    /// wire has gone quiet while its siblings have not.
+    Fallback(Fallback),
+}
+
+/// The passive channel's per-leg knowledge: who is expected, who to ask when one wire goes
+/// quiet, and the windows all of it is judged by.
+struct Fallback {
+    /// The peers' addresses on this segment (`10.<zone id>.<seg>.<node>`) — the escalation's
+    /// targets, and the only frames the fallback prober ever sends.
+    targets: Vec<Ipv4Addr>,
+    /// The OSPF Router IDs of the members expected on this segment, self excluded. Empty when
+    /// this member is alone in the zone's universal segment.
+    peers: BTreeSet<u32>,
+    /// Our own Router ID in this zone. A hello carrying it is not a peer — it is our own hello
+    /// reflected back through the backbone, which is what makes a BACKUP slave judgeable even
+    /// with no peer alive anywhere (spec §4).
+    self_rid: u32,
+    windows: Windows,
+    /// The whole leg has gone quiet and it has been said. Cleared when anything is heard again,
+    /// so the next silence is reported.
+    noted_quiet: bool,
+    /// No tap on this leg could be opened; said once, and the leg is not probed until one can
+    /// be. The environment is an undeclared dependency: a container without the privileges for
+    /// `AF_PACKET` must refuse the leg by name, not report every wire quiet forever.
+    noted_deaf: bool,
+}
+
+/// One leg's probe state.
 struct Leg {
     zone: String,
     /// The leg netdev: a bond when the leg migrates, a plain sub-interface otherwise.
     bond: String,
-    /// Only a migrating leg has slaves to move between. A single-domain leg is still probed —
-    /// per-wire router reachability is an observable either way — but never actuated on.
-    migrates: bool,
-    router: Ipv4Addr,
-    /// The zone's wire order, rank 0 first: what decides which reachable wire ingress belongs on.
+    /// Only a leg with slaves has anywhere to move to. A single-domain ingress leg is still
+    /// probed — per-wire router reachability is an observable either way — but never actuated
+    /// on. Every fallback leg has slaves by construction.
+    actuates: bool,
+    /// The zone's wire order, rank 0 first: what decides which live wire the leg belongs on.
     prefs: Vec<String>,
-    /// The slave `bonding/primary` must name. The prober owns `primary` on a migrating leg: an
-    /// `active_slave` write alone survives only until the next link event, after which
+    /// The slave `bonding/primary` must name. The prober owns `primary` on a leg it actuates:
+    /// an `active_slave` write alone survives only until the next link event, after which
     /// `primary_reselect=always` hands the bond back to the old primary (VERIFIED on the rack,
     /// 2026-09-07). It starts as the leg's home and only ever moves with the bond.
     held: String,
     /// The slave the KERNEL has active, as of this tick's read — which is not always the one we
-    /// hold: with nothing reachable the prober leaves the bond alone and the kernel's own
-    /// carrier reselect moves it. `None` before the first read, and for a leg that has none.
+    /// hold: with nothing usable the prober leaves the bond alone and the kernel's own carrier
+    /// reselect moves it. `None` before the first read, and for a leg that has none.
     active_now: Option<String>,
     slaves: Vec<ProbeSlave>,
     /// The (skipped wire, wire we are on) pair the last no-carrier note named, so the same
@@ -68,6 +101,7 @@ struct Leg {
     /// while nothing has changed — the kernel refused it for a reason we can no longer see, and
     /// a refusal repeated every 500 ms is noise, not a diagnosis.
     refused: Option<(String, Option<String>)>,
+    kind: Kind,
 }
 
 struct ProbeSlave {
@@ -84,17 +118,74 @@ struct ProbeSlave {
     /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
     /// to believe it is three refused `active_slave` writes (F23).
     carrier: bool,
+    /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
+    /// that has just come back is a slave that has just been re-enslaved, which is where the
+    /// grace period comes from.
+    present: bool,
     last_reply: Option<Instant>,
+    /// Passive evidence, fallback legs only: the last peer packet and the last reflection of our
+    /// own hello heard on this slave.
+    peer_heard: Option<Instant>,
+    self_heard: Option<Instant>,
+    /// Peers heard on this slave, most recent first — the escalation's targets, so it asks the
+    /// members that were demonstrably reachable over this wire rather than all of them (spec §7).
+    recent: Vec<u32>,
+    /// Until when this slave may not be suspected: it has just appeared, or just been promoted.
+    grace_until: Option<Instant>,
+    /// The ARP escalation is running on this slave.
+    escalating: bool,
 }
 
-/// Which slave each migrating ingress bond's `primary` must name: the prober's current choice,
-/// which is the leg's home until the prober has a reason to hold another.
+/// At most this many peers are asked when one wire is escalated. Four is the point past which
+/// asking more stops adding evidence — any one answer clears the wire — and it is what bounds
+/// the fabric-wide worst case to a burst rather than a storm (spec §7).
+const ESCALATION_TARGETS: usize = 4;
+
+impl ProbeSlave {
+    fn new(ifname: String, wire: String, island: String, mac: [u8; 6]) -> ProbeSlave {
+        ProbeSlave {
+            ifname,
+            wire,
+            island,
+            mac,
+            state: Hysteresis::default(),
+            probed: false,
+            carrier: false,
+            present: true,
+            last_reply: None,
+            peer_heard: None,
+            self_heard: None,
+            recent: Vec::new(),
+            grace_until: None,
+            escalating: false,
+        }
+    }
+
+    fn evidence(&self, active: Option<&str>) -> Evidence {
+        Evidence {
+            active: active == Some(self.ifname.as_str()),
+            peer: self.peer_heard,
+            reflected: self.self_heard,
+            grace_until: self.grace_until,
+        }
+    }
+
+    /// Record a peer, most recent first, without letting the list grow with the fabric.
+    fn saw(&mut self, rid: u32) {
+        self.recent.retain(|r| *r != rid);
+        self.recent.insert(0, rid);
+        self.recent.truncate(ESCALATION_TARGETS);
+    }
+}
+
+/// Which slave each bond the prober actuates must name as `primary`: its current choice, which
+/// is the leg's home until the prober has a reason to hold another.
 ///
 /// The prober owns `primary` on those bonds — an `active_slave` write alone survives only until
 /// the next link event — so anything else that re-asserts `primary` must ask here first. The
 /// forwarding watchdog rebuilds legs a re-enumerated wire took with it, and writing the DECLARED
-/// home there would snap a bond the prober had deliberately moved straight back onto a
-/// router-dead wire on the next USB blip.
+/// home there would snap a bond the prober had deliberately moved straight back onto a wire it
+/// had moved off, on the next USB blip.
 #[derive(Clone, Debug, Default)]
 pub struct HeldPrimaries(BTreeMap<String, String>);
 
@@ -114,7 +205,14 @@ impl HeldPrimaries {
     }
 }
 
-/// Every ingress leg this member carries, probed once per `PROBE_INTERVAL`.
+/// The two families of leg, as the supervisor publishes them.
+#[derive(Clone, Debug, Default)]
+pub struct ProbeRows {
+    pub ingress: Vec<ProbedLeg>,
+    pub fallback: Vec<ProbedLeg>,
+}
+
+/// Every leg this member probes, ticked once per `PROBE_INTERVAL`.
 pub struct Prober {
     legs: Vec<Leg>,
     /// What the last ticks have to say, oldest first, ready-formatted. The prober decides and
@@ -125,11 +223,26 @@ pub struct Prober {
 }
 
 impl Prober {
-    /// The legs to probe. Empty on a leaf: a leaf builds no ingress leg at all (the outside
-    /// reaches a leaf at the leaf's own addresses, never at a fabric identity), so there is
-    /// nothing to ask and nothing to move.
+    /// The legs to probe: this member's ingress legs (hosts only — a leaf builds none) and every
+    /// zone's universal segment, leaves included. A leaf's fallback path is a real path and
+    /// F20 is a real defect on it.
     pub fn from_view(view: &View) -> Prober {
         let mut legs = Vec::new();
+        let island_of = |wire: &str| {
+            view.member
+                .wires
+                .iter()
+                .find(|w| w.name == wire)
+                .map(|w| w.domain.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let prefs_for = |zone: &str| {
+            view.prefs()
+                .into_iter()
+                .find(|p| p.zone == zone)
+                .map(|p| p.order)
+                .unwrap_or_default()
+        };
         for r in view.gw_rows() {
             let Ok(z) = view.fabric.zone(&r.zone) else {
                 continue;
@@ -141,70 +254,114 @@ impl Prober {
             let Ok(router) = gw.router.parse::<Ipv4Addr>() else {
                 continue;
             };
-            let prefs = view
-                .prefs()
-                .into_iter()
-                .find(|p| p.zone == r.zone)
-                .map(|p| p.order)
-                .unwrap_or_default();
-            let island_of = |wire: &str| {
-                view.member
-                    .wires
-                    .iter()
-                    .find(|w| w.name == wire)
-                    .map(|w| w.domain.as_str().to_string())
-                    .unwrap_or_default()
-            };
             let slaves: Vec<ProbeSlave> = if r.migrates() {
                 r.slaves
                     .iter()
                     .enumerate()
-                    .map(|(i, s)| ProbeSlave {
-                        ifname: s.ifname.clone(),
-                        wire: s.wire.clone(),
-                        island: island_of(&s.wire),
-                        mac: frame::synthetic_mac(view.node(), z.id, i as u8),
-                        state: Hysteresis::default(),
-                        probed: false,
-                        carrier: false,
-                        last_reply: None,
+                    .map(|(i, s)| {
+                        ProbeSlave::new(
+                            s.ifname.clone(),
+                            s.wire.clone(),
+                            island_of(&s.wire),
+                            frame::synthetic_mac(view.node(), z.id, i as u8),
+                        )
                     })
                     .collect()
             } else {
-                vec![ProbeSlave {
-                    ifname: r.ifname.clone(),
-                    wire: r.home.clone(),
-                    island: island_of(&r.home),
-                    mac: frame::synthetic_mac(view.node(), z.id, 0),
-                    state: Hysteresis::default(),
-                    probed: false,
-                    carrier: false,
-                    last_reply: None,
-                }]
+                vec![ProbeSlave::new(
+                    r.ifname.clone(),
+                    r.home.clone(),
+                    island_of(&r.home),
+                    frame::synthetic_mac(view.node(), z.id, 0),
+                )]
             };
-            let held = slaves
-                .iter()
-                .find(|s| s.wire == r.home)
-                .or_else(|| slaves.first())
-                .map(|s| s.ifname.clone())
-                .unwrap_or_default();
-            legs.push(Leg {
-                zone: r.zone.clone(),
-                bond: r.ifname.clone(),
-                migrates: r.migrates(),
-                router,
-                prefs,
-                held,
-                active_now: None,
-                noted_no_carrier: None,
-                refused: None,
+            legs.push(Leg::new(
+                r.zone.clone(),
+                r.ifname.clone(),
+                r.migrates(),
+                prefs_for(&r.zone),
+                &r.home,
                 slaves,
-            });
+                Kind::Ingress { router },
+            ));
         }
-        Prober {
-            legs,
-            log: Vec::new(),
+        for r in view.fallback_rows() {
+            let Ok(z) = view.fabric.zone(&r.zone) else {
+                continue;
+            };
+            let addr_of = |node: u8| format!("{}.{}.{}", z.block(), r.seg, node).parse().ok();
+            let rid_of = |m: &crate::model::Member| {
+                crate::derive::identity_addr_of(z, m)
+                    .parse::<Ipv4Addr>()
+                    .ok()
+                    .map(u32::from)
+            };
+            let Some(self_rid) = rid_of(view.member) else {
+                continue;
+            };
+            let peer_members: Vec<&crate::model::Member> = view
+                .fabric
+                .members
+                .iter()
+                .filter(|m| m.name != view.member.name)
+                .filter(|m| {
+                    crate::derive::fallback_rows_of(view.fabric, m)
+                        .iter()
+                        .any(|p| p.zone == r.zone)
+                })
+                .collect();
+            let slaves: Vec<ProbeSlave> = r
+                .slaves
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    ProbeSlave::new(
+                        s.ifname.clone(),
+                        s.wire.clone(),
+                        island_of(&s.wire),
+                        // The same synthetic-MAC scheme as the ingress prober, and it cannot
+                        // collide with one: the two families' slaves are different netdevs, and
+                        // the index is per leg within a zone whose id is in the address.
+                        frame::synthetic_mac(view.node(), z.id, i as u8),
+                    )
+                })
+                .collect();
+            legs.push(Leg::new(
+                r.zone.clone(),
+                r.ifname.clone(),
+                true,
+                prefs_for(&r.zone),
+                &r.home,
+                slaves,
+                Kind::Fallback(Fallback {
+                    targets: peer_members.iter().filter_map(|m| addr_of(m.node)).collect(),
+                    peers: peer_members.iter().filter_map(|m| rid_of(m)).collect(),
+                    self_rid,
+                    windows: Windows::from_ospf(
+                        view.fabric.ospf_hello,
+                        view.fabric.ospf_dead,
+                    ),
+                    noted_quiet: false,
+                    noted_deaf: false,
+                }),
+            ));
         }
+        let mut log = Vec::new();
+        // Said at start, once, because it is a property of the DECLARATION and not of anything
+        // that happens later: with these timers a move cannot be decided before OSPF has already
+        // torn the adjacency down, so the fallback prober can only ever be late. There is no
+        // knob to offer — the remedy is the declared dead interval.
+        let w = Windows::from_ospf(view.fabric.ospf_hello, view.fabric.ospf_dead);
+        if legs.iter().any(|l| matches!(l.kind, Kind::Fallback(_)))
+            && !w.move_fits_inside_dead(PROBE_INTERVAL, view.fabric.ospf_dead)
+        {
+            log.push(format!(
+                "cfab: warn: [ospf] hello {} s with dead {} s leaves no room to move a fallback \
+                 bond before the adjacency expires",
+                view.fabric.ospf_hello, view.fabric.ospf_dead
+            ));
+        }
+        Prober { legs, log }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -217,100 +374,75 @@ impl Prober {
         std::mem::take(&mut self.log)
     }
 
-    /// One round: read the previous round's answers, move the bond if it belongs elsewhere,
-    /// then ask again. Returns the rows `Components` publishes.
+    /// One round: read what has arrived, move a bond that belongs elsewhere, then ask again —
+    /// where "ask" is every slave of an ingress leg and only an escalating slave of a fallback
+    /// leg, whose steady state sends nothing at all.
     ///
     /// Draining BEFORE sending is what gives a reply a whole `PROBE_INTERVAL` to arrive; the
     /// measured round trip is 80 µs, so the window is three orders of magnitude of margin, and
     /// the alternative (send, then read immediately) would score every wire as dark.
-    pub fn tick(
-        &mut self,
-        sys: &mut dyn Sys,
-        io: &mut dyn ProbeIo,
-        now: Instant,
-    ) -> Vec<IngressLeg> {
+    pub fn tick(&mut self, sys: &mut dyn Sys, io: &mut dyn ProbeIo, now: Instant) -> ProbeRows {
         let Prober { legs, log } = self;
         for leg in legs.iter_mut() {
-            for s in &mut leg.slaves {
-                let frames = io.recv(&s.ifname).unwrap_or_default();
-                let replied = frames
-                    .iter()
-                    .any(|f| frame::reply_from(f, s.mac, &[leg.router]).is_some());
-                if replied {
-                    s.last_reply = Some(now);
-                }
-                // A tick with no probe outstanding learns nothing on the RECEIVE side: the
-                // first tick has asked nobody anything, and a tick whose send failed is
-                // accounted for below instead. A failed `recv` IS a miss, though — the tap is
-                // on the slave, so losing it is the wire being unusable.
-                if s.probed {
-                    s.state.observe(replied);
-                }
-                s.carrier = has_carrier(sys, &s.ifname);
-            }
-            leg.actuate(sys, log);
-            for s in &mut leg.slaves {
-                match io.send(&s.ifname, &frame::probe(s.mac, leg.router)) {
-                    Ok(()) => s.probed = true,
-                    // A probe we cannot even put on the wire is evidence about the wire, not a
-                    // gap in our knowledge of it: the netdev went away with a re-enumerated USB
-                    // NIC, or the socket cannot be bound. Fold it in HERE rather than leaving
-                    // the slave un-observed, or its state freezes at whatever it last was and
-                    // ingress stays pinned to a dead wire forever, silently.
-                    Err(_) => {
-                        s.probed = false;
-                        s.state.observe(false);
-                    }
-                }
-            }
+            leg.tick(sys, io, now, log);
         }
         self.report(now)
     }
 
-    /// The slave each migrating ingress bond's `primary` must name right now.
+    /// The slave each bond the prober actuates must name as `primary`.
     pub fn held_primaries(&self) -> HeldPrimaries {
         HeldPrimaries(
             self.legs
                 .iter()
-                .filter(|l| l.migrates)
+                .filter(|l| l.actuates)
                 .map(|l| (l.bond.clone(), l.held.clone()))
                 .collect(),
         )
     }
 
-    fn report(&self, now: Instant) -> Vec<IngressLeg> {
-        self.legs
-            .iter()
-            .map(|l| IngressLeg {
+    fn report(&self, now: Instant) -> ProbeRows {
+        let mut rows = ProbeRows::default();
+        for l in &self.legs {
+            let row = ProbedLeg {
                 zone: l.zone.clone(),
                 bond: l.bond.clone(),
                 active: l.active_now.clone(),
+                quiet: l.quiet(),
                 slaves: l
                     .slaves
                     .iter()
-                    .map(|s| IngressSlave {
+                    .map(|s| ProbedSlave {
                         wire: s.wire.clone(),
                         island: s.island.clone(),
                         // A wire with no carrier reaches nothing, whatever the last three probes
-                        // said; reporting it reachable would have `status` blame the router for
+                        // said; reporting it reachable would have `status` blame the far end for
                         // an unplugged cable.
                         reachable: s.state.reachable() && s.carrier,
+                        // Silent, being asked, not yet answered for: a fact `status` renders as
+                        // a settling line rather than a standing verdict.
+                        suspect: s.escalating,
                         last_reply_ms: s
                             .last_reply
                             .map(|t| now.saturating_duration_since(t).as_millis() as u64),
                     })
                     .collect(),
-            })
-            .collect()
+            };
+            match l.kind {
+                Kind::Ingress { .. } => rows.ingress.push(row),
+                Kind::Fallback(_) => rows.fallback.push(row),
+            }
+        }
+        rows
     }
 }
 
 /// Does this netdev have carrier? An unreadable file is NO carrier, deliberately: `carrier`
 /// returns `EINVAL` on an interface that is administratively down and `ENOENT` on one that has
 /// gone away, and the kernel refuses `bonding/active_slave` in both of those states too.
-fn has_carrier(sys: &dyn Sys, ifname: &str) -> bool {
+fn has_carrier(sys: &dyn Sys, ifname: &str) -> Option<bool> {
     sys.read(&format!("/sys/class/net/{ifname}/carrier"))
-        .is_ok_and(|s| s.trim() == "1")
+        .ok()
+        .map(|s| s.trim() == "1")
 }
 
 /// One `Sys` error as a line a task that carries on may print. `Sys::write` reports every
@@ -325,22 +457,285 @@ fn without_fatal(e: &crate::error::Error) -> String {
 }
 
 impl Leg {
-    /// Move the bond if the decision says it belongs elsewhere. Reads only on a healthy leg.
-    /// Anything worth saying is pushed onto `log` for the supervisor to print.
-    fn actuate(&mut self, sys: &mut dyn Sys, log: &mut Vec<String>) {
-        if !self.migrates {
-            return;
+    #[expect(clippy::too_many_arguments, reason = "one constructor, all of it per-leg state")]
+    fn new(
+        zone: String,
+        bond: String,
+        actuates: bool,
+        prefs: Vec<String>,
+        home: &str,
+        slaves: Vec<ProbeSlave>,
+        kind: Kind,
+    ) -> Leg {
+        let held = slaves
+            .iter()
+            .find(|s| s.wire == home)
+            .or_else(|| slaves.first())
+            .map(|s| s.ifname.clone())
+            .unwrap_or_default();
+        Leg {
+            zone,
+            bond,
+            actuates,
+            prefs,
+            held,
+            active_now: None,
+            slaves,
+            noted_no_carrier: None,
+            refused: None,
+            kind,
         }
-        let base = format!("/sys/class/net/{}/bonding", self.bond);
-        // An unreadable `bonding/` means the bond is not there (or is not a bond). Writing into
-        // it would be a guess about a netdev we cannot see; `status` and the forwarding watchdog
-        // own that fault.
-        let Ok(active) = sys.read(&format!("{base}/active_slave")) else {
+    }
+
+    /// Has this leg heard nothing at all, on any wire? Only a fallback leg can: an ingress leg
+    /// asks rather than listens, and "nobody answered" is already reported per wire.
+    fn quiet(&self) -> bool {
+        matches!(self.kind, Kind::Fallback(ref f) if !f.peers.is_empty())
+            && self
+                .slaves
+                .iter()
+                .all(|s| s.peer_heard.is_none() && s.self_heard.is_none())
+    }
+
+    fn tick(&mut self, sys: &mut dyn Sys, io: &mut dyn ProbeIo, now: Instant, log: &mut Vec<String>) {
+        // The kernel's own answer to "where is this bond", read once and used by everything
+        // below: the passive channel judges a slave by its role, and the decision compares
+        // against it. A leg whose `bonding/` cannot be read is a leg we do not own this tick.
+        // A leg with nowhere to move to is not asked where it sits: the read would be a
+        // guess about a netdev that is not a bond, and nothing would be done with the answer.
+        let active = self.actuates.then(|| self.read_active(sys)).flatten();
+        self.observe(sys, io, now, active.as_deref(), log);
+        if active.is_some() {
+            self.actuate(sys, active.as_deref(), now, log);
+        }
+        self.ask(io, now);
+    }
+
+    /// `bonding/active_slave`, trimmed, or `None` when the leg is not a bond we can read. The
+    /// empty string — a bond with no active slave — reads as `Some("")`, which no slave matches.
+    fn read_active(&mut self, sys: &mut dyn Sys) -> Option<String> {
+        let read = sys
+            .read(&format!("/sys/class/net/{}/bonding/active_slave", self.bond))
+            .ok()?;
+        let active = read.trim().to_string();
+        self.active_now = (!active.is_empty()).then(|| active.clone());
+        Some(active)
+    }
+
+    /// Drain every tap, fold in what arrived, and decide what each slave's standing is now.
+    fn observe(
+        &mut self,
+        sys: &mut dyn Sys,
+        io: &mut dyn ProbeIo,
+        now: Instant,
+        active: Option<&str>,
+        log: &mut Vec<String>,
+    ) {
+        let mut deaf = 0usize;
+        for s in &mut self.slaves {
+            // A fallback leg never sends in steady state, so the tap has to be asked for.
+            if let Kind::Fallback(_) = self.kind
+                && let Err(e) = io.listen(&s.ifname)
+            {
+                deaf += 1;
+                if !matches!(self.kind, Kind::Fallback(ref f) if f.noted_deaf) {
+                    log.push(format!(
+                        "cfab: {} fallback: cannot listen on {} ({}) — the leg is not probed",
+                        self.zone,
+                        s.wire,
+                        without_fatal(&e)
+                    ));
+                }
+                continue;
+            }
+            let frames = io.recv(&s.ifname).unwrap_or_default();
+            let mut replied = false;
+            match &self.kind {
+                Kind::Ingress { router } => {
+                    replied = frames
+                        .iter()
+                        .any(|f| frame::reply_from(f, s.mac, &[*router]).is_some());
+                }
+                Kind::Fallback(f) => {
+                    for fr in &frames {
+                        if let Some(rid) = frame::hello_router_id(fr) {
+                            if rid == f.self_rid {
+                                s.self_heard = Some(now);
+                            } else if f.peers.contains(&rid) {
+                                s.peer_heard = Some(now);
+                                s.saw(rid);
+                            }
+                            // A hello from a Router ID we do not expect on this segment is not
+                            // evidence about our fabric: another OSPF speaker on the VLAN would
+                            // otherwise keep a wire looking live for peers that are gone.
+                        } else if s.escalating
+                            && frame::reply_from(fr, s.mac, &f.targets).is_some()
+                        {
+                            replied = true;
+                        }
+                    }
+                }
+            }
+            if replied || s.peer_heard == Some(now) || s.self_heard == Some(now) {
+                s.last_reply = Some(now);
+            }
+            match &self.kind {
+                // A tick with no probe outstanding learns nothing on the RECEIVE side: the
+                // first tick has asked nobody anything, and a tick whose send failed is
+                // accounted for in `ask`. A failed `recv` IS a miss, though — the tap is on
+                // the slave, so losing it is the wire being unusable.
+                Kind::Ingress { .. } => {
+                    if s.probed {
+                        s.state.observe(replied);
+                    }
+                }
+                // The escalation's counted evidence, and only while it is running: a wire
+                // nobody is asking is judged by the passive channel below, not by a count.
+                Kind::Fallback(_) => {
+                    if s.escalating {
+                        if replied {
+                            s.state.heard();
+                            s.escalating = false;
+                        } else if s.probed {
+                            s.state.observe(false);
+                        }
+                    }
+                }
+            }
+            let present = has_carrier(&*sys, &s.ifname);
+            s.carrier = present.unwrap_or(false);
+            // A netdev that has just come back is a slave the kernel has just re-enslaved (F5).
+            // Judging it before a hello can arrive on it would confirm it dead for being new.
+            if present.is_some() && !s.present {
+                s.grace_until = Some(now + grace_of(&self.kind));
+            }
+            s.present = present.is_some();
+        }
+        let Kind::Fallback(f) = &mut self.kind else {
             return;
         };
-        let active = active.trim();
-        let active = (!active.is_empty()).then_some(active);
-        self.active_now = active.map(str::to_string);
+        if deaf == self.slaves.len() && deaf > 0 {
+            f.noted_deaf = true;
+            return;
+        }
+        f.noted_deaf = false;
+        let evidence: Vec<Evidence> = self.slaves.iter().map(|s| s.evidence(active)).collect();
+        let verdicts = passive::verdicts(now, &evidence, &f.windows, !f.peers.is_empty());
+        let mut all_quiet = true;
+        for (s, v) in self.slaves.iter_mut().zip(verdicts) {
+            match v {
+                Verdict::Good => {
+                    // A heard frame outranks any number of unanswered probes: it is one frame
+                    // that traversed the actual path, which is what OSPF itself restarts its
+                    // dead timer on.
+                    s.state.heard();
+                    s.escalating = false;
+                    s.probed = false;
+                    all_quiet = false;
+                }
+                Verdict::Suspect => {
+                    all_quiet = false;
+                    if !s.escalating {
+                        s.escalating = true;
+                        s.probed = false;
+                        s.state.precharge();
+                    }
+                }
+                Verdict::Watch => all_quiet = false,
+                Verdict::Quiet => {
+                    // Nothing to move to and nothing to ask: whatever is wrong is not this wire.
+                    s.escalating = false;
+                    s.probed = false;
+                }
+            }
+        }
+        if all_quiet && !f.noted_quiet {
+            f.noted_quiet = true;
+            log.push(format!(
+                "cfab: {} fallback: no peers heard on any wire — nothing to move to",
+                self.zone
+            ));
+        } else if !all_quiet {
+            f.noted_quiet = false;
+        }
+    }
+
+    /// Ask, where asking is warranted: every slave of an ingress leg, and only an escalating
+    /// slave of a fallback leg. A healthy fallback leg puts nothing on the wire at all.
+    fn ask(&mut self, io: &mut dyn ProbeIo, now: Instant) {
+        match &self.kind {
+            Kind::Ingress { router } => {
+                for s in &mut self.slaves {
+                    match io.send(&s.ifname, &frame::probe(s.mac, *router)) {
+                        Ok(()) => s.probed = true,
+                        // A probe we cannot even put on the wire is evidence about the wire, not
+                        // a gap in our knowledge of it: the netdev went away with a re-enumerated
+                        // USB NIC, or the socket cannot be bound. Fold it in HERE rather than
+                        // leaving the slave un-observed, or its state freezes at whatever it last
+                        // was and the leg stays pinned to a dead wire forever, silently.
+                        Err(_) => {
+                            s.probed = false;
+                            s.state.observe(false);
+                        }
+                    }
+                }
+            }
+            Kind::Fallback(f) => {
+                for s in &mut self.slaves {
+                    if !s.escalating {
+                        continue;
+                    }
+                    // The members demonstrably reachable over this wire until a moment ago, in
+                    // preference to the whole segment: any one answer clears the wire, and the
+                    // bound is what keeps a fabric-wide event a burst rather than a storm.
+                    let mut targets: Vec<Ipv4Addr> = s
+                        .recent
+                        .iter()
+                        .filter_map(|rid| target_of(&f.targets, *rid))
+                        .collect();
+                    for t in &f.targets {
+                        if targets.len() >= ESCALATION_TARGETS {
+                            break;
+                        }
+                        if !targets.contains(t) {
+                            targets.push(*t);
+                        }
+                    }
+                    let mut sent = false;
+                    for t in &targets {
+                        sent |= io.send(&s.ifname, &frame::probe(s.mac, *t)).is_ok();
+                    }
+                    if sent {
+                        s.probed = true;
+                    } else {
+                        s.probed = false;
+                        s.state.observe(false);
+                        // Nothing can be put on this wire at all. That is the wire, not our
+                        // knowledge of it, so it is folded in as a miss and the escalation stops
+                        // there — the decision below has already been told.
+                        s.escalating = s.state.reachable();
+                    }
+                    let _ = now;
+                }
+            }
+        }
+    }
+
+    /// Move the bond if the decision says it belongs elsewhere. Reads only on a healthy leg.
+    /// Anything worth saying is pushed onto `log` for the supervisor to print.
+    fn actuate(
+        &mut self,
+        sys: &mut dyn Sys,
+        active: Option<&str>,
+        now: Instant,
+        log: &mut Vec<String>,
+    ) {
+        if !self.actuates {
+            return;
+        }
+        let noun = self.kind.noun();
+        let base = format!("/sys/class/net/{}/bonding", self.bond);
+        let active = active.filter(|a| !a.is_empty());
         let cands: Vec<Candidate> = self
             .slaves
             .iter()
@@ -352,7 +747,7 @@ impl Leg {
             })
             .collect();
         let Some(target) = decide(active, &cands, &self.prefs) else {
-            // Staying put. Say so once if the wire an operator would expect ingress on is out
+            // Staying put. Say so once if the wire an operator would expect the leg on is out
             // of the running for a reason the bond cannot fix.
             self.note_no_carrier(active, &cands, log);
             return;
@@ -384,8 +779,9 @@ impl Leg {
                 // failure as `Error::Fatal`, whose Display carries that word, so the message is
                 // taken out of it rather than printed through it.
                 log.push(format!(
-                    "cfab: warn: {} ingress: cannot move {} to {to} ({target}): {}",
+                    "cfab: warn: {} {}: cannot move {} to {to} ({target}): {}",
                     self.zone,
+                    self.kind.family(),
                     self.bond,
                     without_fatal(&e)
                 ));
@@ -395,32 +791,43 @@ impl Leg {
         }
         self.refused = None;
         self.held = target.clone();
-        self.active_now = Some(target);
-        match from {
+        self.active_now = Some(target.clone());
+        let family = self.kind.family();
+        let from_wire = from.map(|f| f.wire.clone());
+        let from_carrier = from.map(|f| f.carrier);
+        let from_reachable = from.map(|f| f.state.reachable());
+        // The slave that has just been promoted gets its grace period here: it was chosen after
+        // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
+        // interval. Without it a two-slave ping-pong could move once per tick.
+        let grace = grace_of(&self.kind);
+        if let Some(s) = self.slaves.iter_mut().find(|s| s.ifname == target) {
+            s.grace_until = Some(now + grace);
+        }
+        match (from_wire, from_carrier, from_reachable) {
             // Carrier is tested FIRST, and not only because it is the actionable end of a wire
             // that has both faults: the carrier fast path moves the bond while the hysteresis
             // still calls the wire reachable, so keying on `reachable()` alone would announce a
             // move AWAY from a dead wire as a move back to a live one.
-            Some(f) if !f.carrier => log.push(format!(
-                "cfab: {} ingress: {} lost carrier, moved {} to {to}",
-                self.zone, f.wire, self.bond
+            (Some(w), Some(false), _) => log.push(format!(
+                "cfab: {} {family}: {w} lost carrier, moved {} to {to}",
+                self.zone, self.bond
             )),
-            Some(f) if !f.state.reachable() => log.push(format!(
-                "cfab: {} ingress: router unreachable on {}, moved {} to {to}",
-                self.zone, f.wire, self.bond
+            (Some(w), _, Some(false)) => log.push(format!(
+                "cfab: {} {family}: {noun} unreachable on {w}, moved {} to {to}",
+                self.zone, self.bond
             )),
-            Some(f) => log.push(format!(
-                "cfab: {} ingress: router reachable on {to} again, moved {} back from {}",
-                self.zone, self.bond, f.wire
+            (Some(w), _, _) => log.push(format!(
+                "cfab: {} {family}: {noun} reachable on {to} again, moved {} back from {w}",
+                self.zone, self.bond
             )),
-            None => log.push(format!(
-                "cfab: {} ingress: no slave of ours was active on {}, moved it to {to}",
+            (None, _, _) => log.push(format!(
+                "cfab: {} {family}: no slave of ours was active on {}, moved it to {to}",
                 self.zone, self.bond
             )),
         }
     }
 
-    /// Say once that ingress is not on the wire the preference order asks for, because that
+    /// Say once that the leg is not on the wire the preference order asks for, because that
     /// wire has no carrier. Repeated every tick it would be a stuck island's log, twice a
     /// second; said once per (skipped wire, wire we are on) it is the diagnosis.
     fn note_no_carrier(
@@ -439,14 +846,49 @@ impl Leg {
         }
         if let Some((skipped, on)) = &note {
             log.push(format!(
-                "cfab: {} ingress: {skipped} has no carrier, staying on {on}",
-                self.zone
+                "cfab: {} {}: {skipped} has no carrier, staying on {on}",
+                self.zone,
+                self.kind.family()
             ));
         }
         self.noted_no_carrier = note;
     }
 }
 
+impl Kind {
+    /// The word every line about this leg uses for what it is asking about. One spelling per
+    /// condition: the two families' lines differ by this noun and nothing else.
+    fn noun(&self) -> &'static str {
+        match self {
+            Kind::Ingress { .. } => "router",
+            Kind::Fallback(_) => "peers",
+        }
+    }
+
+    /// The word every line uses for the leg itself.
+    fn family(&self) -> &'static str {
+        match self {
+            Kind::Ingress { .. } => "ingress",
+            Kind::Fallback(_) => "fallback",
+        }
+    }
+}
+
+/// How long a slave of this leg is left alone after it appears or is promoted. An ingress leg
+/// has no passive channel and no grace: it asks, every tick, and the answer is the answer.
+fn grace_of(kind: &Kind) -> Duration {
+    match kind {
+        Kind::Ingress { .. } => Duration::ZERO,
+        Kind::Fallback(f) => f.windows.grace,
+    }
+}
+
+/// The address of the peer whose Router ID is `rid`. Both are built from the member's node
+/// number, which is the last octet of each — so the map is the octet, not a second table.
+fn target_of(targets: &[Ipv4Addr], rid: u32) -> Option<Ipv4Addr> {
+    let node = Ipv4Addr::from(rid).octets()[3];
+    targets.iter().find(|t| t.octets()[3] == node).copied()
+}
 #[cfg(test)]
 mod tests {
     use super::io::mock::ScriptedIo;
@@ -500,10 +942,12 @@ mod tests {
         sys
     }
 
-    /// The prober for the host member, and its slave names in enslave order.
+    /// The host member's INGRESS prober — the fallback legs are dropped, so these cases read
+    /// exactly the leg they are about. The fallback legs have their own tests below.
     fn prober(f: &Fabric) -> (Prober, Vec<String>) {
         let view = View::new(f, "pve1-tb").unwrap();
-        let p = Prober::from_view(&view);
+        let mut p = Prober::from_view(&view);
+        p.legs.retain(|l| matches!(l.kind, Kind::Ingress { .. }));
         let names = p.legs[0].slaves.iter().map(|s| s.ifname.clone()).collect();
         (p, names)
     }
@@ -513,10 +957,10 @@ mod tests {
         sys: &mut MockSys,
         io: &mut ScriptedIo,
         n: usize,
-    ) -> Vec<IngressLeg> {
+    ) -> Vec<ProbedLeg> {
         let mut last = Vec::new();
         for i in 0..n {
-            last = p.tick(sys, io, Instant::now() + PROBE_INTERVAL * i as u32);
+            last = p.tick(sys, io, Instant::now() + PROBE_INTERVAL * i as u32).ingress;
         }
         last
     }
@@ -545,12 +989,25 @@ mod tests {
     }
 
     #[test]
-    fn a_leaf_has_no_ingress_leg_to_probe() {
+    fn a_leaf_has_no_ingress_leg_to_probe_and_every_fallback_leg() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let p = Prober::from_view(&view);
-        assert!(p.is_empty());
-        assert!(p.held_primaries().is_empty());
+        let rows = p.report(Instant::now());
+        assert!(
+            rows.ingress.is_empty(),
+            "the outside reaches a leaf at the leaf's own addresses, never at a fabric identity"
+        );
+        assert_eq!(
+            rows.fallback.iter().map(|l| l.zone.clone()).collect::<Vec<_>>(),
+            vec!["storage", "cluster", "mgmt"],
+            "a leaf's fallback path is a real path, and F20 is a real defect on it"
+        );
+        assert_eq!(
+            p.held_primaries().slave_for("cfab-st-fb"),
+            Some("cfab-st-fb-a"),
+            "and the watchdog must be told which slave to re-assert"
+        );
     }
 
     /// The healthy case, which is every second the fabric spends working: nothing is written.
@@ -770,6 +1227,7 @@ mod tests {
         let f = fabric_with_a_domain_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut p = Prober::from_view(&view);
+        p.legs.retain(|l| matches!(l.kind, Kind::Ingress { .. }));
         let leg = p.legs[0].bond.clone();
         let mut sys = bonding(&leg);
         let mut io = ScriptedIo::answering_on(ROUTER, &[]);

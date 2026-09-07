@@ -389,11 +389,23 @@ fn restore_missing_legs(
             let z = f.zone(&r.zone)?;
             let qos = apply::qos_map(f, z);
             let cidr = format!("{}/24", view.segment_addr(z, r.seg));
-            // A fallback bond carries no router, so nothing probes it and nothing holds its
-            // primary: its home is the declaration's, as it has always been.
+            // A fallback bond's primary is the prober's too (F20): a wire that re-enumerates
+            // is re-enslaved last, and re-asserting the DECLARED home here would undo a move
+            // the prober made for cause on the very next USB blip.
             rebuild_bond_slaves(
-                sys, view, &wire, &r.zone, &r.ifname, r.vid, &r.slaves, &r.home, None, &qos, &cidr,
-                rebuilt, unrestored,
+                sys,
+                view,
+                &wire,
+                &r.zone,
+                &r.ifname,
+                r.vid,
+                &r.slaves,
+                &r.home,
+                held.slave_for(&r.ifname),
+                &qos,
+                &cidr,
+                rebuilt,
+                unrestored,
             )?;
         }
         if rebuilt.len() > rebuilt_before {
@@ -613,13 +625,13 @@ fn restore_bond_membership(
         }
         if sys.run(&["ip", "link", "set", &active, "nomaster"])?.ok() {
             restored.push(format!(
-                "fallback {}: released foreign slave {active}",
+                "{} fallback: released foreign slave {active}",
                 r.zone
             ));
         } else {
             run_ignore(sys, &["ip", "link", "set", &r.ifname, "down"])?;
             downed.push(format!(
-                "fallback {} down: foreign slave {active} could not be released",
+                "{} fallback down: foreign slave {active} could not be released",
                 r.zone
             ));
         }
@@ -1171,7 +1183,7 @@ pub(crate) mod tests {
         // The bond restore behind it still ran.
         assert_eq!(
             report.restored,
-            vec!["fallback cluster: released foreign slave someone-elses0".to_string()]
+            vec!["cluster fallback: released foreign slave someone-elses0".to_string()]
         );
         assert!(report.downed.is_empty(), "{:?}", report.downed);
     }
@@ -1198,7 +1210,7 @@ pub(crate) mod tests {
         assert!(
             report
                 .restored
-                .contains(&"fallback storage: released foreign slave someone-elses0".to_string()),
+                .contains(&"storage fallback: released foreign slave someone-elses0".to_string()),
             "{:?}",
             report.restored
         );
@@ -1376,7 +1388,7 @@ pub(crate) mod tests {
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.restored,
-            vec!["fallback storage: released foreign slave someone-elses0".to_string()]
+            vec!["storage fallback: released foreign slave someone-elses0".to_string()]
         );
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         assert!(
@@ -1411,7 +1423,7 @@ pub(crate) mod tests {
         assert_eq!(
             report.downed,
             vec![
-                "fallback storage down: foreign slave someone-elses0 could not be released"
+                "storage fallback down: foreign slave someone-elses0 could not be released"
                     .to_string()
             ]
         );

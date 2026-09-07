@@ -23,7 +23,7 @@ use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
 use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
-use crate::supervisor::report::{Component, Components, render_line};
+use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
 use crate::sys::{Output, Sys, run_optional};
 
 /// The re-read cadence of `--wait`.
@@ -470,6 +470,7 @@ fn read(
         sys,
         view,
         doc.as_ref(),
+        comps.as_deref(),
         c,
         &absent,
         &mut counts,
@@ -1005,54 +1006,67 @@ fn at_least_two_way(state: &str) -> bool {
 
 /// One active-backup leg to grade. The two migrating legs cfab builds — a zone's universal
 /// segment and an ingress leg on gw scope `any` — are the SAME netdev shape built by the same
-/// builder, so they are read by the same code and every condition has one spelling. Only two
-/// things differ per caller, and both are here rather than in a branch: the `subject` each line
-/// opens with (`fallback <zone>` / `<zone> ingress`), and the `dark` line, because a leg with no
-/// live slave means "the safety net is gone" on a fallback and "the outside cannot reach this
-/// zone" on the ingress.
+/// builder, so they are read by the same code and every condition has one spelling. Only three
+/// things differ per caller, and all of them are here rather than in a branch: the `subject`
+/// each line opens with (`<zone> fallback` / `<zone> ingress`), the `noun` for what is on the
+/// far end (`peers` / `router`), and the `dark` line, because a leg with no live slave means
+/// "the safety net is gone" on a fallback and "the outside cannot reach this zone" on the
+/// ingress.
 struct BondCheck<'a> {
     subject: String,
+    /// What this leg's liveness is about, in every line that names it. One spelling per
+    /// condition: the two families' reason lines differ by this word and nothing else.
+    noun: &'a str,
     ifname: &'a str,
     slaves: &'a [Slave],
     home: &'a str,
     dark: String,
-    /// What the ingress prober says about the router under this leg. Always `Unknown` for a
-    /// fallback bond: no router lives on a fallback segment, so nothing probes one.
-    reach: RouterReach,
+    /// What the prober says about the far end under this leg.
+    reach: Reach,
 }
 
-/// What the supervisor's ingress prober says about the router's reachability under one leg.
-/// Carrier cannot answer this — an island whose uplink is dead keeps carrier and keeps switching
-/// locally (finding F21) — so where the bond SITS and whether the router can be reached over the
-/// wire it sits on are two different facts, and `status` needs both to name a cause.
+/// What the supervisor's prober says about the far end's liveness under one leg. Carrier cannot
+/// answer this — an island whose uplink is dead keeps carrier and keeps switching locally
+/// (finding F21) — so where the bond SITS and whether anything can be reached over the wire it
+/// sits on are two different facts, and `status` needs both to name a cause.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RouterReach {
+enum Reach {
     /// No rows: no supervisor answering, a supervisor from before the prober, or a leg nothing
     /// probes. Every line reads exactly as it did before the prober existed.
     Unknown,
-    /// The router answers over the home wire.
+    /// The far end is live over the home wire.
     Home,
-    /// The home wire has no router, but another wire does — the migration the prober makes.
+    /// The home wire is silent and being asked, but nothing is confirmed yet. A suspicion is not
+    /// a verdict, which is the whole difference between this and `HomeDark`.
+    HomeSuspect,
+    /// The home wire is confirmed dead, but another wire is live — the migration the prober makes.
     HomeDark,
-    /// No wire reaches the router.
+    /// No wire reaches the far end.
     AllDark,
+    /// No wire of this leg has heard anything at all (spec §5 rule 2). Nothing was moved,
+    /// because there is nowhere to move to; only a fallback leg can be in this state.
+    Quiet,
 }
 
 /// The prober's verdict for one zone's leg, from the `components` document.
-fn router_reach(comps: Option<&Components>, zone: &str, home: &str) -> RouterReach {
-    let Some(row) = comps.and_then(|c| c.ingress.iter().find(|i| i.zone == zone)) else {
-        return RouterReach::Unknown;
+fn reach(rows: Option<&[ProbedLeg]>, zone: &str, home: &str) -> Reach {
+    let Some(row) = rows.and_then(|r| r.iter().find(|i| i.zone == zone)) else {
+        return Reach::Unknown;
     };
     if row.slaves.is_empty() {
-        return RouterReach::Unknown;
+        return Reach::Unknown;
     }
     if row.slaves.iter().all(|s| !s.reachable) {
-        return RouterReach::AllDark;
+        return Reach::AllDark;
+    }
+    if row.quiet {
+        return Reach::Quiet;
     }
     match row.slaves.iter().find(|s| s.wire == home) {
-        Some(s) if !s.reachable => RouterReach::HomeDark,
+        Some(s) if !s.reachable => Reach::HomeDark,
+        Some(s) if s.suspect => Reach::HomeSuspect,
         // A home wire the prober does not list at all cannot be called dark.
-        Some(_) | None => RouterReach::Home,
+        Some(_) | None => Reach::Home,
     }
 }
 
@@ -1061,6 +1075,7 @@ fn router_reach(comps: Option<&Components>, zone: &str, home: &str) -> RouterRea
 fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, leg: &BondCheck) {
     let BondCheck {
         subject,
+        noun,
         ifname,
         slaves,
         home,
@@ -1095,8 +1110,13 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         // The prober's verdict outranks where the bond sits: with no wire reaching the router,
         // the active slave explains nothing an operator can act on, and the wire whose uplink
         // to fix is every one of them.
-        (Ok(_), Ok(_)) if *reach == RouterReach::AllDark => {
-            c.settling(format!("{subject}: router unreachable on every wire"));
+        (Ok(_), Ok(_)) if *reach == Reach::AllDark => {
+            c.settling(format!("{subject}: {noun} unreachable on every wire"));
+        }
+        // Nobody is heard anywhere, so no wire is to blame and the bond was left where it is.
+        // Settling: the fabric may simply be starting, and one line says it once.
+        (Ok(_), Ok(_)) if *reach == Reach::Quiet => {
+            c.settling(format!("{subject}: no {noun} heard on any wire"));
         }
         (Ok(_), Ok(active)) => {
             let active = active.trim();
@@ -1125,8 +1145,13 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                         // fault is fixed — a member that lives on one of these (a dead island
                         // uplink, a stuck reselect) would otherwise spend every deadline of
                         // every `status --wait` on it.
-                        Ok(s) if s.trim() == "1" && *reach == RouterReach::HomeDark => c.standing(
-                            format!("{subject} via {wire} (home {home}: router unreachable)"),
+                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeDark => c.standing(
+                            format!("{subject} via {wire} (home {home}: {noun} unreachable)"),
+                        ),
+                        // A suspicion, not a verdict: the home wire is silent and is being
+                        // asked. Settling, because the next tick or two answers it either way.
+                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeSuspect => c.settling(
+                            format!("{subject} via {wire} (home {home}: no {noun} heard)"),
                         ),
                         Ok(s) if s.trim() == "1" => {
                             c.standing(format!("{subject} via {wire} (home {home} has carrier)"))
@@ -1185,6 +1210,7 @@ fn fallback(
     sys: &mut dyn Sys,
     view: &View,
     doc: Option<&Value>,
+    comps: Option<&Components>,
     c: &mut Ctx,
     absent: &BTreeSet<String>,
     counts: &mut Counts,
@@ -1207,12 +1233,13 @@ fn fallback(
             c,
             absent,
             &BondCheck {
-                subject: format!("fallback {zone}"),
+                subject: format!("{zone} fallback"),
+                noun: "peers",
                 ifname: &r.ifname,
                 slaves: &r.slaves,
                 home: &r.home,
-                dark: format!("fallback {zone} no carrier"),
-                reach: RouterReach::Unknown,
+                dark: format!("{zone} fallback no carrier"),
+                reach: reach(comps.map(|c| c.fallback.as_slice()), zone, &r.home),
             },
         );
 
@@ -1240,7 +1267,7 @@ fn fallback(
         let Some(nbrs) = nbrs else {
             if doc.is_some() {
                 c.settling(format!(
-                    "fallback {zone}: {} is missing from the engine's ospf state (its neighbors \
+                    "{zone} fallback: {} is missing from the engine's ospf state (its neighbors \
                      cannot be read) — re-run cfab up",
                     r.ifname
                 ));
@@ -1454,6 +1481,7 @@ fn return_path_and_ingress(
                 absent,
                 &BondCheck {
                     subject: format!("{} ingress", z.name),
+                    noun: "router",
                     ifname: &leg.ifname,
                     slaves: &leg.slaves,
                     home: &leg.home,
@@ -1464,7 +1492,7 @@ fn return_path_and_ingress(
                         "{} gw {} unreachable (ingress leg {} has no live slave)",
                         z.name, gw.router, leg.ifname
                     ),
-                    reach: router_reach(comps, &z.name, &leg.home),
+                    reach: reach(comps.map(|c| c.ingress.as_slice()), &z.name, &leg.home),
                 },
             );
         }
@@ -1596,7 +1624,7 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
         {
             // Standing: a drop counter since this member's last `up`.
             c.standing(format!(
-                "fallback {}: control egress ceiling tripped ({n} drops, limit {}/s)",
+                "{} fallback: control egress ceiling tripped ({n} drops, limit {}/s)",
                 ce.zone, ce.rate_pps
             ));
         }
@@ -2592,7 +2620,7 @@ mod tests {
         );
         for zone in ["storage", "cluster", "mgmt"] {
             let want =
-                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+                format!("  {zone} fallback: control egress ceiling tripped (28 drops, limit 80/s)");
             assert!(
                 report.output.lines().filter(|l| *l == want).count() == 1,
                 "expected exactly one {want:?} in:\n{}",
@@ -2623,7 +2651,7 @@ mod tests {
         );
         for zone in ["storage", "cluster", "mgmt"] {
             let want =
-                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+                format!("  {zone} fallback: control egress ceiling tripped (28 drops, limit 80/s)");
             assert!(
                 report.output.lines().filter(|l| *l == want).count() == 1,
                 "expected exactly one {want:?} in:\n{}",
@@ -2731,7 +2759,7 @@ mod tests {
         assert_eq!(report.code, 0);
         for zone in ["storage", "cluster", "mgmt"] {
             let want =
-                format!("  fallback {zone}: control egress ceiling tripped (28 drops, limit 80/s)");
+                format!("  {zone} fallback: control egress ceiling tripped (28 drops, limit 80/s)");
             assert!(
                 report.output.lines().filter(|l| *l == want).count() == 1,
                 "expected exactly one {want:?} in:\n{}",
@@ -3897,7 +3925,7 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
-                "  fallback storage: slave cfab-st-fb-b on eth1 is not enslaved to cfab-st-fb \
+                "  storage fallback: slave cfab-st-fb-b on eth1 is not enslaved to cfab-st-fb \
                  — re-run cfab up\n"
             ),
             "{}",
@@ -4327,7 +4355,7 @@ mod tests {
         assert!(
             report
                 .output
-                .contains("  fallback storage via eth0 (home eth9 has carrier)\n"),
+                .contains("  storage fallback via eth0 (home eth9 has carrier)\n"),
             "{}",
             report.output
         );
@@ -4348,7 +4376,7 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
         assert!(
-            report.output.contains("  fallback storage via eth0\n"),
+            report.output.contains("  storage fallback via eth0\n"),
             "{}",
             report.output
         );
@@ -4369,7 +4397,7 @@ mod tests {
         assert!(
             report
                 .output
-                .contains("  fallback storage via eth0 (home eth9 carrier unreadable)\n"),
+                .contains("  storage fallback via eth0 (home eth9 carrier unreadable)\n"),
             "{}",
             report.output
         );
@@ -4385,7 +4413,7 @@ mod tests {
             .file("/sys/class/net/cfab-cl-fb/bonding/active_slave", "\n");
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
-            report.output.contains("  fallback cluster no carrier\n"),
+            report.output.contains("  cluster fallback no carrier\n"),
             "{}",
             report.output
         );
@@ -4409,12 +4437,12 @@ mod tests {
         assert!(
             report
                 .output
-                .contains("  fallback storage down with foreign slave someone-elses0 active\n"),
+                .contains("  storage fallback down with foreign slave someone-elses0 active\n"),
             "{}",
             report.output
         );
         assert!(
-            !report.output.contains("fallback storage no carrier"),
+            !report.output.contains("storage fallback no carrier"),
             "{}",
             report.output
         );
@@ -4441,7 +4469,7 @@ mod tests {
         );
         assert!(
             report.output.contains(
-                "  fallback storage: cfab-st-fb is missing from the engine's ospf state \
+                "  storage fallback: cfab-st-fb is missing from the engine's ospf state \
                  (its neighbors cannot be read) — re-run cfab up\n"
             ),
             "{}",
