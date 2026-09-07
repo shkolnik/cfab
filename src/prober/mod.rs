@@ -58,6 +58,14 @@ struct Leg {
     /// carrier reselect moves it. `None` before the first read, and for a leg that has none.
     active_now: Option<String>,
     slaves: Vec<ProbeSlave>,
+    /// The (skipped wire, wire we are on) pair the last no-carrier note named, so the same
+    /// sentence is not repeated twice a second for as long as an island stays dark. `None`
+    /// re-arms it: the next time the pair exists, it is said again.
+    noted_no_carrier: Option<(String, String)>,
+    /// The (target, active) the last refused sysfs write was for. The same write is not retried
+    /// while nothing has changed — the kernel refused it for a reason we can no longer see, and
+    /// a refusal repeated every 500 ms is noise, not a diagnosis.
+    refused: Option<(String, Option<String>)>,
 }
 
 struct ProbeSlave {
@@ -70,6 +78,10 @@ struct ProbeSlave {
     /// A probe went out on the previous tick, so this tick's silence means something. Without
     /// it the very first tick — which has asked nobody anything — would count as a miss.
     probed: bool,
+    /// This slave's netdev had carrier as of this tick's read. Not folded into `state`: carrier
+    /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
+    /// to believe it is three refused `active_slave` writes (F23).
+    carrier: bool,
     last_reply: Option<Instant>,
 }
 
@@ -152,6 +164,7 @@ impl Prober {
                         mac: frame::synthetic_mac(view.node(), z.id, i as u8),
                         state: Hysteresis::default(),
                         probed: false,
+                        carrier: false,
                         last_reply: None,
                     })
                     .collect()
@@ -163,6 +176,7 @@ impl Prober {
                     mac: frame::synthetic_mac(view.node(), z.id, 0),
                     state: Hysteresis::default(),
                     probed: false,
+                    carrier: false,
                     last_reply: None,
                 }]
             };
@@ -180,6 +194,8 @@ impl Prober {
                 prefs,
                 held,
                 active_now: None,
+                noted_no_carrier: None,
+                refused: None,
                 slaves,
             });
         }
@@ -228,6 +244,7 @@ impl Prober {
                 if s.probed {
                     s.state.observe(replied);
                 }
+                s.carrier = has_carrier(sys, &s.ifname);
             }
             leg.actuate(sys, log);
             for s in &mut leg.slaves {
@@ -272,7 +289,10 @@ impl Prober {
                     .map(|s| IngressSlave {
                         wire: s.wire.clone(),
                         island: s.island.clone(),
-                        reachable: s.state.reachable(),
+                        // A wire with no carrier reaches nothing, whatever the last three probes
+                        // said; reporting it reachable would have `status` blame the router for
+                        // an unplugged cable.
+                        reachable: s.state.reachable() && s.carrier,
                         last_reply_ms: s
                             .last_reply
                             .map(|t| now.saturating_duration_since(t).as_millis() as u64),
@@ -280,6 +300,25 @@ impl Prober {
                     .collect(),
             })
             .collect()
+    }
+}
+
+/// Does this netdev have carrier? An unreadable file is NO carrier, deliberately: `carrier`
+/// returns `EINVAL` on an interface that is administratively down and `ENOENT` on one that has
+/// gone away, and the kernel refuses `bonding/active_slave` in both of those states too.
+fn has_carrier(sys: &dyn Sys, ifname: &str) -> bool {
+    sys.read(&format!("/sys/class/net/{ifname}/carrier"))
+        .is_ok_and(|s| s.trim() == "1")
+}
+
+/// One `Sys` error as a line a task that carries on may print. `Sys::write` reports every
+/// failure as `Error::Fatal`, which Displays as `FATAL: …`; the prober's writes are not fatal to
+/// anything — it logs, keeps the bond where it is and ticks again — so the word must not appear.
+fn without_fatal(e: &crate::error::Error) -> String {
+    if let crate::error::Error::Fatal(m) = e {
+        m.clone()
+    } else {
+        e.to_string()
     }
 }
 
@@ -307,11 +346,16 @@ impl Leg {
                 ifname: s.ifname.clone(),
                 wire: s.wire.clone(),
                 reachable: s.state.reachable(),
+                carrier: s.carrier,
             })
             .collect();
         let Some(target) = decide(active, &cands, &self.prefs) else {
+            // Staying put. Say so once if the wire an operator would expect ingress on is out
+            // of the running for a reason the bond cannot fix.
+            self.note_no_carrier(active, &cands, log);
             return;
         };
+        self.noted_no_carrier = None;
         let to = self
             .slaves
             .iter()
@@ -324,15 +368,30 @@ impl Leg {
         // which point `primary_reselect=always` hands the bond straight back to the primary the
         // declaration set. Writing `primary` is therefore not bookkeeping — it is what makes the
         // move survive.
+        // A refusal we have already reported and nothing has changed since: the write would be
+        // refused again, and saying so twice a second is noise. Any change in what we want or
+        // where the bond sits re-arms it below.
+        let attempt = (target.clone(), active.map(str::to_string));
+        if self.refused.as_ref() == Some(&attempt) {
+            return;
+        }
         for file in ["primary", "active_slave"] {
             if let Err(e) = sys.write(&format!("{base}/{file}"), &target) {
+                // WARN, not FATAL: the supervisor is running, the bond is where it was, and the
+                // next tick with different inputs will try again. `Sys::write` wraps every
+                // failure as `Error::Fatal`, whose Display carries that word, so the message is
+                // taken out of it rather than printed through it.
                 log.push(format!(
-                    "cfab: {} ingress: cannot move {} to {to}: {e}",
-                    self.zone, self.bond
+                    "cfab: warn: {} ingress: cannot move {} to {to} ({target}): {}",
+                    self.zone,
+                    self.bond,
+                    without_fatal(&e)
                 ));
+                self.refused = Some(attempt);
                 return;
             }
         }
+        self.refused = None;
         self.held = target.clone();
         self.active_now = Some(target);
         match from {
@@ -349,6 +408,32 @@ impl Leg {
                 self.zone, self.bond
             )),
         }
+    }
+
+    /// Say once that ingress is not on the wire the preference order asks for, because that
+    /// wire has no carrier. Repeated every tick it would be a stuck island's log, twice a
+    /// second; said once per (skipped wire, wire we are on) it is the diagnosis.
+    fn note_no_carrier(
+        &mut self,
+        active: Option<&str>,
+        cands: &[Candidate],
+        log: &mut Vec<String>,
+    ) {
+        let on = active.and_then(|a| cands.iter().find(|c| c.ifname == a));
+        let note = match (decide::skipped_for_carrier(active, cands, &self.prefs), on) {
+            (Some(skipped), Some(on)) => Some((skipped.wire.clone(), on.wire.clone())),
+            _ => None,
+        };
+        if note == self.noted_no_carrier {
+            return;
+        }
+        if let Some((skipped, on)) = &note {
+            log.push(format!(
+                "cfab: {} ingress: {skipped} has no carrier, staying on {on}",
+                self.zone
+            ));
+        }
+        self.noted_no_carrier = note;
     }
 }
 
