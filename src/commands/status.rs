@@ -106,16 +106,48 @@ impl Counts {
     }
 }
 
+/// What one reason line means for `--wait`, and the only thing the classification decides
+/// (F22, VERIFIED on the rack 2026-09-07: the headline goes UP seconds before the engine has
+/// installed the routes, and a wait that ends on the headline alone lets a deployment gate pass
+/// over a fabric that cannot carry anything yet).
+///
+/// Every emitter states its class at the call site — there is no default and no matching on the
+/// text of a line, so a new reason line cannot join either set by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// The fabric itself clears this one: an adjacency that is still forming, a route or an
+    /// address the engine has not installed yet, a child the supervisor is restarting, a
+    /// sysctl/rule/leg `up` and the watchdog own. Its presence means "not settled", so it holds
+    /// `--wait` open until the deadline.
+    Settling,
+    /// Waiting changes nothing: the line is a design-health note a settled fabric prints, a
+    /// counter, a drift against generated state, a foreign daemon, or a hardware fact. Holding
+    /// the wait on one would cost every `status --wait` its whole deadline, every time.
+    Standing,
+}
+
 /// Reason lines. Not verdicts: a posture condition either actuates (the links go down and the
 /// state follows) or lands here, where it never moves the state.
 #[derive(Default, Clone)]
 struct Ctx {
-    reasons: Vec<String>,
+    reasons: Vec<(Class, String)>,
 }
 
 impl Ctx {
-    fn note(&mut self, msg: impl Into<String>) {
-        self.reasons.push(msg.into());
+    /// A line the fabric is expected to clear by itself (see `Class::Settling`).
+    fn settling(&mut self, msg: impl Into<String>) {
+        self.reasons.push((Class::Settling, msg.into()));
+    }
+
+    /// A line no amount of waiting changes (see `Class::Standing`).
+    fn standing(&mut self, msg: impl Into<String>) {
+        self.reasons.push((Class::Standing, msg.into()));
+    }
+
+    /// Is this fabric still settling? One settling line is enough: `--wait` exists for exactly
+    /// the window in which they are still there.
+    fn settling_now(&self) -> bool {
+        self.reasons.iter().any(|(k, _)| *k == Class::Settling)
     }
 }
 
@@ -135,7 +167,8 @@ pub fn run(
     if let Some(cfg) = declared
         && let Some(note) = declaration_note(&*sys, view, cfg)
     {
-        base.note(note);
+        // Standing: only an operator's edit or a reload changes what this file says.
+        base.standing(note);
     }
     let expected = expected_links(view)?;
     let mut t = 0u64;
@@ -151,10 +184,15 @@ pub fn run(
         } else {
             None
         };
-        // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
-        // Every other state — degraded, failed, not applied — waits the full deadline and then
-        // reports what it reached.
-        let done = counts.as_ref().is_some_and(|n| n.state() == State::Up) || t >= wait_s;
+        // The wait exists for the post-`up` settle, not as a verdict: only a settled UP ends it
+        // early. Every other state — degraded, failed, not applied — and every UP that still
+        // carries a settling reason line waits the full deadline and then reports what it
+        // reached. The headline alone is not enough: it counts sessions, and a member's routes,
+        // addresses and source pins arrive after the sessions do (F22).
+        let done = counts
+            .as_ref()
+            .is_some_and(|n| n.state() == State::Up && !c.settling_now())
+            || t >= wait_s;
         if done {
             return Ok(match counts {
                 Some(n) => finish(
@@ -385,7 +423,7 @@ fn read(
         // The engine's socket is silent. The supervisor (spec §9) is the authority on why:
         // if it answers, quote the child's state; if it does not, the fault is upstream of
         // the engine and the remedy is to start the service — one spelling each.
-        c.note(engine_down_reason(f, comps));
+        c.settling(engine_down_reason(f, comps));
     }
     let absent = absent_ifs(&*sys, view);
     posture(sys, view, doc.as_ref(), comps, c, &absent)?;
@@ -423,7 +461,7 @@ fn read(
             peers_up.insert(*p);
             up_legs.insert((*p, z.clone(), *seg));
         } else {
-            c.note(format!("down {z}:{seg}:.{p}"));
+            c.settling(format!("down {z}:{seg}:.{p}"));
         }
     }
 
@@ -487,10 +525,12 @@ fn bfd_port(sys: &mut dyn Sys, view: &View, c: &mut Ctx, comps: Option<&Componen
     };
     let joined = doc.lines.join("\n");
     if let Some(line) = engine_ctl::bfd_bind_error_line(&joined, port) {
-        c.note(format!(
+        // Standing, both: a port somebody else holds is let go by that somebody, never by
+        // waiting — and the second line is this one's remedy.
+        c.standing(format!(
             "bfd udp/{port}: the engine is not running and could not bind it — {line}"
         ));
-        c.note(format!(
+        c.standing(format!(
             "remedy: {}",
             engine_ctl::bfd_bind_remedy(line, port)
         ));
@@ -550,10 +590,11 @@ fn port_custody(sys: &mut dyn Sys, port: u16, c: &mut Ctx, engine: Option<&Compo
         ),
         None => return false,
     };
-    c.note(format!(
+    // Standing, both: the holder is another daemon, and the second line is this one's remedy.
+    c.standing(format!(
         "bfd udp/{port}: {what} holds this port, which the engine needs exclusively"
     ));
-    c.note(format!(
+    c.standing(format!(
         "remedy: {}",
         engine_ctl::bfd_port_remedy(&remedy, port)
     ));
@@ -706,7 +747,7 @@ fn if_file(
     match sys.read(path) {
         Ok(v) => Some(v),
         Err(e) => {
-            c.note(format!("{path} unreadable ({e})"));
+            c.settling(format!("{path} unreadable ({e})"));
             None
         }
     }
@@ -738,7 +779,7 @@ fn posture(
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "missing".to_string());
         if got != "2" {
-            c.note(format!("rp_filter {ifname}={got} (want 2 = loose)"));
+            c.settling(format!("rp_filter {ifname}={got} (want 2 = loose)"));
         }
     }
 
@@ -762,20 +803,20 @@ fn posture(
                 };
                 let v = v.trim();
                 if v != "0" {
-                    c.note(format!("{ifn} forwarding!=0 (a leaf never transits)"));
+                    c.settling(format!("{ifn} forwarding!=0 (a leaf never transits)"));
                 }
             }
             for z in &f.zones {
                 let blk = format!("{}.0.0/16", z.block());
                 let r1000 = sys.run(&["ip", "rule", "show", "pref", "1000"])?.stdout;
                 if !r1000.contains(&format!("to {blk} iif lo lookup main")) {
-                    c.note(format!(
+                    c.settling(format!(
                         "leak guard missing: pref 1000 to {blk} iif lo lookup main"
                     ));
                 }
                 let r1001 = sys.run(&["ip", "rule", "show", "pref", "1001"])?.stdout;
                 if !r1001.contains(&format!("to {blk} unreachable")) {
-                    c.note(format!(
+                    c.settling(format!(
                         "leak guard missing: pref 1001 to {blk} unreachable"
                     ));
                 }
@@ -819,7 +860,7 @@ fn posture(
                     }
                 }
                 if below {
-                    c.note(format!(
+                    c.settling(format!(
                         "ospf {}: a transit link in our router LSA is advertised below \
                          `[cost] leaf_offset`={} (we could be chosen as a transit) — re-run cfab up",
                         z.id, f.leaf_cost_offset
@@ -833,20 +874,21 @@ fn posture(
                 .read(&format!("{}/policy.nft", f.run_dir))
                 .unwrap_or_default();
             if want_policy != loaded {
-                c.note("policy drift — re-run cfab up");
+                // Standing: a mismatch against generated state, repaired by `up` alone.
+                c.standing("policy drift — re-run cfab up");
             }
             let live = sys.run(&["nft", "-s", "list", "table", "inet", "cfab-fwd"])?;
             let applied = sys
                 .read(&format!("{}/policy.applied", f.run_dir))
                 .unwrap_or_default();
             if !live.ok() || live.stdout != applied {
-                c.note("ruleset drift — re-run cfab up");
+                c.standing("ruleset drift — re-run cfab up");
             }
             let chain = sys
                 .run(&["nft", "list", "chain", "inet", "cfab-fwd", "forward"])?
                 .stdout;
             if !chain.contains("policy drop;") {
-                c.note(
+                c.standing(
                     "transit disabled: table inet cfab-fwd / chain forward with policy drop is \
                      not loaded — re-run cfab up",
                 );
@@ -862,22 +904,25 @@ fn posture(
                     .filter(|(_, fwd)| *fwd)
                     .map(|(ifn, _)| ifn)
                     .collect();
+                // Standing, both: a foreign chain at the forward hook is another package's,
+                // and the second line is this one's remedy.
                 for b in &blocked {
-                    c.note(format!(
+                    c.standing(format!(
                         "transit blocked by a foreign forward-hook chain: {b}"
                     ));
                 }
-                c.note(foreign_forward_remedy(&ifs));
+                c.standing(foreign_forward_remedy(&ifs));
             }
             if !view.admin_ifs().is_empty() {
                 let admin = view.admin_ifs().join(" ");
                 for counter in ["admin-in", "admin-out"] {
                     match counter_packets(&chain, counter) {
                         Some(0) => {}
-                        Some(n) => c.note(format!(
+                        // Standing: a counter is history, and history does not settle.
+                        Some(n) => c.standing(format!(
                             "{counter} counter = {n} (something tried to transit {admin})"
                         )),
-                        None => c.note(format!(
+                        None => c.standing(format!(
                             "{counter} counter = absent (something tried to transit {admin})"
                         )),
                     }
@@ -885,7 +930,7 @@ fn posture(
                 for a in view.admin_ifs() {
                     let path = format!("/proc/sys/net/ipv4/conf/{a}/forwarding");
                     if if_file(&*sys, c, absent, a, &path).is_some_and(|v| v.trim() != "0") {
-                        c.note(format!("{a} forwarding=1"));
+                        c.settling(format!("{a} forwarding=1"));
                     }
                 }
             }
@@ -905,11 +950,11 @@ fn posture(
                 };
                 let v = v.trim();
                 if fwd && v != "1" {
-                    c.note(format!(
+                    c.settling(format!(
                         "{ifn} forwarding=0 (class-table interface should forward)"
                     ));
                 } else if !fwd && v != "0" {
-                    c.note(format!(
+                    c.settling(format!(
                         "{ifn} forwarding=1 (cfab interface that must not transit)"
                     ));
                 }
@@ -921,14 +966,15 @@ fn posture(
                 && let Some(ago) = cc.watchdog.last_tick_s_ago
                 && ago > WATCHDOG_STALE_SECS
             {
-                c.note(format!(
+                c.settling(format!(
                     "forwarding watchdog not ticking (last tick {ago}s ago) — the actuator is down"
                 ));
             }
         }
         MemberKind::Host => {
             if sys.run(&["nft", "list", "table", "inet", "cfab-fwd"])?.ok() {
-                c.note("`[forward] enabled`=0 but table inet cfab-fwd is loaded");
+                // Standing: a table left behind by an earlier declaration; `down` removes it.
+                c.standing("`[forward] enabled`=0 but table inet cfab-fwd is loaded");
             }
             for ifn in conf_interfaces(sys)? {
                 if !view.owns_if(&ifn) {
@@ -936,7 +982,7 @@ fn posture(
                 }
                 let path = format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding");
                 if if_file(&*sys, c, absent, &ifn, &path).is_some_and(|v| v.trim() != "0") {
-                    c.note(format!("{path} = 1 with `[forward] enabled`=0"));
+                    c.settling(format!("{path} = 1 with `[forward] enabled`=0"));
                 }
             }
         }
@@ -1027,7 +1073,7 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         (Err(_), _) | (_, Err(_)) => {
             // Nothing under `bonding/` can be read, the slave list included: one line, and the
             // per-slave check below would only repeat it.
-            c.note(format!(
+            c.settling(format!(
                 "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
                  — re-run cfab up"
             ));
@@ -1041,16 +1087,16 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
             // even scheduled), and a confident wrong diagnosis is worse than a plain one.
             let active = active.trim().to_string();
             if !active.is_empty() && !slaves.iter().any(|s| s.ifname == active) {
-                c.note(format!("{subject} down with foreign slave {active} active"));
+                c.settling(format!("{subject} down with foreign slave {active} active"));
             } else {
-                c.note(dark.clone());
+                c.settling(dark.clone());
             }
         }
         // The prober's verdict outranks where the bond sits: with no wire reaching the router,
         // the active slave explains nothing an operator can act on, and the wire whose uplink
         // to fix is every one of them.
         (Ok(_), Ok(_)) if *reach == RouterReach::AllDark => {
-            c.note(format!("{subject}: router unreachable on every wire"));
+            c.settling(format!("{subject}: router unreachable on every wire"));
         }
         (Ok(_), Ok(active)) => {
             let active = active.trim();
@@ -1059,7 +1105,7 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                 .find(|s| s.ifname == active)
                 .map(|s| s.wire.clone())
             {
-                None => c.note(format!(
+                None => c.settling(format!(
                     "{subject}: {ifname} is up with no slave of ours active \
                      (active_slave={active:?})"
                 )),
@@ -1074,14 +1120,19 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                         // prober knows the home wire cannot reach the router, THAT is the cause
                         // and the carrier is a detail — the operator's next move is the uplink,
                         // not the bond.
-                        Ok(s) if s.trim() == "1" && *reach == RouterReach::HomeDark => c.note(
+                        // Standing, all four: the leg is up and carrying on a backup wire.
+                        // That is the migration working, and it holds until the home wire's
+                        // fault is fixed — a member that lives on one of these (a dead island
+                        // uplink, a stuck reselect) would otherwise spend every deadline of
+                        // every `status --wait` on it.
+                        Ok(s) if s.trim() == "1" && *reach == RouterReach::HomeDark => c.standing(
                             format!("{subject} via {wire} (home {home}: router unreachable)"),
                         ),
                         Ok(s) if s.trim() == "1" => {
-                            c.note(format!("{subject} via {wire} (home {home} has carrier)"))
+                            c.standing(format!("{subject} via {wire} (home {home} has carrier)"))
                         }
-                        Ok(_) => c.note(format!("{subject} via {wire}")),
-                        Err(_) => c.note(format!(
+                        Ok(_) => c.standing(format!("{subject} via {wire}")),
+                        Err(_) => c.standing(format!(
                             "{subject} via {wire} (home {home} carrier unreadable)"
                         )),
                     }
@@ -1101,14 +1152,16 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         // the slave list is the only thing that can say a slave went missing, so losing it is
         // a named gap in the diagnosis, never silence.
         Err(e) => {
-            c.note(format!("{subject}: {path} unreadable ({e})"));
+            c.settling(format!("{subject}: {path} unreadable ({e})"));
             return;
         }
     };
     let listed: Vec<&str> = listed.split_whitespace().collect();
     for s in slaves.iter().filter(|s| !absent.contains(&s.ifname)) {
         if !listed.contains(&s.ifname.as_str()) {
-            c.note(format!(
+            // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
+            // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
+            c.settling(format!(
                 "{subject}: slave {} on {} is not enslaved to {ifname} — re-run cfab up",
                 s.ifname, s.wire
             ));
@@ -1118,7 +1171,8 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         .iter()
         .filter(|n| !slaves.iter().any(|s| s.ifname == **n))
     {
-        c.note(format!("{subject}: {ifname} has a foreign slave {name}"));
+        // Standing: nothing of ours enslaved it, so nothing of ours takes it back.
+        c.standing(format!("{subject}: {ifname} has a foreign slave {name}"));
     }
 }
 
@@ -1185,14 +1239,14 @@ fn fallback(
             .map(|i| &i["neighbors"]);
         let Some(nbrs) = nbrs else {
             if doc.is_some() {
-                c.note(format!(
+                c.settling(format!(
                     "fallback {zone}: {} is missing from the engine's ospf state (its neighbors \
                      cannot be read) — re-run cfab up",
                     r.ifname
                 ));
             }
             for m in &peer_members {
-                c.note(format!("down {zone}:fallback:.{}", m.node));
+                c.settling(format!("down {zone}:fallback:.{}", m.node));
             }
             continue;
         };
@@ -1211,7 +1265,7 @@ fn fallback(
                 peers_up.insert(m.node);
                 two_way.insert((m.node, zone.clone()));
             } else {
-                c.note(format!("down {zone}:fallback:.{}", m.node));
+                c.settling(format!("down {zone}:fallback:.{}", m.node));
             }
         }
     }
@@ -1268,18 +1322,30 @@ fn reachability(
             };
             let target = format!("{}.0.{p}", z.block());
             let (dev, route_line) = route_dev(sys, &target)?;
+            // No route at all is one condition with one line: the src pin is a property of a
+            // route, so quoting an empty route line under it would say the same thing twice in
+            // a spelling (`src not pinned: []`) that names the wrong fault.
+            let Some(dev) = dev else {
+                c.settling(format!(
+                    "{} to {}: no route yet, expected {expect}",
+                    z.name, m.name
+                ));
+                continue;
+            };
             if dev != *expect {
-                c.note(format!(
+                c.settling(format!(
                     "{} to {} via {dev}, expected {expect}",
                     z.name, m.name
                 ));
             } else if *is_fallback {
                 // Health, whichever branch supplied the expectation — but worth a line: this
-                // peer is reachable, and not over a declared segment.
-                c.note(format!("{} to {} via fallback", z.name, m.name));
+                // peer is reachable, and not over a declared segment. Standing: a member that
+                // is domain-disjoint from this peer reaches it over the bond by design, and
+                // no amount of waiting moves it back onto a segment it does not share.
+                c.standing(format!("{} to {} via fallback", z.name, m.name));
             }
             if !route_line.contains(&format!("src {}.0.{}", z.block(), view.node())) {
-                c.note(format!(
+                c.settling(format!(
                     "{} to {} src not pinned: [{route_line}]",
                     z.name, m.name
                 ));
@@ -1309,7 +1375,7 @@ fn return_path_and_ingress(
         if !r2000.contains(&format!(
             "from {blk} to {blk} lookup main suppress_prefixlength 0"
         )) {
-            c.note(format!(
+            c.settling(format!(
                 "return path missing: pref 2000 from {blk} to {blk} lookup main \
                  suppress_prefixlength 0"
             ));
@@ -1319,13 +1385,13 @@ fn return_path_and_ingress(
             .lines()
             .any(|l| l.trim_end().ends_with(&format!("from {blk} lookup {id}")))
         {
-            c.note(format!(
+            c.settling(format!(
                 "return path missing: pref 2001 from {blk} lookup {id}"
             ));
         }
         let r2002 = sys.run(&["ip", "rule", "show", "pref", "2002"])?.stdout;
         if !r2002.contains(&format!("from {blk} unreachable")) {
-            c.note(format!(
+            c.settling(format!(
                 "return path missing: pref 2002 from {blk} unreachable"
             ));
         }
@@ -1350,7 +1416,9 @@ fn return_path_and_ingress(
             .filter(|l| l.starts_with("default "))
             .collect();
         if default_lines.is_empty() {
-            c.note(format!(
+            // Settling: the default in this table is LEARNED from the router, so a table with
+            // none is the ordinary state of the first seconds after the engine starts.
+            c.settling(format!(
                 "{} gw {} unreachable (table {id} has no default)",
                 z.name, gw.router
             ));
@@ -1365,7 +1433,7 @@ fn return_path_and_ingress(
                 // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
                 .any(|l| l.contains("linkdown") || l.contains("dead"))
         {
-            c.note(format!(
+            c.settling(format!(
                 "{} gw {} unreachable (table {id} default is linkdown - the ingress leg has no \
                  carrier)",
                 z.name, gw.router
@@ -1405,7 +1473,7 @@ fn return_path_and_ingress(
             .run(&["ip", "-4", "-br", "addr", "show", "dev", &leg.ifname])?
             .stdout;
         if !addr.contains(&format!(" {cidr}")) {
-            c.note(format!(
+            c.settling(format!(
                 "{} ingress leg {} missing or not {cidr}",
                 z.name, leg.ifname
             ));
@@ -1421,7 +1489,9 @@ fn return_path_and_ingress(
             .unwrap_or("absent")
             .to_string();
         if state != "Established" {
-            c.note(format!(
+            // Settling, and so is the `pfx_snt == 0` line below it: a BGP session takes seconds
+            // to establish and another moment to send the zone's prefixes.
+            c.settling(format!(
                 "{} ingress: bgp {} {state} (not Established - the router is not \
                  learning this zone's identities)",
                 z.name, gw.router
@@ -1429,7 +1499,7 @@ fn return_path_and_ingress(
         } else if entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0) == 0 {
             // Established but advertising nothing is the exact signature of a missing neighbor
             // afi-safi export policy: the session is healthy, the zone's identities never leave.
-            c.note(format!(
+            c.settling(format!(
                 "{} ingress: bgp {} Established but advertising nothing (0 sent prefixes \
                  - the neighbor afi-safi export policy is not attached)",
                 z.name, gw.router
@@ -1454,7 +1524,9 @@ fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     // degradation an operator must not have to infer.
     let f = view.fabric;
     let backend = mark_backend(sys, f);
-    c.note(backend.status_line());
+    // Standing: printed on every healthy member, every time — the one line that would make
+    // `--wait` spend its whole deadline on every run if it were ever called settling.
+    c.standing(backend.status_line());
     let (want, loaded_path, live) = match backend {
         MarkBackend::Nft => (
             emit::mark::generate(view)?,
@@ -1477,13 +1549,13 @@ fn mark_drift(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     };
     let loaded = sys.read(&loaded_path).unwrap_or_default();
     if want != loaded {
-        c.note("mark drift — re-run cfab up");
+        c.standing("mark drift — re-run cfab up");
     }
     let applied = sys
         .read(&format!("{}/mark.applied", f.run_dir))
         .unwrap_or_default();
     if !live.ok() || live.stdout != applied {
-        c.note("mark drift — re-run cfab up");
+        c.standing("mark drift — re-run cfab up");
     }
     Ok(())
 }
@@ -1522,7 +1594,8 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
         if let Some(n) = dropped
             && n > 0
         {
-            c.note(format!(
+            // Standing: a drop counter since this member's last `up`.
+            c.standing(format!(
                 "fallback {}: control egress ceiling tripped ({n} drops, limit {}/s)",
                 ce.zone, ce.rate_pps
             ));
@@ -1550,7 +1623,7 @@ fn shape_posture(
         && let Some(sd) = cc.components.iter().find(|k| k.name == "shape-daemon")
         && sd.state != CompState::Running
     {
-        c.note(format!(
+        c.settling(format!(
             "shaping down: shape-daemon is {}, {} restart(s)",
             sd.state.as_str(),
             sd.restarts
@@ -1578,7 +1651,8 @@ fn shape_posture(
         let derivation = match emit::shape::derive(view, dev, measured, &carrier) {
             Ok(d) => d,
             Err(e) => {
-                c.note(format!("shape derivation for {dev} failed: {e}"));
+                // Standing: the derivation is a pure function of the declaration.
+                c.standing(format!("shape derivation for {dev} failed: {e}"));
                 continue;
             }
         };
@@ -1596,7 +1670,9 @@ fn shape_posture(
                 l.contains(&format!("class htb {cid} ")) && l.contains(&format!(" {want} "))
             });
             if !hit {
-                c.note(format!("shape drift on {dev}: class {cid} want {want}"));
+                // Standing: drift against the derived tree, which only a re-apply installs
+                // (F19 is open on exactly these lines).
+                c.standing(format!("shape drift on {dev}: class {cid} want {want}"));
             }
         }
     }
@@ -1615,7 +1691,9 @@ fn link_speeds(
         // This is the one place it is said: every other per-interface read in `status` goes
         // silent for what the wire took with it (`absent_ifs`).
         if absent.contains(&wire) {
-            c.note(format!(
+            // Standing: a netdev the kernel does not have is hardware or driver, not a
+            // settle — and what it costs is already graded on the links axis.
+            c.standing(format!(
                 "wire {wire} absent (no such netdev) — its segments are not configured"
             ));
             continue;
@@ -1636,7 +1714,9 @@ fn link_speeds(
                 .find_map(|l| l.strip_prefix("driver:"))
                 .map(str::trim)
                 .unwrap_or("?");
-            c.note(format!(
+            // Standing: the wire negotiated what it negotiated; the declaration is what
+            // disagrees with it.
+            c.standing(format!(
                 "{wire}: link speed {obs} != declared {decl} (driver {driver})"
             ));
         }
@@ -1646,7 +1726,12 @@ fn link_speeds(
 
 /// `ip route get <target>` → (the `dev` it leaves by, the whole first line). The line is
 /// carried back with the device because every caller quotes it in the reason it reports.
-fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(String, String)> {
+///
+/// `None` is "there is no route to this target": right after `up` the engine has not installed
+/// one yet, and `ip route get` then fails with nothing on stdout. It is never an empty device
+/// name — F22 printed one into a reason line (`via , expected cfab-cl`), which reads as a
+/// device whose name is missing rather than as a route that is missing.
+fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(Option<String>, String)> {
     let route = sys.run(&["ip", "route", "get", target])?.stdout;
     let route_line = route.lines().next().unwrap_or("").trim().to_string();
     let words: Vec<&str> = route_line.split_whitespace().collect();
@@ -1654,15 +1739,14 @@ fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(String, String)> {
         .iter()
         .position(|w| *w == "dev")
         .and_then(|i| words.get(i + 1))
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map(|s| s.to_string());
     Ok((dev, route_line))
 }
 
 /// Each condition is named once and the lines are sorted: a zone with two down peers pushes its
 /// line per peer, and this output is read by humans, scripts and agents alike.
-fn once_each(reasons: &[String]) -> Vec<String> {
-    let mut sorted: Vec<String> = reasons.to_vec();
+fn once_each(reasons: &[(Class, String)]) -> Vec<String> {
+    let mut sorted: Vec<String> = reasons.iter().map(|(_, m)| m.clone()).collect();
     sorted.sort();
     sorted.dedup();
     sorted
@@ -2415,10 +2499,10 @@ mod tests {
     #[test]
     fn reasons_are_sorted_and_named_once() {
         let r = vec![
-            "b".to_string(),
-            "a".to_string(),
-            "b".to_string(),
-            "a".to_string(),
+            (Class::Settling, "b".to_string()),
+            (Class::Standing, "a".to_string()),
+            (Class::Settling, "b".to_string()),
+            (Class::Standing, "a".to_string()),
         ];
         assert_eq!(once_each(&r), vec!["a".to_string(), "b".to_string()]);
     }
@@ -4097,6 +4181,103 @@ mod tests {
         assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps");
     }
 
+    /// F22 (VERIFIED on the rack 2026-09-07): the headline goes UP as soon as the sessions are
+    /// up, seconds before the engine has installed the routes the identities answer on — and
+    /// `--wait` returned on the headline alone, so the role's deployment gate passed ~3 s before
+    /// the fabric could carry anything. A settling reason line holds the wait.
+    #[test]
+    fn wait_holds_while_a_settle_line_is_present() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The cluster route to pve1-tb is not installed yet: `ip route get` answers nothing.
+        let mut sys = healthy_leaf(&view).on_stdout(&["ip", "route", "get", "10.199.0.1"], "");
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(
+            sys.slept.len(),
+            3,
+            "the wait must ride out the settle, not return on the headline:\n{}",
+            report.output
+        );
+    }
+
+    /// The other half: the wait ends the moment the settle lines are gone, not at the deadline.
+    /// The rp_filter one stands in for every line the fabric installs after `up` — it is the one
+    /// a `MockSys` can make arrive while the loop is sleeping.
+    #[test]
+    fn wait_ends_as_soon_as_the_settle_lines_clear() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let path = "/proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter";
+        let mut sys = healthy_leaf(&view)
+            .file(path, "1\n")
+            .appears_after(1, path, "2\n");
+        let report = run(&mut sys, &view, 30, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report.output.contains("rp_filter"),
+            "the settled fabric is what gets reported:\n{}",
+            report.output
+        );
+        assert_eq!(
+            sys.slept,
+            vec![Duration::from_secs(2)],
+            "one 2 s sleep, then the settle line was gone"
+        );
+    }
+
+    /// Standing lines are what a healthy fabric prints by design (the mark backend on every
+    /// member, an operator's edited file here). They must never hold the gate: a member with one
+    /// would wait the whole deadline out on every single `status --wait`.
+    #[test]
+    fn wait_ends_at_once_when_only_standing_lines_are_present() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let text = example_text().replace("node = 3", "node = 7");
+        let mut sys = healthy_leaf(&view).file(CONFIG, &text);
+        let report = run(&mut sys, &view, 30, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            report.output.contains("changed since apply") && report.output.contains("mark: nft"),
+            "the standing lines must still be reported:\n{}",
+            report.output
+        );
+        assert!(
+            sys.slept.is_empty(),
+            "a standing line is not something to wait for:\n{}",
+            report.output
+        );
+    }
+
+    /// F22, the second half: with no route at all `ip route get` names no device, and the line
+    /// read `cluster to pve1-tb via , expected cfab-cl` — an empty name where a device belongs.
+    /// One spelling per condition: no route is its own line, and it stands in for the src-pin
+    /// line too (there is no route to pin a source on).
+    #[test]
+    fn a_peer_with_no_route_says_so_instead_of_an_empty_device() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).on_stdout(&["ip", "route", "get", "10.199.0.1"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("cluster to pve1-tb: no route yet, expected cfab-cl"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("via ,"),
+            "an empty device name is not a spelling:\n{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("src not pinned"),
+            "no route is one condition, not two:\n{}",
+            report.output
+        );
+    }
+
     /// The bond is active on a wire that is not the home while the home still has carrier — a
     /// stuck reselect. Ruled a warn: it is a reason line, and the state does not move.
     #[test]
@@ -4722,7 +4903,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            c.reasons
+            once_each(&c.reasons)
                 .contains(&"storage to pve2-tb via cfab-st, expected cfab-st-fb".to_string()),
             "{:?}",
             c.reasons

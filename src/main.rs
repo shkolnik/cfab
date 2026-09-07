@@ -53,7 +53,7 @@ enum Command {
     /// BFD sessions on declared segments, and OSPF neighbors on the fallback segment. One
     /// indented line per condition follows. Never writes: the watchdog actuates, status reports.
     Status {
-        /// Seconds to re-read (every 2 s) while the state is not UP; 0 = one instant read
+        /// Seconds to re-read (every 2 s) until UP with nothing left settling; 0 = one instant read
         #[arg(long, default_value_t = 0)]
         wait: u64,
         /// Exit 0 for UP-DEGRADED as well as UP (FAILED and DOWN are unchanged)
