@@ -103,6 +103,11 @@ impl HeldPrimaries {
 /// Every ingress leg this member carries, probed once per `PROBE_INTERVAL`.
 pub struct Prober {
     legs: Vec<Leg>,
+    /// What the last ticks have to say, oldest first, ready-formatted. The prober decides and
+    /// the supervisor prints: a line that is returned rather than written to stderr is a line a
+    /// unit test can assert, and "said once, not on every tick" is a property only a test can
+    /// hold on to.
+    log: Vec<String>,
 }
 
 impl Prober {
@@ -178,11 +183,20 @@ impl Prober {
                 slaves,
             });
         }
-        Prober { legs }
+        Prober {
+            legs,
+            log: Vec::new(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.legs.is_empty()
+    }
+
+    /// Take everything the prober has to say since the last call. The supervisor drains this
+    /// every tick and prints it; nothing else keeps it, so it cannot grow.
+    pub fn drain_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.log)
     }
 
     /// One round: read the previous round's answers, move the bond if it belongs elsewhere,
@@ -197,7 +211,8 @@ impl Prober {
         io: &mut dyn ProbeIo,
         now: Instant,
     ) -> Vec<IngressLeg> {
-        for leg in &mut self.legs {
+        let Prober { legs, log } = self;
+        for leg in legs.iter_mut() {
             for s in &mut leg.slaves {
                 let frames = io.recv(&s.ifname).unwrap_or_default();
                 let replied = frames
@@ -214,7 +229,7 @@ impl Prober {
                     s.state.observe(replied);
                 }
             }
-            leg.actuate(sys);
+            leg.actuate(sys, log);
             for s in &mut leg.slaves {
                 match io.send(&s.ifname, &frame::probe(s.mac, leg.router)) {
                     Ok(()) => s.probed = true,
@@ -270,7 +285,8 @@ impl Prober {
 
 impl Leg {
     /// Move the bond if the decision says it belongs elsewhere. Reads only on a healthy leg.
-    fn actuate(&mut self, sys: &mut dyn Sys) {
+    /// Anything worth saying is pushed onto `log` for the supervisor to print.
+    fn actuate(&mut self, sys: &mut dyn Sys, log: &mut Vec<String>) {
         if !self.migrates {
             return;
         }
@@ -310,28 +326,28 @@ impl Leg {
         // move survive.
         for file in ["primary", "active_slave"] {
             if let Err(e) = sys.write(&format!("{base}/{file}"), &target) {
-                eprintln!(
+                log.push(format!(
                     "cfab: {} ingress: cannot move {} to {to}: {e}",
                     self.zone, self.bond
-                );
+                ));
                 return;
             }
         }
         self.held = target.clone();
         self.active_now = Some(target);
         match from {
-            Some(f) if !f.state.reachable() => eprintln!(
+            Some(f) if !f.state.reachable() => log.push(format!(
                 "cfab: {} ingress: router unreachable on {}, moved {} to {to}",
                 self.zone, f.wire, self.bond
-            ),
-            Some(f) => eprintln!(
+            )),
+            Some(f) => log.push(format!(
                 "cfab: {} ingress: router reachable on {to} again, moved {} back from {}",
                 self.zone, self.bond, f.wire
-            ),
-            None => eprintln!(
+            )),
+            None => log.push(format!(
                 "cfab: {} ingress: no slave of ours was active on {}, moved it to {to}",
                 self.zone, self.bond
-            ),
+            )),
         }
     }
 }
@@ -369,13 +385,24 @@ mod tests {
         Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    /// Every slave of the mgmt leg, enslave order.
+    const SLAVES: [&str; 3] = ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"];
+
+    /// A bond sitting on `active`, with carrier on every slave — the healthy shape. Carrier is
+    /// part of it because the kernel refuses `bonding/active_slave` on a slave whose netdev has
+    /// none, so a test that wants a move to happen has to say the target can take it.
     fn bonding(active: &str) -> MockSys {
-        MockSys::default()
+        let mut sys = MockSys::default()
             .file(
                 &format!("/sys/class/net/{BOND}/bonding/active_slave"),
                 active,
             )
             .file(&format!("/sys/class/net/{BOND}/bonding/primary"), active)
+            .file(&format!("/sys/class/net/{active}/carrier"), "1\n");
+        for s in SLAVES {
+            sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
+        }
+        sys
     }
 
     /// The prober for the host member, and its slave names in enslave order.
@@ -697,6 +724,92 @@ mod tests {
             rows[0].active.as_deref(),
             Some(BACKUP),
             "the row reports the kernel, not the prober's wish"
+        );
+    }
+
+    /// F23, seen on the rack 2026-09-07 21:06:01 UTC: the home island lost power, its slave lost
+    /// carrier, and the kernel failed the bond over on its own. The prober's home wire was still
+    /// inside its hysteresis, so the decision named it as the better-preferred target — and the
+    /// kernel refuses `bonding/active_slave` on a slave with no carrier (EINVAL). A slave
+    /// without carrier is not a place ingress can be put: never a target, never reachable.
+    #[test]
+    fn a_carrier_less_slave_is_never_a_move_target() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // The kernel has already moved the bond off the dead island.
+        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        io.dark(HOME);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "a slave with no carrier is never written as active_slave: {:?}",
+            sys.calls
+        );
+        let home = rows[0]
+            .slaves
+            .iter()
+            .find(|s| s.wire == "eth0")
+            .expect("the home wire has a row");
+        assert!(
+            !home.reachable,
+            "no carrier is not router-reachable: {rows:?}"
+        );
+    }
+
+    /// The prober says the home wire is out of the running once, not twice a second forever.
+    #[test]
+    fn the_no_carrier_note_is_said_once_not_on_every_tick() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        io.dark(HOME);
+        run_ticks(&mut p, &mut sys, &mut io, 8);
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| *l == "cfab: mgmt ingress: eth0 has no carrier, staying on eth9")
+                .count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(log.len(), 1, "and nothing else: {log:?}");
+    }
+
+    /// A sysfs write that fails anyway (the kernel has a precondition of its own we did not
+    /// model, or `/sys` is read-only): one WARN naming the slave and the OS error, no retry
+    /// while nothing has changed, and never the word FATAL — the prober is still running and
+    /// the bond is still where it was.
+    #[test]
+    fn a_refused_move_warns_once_and_is_not_retried() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME).write_fail(&format!("/sys/class/net/{BOND}/bonding/primary"));
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 3);
+        io.dark(HOME);
+        run_ticks(&mut p, &mut sys, &mut io, 8);
+        let log = p.drain_log();
+        assert_eq!(log.len(), 1, "one line for one unchanged failure: {log:?}");
+        assert!(
+            log[0].starts_with("cfab: warn: mgmt ingress: cannot move cfab-gw249 to eth9 ")
+                && log[0].contains(BACKUP)
+                && log[0].contains("permission denied"),
+            "{log:?}"
+        );
+        assert!(!log[0].contains("FATAL"), "{log:?}");
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.as_str() == format!("write /sys/class/net/{BOND}/bonding/primary"))
+                .count(),
+            1,
+            "the identical write is not retried every tick: {:?}",
+            sys.calls
         );
     }
 
