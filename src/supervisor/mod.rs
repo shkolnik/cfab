@@ -1220,6 +1220,9 @@ fn prober_tick(
     shared: &Arc<Mutex<Shared>>,
 ) {
     let rows = prober.tick(sys, io, Instant::now());
+    for line in prober.drain_log() {
+        eprintln!("{line}");
+    }
     let held = prober.held_primaries();
     let mut st = shared.lock().unwrap();
     st.ingress = rows;

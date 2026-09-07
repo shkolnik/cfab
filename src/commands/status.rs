@@ -3723,6 +3723,37 @@ mod tests {
         );
     }
 
+    /// F23: the ingress prober reports a slave with no carrier as router-unreachable, because a
+    /// wire with no carrier reaches nothing and the kernel will not put ingress on it either.
+    /// The reason an operator reads must still be the carrier, never the router: the home wire
+    /// being dark is the bond doing its job, and it keeps the plain spelling it has always had.
+    #[test]
+    fn a_migration_off_a_carrier_less_home_never_blames_the_router() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .file(
+                &format!("/sys/class/net/{GW_BOND}/bonding/active_slave"),
+                "cfab-gw249-a\n",
+            )
+            .file("/sys/class/net/eth0/carrier", "0\n")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_ingress(&view, &["eth0"]),
+            );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains("  mgmt ingress via eth9\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("router unreachable"),
+            "no carrier is not the router's fault: {}",
+            report.output
+        );
+    }
+
     /// The same migration while the router DOES answer over the home wire is the old fault (a
     /// stuck reselect), and must keep the old sentence.
     #[test]
