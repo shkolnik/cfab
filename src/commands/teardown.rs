@@ -12,7 +12,7 @@ use crate::derive::{Slave, View};
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
-use crate::sys::{Sys, UnixProbe, have_tool, run_ignore, run_ok};
+use crate::sys::{Sys, UnixProbe, have_tool, run_ignore, run_ok, run_optional};
 
 /// Stage one of the teardown, callable alone: forwarding OFF, the forward policy off, and the
 /// foreign-stack accept removed. Run before anything that can fail or block — this is what
@@ -180,6 +180,26 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             lock_path.display()
         )));
     }
+    // Driver features go back to what `up` FOUND, from the record `up` wrote — only the
+    // features it really changed, and only on the wires it changed them on. Last read of the
+    // run dir, so it happens after the refusal above and before the dir is removed.
+    // `run_optional`: the netdev may already be gone (a wire pulled before the teardown) and
+    // ethtool may not even be installed any more — neither is a reason to leave the fabric
+    // half torn down.
+    let restored_features = crate::driver_features::recorded_changes(sys, &f.run_dir);
+    for c in &restored_features {
+        run_optional(sys, &["ethtool", "-K", &c.wire, &c.feature, &c.prior]);
+    }
+    if !restored_features.is_empty() {
+        notes.push(format!(
+            "note: driver features put back: {}",
+            restored_features
+                .iter()
+                .map(|c| format!("{} {} {}", c.wire, c.feature, c.prior))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     sys.remove(&f.run_dir)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
@@ -335,6 +355,45 @@ mod tests {
                 &["ip", "-d", "link", "show", "cfab-st-fb-a"],
                 "10: cfab-st-fb-a@eth9: vlan protocol 802.1Q id 300 \n",
             )
+    }
+
+    /// `down` puts each feature back at the value `up` RECORDED — not at some default, and not
+    /// at whatever the wire happens to read now — one `ethtool -K` per recorded change, and it
+    /// says so in the teardown message.
+    #[test]
+    fn down_restores_every_driver_feature_up_changed() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .file("/run/cfab/mark.backend", "nft\n")
+            .file(
+                "/run/cfab/wire-driver-features",
+                "eth9 sg on\neth9 tso on\n",
+            );
+        let msg = run(&mut sys, &view).unwrap();
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.starts_with("ethtool"))
+                .collect::<Vec<_>>(),
+            ["ethtool -K eth9 sg on", "ethtool -K eth9 tso on"]
+        );
+        assert!(
+            msg.contains("driver features put back: eth9 sg on, eth9 tso on"),
+            "{msg}"
+        );
+    }
+
+    /// Nothing was changed, or the run dir predates the record: `down` runs no ethtool at all
+    /// and says nothing about features. A missing record is not an error (`mark.backend`'s rule).
+    #[test]
+    fn down_without_a_feature_record_runs_no_ethtool() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg().file("/run/cfab/mark.backend", "nft\n");
+        let msg = run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("ethtool"), "{:?}", sys.calls);
+        assert!(!msg.contains("driver features"), "{msg}");
     }
 
     /// A mangle dump with our chains resident, plus a foreign chain that must survive.

@@ -11,6 +11,7 @@ use crate::commands::common::{
     conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::derive::{GwRow, Slave, View};
+use crate::driver_features;
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
@@ -311,34 +312,38 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // non-admin wire left to take: cfab adds tagged sub-interfaces and never touches a wire's
     // own L3, so NM and DHCP keep every wire they had. `up` proves it by never running those
     // commands (`up_never_takes_a_wire_from_its_manager`).
-    // ---- NIC safe mode ---------------------------------------------------------
-    for (_, dev) in f
-        .usb_nics
+    // ---- per-wire driver features ----------------------------------------------
+    // No adapter and no driver is named here: a NIC that needs scatter-gather off says so in
+    // its own `driver_features` string, which goes to `ethtool -K` as written. Two records go
+    // to the run dir: what was CHANGED (so `down` puts each feature back at the value this
+    // apply found, and nothing else), and which driver each present wire had (so the
+    // forwarding watchdog can tell a re-enumerated wire from a swapped adapter).
+    let mut drivers: Vec<(String, String)> = Vec::new();
+    let mut changed: Vec<driver_features::Change> = Vec::new();
+    for w in view
+        .member
+        .wires
         .iter()
-        .filter(|(m, dev)| m == host && !absent.contains(dev.as_str()))
+        .filter(|w| !absent.contains(w.name.as_str()))
     {
-        let out = run_ok(sys, &["ethtool", "-i", dev])?;
-        let drv = out
-            .stdout
-            .lines()
-            .find_map(|l| l.strip_prefix("driver:"))
-            .map(str::trim)
-            .unwrap_or("");
-        if drv == "r8152" {
-            // RTL8157 SG-lockup mitigation
-            run_ok(
+        drivers.push((w.name.clone(), driver_features::driver_of(sys, &w.name)?));
+        if let Some(spec) = &w.driver_features {
+            changed.extend(driver_features::apply_to_wire(
                 sys,
-                &[
-                    "ethtool", "-K", dev, "sg", "off", "tso", "off", "gso", "off",
-                ],
-            )?;
-        } else {
-            warnings.push(format!(
-                "WARNING: {dev} on {host} is driven by '{drv}', not r8152 (RTL8157 re-enumerated \
-                 as CDC?) — SG mitigation skipped, link speed unverified"
-            ));
+                &w.name,
+                spec,
+                &mut warnings,
+            )?);
         }
     }
+    sys.write(
+        &driver_features::drivers_path(&f.run_dir),
+        &driver_features::render_drivers(&drivers),
+    )?;
+    sys.write(
+        &driver_features::changed_path(&f.run_dir),
+        &driver_features::render_changes(&changed),
+    )?;
 
     // ---- sysctls (host-only: GLOBAL; a leaf shares its kernel with an external owner) --------
     if kind == MemberKind::Host {
@@ -1476,6 +1481,92 @@ mod tests {
     }
 
     /// The same declaration with the ingress leg on domain `any`.
+    /// The example with `driver_features` on pve1's eth9 — the RTL8157 case the retired `usb`
+    /// flag used to hard-code, now declared instead of inferred.
+    fn fabric_with_driver_features() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+                .unwrap()
+                .replace(
+                    "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                    "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
+                     off tso off gso off\" },",
+                );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    const ETHTOOL_K: &str = "Features for eth9:\nscatter-gather: on\ntcp-segmentation-offload: on\ngeneric-segmentation-offload: off\n";
+
+    /// The declared words reach `ethtool -K` verbatim — minus the one feature already at the
+    /// declared value — and cfab names no adapter and no driver anywhere in the sequence.
+    #[test]
+    fn a_wires_declared_driver_features_are_applied_verbatim() {
+        let f = fabric_with_driver_features();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view).on_stdout(&["ethtool", "-k", "eth9"], ETHTOOL_K);
+        run(&mut sys, &view, &opts()).unwrap();
+        assert_eq!(
+            calls_for(&sys, "ethtool -K"),
+            ["ethtool -K eth9 sg off tso off"],
+            "gso is already off: not set"
+        );
+        for c in &sys.calls {
+            assert!(!c.contains("r8152") && !c.contains("8157"), "{c}");
+        }
+    }
+
+    /// `up` records what it CHANGED (the feature and the value it found) so `down` can put it
+    /// back, and the driver of every present wire so the watchdog can spot a swapped adapter.
+    #[test]
+    fn up_records_the_prior_values_and_every_wires_driver() {
+        let f = fabric_with_driver_features();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ethtool", "-k", "eth9"], ETHTOOL_K)
+            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
+            .on_stdout(&["ethtool", "-i", "eth1"], "driver: igb\n")
+            .on_stdout(&["ethtool", "-i", "eth0"], "driver: igb\n");
+        run(&mut sys, &view, &opts()).unwrap();
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-drivers"),
+            Some("eth9 r8152\neth1 igb\neth0 igb\n")
+        );
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-driver-features"),
+            Some("eth9 sg on\neth9 tso on\n"),
+            "only what changed, with the value it changed FROM"
+        );
+    }
+
+    /// A wire that declares nothing still gets its driver recorded, and nothing else: no
+    /// `ethtool -k`, no `ethtool -K`, and an empty change record `down` reads as "nothing".
+    #[test]
+    fn a_fabric_declaring_no_driver_features_touches_no_nic_features() {
+        let (mut sys, view) = up_sys_and_view();
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(calls_for(&sys, "ethtool -K").is_empty(), "{:?}", sys.calls);
+        assert!(calls_for(&sys, "ethtool -k").is_empty(), "{:?}", sys.calls);
+        assert_eq!(sys.writes_to("/run/cfab/wire-driver-features"), Some(""));
+    }
+
+    /// An absent wire is not probed and not recorded — same rule the rest of `up` follows.
+    #[test]
+    fn an_absent_wire_gets_no_driver_probe_and_no_record() {
+        let f = fabric_with_driver_features();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_fail(&["ip", "link", "show", "eth9"], 1, "Device does not exist")
+            .on_stdout(&["ethtool", "-i", "eth1"], "driver: igb\n")
+            .on_stdout(&["ethtool", "-i", "eth0"], "driver: igb\n");
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(!sys.ran("ethtool -i eth9"), "{:?}", sys.calls);
+        assert!(!sys.ran("ethtool -K"), "{:?}", sys.calls);
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-drivers"),
+            Some("eth1 igb\neth0 igb\n")
+        );
+    }
+
     fn fabric_with_a_migrating_gw() -> Fabric {
         let text =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))

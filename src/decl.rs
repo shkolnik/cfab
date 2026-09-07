@@ -95,10 +95,18 @@ pub struct WireDecl {
     /// DECLARED link speed in Mb/s; the observed ethtool speed is only cross-checked
     /// (USB NICs misreport, and a down link reports "Unknown").
     pub speed_mbps: u32,
-    /// A USB NIC: offloads are disabled on bringup (scatter-gather lockups observed on
-    /// RTL8157-class adapters under sustained load).
-    #[serde(default)]
-    pub usb: bool,
+    /// Optional `ethtool -K <nic>` words, applied on bringup and put back by `down`:
+    /// `<feature> on|off` pairs, handed to ethtool VERBATIM. cfab knows no adapter and no
+    /// driver — which features a NIC needs is the operator's declaration (`driver_features`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_features: Option<String>,
+    /// RETIRED. `usb = true` used to select a hard-coded r8152 offload mitigation; it is gone,
+    /// and a declaration that still carries it is refused by name (`model::Fabric::from_decl`)
+    /// rather than by `deny_unknown_fields`' generic "unknown field". Kept out of the emitted
+    /// schema: it is a tombstone for a good error message, not a key anyone may write.
+    #[serde(default, rename = "usb", skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub usb: Option<bool>,
 }
 
 /// One `[[zone]]`: a traffic class and the segments that carry it.
@@ -424,8 +432,17 @@ mod tests {
         assert_eq!(d.zones.len(), 3);
         assert_eq!(d.members[0].wires[0].nic, "eth9");
         assert_eq!(d.members[0].wires[0].speed_mbps, 5000);
-        assert!(d.members[0].wires[0].usb);
-        assert!(!d.members[0].wires[1].usb, "usb defaults to false");
+        assert!(
+            d.members[0].wires[0].driver_features.is_none(),
+            "the example declares no driver_features on a live wire"
+        );
+        assert!(
+            d.members
+                .iter()
+                .flat_map(|m| &m.wires)
+                .all(|w| w.usb.is_none()),
+            "the retired `usb` key is absent from the example"
+        );
         assert!(d.members[0].prefs.is_empty(), "no override in the example");
         assert_eq!(d.zones[0].segments.len(), 3);
         assert_eq!(d.zones[0].universal.as_ref().unwrap().vid, 300);
@@ -628,7 +645,8 @@ pub(crate) mod fixtures {
             .join(", ")
     }
 
-    /// Replace one member's whole wire set (and, with it, any `usb` flag those wires carried).
+    /// Replace one member's whole wire set (and, with it, any `driver_features` those wires
+    /// carried).
     pub fn with_wires(text: &str, member: &str, spec: &str) -> String {
         let at = text
             .find(&format!("name = \"{member}\""))

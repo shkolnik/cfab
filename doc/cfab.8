@@ -487,6 +487,26 @@ and has an unparseable file leaves nothing on disk to say where the copy is, and
 .B status
 then fails on the parse error as before. Never re\-read by anything else.
 .TP
+.I RUN_DIR/wire\-drivers, RUN_DIR/wire\-driver\-features
+Written by
+.BR up ,
+one line each.
+.I wire\-drivers
+records the
+.BR "ethtool \-i" " driver every present wire had at apply; the forwarding"
+watchdog compares it when a wire's netdev returns and reports an adapter that
+is not the one that was configured.
+.I wire\-driver\-features
+records
+.RI "\(dq" "wire feature prior" "\(dq for every feature"
+.B up
+actually changed from a
+.B driver_features
+string, and
+.B down
+replays each line as
+.BR "ethtool \-K" .
+.TP
 .I RUN_DIR/conf\-sync\-attempted, RUN_DIR/conf\-sync\-committed
 The daemon's generation state (decimal), under the declaration's run
 directory.

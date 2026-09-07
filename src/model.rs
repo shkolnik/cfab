@@ -107,6 +107,9 @@ pub struct Wire {
     pub name: String,
     pub domain: DomainId,
     pub speed_mbps: u32,
+    /// The declared `ethtool -K` words for this NIC, validated at load, applied on bringup and
+    /// restored by `down`. `None` = cfab does not touch this NIC's features at all.
+    pub driver_features: Option<String>,
 }
 
 /// The widest ifname a bond leg (a universal segment, or a migrating ingress leg) may carry.
@@ -309,8 +312,6 @@ pub struct Fabric {
     pub bgp_keepalive_s: u32,
     pub bgp_hold_s: u32,
     pub bgp_connect_s: u32,
-    /// `(member, dev)` pairs from the `usb` wire flag: USB NICs that get offload safe mode on `up`.
-    pub usb_nics: Vec<(String, String)>,
     /// Runtime state dir written by `up`, read by `status` and the daemons (`[runtime] run_dir`).
     pub run_dir: String,
     pub dns_domain: String,
@@ -360,20 +361,29 @@ impl Fabric {
             .collect::<Result<Vec<_>>>()?;
         let mut members = Vec::new();
         let mut wire_prefs = Vec::new();
-        let mut usb_nics = Vec::new();
         for m in &d.members {
             let mut wires = Vec::new();
             for w in &m.wires {
-                let domain = DomainId::parse(&w.domain).map_err(|e| {
-                    Error::context(format!("member {}: wire {}: ", m.name, w.nic), e)
-                })?;
-                if w.usb {
-                    usb_nics.push((m.name.clone(), w.nic.clone()));
+                let ctx = || format!("member {}: wire {}: ", m.name, w.nic);
+                let domain = DomainId::parse(&w.domain).map_err(|e| Error::context(ctx(), e))?;
+                // The retired `usb` flag: refuse by name with the replacement, rather than let
+                // `deny_unknown_fields` say "unknown field `usb`" and leave the operator
+                // guessing what the mitigation became.
+                if w.usb.is_some() {
+                    return Err(Error::config(format!(
+                        "{}'usb' is gone; declare driver_features = \"sg off tso off gso off\" \
+                         instead (the words go to `ethtool -K <nic>` as written)",
+                        ctx()
+                    )));
+                }
+                if let Some(spec) = &w.driver_features {
+                    crate::driver_features::parse(spec).map_err(|e| Error::context(ctx(), e))?;
                 }
                 wires.push(Wire {
                     name: w.nic.clone(),
                     domain,
                     speed_mbps: w.speed_mbps,
+                    driver_features: w.driver_features.clone(),
                 });
             }
             // A zone appears at most once per member (a TOML table has one key per name), so
@@ -493,7 +503,6 @@ impl Fabric {
             bgp_keepalive_s: bgp.keepalive_s,
             bgp_hold_s: bgp.hold_s,
             bgp_connect_s: bgp.connect_s,
-            usb_nics,
             run_dir: runtime.run_dir,
             dns_domain: d.dns_domain.clone(),
         };
@@ -917,18 +926,79 @@ mod tests {
         assert_eq!(f.forward_allow.len(), 3);
     }
 
-    /// `usb = true` on a wire IS the USB list: the pair is built from the member's own wires,
-    /// so a USB entry can no longer name a member or a device that does not exist.
+    /// A `driver_features` string reaches the model on the wire that declared it, and only
+    /// there — it is per-NIC, not a member-wide or fabric-wide list.
     #[test]
-    fn usb_wires_become_the_usb_list() {
-        let f = parse_fabric(|_| {}).unwrap();
+    fn driver_features_land_on_the_wire_that_declared_them() {
+        let f = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
+                 off tso off\" },",
+            )
+        })
+        .unwrap();
         assert_eq!(
-            f.usb_nics,
-            vec![
-                ("pve1-tb".to_string(), "eth9".to_string()),
-                ("pve2-tb".to_string(), "eth9".to_string())
-            ]
+            f.member("pve1-tb").unwrap().wires[0]
+                .driver_features
+                .as_deref(),
+            Some("sg off tso off")
         );
+        assert_eq!(f.member("pve1-tb").unwrap().wires[1].driver_features, None);
+        assert_eq!(f.member("pve3-tb").unwrap().wires[0].driver_features, None);
+    }
+
+    /// The retired `usb` key fails LOUD at load, naming the wire and the replacement — not
+    /// `deny_unknown_fields`' "unknown field `usb`", which says nothing about what to write
+    /// instead.
+    #[test]
+    fn the_retired_usb_key_is_refused_by_name_with_the_remedy() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "fabric.toml: member pve1-tb: wire eth9: 'usb' is gone; declare driver_features = \
+             \"sg off tso off gso off\" instead (the words go to `ethtool -K <nic>` as written)"
+        );
+    }
+
+    /// `usb = false` is the same retired key: refused, not quietly accepted as "no mitigation".
+    #[test]
+    fn usb_false_is_refused_too() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },",
+                "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000, usb = false },",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("wire eth1: 'usb' is gone"), "{err}");
+    }
+
+    /// A malformed `driver_features` string is a DECLARATION error (`cfab check`), not a
+    /// surprise from ethtool half way through a bringup. The message names the member and
+    /// the wire, like every other wire error.
+    #[test]
+    fn a_malformed_driver_features_string_is_refused_at_load() {
+        let err = parse_fabric(|t| {
+            *t = t.replace(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
+                 off tso\" },",
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("member pve1-tb: wire eth9: "), "{err}");
+        assert!(err.contains("3 words"), "{err}");
+        assert!(err.contains("<feature> on|off pairs"), "{err}");
     }
 
     #[test]
@@ -1182,9 +1252,9 @@ mod tests {
         let err = parse_fabric(|t| {
             *t = t.replace(
                 "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
-                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
                 "{ nic = \"eth1\", domain = \"d\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
-                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
             )
         })
         .unwrap_err()
@@ -1235,9 +1305,9 @@ mod tests {
                     "c = \"1G admin switch\"\nd = \"a fourth switch\"",
                 )
                 .replace(
-                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
                     "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n  { nic = \"eth2\", \
-                     domain = \"d\", speed_mbps = 1000 },\n]\n# Optional",
+                     domain = \"d\", speed_mbps = 1000 },\n]\n# USB",
                 )
                 .replace("weight = 4\nprimary = \"a\"", "weight = 4\nprimary = \"d\"");
         })
@@ -1254,13 +1324,13 @@ mod tests {
     fn two_wires_on_one_domain_are_refused_with_the_reason() {
         let err = parse_fabric(|t| {
             *t = t.replace(
-                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },\n  { nic = \
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \
                  \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \
-                 \"c\", speed_mbps = 1000 },\n]\n# Optional",
-                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },\n  { nic = \
+                 \"c\", speed_mbps = 1000 },\n]\n# USB",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \
                  \"eth8\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \"eth1\", domain = \
                  \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = \
-                 1000 },\n]\n# Optional",
+                 1000 },\n]\n# USB",
             )
         })
         .unwrap_err()

@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod commands;
 pub mod decl;
 pub mod derive;
+pub mod driver_features;
 pub mod emit;
 pub mod engine;
 pub mod error;
