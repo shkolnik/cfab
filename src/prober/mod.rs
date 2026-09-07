@@ -523,6 +523,38 @@ mod tests {
         );
     }
 
+    /// A slave whose probe cannot even be SENT — the netdev went away with a re-enumerated USB
+    /// NIC — is a wire the router cannot be reached over, and must be folded in as a miss like
+    /// any other. Freezing its state at "reachable" instead would pin ingress to a dead wire
+    /// indefinitely: no move, no log line, and a row that reports the wire healthy.
+    #[test]
+    fn a_slave_whose_probe_cannot_be_sent_goes_unreachable_and_the_bond_moves() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        io.send_fails.insert(HOME.to_string());
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/primary")),
+            Some(BACKUP)
+        );
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/active_slave")),
+            Some(BACKUP)
+        );
+        let home_row = rows[0]
+            .slaves
+            .iter()
+            .find(|s| s.wire == "eth0")
+            .expect("the home wire has a row");
+        assert!(
+            !home_row.reachable,
+            "a wire we cannot even ask over is not reachable: {rows:?}"
+        );
+    }
+
     /// The first tick has asked nobody anything, so it cannot count as a miss: three misses
     /// means three ANSWERED-NOTHING rounds after a probe went out.
     #[test]
