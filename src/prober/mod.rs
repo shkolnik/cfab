@@ -233,7 +233,7 @@ impl Prober {
                 let frames = io.recv(&s.ifname).unwrap_or_default();
                 let replied = frames
                     .iter()
-                    .any(|f| frame::reply_from(f, s.mac, leg.router).is_some());
+                    .any(|f| frame::reply_from(f, s.mac, &[leg.router]).is_some());
                 if replied {
                     s.last_reply = Some(now);
                 }
