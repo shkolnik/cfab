@@ -843,6 +843,32 @@ mod tests {
         );
     }
 
+    /// Carrier is believed at once, not three ticks later. The probe answers can even still be
+    /// arriving — a switch that has just lost the link to this host answers nothing new, but the
+    /// hysteresis remembers the last three that did — and the wire is still no longer one the
+    /// router can be reached over. `status` reads this row to name a cause, so a carrier-less
+    /// wire reported reachable is `status` blaming the router for an unplugged cable.
+    #[test]
+    fn a_carrier_less_wire_is_reported_unreachable_at_once() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 2);
+        let home = rows[0]
+            .slaves
+            .iter()
+            .find(|s| s.wire == "eth0")
+            .expect("the home wire has a row");
+        assert!(!home.reachable, "on the second tick already: {rows:?}");
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
     /// The prober says the home wire is out of the running once, not twice a second forever.
     #[test]
     fn the_no_carrier_note_is_said_once_not_on_every_tick() {
