@@ -1980,6 +1980,55 @@ mod tests {
         );
     }
 
+    /// The declaration change that moves the most netdevs under a running fabric: the ingress
+    /// leg's `gw` domain flipped from one domain to `any`, which turns a plain tagged
+    /// sub-interface into an active-backup bond with one slave per wire, under the SAME name.
+    ///
+    /// The claim under test is that the reload path needs no special case for it: the stop
+    /// sequence tears down under the declaration the supervisor was STARTED on (finding F2's
+    /// fix), so the plain leg is deleted and no slave of the shape that does not exist yet is
+    /// ever named; the restart then builds the bond from scratch. Without that, `up` on the new
+    /// file would meet the old shape and refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sighup_that_flips_the_gw_to_any_tears_down_the_leg_the_old_declaration_built() {
+        let o = reload_with(|m, dir| {
+            let needle = "gw = { domain = \"c\"";
+            let text = decl_text(dir);
+            assert!(
+                text.contains(needle),
+                "the example's gw is no longer on a domain"
+            );
+            m.files.insert(
+                CONFIG.to_string(),
+                text.replace(needle, "gw = { domain = \"any\""),
+            );
+            // the leg the OLD declaration built, live on the box
+            let taken = std::mem::take(m);
+            *m = taken
+                .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+                .on_stdout(
+                    &["ip", "-d", "link", "show", "cfab-gw249"],
+                    "20: cfab-gw249@eth0: vlan protocol 802.1Q id 249 \n",
+                );
+        })
+        .await;
+        assert_eq!(o.code, EXIT_RELOAD, "the exit status asks for the restart");
+        assert_eq!(
+            o.applies, 1,
+            "the new declaration is NOT applied in-process"
+        );
+        assert!(
+            o.calls.iter().any(|c| c == "ip link del cfab-gw249"),
+            "the stop sequence removes the leg the old declaration built: {:?}",
+            o.calls
+        );
+        assert!(
+            !o.calls.iter().any(|c| c.contains("cfab-gw249-")),
+            "the teardown never names a slave of the shape the NEW declaration wants: {:?}",
+            o.calls
+        );
+    }
+
     /// A changed, valid declaration cannot be applied in place — `apply::run` never removes what
     /// the previous declaration had — so the reload tears the fabric down and exits `EXIT_RELOAD`
     /// for systemd to start a supervisor on the new file. Nothing is applied in-process.

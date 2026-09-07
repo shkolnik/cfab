@@ -558,6 +558,125 @@ mod tests {
         );
     }
 
+    /// The same declaration with the ingress leg back on ONE domain, for the reverse flip.
+    fn fabric_with_a_domain_gw() -> Fabric {
+        let f = fabric();
+        assert!(
+            !f.zones
+                .iter()
+                .filter_map(|z| z.gw.as_ref())
+                .any(|g| matches!(g.scope, crate::model::SegScope::Universal)),
+            "the example's gw is already on scope `any`"
+        );
+        f
+    }
+
+    /// A live ingress BOND named by a declaration that now puts the gw on one domain, plus its
+    /// three slaves: what an operator has after flipping `any` -> a domain.
+    fn sys_with_a_migrating_gw_leg() -> MockSys {
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            );
+        for (i, (slave, wire)) in [
+            ("cfab-gw249-a", "eth9"),
+            ("cfab-gw249-b", "eth1"),
+            ("cfab-gw249-c", "eth0"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sys = sys
+                .on_stdout(
+                    &["ip", "link", "show", slave],
+                    &format!("{}: {slave}\n", 21 + i),
+                )
+                .on_stdout(
+                    &["ip", "-d", "link", "show", slave],
+                    &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                );
+        }
+        sys
+    }
+
+    /// The declaration on disk says the gw is on ONE domain; the running fabric wears the bond
+    /// the PREVIOUS declaration built. `down` must remove what is really there — bond first,
+    /// then every slave — or the flip can be neither applied nor undone: the plain
+    /// sub-interface loop refuses a bond ("not a vlan") and strands the leg.
+    #[test]
+    fn down_removes_an_ingress_bond_the_previous_declaration_built() {
+        let f = fabric_with_a_domain_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_migrating_gw_leg();
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            [
+                "ip link del cfab-st-fb",
+                "ip link del cfab-gw249",
+                "ip link del cfab-st-fb-a",
+                "ip link del cfab-gw249-a",
+                "ip link del cfab-gw249-b",
+                "ip link del cfab-gw249-c",
+            ]
+        );
+    }
+
+    /// The other direction: the declaration says `any`, the box wears the plain sub-interface
+    /// the previous one built. The bond loop refused it ("not a bond"); it must be deleted.
+    #[test]
+    fn down_removes_a_plain_ingress_leg_after_a_flip_to_any() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249@eth0: vlan protocol 802.1Q id 249 \n",
+            );
+        run(&mut sys, &view).unwrap();
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect();
+        assert_eq!(
+            dels,
+            [
+                "ip link del cfab-st-fb",
+                "ip link del cfab-st-fb-a",
+                "ip link del cfab-gw249"
+            ]
+        );
+    }
+
+    /// Reading the shape off the box is not a licence to delete anything wearing the name: a
+    /// netdev that is neither of the ingress leg's two shapes is still refused.
+    #[test]
+    fn down_refuses_a_stranger_wearing_the_ingress_legs_name() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bridge \n",
+            );
+        let e = run(&mut sys, &view).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSING: cfab-gw249 exists but is not a vlan"),
+            "{e}"
+        );
+        assert!(!sys.ran("ip link del cfab-gw249"), "{:?}", sys.calls);
+    }
+
     /// Prove ownership before destroy: a stranger wearing the bond's name is refused, and a
     /// slave name carrying something that is not a vlan is refused too.
     #[test]

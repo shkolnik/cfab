@@ -1624,6 +1624,70 @@ mod tests {
         );
     }
 
+    /// The ingress leg's two shapes wear the SAME name: a plain tagged sub-interface on a
+    /// single gw domain, an active-backup bond on scope `any`. A plain `cfab up` on a flipped
+    /// declaration (an unclean exit, then a restart on the new file) meets the shape the
+    /// PREVIOUS declaration built. `up` refuses — cfab never rebuilds a live leg under itself
+    /// — and the refusal names the remedy that `down` really performs.
+    #[test]
+    fn up_refuses_an_ingress_leg_the_previous_declaration_built_as_a_bond() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "FATAL: REFUSING: cfab-gw249 exists as a bond but this declaration puts the ingress \
+             leg on one domain; the gw domain changed between `any` and a domain since the leg \
+             was built, so run `cfab down` then `cfab up` to rebuild it"
+        );
+        assert!(!sys.ran("ip link del cfab-gw249"), "{:?}", sys.calls);
+    }
+
+    /// The other direction, in the same words: the box wears the plain sub-interface and the
+    /// declaration now says `any`. Without this the generic bond refusal fired ("exists but is
+    /// not a bond") and named no remedy at all.
+    #[test]
+    fn up_refuses_an_ingress_leg_the_previous_declaration_built_as_a_sub_interface() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249@eth0: vlan protocol 802.1Q id 249 \n",
+            );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "FATAL: REFUSING: cfab-gw249 exists as a sub-interface but this declaration puts \
+             the ingress leg on scope `any`; the gw domain changed between `any` and a domain \
+             since the leg was built, so run `cfab down` then `cfab up` to rebuild it"
+        );
+        assert!(!sys.ran("ip link del cfab-gw249"), "{:?}", sys.calls);
+    }
+
+    /// A netdev of NEITHER shape wearing the leg's name is not the flip: it keeps the builders'
+    /// own refusals, which do not offer a remedy `down` cannot perform on a stranger.
+    #[test]
+    fn up_still_refuses_a_stranger_wearing_the_ingress_legs_name() {
+        let f = fabric_with_a_migrating_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bridge \n",
+            );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert_eq!(e, "FATAL: REFUSING: cfab-gw249 exists but is not a bond");
+    }
+
     /// The per-zone return-path default (task E2.2): after the ingress leg is addressed, `up`
     /// installs cfab's own default in the zone's table, via the router, through the leg, under
     /// proto 205 (cfab's own id, outside the engine's swept range). Exact argv.
