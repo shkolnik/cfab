@@ -381,12 +381,124 @@ impl Derivation {
         cmds
     }
 
+    /// The classes this derivation installs, as `(classid, rate token)` — what the daemon
+    /// records after a successful apply and what `status` matches against the kernel.
+    pub fn applied_classes(&self) -> Vec<(String, String)> {
+        self.bands
+            .iter()
+            .map(|b| (format!("1:{}", b.minor), rate_token(b.eff)))
+            .collect()
+    }
+
     /// The "classid effective-rate" lines status diffs (--expect).
     pub fn render_expect(&self) -> String {
         self.bands
             .iter()
             .map(|b| format!("1:{} {}\n", b.minor, b.eff))
             .collect()
+    }
+}
+
+/// How a band's effective rate is spelled in a `tc` command and in the applied record. The one
+/// place this formatting lives: the daemon writes these tokens and `status` matches the kernel's
+/// class lines against the same string, so the two can never drift apart in spelling alone.
+pub fn rate_token(eff: u64) -> String {
+    if eff >= 1000 && eff.is_multiple_of(1000) {
+        format!("{}Gbit", eff / 1000)
+    } else if eff >= 1 {
+        format!("{eff}Mbit")
+    } else {
+        "1Kbit".to_string()
+    }
+}
+
+/// What the shape-daemon did to ONE wire on its last reconverge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedWire {
+    /// The tree it installed: `(classid, rate token)`, in band order.
+    Shaped(Vec<(String, String)>),
+    /// Deliberately skipped: no carrier. Whatever tc holds on it is stale by design.
+    NoCarrier,
+    /// The derivation refused (see the message); nothing was installed.
+    Failed(String),
+}
+
+/// The record the shape-daemon writes after every reconverge (`<run_dir>/shape.applied`).
+/// It exists so `status` never has to derive the shape a second time: two derivations from two
+/// carrier reads across a debounce window reported drift on correctly shaped wires (F19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeApplied {
+    /// Wall-clock seconds at the apply — for a human reading the file, not for any decision.
+    pub tick: u64,
+    pub wires: std::collections::BTreeMap<String, AppliedWire>,
+}
+
+const APPLIED_HEADER: &str = "cfab-shape-applied 1";
+
+impl ShapeApplied {
+    pub fn render(&self) -> String {
+        let mut out = format!("{APPLIED_HEADER}\ntick {}\n", self.tick);
+        for (dev, w) in &self.wires {
+            match w {
+                AppliedWire::Shaped(classes) => {
+                    out.push_str(&format!("dev {dev} shaped"));
+                    for (cid, rate) in classes {
+                        out.push_str(&format!(" {cid}={rate}"));
+                    }
+                    out.push('\n');
+                }
+                AppliedWire::NoCarrier => out.push_str(&format!("dev {dev} no-carrier\n")),
+                AppliedWire::Failed(msg) => {
+                    // One line per dev: a message with newlines would forge records.
+                    out.push_str(&format!("dev {dev} failed {}\n", msg.replace('\n', " ")));
+                }
+            }
+        }
+        out
+    }
+
+    /// Strict: anything unexpected is an error, so `status` treats a half-written or
+    /// future-format file as "no record yet" instead of inventing an expectation.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut lines = text.lines();
+        if lines.next() != Some(APPLIED_HEADER) {
+            return Err(Error::config("shape record: bad header".to_string()));
+        }
+        let tick = lines
+            .next()
+            .and_then(|l| l.strip_prefix("tick "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| Error::config("shape record: bad tick line".to_string()))?;
+        let mut wires = std::collections::BTreeMap::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rest = line
+                .strip_prefix("dev ")
+                .ok_or_else(|| Error::config(format!("shape record: bad line '{line}'")))?;
+            let (dev, rest) = rest
+                .split_once(' ')
+                .ok_or_else(|| Error::config(format!("shape record: bad line '{line}'")))?;
+            let w = if rest == "no-carrier" {
+                AppliedWire::NoCarrier
+            } else if let Some(msg) = rest.strip_prefix("failed ") {
+                AppliedWire::Failed(msg.to_string())
+            } else if let Some(spec) = rest.strip_prefix("shaped") {
+                let mut classes = Vec::new();
+                for tok in spec.split_whitespace() {
+                    let (cid, rate) = tok
+                        .split_once('=')
+                        .ok_or_else(|| Error::config(format!("shape record: bad class '{tok}'")))?;
+                    classes.push((cid.to_string(), rate.to_string()));
+                }
+                AppliedWire::Shaped(classes)
+            } else {
+                return Err(Error::config(format!("shape record: bad line '{line}'")));
+            };
+            wires.insert(dev.to_string(), w);
+        }
+        Ok(Self { tick, wires })
     }
 }
 
@@ -506,5 +618,55 @@ mod tests {
                 .contains("no a zone's `segments` zone on wire 'eth5'"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn applied_record_round_trips() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let d = derive(&v, "eth9", None, &|_| true).unwrap();
+        let mut wires = std::collections::BTreeMap::new();
+        wires.insert("eth9".to_string(), AppliedWire::Shaped(d.applied_classes()));
+        wires.insert("eth1".to_string(), AppliedWire::NoCarrier);
+        wires.insert(
+            "eth0".to_string(),
+            AppliedWire::Failed("gen-shape: nope".to_string()),
+        );
+        let rec = ShapeApplied { tick: 42, wires };
+        let text = rec.render();
+        assert!(
+            text.starts_with("cfab-shape-applied 1\ntick 42\n"),
+            "{text}"
+        );
+        assert!(text.contains("dev eth1 no-carrier\n"), "{text}");
+        assert!(text.contains("dev eth0 failed gen-shape: nope\n"), "{text}");
+        assert_eq!(ShapeApplied::parse(&text).unwrap(), rec);
+    }
+
+    #[test]
+    fn applied_record_refuses_anything_it_does_not_understand() {
+        for bad in [
+            "",
+            "cfab-shape-applied 2\ntick 1\n",
+            "cfab-shape-applied 1\n",
+            "cfab-shape-applied 1\ntick x\n",
+            "cfab-shape-applied 1\ntick 1\neth9 shaped 1:10=1Mbit\n",
+            "cfab-shape-applied 1\ntick 1\ndev eth9 wat\n",
+            "cfab-shape-applied 1\ntick 1\ndev eth9 shaped 1:10\n",
+            // A truncated write: the header alone must not read as an empty apply.
+            "cfab-shape-app",
+        ] {
+            assert!(ShapeApplied::parse(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn rate_tokens_are_spelled_the_way_tc_prints_them() {
+        // `tc class show` capitalizes the unit and folds whole thousands to Gbit; a floor of
+        // 0 is installed as the 1Kbit token. These strings are matched against kernel output.
+        assert_eq!(rate_token(2000), "2Gbit");
+        assert_eq!(rate_token(4850), "4850Mbit");
+        assert_eq!(rate_token(1), "1Mbit");
+        assert_eq!(rate_token(0), "1Kbit");
     }
 }
