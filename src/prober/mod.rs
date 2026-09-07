@@ -737,7 +737,8 @@ impl Leg {
                     if !f.noted_engine_unreadable {
                         f.noted_engine_unreadable = true;
                         log.push(format!(
-                            "cfab: {zone} fallback: the engine's ospf state for {bond} cannot be                              read — hello silence on the active wire is left to the arp escalation"
+                            "cfab: {zone} fallback: the engine's ospf state for {bond} cannot be read — hello \
+                             silence on the active wire is left to the arp escalation"
                         ));
                     }
                 }
@@ -2333,10 +2334,12 @@ mod tests {
         let log = p.drain_log();
         assert_eq!(
             log.iter()
-                .filter(|l| l.contains("engine's ospf state"))
+                .filter(|l| l.as_str()
+                    == "cfab: storage fallback: the engine's ospf state for cfab-st-fb cannot be \
+                        read — hello silence on the active wire is left to the arp escalation")
                 .count(),
             1,
-            "said once: {log:?}"
+            "said once, in full: {log:?}"
         );
     }
 }
