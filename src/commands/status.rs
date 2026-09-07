@@ -470,7 +470,7 @@ fn read(
         sys,
         view,
         doc.as_ref(),
-        comps.as_deref(),
+        comps,
         c,
         &absent,
         &mut counts,
@@ -4550,13 +4550,7 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view).socket(
             "/run/cfab/cfab.sock",
-            &components_with_fallback(
-                &view,
-                "cfab-st-fb-a",
-                &["eth9", "eth1", "eth0"],
-                &[],
-                false,
-            ),
+            &components_with_fallback(&view, "cfab-st-fb-a", &["eth9", "eth1", "eth0"], &[], false),
         );
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(

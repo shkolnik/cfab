@@ -65,12 +65,11 @@ impl Evidence {
     fn last(&self, now: Instant) -> Option<Instant> {
         // Our reflection is evidence for a BACKUP slave only. On the active slave it is never
         // expected, so its absence must never be read as a miss.
-        let candidates = [self.peer, (!self.active).then_some(self.reflected).flatten()];
-        candidates
-            .into_iter()
-            .flatten()
-            .filter(|t| *t <= now)
-            .max()
+        let candidates = [
+            self.peer,
+            (!self.active).then_some(self.reflected).flatten(),
+        ];
+        candidates.into_iter().flatten().filter(|t| *t <= now).max()
     }
 }
 
@@ -97,7 +96,12 @@ pub enum Verdict {
 /// member still runs the leg — its own reflection makes its backup slaves judgeable, and F20
 /// (the bond sitting on the wrong wire after a re-enumeration) is a real defect when alone —
 /// but it never suspects a wire of losing peers it does not have, and never says it did.
-pub fn verdicts(now: Instant, slaves: &[Evidence], w: &Windows, expect_peers: bool) -> Vec<Verdict> {
+pub fn verdicts(
+    now: Instant,
+    slaves: &[Evidence],
+    w: &Windows,
+    expect_peers: bool,
+) -> Vec<Verdict> {
     let good: Vec<bool> = slaves
         .iter()
         .map(|e| {
@@ -125,7 +129,11 @@ pub fn verdicts(now: Instant, slaves: &[Evidence], w: &Windows, expect_peers: bo
             if !silent_long_enough {
                 return Verdict::Watch;
             }
-            if any_good { Verdict::Suspect } else { Verdict::Quiet }
+            if any_good {
+                Verdict::Suspect
+            } else {
+                Verdict::Quiet
+            }
         })
         .collect()
 }

@@ -2399,7 +2399,12 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            shared.lock().unwrap().components(Instant::now()).fallback.len(),
+            shared
+                .lock()
+                .unwrap()
+                .components(Instant::now())
+                .fallback
+                .len(),
             3,
             "the leaf's own fallback legs are probed"
         );

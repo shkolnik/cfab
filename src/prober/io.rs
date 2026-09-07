@@ -29,6 +29,20 @@ pub trait ProbeIo {
 /// Unfiltered, as the 0.4.6 tap was, it was a starvation hole on any wire with real traffic.
 const MAX_DRAIN: usize = 64;
 
+/// Is a frame the kernel handed us one that ARRIVED, rather than one we sent?
+///
+/// An `ETH_P_ALL` tap sees this host's own transmitted frames as well as received ones. Counting
+/// our own OSPF hello as evidence that a peer is alive over this wire would make every active
+/// slave look healthy forever, so `PACKET_OUTGOING` is dropped here, at the seam, where nothing
+/// above can forget to. (Our hello REFLECTED back through the backbone onto a backup slave
+/// arrives as a received frame and is kept — that is the lone member's self-check, spec §4.)
+///
+/// An address the kernel did not fill in is treated as received: dropping a frame we cannot
+/// classify would lose evidence, and the codec above still has to agree it is evidence.
+fn received(pkttype: Option<u8>) -> bool {
+    pkttype != Some(libc::PACKET_OUTGOING)
+}
+
 /// The largest frame we will read. Anything longer is not an ARP reply, and the tail is not
 /// needed to know that.
 const RECV_BUF: usize = 256;
@@ -136,18 +150,13 @@ impl ProbeIo for PacketIo {
         let mut out = Vec::new();
         let mut buf = [0u8; RECV_BUF];
         while out.len() < MAX_DRAIN {
-            // `recvfrom`, not `recv`, for one field: `sll_pkttype`. An ETH_P_ALL tap sees this
-            // host's own TRANSMITTED frames too, and counting our own OSPF hello as evidence
-            // that a peer is alive over this wire would make every active slave look healthy
-            // forever. `PACKET_OUTGOING` is dropped here, at the seam, so nothing above can
-            // forget to. (Our hello REFLECTED back through the backbone onto a backup slave is
-            // a received frame and is kept — that is the lone member's self-check, spec §4.)
+            // `recvfrom`, not `recv`, for one field: `sll_pkttype` (see `received`).
             // `nix`'s `recvfrom` takes no flags, so the non-blocking contract rests on the
             // socket's own `SOCK_NONBLOCK` (set at `open`, never cleared) and on `EAGAIN`
             // ending the drain below.
             match recvfrom::<LinkAddr>(raw, &mut buf) {
                 Ok((0, _)) => break,
-                Ok((_, Some(from))) if from.pkttype() == libc::PACKET_OUTGOING => continue,
+                Ok((_, from)) if !received(from.map(|f| f.pkttype())) => continue,
                 Ok((n, _)) => out.push(buf[..n.min(RECV_BUF)].to_vec()),
                 Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => break,
                 Err(e) => {
@@ -291,6 +300,18 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Our own hello leaves on the active slave and the tap sees it go. It is not evidence that
+    /// anyone is out there; the reflection that comes back through the backbone onto a BACKUP
+    /// slave is, and it arrives as a received frame.
+    #[test]
+    fn our_own_transmitted_frames_are_not_evidence() {
+        assert!(!received(Some(libc::PACKET_OUTGOING)));
+        assert!(received(Some(libc::PACKET_HOST)));
+        assert!(received(Some(libc::PACKET_MULTICAST)));
+        assert!(received(Some(libc::PACKET_BROADCAST)));
+        assert!(received(None), "unclassifiable is kept, not silently lost");
+    }
 
     /// The starvation hole the 0.4.6 tap had and this one does not. `MAX_DRAIN` bounds a tick on
     /// a busy wire, and on an idle rack that bound is never reached — but a storage VLAN carries

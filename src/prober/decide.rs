@@ -207,13 +207,19 @@ mod tests {
     /// the decision must still say the bond belongs on the preferred wire.
     #[test]
     fn a_healthy_bond_on_the_wrong_wire_is_moved_to_the_preferred_one() {
+        // Enslave order, which is what the bond's backup order is: the 5G wire re-enumerated
+        // and the kernel put it back LAST.
         let cands = cands(&[
-            ("cfab-st-fb-a", "eth9", true), // 5G
-            ("cfab-st-fb-b", "eth1", true), // 1G, re-enslaved last, and where the bond sits
+            ("cfab-st-fb-b", "eth1", true), // 1G, and where the bond sits
             ("cfab-st-fb-c", "eth0", true),
+            ("cfab-st-fb-a", "eth9", true), // 5G, re-enslaved last
         ]);
         assert_eq!(
-            decide(Some("cfab-st-fb-b"), &cands, &prefs(&["eth9", "eth1", "eth0"])),
+            decide(
+                Some("cfab-st-fb-b"),
+                &cands,
+                &prefs(&["eth9", "eth1", "eth0"])
+            ),
             Some("cfab-st-fb-a".to_string()),
             "the preference order, not the enslave order, decides where a healthy bond sits"
         );
@@ -243,7 +249,10 @@ mod tests {
         assert!(!h.reachable());
         h.precharge();
         assert!(!h.reachable());
-        assert!(!h.observe(true), "and it still needs three replies to come back");
+        assert!(
+            !h.observe(true),
+            "and it still needs three replies to come back"
+        );
     }
 
     #[test]

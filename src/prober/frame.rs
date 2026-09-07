@@ -251,10 +251,7 @@ mod tests {
     /// and there is more than one of them: a reply from ANY of them is evidence about the wire.
     #[test]
     fn a_reply_from_any_target_counts() {
-        let peers = [
-            Ipv4Addr::new(10, 99, 9, 2),
-            Ipv4Addr::new(10, 99, 9, 3),
-        ];
+        let peers = [Ipv4Addr::new(10, 99, 9, 2), Ipv4Addr::new(10, 99, 9, 3)];
         let mut f = rack_reply();
         f[28..32].copy_from_slice(&[10, 99, 9, 3]);
         assert_eq!(reply_from(&f, OURS, &peers), Some(UDM));
@@ -319,7 +316,11 @@ mod tests {
         let mut wrong_dst = hello([10, 99, 0, 2], 5);
         wrong_dst[14 + 16..14 + 20].copy_from_slice(&[224, 0, 0, 6]);
         assert_eq!(hello_router_id(&wrong_dst), None);
-        assert_eq!(hello_router_id(&rack_reply()), None, "an ARP reply is not a hello");
+        assert_eq!(
+            hello_router_id(&rack_reply()),
+            None,
+            "an ARP reply is not a hello"
+        );
         let h = hello([10, 99, 0, 2], 5);
         assert_eq!(hello_router_id(&h[..40]), None, "cut before the router id");
         assert_eq!(hello_router_id(&[]), None);

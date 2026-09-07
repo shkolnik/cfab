@@ -341,13 +341,13 @@ impl Prober {
                 &r.home,
                 slaves,
                 Kind::Fallback(Fallback {
-                    targets: peer_members.iter().filter_map(|m| addr_of(m.node)).collect(),
+                    targets: peer_members
+                        .iter()
+                        .filter_map(|m| addr_of(m.node))
+                        .collect(),
                     peers: peer_members.iter().filter_map(|m| rid_of(m)).collect(),
                     self_rid,
-                    windows: Windows::from_ospf(
-                        view.fabric.ospf_hello,
-                        view.fabric.ospf_dead,
-                    ),
+                    windows: Windows::from_ospf(view.fabric.ospf_hello, view.fabric.ospf_dead),
                     quiet_now: false,
                     noted_quiet: false,
                     noted_deaf: false,
@@ -465,7 +465,6 @@ fn without_fatal(e: &crate::error::Error) -> String {
 }
 
 impl Leg {
-    #[expect(clippy::too_many_arguments, reason = "one constructor, all of it per-leg state")]
     fn new(
         zone: String,
         bond: String,
@@ -501,7 +500,13 @@ impl Leg {
         matches!(self.kind, Kind::Fallback(ref f) if f.quiet_now)
     }
 
-    fn tick(&mut self, sys: &mut dyn Sys, io: &mut dyn ProbeIo, now: Instant, log: &mut Vec<String>) {
+    fn tick(
+        &mut self,
+        sys: &mut dyn Sys,
+        io: &mut dyn ProbeIo,
+        now: Instant,
+        log: &mut Vec<String>,
+    ) {
         // The kernel's own answer to "where is this bond", read once and used by everything
         // below: the passive channel judges a slave by its role, and the decision compares
         // against it. A leg whose `bonding/` cannot be read is a leg we do not own this tick.
@@ -519,7 +524,10 @@ impl Leg {
     /// empty string — a bond with no active slave — reads as `Some("")`, which no slave matches.
     fn read_active(&mut self, sys: &mut dyn Sys) -> Option<String> {
         let read = sys
-            .read(&format!("/sys/class/net/{}/bonding/active_slave", self.bond))
+            .read(&format!(
+                "/sys/class/net/{}/bonding/active_slave",
+                self.bond
+            ))
             .ok()?;
         let active = read.trim().to_string();
         self.active_now = (!active.is_empty()).then(|| active.clone());
@@ -577,8 +585,7 @@ impl Leg {
                             // A hello from a Router ID we do not expect on this segment is not
                             // evidence about our fabric: another OSPF speaker on the VLAN would
                             // otherwise keep a wire looking live for peers that are gone.
-                        } else if s.escalating
-                            && frame::reply_from(fr, s.mac, &f.targets).is_some()
+                        } else if s.escalating && frame::reply_from(fr, s.mac, &f.targets).is_some()
                         {
                             replied = true;
                         }
@@ -971,7 +978,9 @@ mod tests {
     ) -> Vec<ProbedLeg> {
         let mut last = Vec::new();
         for i in 0..n {
-            last = p.tick(sys, io, Instant::now() + PROBE_INTERVAL * i as u32).ingress;
+            last = p
+                .tick(sys, io, Instant::now() + PROBE_INTERVAL * i as u32)
+                .ingress;
         }
         last
     }
@@ -1010,7 +1019,10 @@ mod tests {
             "the outside reaches a leaf at the leaf's own addresses, never at a fabric identity"
         );
         assert_eq!(
-            rows.fallback.iter().map(|l| l.zone.clone()).collect::<Vec<_>>(),
+            rows.fallback
+                .iter()
+                .map(|l| l.zone.clone())
+                .collect::<Vec<_>>(),
             vec!["storage", "cluster", "mgmt"],
             "a leaf's fallback path is a real path, and F20 is a real defect on it"
         );
@@ -1585,7 +1597,11 @@ mod tests {
         for _ in 1..8 {
             fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_secs(10));
         }
-        assert!(io.sent.is_empty(), "a lone member asks nobody: {:?}", io.sent);
+        assert!(
+            io.sent.is_empty(),
+            "a lone member asks nobody: {:?}",
+            io.sent
+        );
         assert!(
             !p.drain_log()
                 .iter()
@@ -1640,17 +1656,23 @@ mod tests {
             "the escalation is bounded to the suspect wire: {:?}",
             io.sent.iter().map(|(s, _)| s).collect::<Vec<_>>()
         );
-        assert!(io.sent_on(FB_B).is_empty(), "a wire that is heard is not asked");
         assert!(
-            p.drain_log()
-                .iter()
-                .any(|l| l == "cfab: storage fallback: peers unreachable on eth9, moved cfab-st-fb to eth1"),
+            io.sent_on(FB_B).is_empty(),
+            "a wire that is heard is not asked"
+        );
+        assert!(
+            p.drain_log().iter().any(|l| l
+                == "cfab: storage fallback: peers unreachable on eth9, moved cfab-st-fb to eth1"),
             "the move says which wire lost the peers"
         );
         let row = last.unwrap();
         assert!(!row.quiet);
         assert!(
-            !row.slaves.iter().find(|s| s.wire == "eth9").unwrap().reachable,
+            !row.slaves
+                .iter()
+                .find(|s| s.wire == "eth9")
+                .unwrap()
+                .reachable,
             "and the row blames that wire, not the bond"
         );
     }
@@ -1713,7 +1735,12 @@ mod tests {
             for s in FB_SLAVES {
                 hear(&mut io, s, &[hello(2)]);
             }
-            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
         }
         p.drain_log();
         let mut row = None;
@@ -1734,13 +1761,25 @@ mod tests {
         // happen is anything at all after the leg has gone quiet: that state has no per-wire
         // answer, so asking or moving again would be walking the bond around its slaves.
         let asked = io.sent.len();
-        let written = sys.calls.iter().filter(|c| c.starts_with("write /sys")).count();
+        let written = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("write /sys"))
+            .count();
         for tick in 24..40u64 {
-            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
         }
         assert_eq!(io.sent.len(), asked, "a quiet leg asks nobody");
         assert_eq!(
-            sys.calls.iter().filter(|c| c.starts_with("write /sys")).count(),
+            sys.calls
+                .iter()
+                .filter(|c| c.starts_with("write /sys"))
+                .count(),
             written,
             "and a quiet leg moves nothing: {:?}",
             sys.calls
@@ -1769,7 +1808,12 @@ mod tests {
         let t0 = Instant::now();
         for tick in 0..6u64 {
             hear(&mut io, FB_B, &[hello(2)]);
-            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
         }
         assert!(
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
@@ -1795,7 +1839,12 @@ mod tests {
         let t0 = Instant::now();
         for tick in 0..6u64 {
             hear(&mut io, FB_B, &[hello(2)]);
-            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
         }
         assert!(
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
@@ -1815,7 +1864,12 @@ mod tests {
         io.deaf = FB_SLAVES.iter().map(|s| s.to_string()).collect();
         let t0 = Instant::now();
         for tick in 0..6u64 {
-            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
         }
         let log = p.drain_log();
         assert_eq!(
