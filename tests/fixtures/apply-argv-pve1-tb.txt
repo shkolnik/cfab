@@ -138,13 +138,32 @@ write /proc/sys/net/ipv4/conf/cfab-mg-b2/send_redirects
 write /proc/sys/net/ipv4/conf/cfab-mg-b2/forwarding
 ip link show cfab-gw249
 ip link show cfab-gw249
-ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6
+ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none
+ip link show cfab-gw249-a
+ip link show cfab-gw249-a
+ip link add link eth9 name cfab-gw249-a type vlan id 249 egress-qos-map 0:2 6:6
+ip link set cfab-gw249-a master cfab-gw249
+ip link set cfab-gw249-a up
+write /proc/sys/net/ipv4/conf/cfab-gw249-a/forwarding
+ip link show cfab-gw249-b
+ip link show cfab-gw249-b
+ip link add link eth1 name cfab-gw249-b type vlan id 249 egress-qos-map 0:2 6:6
+ip link set cfab-gw249-b master cfab-gw249
+ip link set cfab-gw249-b up
+write /proc/sys/net/ipv4/conf/cfab-gw249-b/forwarding
+ip link show cfab-gw249-c
+ip link show cfab-gw249-c
+ip link add link eth0 name cfab-gw249-c type vlan id 249 egress-qos-map 0:2 6:6
+ip link set cfab-gw249-c master cfab-gw249
+ip link set cfab-gw249-c up
+write /proc/sys/net/ipv4/conf/cfab-gw249-c/forwarding
+ip link set cfab-gw249 type bond primary cfab-gw249-c primary_reselect always
 ip addr replace 192.168.249.1/24 dev cfab-gw249
-ip link set cfab-gw249 up
 write /proc/sys/net/ipv4/conf/cfab-gw249/arp_ignore
 write /proc/sys/net/ipv4/conf/cfab-gw249/rp_filter
 write /proc/sys/net/ipv4/conf/cfab-gw249/send_redirects
 write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding
+ip link set cfab-gw249 up
 ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205
 ip link show cfab-st-fb
 ip link add cfab-st-fb type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none

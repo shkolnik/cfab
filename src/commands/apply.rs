@@ -10,6 +10,7 @@ use crate::commands::common;
 use crate::commands::common::{
     conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
+use crate::commands::teardown;
 use crate::derive::{GwRow, Slave, View};
 use crate::driver_features;
 use crate::emit;
@@ -399,6 +400,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         let cidr = gw.leg_cidr(n);
         let qos_map = qos_map(f, z);
         let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
+        replace_a_wrong_shape_gw_leg(sys, view, r, &mut warnings)?;
         if r.migrates() {
             let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
                 continue; // every wire under this leg is absent; already warned above
@@ -865,6 +867,58 @@ pub(crate) fn home_slave<'a>(bond: &str, slaves: &'a [Slave], home: &str) -> Res
             "{bond}: home wire {home} carries no slave of this bond"
         ))
     })
+}
+
+/// The ingress leg's two shapes wear ONE name: `cfab-gw<id>` is a plain tagged sub-interface on
+/// a single gw domain and an active-backup bond over every wire on scope `any`. A leg in the
+/// OTHER shape is state a previous declaration left — after a crash, and also after a clean
+/// stop whose teardown partially failed, which the supervisor logs and exits 0 on — so `up`
+/// REMOVES it and builds the declared shape (James 2026-09-07). Refusing protected nothing: the
+/// daemon is already down by the time `up` runs, and the refusal's exit 3 is on the unit's
+/// `RestartPreventExitStatus`, so systemd would never retry it.
+///
+/// Removal goes through `teardown::remove_gw_leg`, the very code `cfab down` runs — the bond
+/// before the slaves that deleting it RELEASES rather than deletes, so nothing is orphaned, and
+/// one spelling of "what a stale ingress leg is" for both verbs.
+///
+/// Only the other CFAB shape is handled here. A netdev of neither is a stranger wearing the
+/// name and keeps the builders' own refusals, unchanged: `up` never deletes what it cannot
+/// prove is ours.
+fn replace_a_wrong_shape_gw_leg(
+    sys: &mut dyn Sys,
+    view: &View,
+    r: &GwRow,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if !link_exists(sys, &r.ifname)? {
+        return Ok(());
+    }
+    let wrong_shape = if r.migrates() {
+        link_kind_is(sys, &r.ifname, " vlan ")?
+    } else {
+        link_kind_is(sys, &r.ifname, " bond ")?
+    };
+    if !wrong_shape {
+        return Ok(());
+    }
+    let Some(removed) = teardown::remove_gw_leg(sys, view.member, &r.ifname)? else {
+        return Ok(());
+    };
+    warnings.push(gw_leg_shape_replaced(&r.ifname, removed, r.migrates()));
+    Ok(())
+}
+
+/// One spelling for both directions: what was removed, and why this run wanted the other shape.
+fn gw_leg_shape_replaced(ifname: &str, removed: &str, migrates: bool) -> String {
+    let declared = if migrates {
+        "scope `any`"
+    } else {
+        "one domain"
+    };
+    format!(
+        "{ifname}: removed the {removed} a previous declaration left — this one puts the \
+         ingress leg on {declared} — and rebuilt the leg"
+    )
 }
 
 /// One spelling per condition (spec §9 string table), shared by `apply` and the forwarding
@@ -1567,11 +1621,10 @@ mod tests {
         );
     }
 
-    fn fabric_with_a_migrating_gw() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-                .unwrap()
-                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
+    /// The same declaration with the ingress leg pinned to one domain — the example ships
+    /// scope `any`, the migrating leg.
+    fn fabric_with_a_domain_gw() -> Fabric {
+        let text = crate::decl::fixtures::with_a_domain_gw(&crate::decl::fixtures::example());
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
@@ -1581,7 +1634,7 @@ mod tests {
     /// cheapest segment is on the mg domain, so `primary` names the mg SLAVE.
     #[test]
     fn a_migrating_gw_leg_is_built_as_a_bond() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
         let o = opts();
@@ -1589,6 +1642,8 @@ mod tests {
         assert_eq!(
             calls_for(&sys, "cfab-gw249"),
             [
+                // the shape guard's own probe (`gw_leg_shape_ok`), then mk_bond_leg's
+                "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link add cfab-gw249 type bond mode active-backup miimon 100 num_grat_arp 3 updelay 500 fail_over_mac none",
                 "ip link show cfab-gw249-a",
@@ -1624,6 +1679,144 @@ mod tests {
         );
     }
 
+    /// Every `ip link del` the run issued, in order.
+    fn dels(sys: &MockSys) -> Vec<&String> {
+        sys.calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del"))
+            .collect()
+    }
+
+    /// The index of the first call equal to `argv`.
+    fn call_at(sys: &MockSys, argv: &str) -> usize {
+        sys.calls
+            .iter()
+            .position(|c| c == argv)
+            .unwrap_or_else(|| panic!("{argv} never ran: {:?}", sys.calls))
+    }
+
+    /// A migrating ingress leg with one tagged slave per wire, live on the box — what a
+    /// previous `any` declaration left behind.
+    fn a_live_gw_bond(mut sys: MockSys) -> MockSys {
+        sys = sys
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bond \n",
+            );
+        for (i, (slave, wire)) in [
+            ("cfab-gw249-a", "eth9"),
+            ("cfab-gw249-b", "eth1"),
+            ("cfab-gw249-c", "eth0"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sys = sys
+                .on_stdout(
+                    &["ip", "link", "show", slave],
+                    &format!("{}: {slave}\n", 21 + i),
+                )
+                .on_stdout(
+                    &["ip", "-d", "link", "show", slave],
+                    &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                );
+        }
+        sys
+    }
+
+    /// The ingress leg's two shapes wear the SAME name: a plain tagged sub-interface on a
+    /// single gw domain, an active-backup bond on scope `any`. A plain `cfab up` on a flipped
+    /// declaration meets the shape the PREVIOUS declaration built — after a crash, and also
+    /// after a clean exit whose teardown partially failed (the supervisor logs that and exits
+    /// 0). James 2026-09-07: refusing protects nothing with the daemon already down, and exit
+    /// 3 is on `RestartPreventExitStatus`, so systemd would never retry. `up` removes the old
+    /// shape through the same code `cfab down` runs — the bond BEFORE the slaves it releases
+    /// rather than deletes — says so in one line, and builds the declared shape.
+    #[test]
+    fn up_replaces_an_ingress_leg_the_previous_declaration_built_as_a_bond() {
+        let f = fabric_with_a_domain_gw();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = a_live_gw_bond(up_sys(&view));
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert_eq!(
+            dels(&sys),
+            [
+                "ip link del cfab-gw249",
+                "ip link del cfab-gw249-a",
+                "ip link del cfab-gw249-b",
+                "ip link del cfab-gw249-c",
+            ]
+        );
+        assert!(
+            call_at(&sys, "ip link del cfab-gw249-c")
+                < call_at(
+                    &sys,
+                    "ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6"
+                ),
+            "the declared shape is built after the old one is gone: {:?}",
+            sys.calls
+        );
+        assert!(
+            warnings.contains(
+                &"cfab-gw249: removed the bond a previous declaration left — this one puts the \
+                  ingress leg on one domain — and rebuilt the leg"
+                    .to_string()
+            ),
+            "{warnings:?}"
+        );
+    }
+
+    /// The other direction, in the same words: the box wears the plain sub-interface and the
+    /// declaration now says `any`. The stale leg had no slaves, so exactly one delete.
+    #[test]
+    fn up_replaces_an_ingress_leg_the_previous_declaration_built_as_a_sub_interface() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249@eth0: vlan protocol 802.1Q id 249 \n",
+            );
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert_eq!(dels(&sys), ["ip link del cfab-gw249"]);
+        assert!(
+            call_at(&sys, "ip link del cfab-gw249")
+                < call_at(
+                    &sys,
+                    "ip link add cfab-gw249 type bond mode active-backup miimon 100 \
+                     num_grat_arp 3 updelay 500 fail_over_mac none"
+                ),
+            "the declared shape is built after the old one is gone: {:?}",
+            sys.calls
+        );
+        assert!(
+            warnings.contains(
+                &"cfab-gw249: removed the sub-interface a previous declaration left — this one \
+                  puts the ingress leg on scope `any` — and rebuilt the leg"
+                    .to_string()
+            ),
+            "{warnings:?}"
+        );
+    }
+
+    /// A netdev of NEITHER shape wearing the leg's name is not the flip: it keeps the builders'
+    /// own refusals, which do not offer a remedy `down` cannot perform on a stranger.
+    #[test]
+    fn up_still_refuses_a_stranger_wearing_the_ingress_legs_name() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = up_sys(&view)
+            .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-gw249"],
+                "20: cfab-gw249: bridge \n",
+            );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert_eq!(e, "FATAL: REFUSING: cfab-gw249 exists but is not a bond");
+    }
+
     /// The per-zone return-path default (task E2.2): after the ingress leg is addressed, `up`
     /// installs cfab's own default in the zone's table, via the router, through the leg, under
     /// proto 205 (cfab's own id, outside the engine's swept range). Exact argv.
@@ -1647,7 +1840,7 @@ mod tests {
     /// explicitly rather than inheriting conf/default.
     #[test]
     fn a_migrating_gw_bond_forwards_and_its_slaves_never_do() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
         let o = opts();
@@ -1669,7 +1862,7 @@ mod tests {
     /// condition for it as well.
     #[test]
     fn a_down_migrating_gw_bond_is_reported_as_no_wire_with_carrier() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let got = describe_down(&view, &["mgmt/cfab-gw249".to_string()]);
         assert_eq!(
@@ -1722,7 +1915,7 @@ mod tests {
     /// leg must still produce exactly the argv they produced before it — this pins them.
     #[test]
     fn class_and_gw_sub_interfaces_are_created_exactly_as_before() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
         let mut sys = up_sys(&view);
@@ -1740,6 +1933,8 @@ mod tests {
         assert_eq!(
             calls_for_dev(&sys, "cfab-gw249"),
             [
+                // the shape guard's own probe (`gw_leg_shape_ok`), then mk_vlan's two
+                "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link show cfab-gw249",
                 "ip link add link eth0 name cfab-gw249 type vlan id 249 egress-qos-map 0:2 6:6",

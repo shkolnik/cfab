@@ -372,10 +372,13 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
         .collect()
 }
 
-/// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member
-/// has, in `[[member]]` order, named `<ifname>-<domain>`. Shared by the universal segment and a
-/// migrating ingress leg — one fan-out, so the two legs cannot drift apart.
-fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
+/// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member has,
+/// in `[[member]]` order, named `<ifname>-<domain>`. Shared by the universal segment and a
+/// migrating ingress leg — one fan-out, so the two legs cannot drift apart. Reachable from the
+/// rest of the crate because `up` and `down` need these names for a leg the CURRENT declaration
+/// does not describe as a bond at all: an ingress leg whose `gw` scope flipped from `any` to a
+/// domain is still a bond, with these slaves, until it is removed.
+pub(crate) fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
     member
         .wires
         .iter()
@@ -847,9 +850,15 @@ mod tests {
         assert!(err.contains("raise leaf_offset"), "{err}");
     }
 
+    /// The same declaration with the ingress leg pinned to one domain — the example ships
+    /// scope `any`.
+    fn fabric_with_a_domain_gw() -> Fabric {
+        edited(|t| *t = crate::decl::fixtures::with_a_domain_gw(t))
+    }
+
     #[test]
     fn gw_rows_only_on_hosts_with_the_wire() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let host = View::new(&f, "pve1-tb").unwrap();
         let rows = host.gw_rows();
         assert_eq!(rows.len(), 1);
@@ -863,14 +872,9 @@ mod tests {
         assert!(leaf.gw_rows().is_empty());
     }
 
-    /// The same declaration with the ingress on scope `any`.
-    fn fabric_with_a_migrating_gw() -> Fabric {
-        edited(|t| *t = t.replace("gw = { domain = \"c\"", "gw = { domain = \"any\""))
-    }
-
     #[test]
     fn a_gw_scope_of_any_fans_out_into_a_bond() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let host = View::new(&f, "pve1-tb").unwrap();
         let rows = host.gw_rows();
         assert_eq!(rows.len(), 1);
@@ -894,7 +898,7 @@ mod tests {
 
     #[test]
     fn a_migrating_gw_slave_name_fits_ifnamsiz() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         for m in &f.members {
             for s in gw_rows_of(&f, m).iter().flat_map(|r| &r.slaves) {
                 assert!(s.ifname.len() <= 15, "{}", s.ifname);
@@ -904,7 +908,7 @@ mod tests {
 
     #[test]
     fn owned_forwarding_carries_a_migrating_gw_bond_and_its_slaves() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let owned = v.owned_forwarding();
         let get = |n: &str| owned.iter().find(|(i, _)| i == n).map(|(_, t)| *t);
@@ -976,6 +980,10 @@ mod tests {
                 "cfab-cl-fb-a",
                 "cfab-cl-fb-b",
                 "cfab-cl-fb-c",
+                // the migrating ingress leg's slaves: L2 only, like every other bond slave
+                "cfab-gw249-a",
+                "cfab-gw249-b",
+                "cfab-gw249-c",
                 "cfab-id199",
                 "cfab-id199-peer",
                 "cfab-id249",

@@ -1980,6 +1980,87 @@ mod tests {
         );
     }
 
+    /// The declaration change that moves the most netdevs under a running fabric: the ingress
+    /// leg's `gw` scope flipped between `any` (an active-backup bond with one tagged slave per
+    /// wire) and a single domain (one plain sub-interface) — two shapes under the SAME name.
+    ///
+    /// The claim under test is that the reload path needs no special case for it: the stop
+    /// sequence tears down under the declaration the supervisor was STARTED on (finding F2's
+    /// fix), so the bond AND its slaves go, and the restart builds the plain leg from scratch.
+    /// Torn down under the new file instead, the bond's slaves would be nameless and stranded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sighup_that_flips_the_gw_scope_tears_down_the_leg_the_old_declaration_built() {
+        let o = reload_with(|m, dir| {
+            m.files.insert(
+                CONFIG.to_string(),
+                crate::decl::fixtures::with_a_domain_gw(&decl_text(dir)),
+            );
+            // The leg the OLD (shipped, `any`) declaration built, live on the box: the bond,
+            // its parameters as `up` created them (so the initial apply accepts it rather than
+            // refusing an unproven bond), and one tagged slave per wire.
+            for (param, value) in [
+                ("mode", "active-backup 1\n"),
+                ("miimon", "100\n"),
+                ("updelay", "500\n"),
+                ("num_grat_arp", "3\n"),
+                ("fail_over_mac", "none 0\n"),
+            ] {
+                m.files.insert(
+                    format!("/sys/class/net/cfab-gw249/bonding/{param}"),
+                    value.to_string(),
+                );
+            }
+            let taken = std::mem::take(m);
+            let mut sys = taken
+                .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
+                .on_stdout(
+                    &["ip", "-d", "link", "show", "cfab-gw249"],
+                    "20: cfab-gw249: bond \n",
+                );
+            for (i, (slave, wire)) in [
+                ("cfab-gw249-a", "eth9"),
+                ("cfab-gw249-b", "eth1"),
+                ("cfab-gw249-c", "eth0"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                sys = sys
+                    .on_stdout(
+                        &["ip", "link", "show", slave],
+                        &format!("{}: {slave}\n", 21 + i),
+                    )
+                    .on_stdout(
+                        &["ip", "-d", "link", "show", slave],
+                        &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                    );
+            }
+            *m = sys;
+        })
+        .await;
+        assert_eq!(o.code, EXIT_RELOAD, "the exit status asks for the restart");
+        assert_eq!(
+            o.applies, 1,
+            "the new declaration is NOT applied in-process"
+        );
+        let dels: Vec<&String> = o
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip link del cfab-gw249"))
+            .collect();
+        assert_eq!(
+            dels,
+            [
+                "ip link del cfab-gw249",
+                "ip link del cfab-gw249-a",
+                "ip link del cfab-gw249-b",
+                "ip link del cfab-gw249-c",
+            ],
+            "the stop sequence removes the leg the OLD declaration built, slaves included: {:?}",
+            o.calls
+        );
+    }
+
     /// A changed, valid declaration cannot be applied in place — `apply::run` never removes what
     /// the previous declaration had — so the reload tears the fabric down and exits `EXIT_RELOAD`
     /// for systemd to start a supervisor on the new file. Nothing is applied in-process.

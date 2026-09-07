@@ -347,6 +347,18 @@ pub mod mock {
     impl Sys for MockSys {
         fn run(&mut self, argv: &[&str]) -> Result<Output> {
             self.calls.push(argv.join(" "));
+            // A deleted netdev stops existing. Without this the mock answers `ip link show
+            // <dev>` for a device cfab has just removed, and any path that deletes and then
+            // rebuilds under the same name (the ingress leg's two shapes) could not be tested
+            // at all: the builder's own probe would still see the netdev it just destroyed.
+            if let ["ip", "link", "del", dev] = argv {
+                self.cmd_rules.retain(|(prefix, _)| {
+                    prefix.as_slice() != ["ip", "link", "show", dev]
+                        && prefix.as_slice() != ["ip", "-d", "link", "show", dev]
+                });
+                self.files
+                    .retain(|p, _| !p.starts_with(&format!("/sys/class/net/{dev}/")));
+            }
             let hit = self
                 .cmd_rules
                 .iter()

@@ -897,7 +897,7 @@ mod tests {
         let gw = f.zone("mgmt").unwrap().gw.as_ref().unwrap();
         assert_eq!(gw.router, "192.168.249.254");
         assert_eq!(gw.vid, 249);
-        assert_eq!(gw.scope, SegScope::Domain(DomainId::parse("c").unwrap()));
+        assert_eq!(gw.scope, SegScope::Universal);
         assert_eq!(gw.leg_cidr(2), "192.168.249.2/24");
         assert!(f.zone("storage").unwrap().gw.is_none());
         let universal = f
@@ -1228,12 +1228,10 @@ mod tests {
         }
     }
 
-    /// The ingress leg migrates, so `any` is a legal gw scope.
+    /// The ingress leg migrates, so `any` is a legal gw scope — and it is the example's own.
     #[test]
     fn gw_scope_any_is_accepted() {
-        let f =
-            parse_fabric(|t| *t = t.replace("gw = { domain = \"c\"", "gw = { domain = \"any\""))
-                .unwrap();
+        let f = parse_fabric(|_| {}).unwrap();
         assert!(
             f.zone("mgmt")
                 .unwrap()
@@ -1242,6 +1240,17 @@ mod tests {
                 .unwrap()
                 .scope
                 .is_universal()
+        );
+    }
+
+    /// Pinning the leg to one physical domain stays legal: the scope is a choice, not a
+    /// migration path with an opt-out.
+    #[test]
+    fn gw_scope_of_one_domain_is_accepted() {
+        let f = parse_fabric(|t| *t = crate::decl::fixtures::with_a_domain_gw(t)).unwrap();
+        assert_eq!(
+            f.zone("mgmt").unwrap().gw.as_ref().unwrap().scope,
+            SegScope::Domain(DomainId::parse("c").unwrap())
         );
     }
 

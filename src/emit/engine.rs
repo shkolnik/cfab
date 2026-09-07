@@ -770,9 +770,10 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap()
                 .replace(
-                    "gw = { domain = \"c\", vid = 249, router = \"192.168.249.254/24\" }\n",
+                    "gw = { domain = \"any\", vid = 249, router = \"192.168.249.254/24\" }\n",
                     "",
                 );
+        assert!(!text.contains("gw = {"), "the example's gw line moved");
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
