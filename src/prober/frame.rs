@@ -39,13 +39,26 @@ const OP_REPLY: u16 = 2;
 /// the whole fabric, which is what keeps two members' probes on the same broadcast domain from
 /// answering each other's replies. It is never the bond's MAC and never the wire's: those two
 /// belong to the data path, and moving either is exactly the ARP-table damage this frame avoids.
-pub fn synthetic_mac(_node: u8, _zone_id: u8, _slave_index: u8) -> [u8; 6] {
-    [0x02, 0xcf, 0xab, 0, 0, 0]
+pub fn synthetic_mac(node: u8, zone_id: u8, slave_index: u8) -> [u8; 6] {
+    [0x02, 0xcf, 0xab, node, zone_id, slave_index]
 }
 
 /// One RFC 5227 ARP probe for `router`, broadcast, from `src`.
-pub fn probe(_src: [u8; 6], _router: Ipv4Addr) -> [u8; PROBE_LEN] {
-    [0u8; PROBE_LEN]
+pub fn probe(src: [u8; 6], router: Ipv4Addr) -> [u8; PROBE_LEN] {
+    let mut f = [0u8; PROBE_LEN];
+    f[0..6].copy_from_slice(&[0xff; 6]);
+    f[6..12].copy_from_slice(&src);
+    f[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    f[14..16].copy_from_slice(&HTYPE_ETHERNET.to_be_bytes());
+    f[16..18].copy_from_slice(&PTYPE_IPV4.to_be_bytes());
+    f[18] = 6; // hlen
+    f[19] = 4; // plen
+    f[20..22].copy_from_slice(&OP_REQUEST.to_be_bytes());
+    f[22..28].copy_from_slice(&src);
+    // sender IP stays 0.0.0.0 (f[28..32]) and target MAC stays all-zero (f[32..38]): that is
+    // what makes this a probe rather than a request.
+    f[38..42].copy_from_slice(&router.octets());
+    f
 }
 
 /// The router's MAC, iff `frame` is a reply to OUR probe on this slave: an ARP reply whose
@@ -54,8 +67,37 @@ pub fn probe(_src: [u8; 6], _router: Ipv4Addr) -> [u8; PROBE_LEN] {
 /// Everything else is dropped without comment, and two of those are ordinary rather than
 /// exceptional: our own broadcast probe floods back in through the other islands of the same
 /// VLAN (op 1), and the ETH_P_ALL tap sees every frame on the wire.
-pub fn reply_from(_frame: &[u8], _src: [u8; 6], _router: Ipv4Addr) -> Option<[u8; 6]> {
-    None
+pub fn reply_from(frame: &[u8], src: [u8; 6], router: Ipv4Addr) -> Option<[u8; 6]> {
+    // A VLAN header can still be present: the slave netdev normally hands the frame up
+    // stripped, but a tap on a wire carrying tags (or a driver without hardware stripping)
+    // sees it. Skip at most one tag; a doubly tagged frame is not ours.
+    let mut arp = 14;
+    let mut ethertype = be16(frame.get(12..14)?);
+    if ethertype == ETHERTYPE_VLAN || ethertype == ETHERTYPE_QINQ {
+        arp = 18;
+        ethertype = be16(frame.get(16..18)?);
+    }
+    if ethertype != ETHERTYPE_ARP {
+        return None;
+    }
+    let a = frame.get(arp..arp + 28)?;
+    if be16(&a[0..2]) != HTYPE_ETHERNET || be16(&a[2..4]) != PTYPE_IPV4 || a[4] != 6 || a[5] != 4 {
+        return None;
+    }
+    if be16(&a[6..8]) != OP_REPLY {
+        return None;
+    }
+    let sender_mac: [u8; 6] = a[8..14].try_into().ok()?;
+    let sender_ip = Ipv4Addr::new(a[14], a[15], a[16], a[17]);
+    let target_mac: [u8; 6] = a[18..24].try_into().ok()?;
+    if sender_ip != router || target_mac != src {
+        return None;
+    }
+    Some(sender_mac)
+}
+
+fn be16(b: &[u8]) -> u16 {
+    u16::from_be_bytes([b[0], b[1]])
 }
 
 #[cfg(test)]

@@ -38,7 +38,16 @@ impl Default for Hysteresis {
 
 impl Hysteresis {
     /// Fold in one tick's answer. Returns the state after folding.
-    pub fn observe(&mut self, _replied: bool) -> bool {
+    pub fn observe(&mut self, replied: bool) -> bool {
+        if replied == self.reachable {
+            self.streak = 0;
+        } else {
+            self.streak = self.streak.saturating_add(1);
+            if self.streak >= HYSTERESIS {
+                self.reachable = replied;
+                self.streak = 0;
+            }
+        }
         self.reachable
     }
 
@@ -69,8 +78,29 @@ pub struct Candidate {
 /// - the active slave is reachable and nothing better-preferred is ⇒ `None`.
 /// - anything else ⇒ the best reachable slave: the active one is dead, or a better-preferred
 ///   wire came back and ingress belongs on it.
-pub fn decide(_active: Option<&str>, _cands: &[Candidate], _prefs: &[String]) -> Option<String> {
-    None
+pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Option<String> {
+    let rank = |wire: &str| {
+        prefs
+            .iter()
+            .position(|w| w == wire)
+            .unwrap_or(usize::MAX - 1)
+    };
+    // Ties (two wires outside the preference order) keep enslave order, which is `[[member]]`
+    // order: a deterministic answer, so two consecutive ticks never disagree and flap.
+    let best = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.reachable)
+        .min_by_key(|(i, c)| (rank(&c.wire), *i))
+        .map(|(_, c)| c)?;
+    match active.and_then(|a| cands.iter().find(|c| c.ifname == a)) {
+        // Already where we want it, or already on an equally preferred live wire.
+        Some(c) if c.reachable && rank(&c.wire) <= rank(&best.wire) => None,
+        // Dead, or worse-preferred than a live wire — and the `None` arm also covers an
+        // active_slave that is not a slave of ours at all (or none at all), which is a bond we
+        // should own and do not.
+        _ => Some(best.ifname.clone()),
+    }
 }
 
 #[cfg(test)]
