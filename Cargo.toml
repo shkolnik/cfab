@@ -24,6 +24,7 @@ holo-policy = { path = "../holo/holo-policy" }
 yang5 = { version = "0.3", features = ["bundled"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "process"] }
 nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "net"] }
+socket2 = { version = "0.6", features = ["all"] }
 sd-notify = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

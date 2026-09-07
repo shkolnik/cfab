@@ -61,13 +61,18 @@ pub fn probe(src: [u8; 6], router: Ipv4Addr) -> [u8; PROBE_LEN] {
     f
 }
 
-/// The router's MAC, iff `frame` is a reply to OUR probe on this slave: an ARP reply whose
-/// sender IP is `router` and whose target MAC is this slave's synthetic address.
+/// The answering MAC, iff `frame` is a reply to OUR probe on this slave: an ARP reply whose
+/// sender IP is one of `targets` and whose target MAC is this slave's synthetic address.
+///
+/// `targets` is a list because the two probers ask different questions with the same frame: the
+/// ingress prober asks one router, and the fallback prober asks the zone's peers, any one of
+/// which answering is evidence that the wire carries the segment (spec §3). One target is the
+/// one-element case, not a second code path.
 ///
 /// Everything else is dropped without comment, and two of those are ordinary rather than
 /// exceptional: our own broadcast probe floods back in through the other islands of the same
 /// VLAN (op 1), and the ETH_P_ALL tap sees every frame on the wire.
-pub fn reply_from(frame: &[u8], src: [u8; 6], router: Ipv4Addr) -> Option<[u8; 6]> {
+pub fn reply_from(frame: &[u8], src: [u8; 6], targets: &[Ipv4Addr]) -> Option<[u8; 6]> {
     // A VLAN header can still be present: the slave netdev normally hands the frame up
     // stripped, but a tap on a wire carrying tags (or a driver without hardware stripping)
     // sees it. Skip at most one tag; a doubly tagged frame is not ours.
@@ -90,10 +95,51 @@ pub fn reply_from(frame: &[u8], src: [u8; 6], router: Ipv4Addr) -> Option<[u8; 6
     let sender_mac: [u8; 6] = a[8..14].try_into().ok()?;
     let sender_ip = Ipv4Addr::new(a[14], a[15], a[16], a[17]);
     let target_mac: [u8; 6] = a[18..24].try_into().ok()?;
-    if sender_ip != router || target_mac != src {
+    if !targets.contains(&sender_ip) || target_mac != src {
         return None;
     }
     Some(sender_mac)
+}
+
+/// AllSPFRouters — the only IPv4 destination an OSPF hello is sent to on a broadcast segment,
+/// and the one the BPF filter (`super::bpf`) selects on.
+const ALL_SPF_ROUTERS: [u8; 4] = [224, 0, 0, 5];
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const IPPROTO_OSPF: u8 = 89;
+
+/// The Router ID of the member that sent `frame`, iff it is an OSPF packet to AllSPFRouters.
+///
+/// This is the whole of the passive channel's parsing. A hello on a slave means a member that
+/// carries this zone's fallback segment is alive on the far side of that wire — which is the
+/// question the fallback prober asks — and the Router ID is the only field that says WHICH
+/// member, so nothing else is read: not the neighbor list, not the area, not the checksum. A
+/// packet whose type is not Hello is the same evidence (a member that is talking OSPF on this
+/// segment is a member that is there), so the type is not read either.
+///
+/// Layout: RFC 791 (IHL × 4 = the IPv4 header length, so options shift what follows) and RFC
+/// 2328 A.3.1 (version, type, length, then the Router ID at OSPF payload offset 4..8).
+pub fn hello_router_id(frame: &[u8]) -> Option<u32> {
+    // One VLAN tag is skipped for the same reason `reply_from` skips it: a tap on a netdev
+    // without hardware tag stripping sees the tag. A doubly tagged frame is not ours.
+    let mut ip = 14;
+    let mut ethertype = be16(frame.get(12..14)?);
+    if ethertype == ETHERTYPE_VLAN || ethertype == ETHERTYPE_QINQ {
+        ip = 18;
+        ethertype = be16(frame.get(16..18)?);
+    }
+    if ethertype != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ihl = (frame.get(ip)? & 0x0f) as usize * 4;
+    if ihl < 20 {
+        return None;
+    }
+    let hdr = frame.get(ip..ip + ihl)?;
+    if hdr[9] != IPPROTO_OSPF || hdr[16..20] != ALL_SPF_ROUTERS {
+        return None;
+    }
+    let rid = frame.get(ip + ihl + 4..ip + ihl + 8)?;
+    Some(u32::from_be_bytes([rid[0], rid[1], rid[2], rid[3]]))
 }
 
 fn be16(b: &[u8]) -> u16 {
@@ -146,7 +192,7 @@ mod tests {
 
     #[test]
     fn the_rack_reply_yields_the_routers_mac() {
-        assert_eq!(reply_from(&rack_reply(), OURS, ROUTER), Some(UDM));
+        assert_eq!(reply_from(&rack_reply(), OURS, &[ROUTER]), Some(UDM));
     }
 
     /// Ethernet pads a 42-byte frame to the 60-byte minimum; the parse must not care.
@@ -154,7 +200,7 @@ mod tests {
     fn a_padded_reply_still_parses() {
         let mut f = rack_reply();
         f.resize(60, 0);
-        assert_eq!(reply_from(&f, OURS, ROUTER), Some(UDM));
+        assert_eq!(reply_from(&f, OURS, &[ROUTER]), Some(UDM));
     }
 
     /// Our own broadcast probe floods back in through the other islands of the same VLAN. It is
@@ -162,13 +208,13 @@ mod tests {
     #[test]
     fn our_own_flooded_request_is_not_a_reply() {
         let mine = probe(OURS, ROUTER);
-        assert_eq!(reply_from(&mine, OURS, ROUTER), None);
+        assert_eq!(reply_from(&mine, OURS, &[ROUTER]), None);
     }
 
     #[test]
     fn a_reply_from_another_address_is_not_ours() {
         assert_eq!(
-            reply_from(&rack_reply(), OURS, Ipv4Addr::new(192, 168, 249, 1)),
+            reply_from(&rack_reply(), OURS, &[Ipv4Addr::new(192, 168, 249, 1)]),
             None
         );
     }
@@ -178,16 +224,16 @@ mod tests {
     #[test]
     fn a_reply_to_another_slaves_mac_is_not_ours() {
         let other = synthetic_mac(0xf2, 0x10, 1);
-        assert_eq!(reply_from(&rack_reply(), other, ROUTER), None);
+        assert_eq!(reply_from(&rack_reply(), other, &[ROUTER]), None);
     }
 
     #[test]
     fn a_non_arp_or_short_frame_is_dropped_quietly() {
         let mut ip = rack_reply();
         ip[12..14].copy_from_slice(&[0x08, 0x00]);
-        assert_eq!(reply_from(&ip, OURS, ROUTER), None);
-        assert_eq!(reply_from(&rack_reply()[..20], OURS, ROUTER), None);
-        assert_eq!(reply_from(&[], OURS, ROUTER), None);
+        assert_eq!(reply_from(&ip, OURS, &[ROUTER]), None);
+        assert_eq!(reply_from(&rack_reply()[..20], OURS, &[ROUTER]), None);
+        assert_eq!(reply_from(&[], OURS, &[ROUTER]), None);
     }
 
     /// A tagged copy of the same reply parses identically: the tap is ETH_P_ALL, so a frame
@@ -198,7 +244,100 @@ mod tests {
         let mut f = r[..12].to_vec();
         f.extend_from_slice(&[0x81, 0x00, 0x00, 0xf9]);
         f.extend_from_slice(&r[12..]);
-        assert_eq!(reply_from(&f, OURS, ROUTER), Some(UDM));
+        assert_eq!(reply_from(&f, OURS, &[ROUTER]), Some(UDM));
+    }
+
+    /// The peers' own fallback addresses (`10.<zone>.<seg>.<node>`) are the escalation targets,
+    /// and there is more than one of them: a reply from ANY of them is evidence about the wire.
+    #[test]
+    fn a_reply_from_any_target_counts() {
+        let peers = [Ipv4Addr::new(10, 99, 9, 2), Ipv4Addr::new(10, 99, 9, 3)];
+        let mut f = rack_reply();
+        f[28..32].copy_from_slice(&[10, 99, 9, 3]);
+        assert_eq!(reply_from(&f, OURS, &peers), Some(UDM));
+        f[28..32].copy_from_slice(&[10, 99, 9, 4]);
+        assert_eq!(reply_from(&f, OURS, &peers), None, "not one of ours");
+        assert_eq!(reply_from(&rack_reply(), OURS, &[]), None, "nobody to hear");
+    }
+
+    /// A golden OSPFv2 hello: the peer's own router id is at payload offset 4..8, and that is
+    /// the only field read.
+    fn hello(router_id: [u8; 4], ihl: u8) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x05]); // AllSPFRouters
+        f.extend_from_slice(&[0x02, 0xcf, 0xab, 0x00, 0x00, 0x01]);
+        f.extend_from_slice(&[0x08, 0x00]); // IPv4
+        let hlen = (ihl * 4) as usize;
+        let mut ip = vec![0u8; hlen];
+        ip[0] = 0x40 | ihl;
+        ip[9] = 89; // OSPF
+        ip[12..16].copy_from_slice(&[10, 99, 9, 2]); // src
+        ip[16..20].copy_from_slice(&[224, 0, 0, 5]); // dst
+        f.extend_from_slice(&ip);
+        let mut ospf = vec![0u8; 24];
+        ospf[0] = 2; // version
+        ospf[1] = 1; // hello
+        ospf[4..8].copy_from_slice(&router_id);
+        f.extend_from_slice(&ospf);
+        f
+    }
+
+    #[test]
+    fn a_golden_hello_yields_its_router_id() {
+        let rid = u32::from_be_bytes([10, 99, 0, 2]);
+        assert_eq!(hello_router_id(&hello([10, 99, 0, 2], 5)), Some(rid));
+        assert_eq!(
+            hello_router_id(&hello([10, 99, 0, 2], 6)),
+            Some(rid),
+            "an IHL 6 header (one option word) shifts the OSPF header"
+        );
+    }
+
+    /// A tagged copy is the same evidence, exactly as for an ARP reply.
+    #[test]
+    fn a_vlan_tagged_hello_parses() {
+        let h = hello([10, 99, 0, 3], 5);
+        let mut f = h[..12].to_vec();
+        f.extend_from_slice(&[0x81, 0x00, 0x01, 0x2c]);
+        f.extend_from_slice(&h[12..]);
+        assert_eq!(
+            hello_router_id(&f),
+            Some(u32::from_be_bytes([10, 99, 0, 3]))
+        );
+    }
+
+    /// Anything that is not OSPF to AllSPFRouters is not evidence, and neither is a frame that
+    /// stops before the router id.
+    #[test]
+    fn a_non_ospf_or_short_frame_yields_no_router_id() {
+        let mut wrong_proto = hello([10, 99, 0, 2], 5);
+        wrong_proto[14 + 9] = 17;
+        assert_eq!(hello_router_id(&wrong_proto), None);
+        let mut wrong_dst = hello([10, 99, 0, 2], 5);
+        wrong_dst[14 + 16..14 + 20].copy_from_slice(&[224, 0, 0, 6]);
+        assert_eq!(hello_router_id(&wrong_dst), None);
+        assert_eq!(
+            hello_router_id(&rack_reply()),
+            None,
+            "an ARP reply is not a hello"
+        );
+        let h = hello([10, 99, 0, 2], 5);
+        assert_eq!(hello_router_id(&h[..40]), None, "cut before the router id");
+        assert_eq!(hello_router_id(&[]), None);
+        let mut bad_ihl = hello([10, 99, 0, 2], 5);
+        bad_ihl[14] = 0x43; // IHL 3: shorter than an IPv4 header can be
+        assert_eq!(hello_router_id(&bad_ihl), None);
+    }
+
+    /// A type that is not Hello is still a live peer on that wire, and is read the same way.
+    #[test]
+    fn any_ospf_packet_type_is_evidence_of_the_peer() {
+        let mut lsu = hello([10, 99, 0, 3], 5);
+        lsu[14 + 20 + 1] = 4; // Link State Update
+        assert_eq!(
+            hello_router_id(&lsu),
+            Some(u32::from_be_bytes([10, 99, 0, 3]))
+        );
     }
 
     #[test]

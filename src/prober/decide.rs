@@ -54,6 +54,28 @@ impl Hysteresis {
     pub fn reachable(&self) -> bool {
         self.reachable
     }
+
+    /// A real frame arrived: reachable, with the streak cleared.
+    ///
+    /// The passive channel does not count ticks. One hello is a whole frame that traversed the
+    /// actual path, and OSPF itself restarts its dead timer on one — so it outranks any number
+    /// of unanswered probes, exactly as it does for the protocol whose frames they are.
+    pub fn heard(&mut self) {
+        self.reachable = true;
+        self.streak = 0;
+    }
+
+    /// Enter an escalation already carrying `HYSTERESIS - 1` misses.
+    ///
+    /// The escalation is not asking "is this wire dead" from a standing start: it is asking for
+    /// a second opinion on two hello periods of silence that have already been observed. Making
+    /// it spend three more ticks earning that evidence again would push the move past the dead
+    /// interval it exists to beat.
+    pub fn precharge(&mut self) {
+        if self.reachable {
+            self.streak = HYSTERESIS.saturating_sub(1);
+        }
+    }
 }
 
 /// One slave the bond could be active on, as the decision sees it.
@@ -174,6 +196,63 @@ mod tests {
 
     fn prefs(order: &[&str]) -> Vec<String> {
         order.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The escalation's arithmetic: silence has already been observed, so ONE unanswered probe
+    /// tick confirms — and one heard frame clears the whole thing.
+    /// F20, the defect this decision closes for a FALLBACK bond: after a USB NIC re-enumerates,
+    /// the kernel re-enslaves it last, so the bond's backup order is enslave order and a 1G
+    /// island can end up carrying the fallback segment while the 5G one sits idle (measured on
+    /// pve1/pve2, 2026-09-07). Every wire is healthy here — there is no fault to react to — and
+    /// the decision must still say the bond belongs on the preferred wire.
+    #[test]
+    fn a_healthy_bond_on_the_wrong_wire_is_moved_to_the_preferred_one() {
+        // Enslave order, which is what the bond's backup order is: the 5G wire re-enumerated
+        // and the kernel put it back LAST.
+        let cands = cands(&[
+            ("cfab-st-fb-b", "eth1", true), // 1G, and where the bond sits
+            ("cfab-st-fb-c", "eth0", true),
+            ("cfab-st-fb-a", "eth9", true), // 5G, re-enslaved last
+        ]);
+        assert_eq!(
+            decide(
+                Some("cfab-st-fb-b"),
+                &cands,
+                &prefs(&["eth9", "eth1", "eth0"])
+            ),
+            Some("cfab-st-fb-a".to_string()),
+            "the preference order, not the enslave order, decides where a healthy bond sits"
+        );
+    }
+
+    #[test]
+    fn a_precharged_hysteresis_confirms_on_one_miss_and_clears_on_one_frame() {
+        let mut h = Hysteresis::default();
+        h.precharge();
+        assert!(h.reachable(), "precharging is not a verdict");
+        assert!(!h.observe(false), "one unanswered probe confirms it");
+
+        let mut h = Hysteresis::default();
+        h.precharge();
+        h.heard();
+        assert!(h.reachable());
+        assert!(
+            h.observe(false),
+            "a heard frame cleared the streak, so one miss is only the first of three"
+        );
+
+        // Precharging a wire already called dead must not walk it back toward reachable.
+        let mut h = Hysteresis::default();
+        for _ in 0..HYSTERESIS {
+            h.observe(false);
+        }
+        assert!(!h.reachable());
+        h.precharge();
+        assert!(!h.reachable());
+        assert!(
+            !h.observe(true),
+            "and it still needs three replies to come back"
+        );
     }
 
     #[test]

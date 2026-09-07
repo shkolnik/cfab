@@ -115,10 +115,10 @@ pub(crate) struct Shared {
     wd_result: String,
     wd_detail: Option<String>,
     wd_last_tick: Option<Instant>,
-    /// The ingress prober's latest rows, republished on every probe tick.
-    ingress: Vec<report::IngressLeg>,
-    /// The slave the ingress prober holds each migrating gw bond's `primary` on. Read by the
-    /// forwarding watchdog, which must re-assert THAT and not the declared home.
+    /// The prober's latest rows, republished on every probe tick.
+    probed: crate::prober::ProbeRows,
+    /// The slave the prober holds each bond's `primary` on. Read by the forwarding watchdog,
+    /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
 }
 
@@ -139,7 +139,7 @@ impl Shared {
             wd_result: "ok".to_string(),
             wd_detail: None,
             wd_last_tick: None,
-            ingress: Vec::new(),
+            probed: crate::prober::ProbeRows::default(),
             held: crate::prober::HeldPrimaries::default(),
         }
     }
@@ -197,7 +197,8 @@ impl Shared {
                 result: self.wd_result.clone(),
                 detail: self.wd_detail.clone(),
             },
-            ingress: self.ingress.clone(),
+            ingress: self.probed.ingress.clone(),
+            fallback: self.probed.fallback.clone(),
         }
     }
 
@@ -607,8 +608,9 @@ pub(crate) async fn run_with(
         tokio::time::Instant::now() + Duration::from_secs(3),
         Duration::from_secs(3),
     );
-    // The ingress prober (finding F21). Built from the view, so it is empty on a leaf and on a
-    // host whose zones declare no gw — no branch, an empty prober whose tick does nothing.
+    // The prober (findings F20, F21): ingress legs on a host with a gw, and every zone's
+    // universal segment, leaves included. Built from the view, so a member with neither gets an
+    // empty prober whose tick does nothing — no branch.
     let mut prober = Prober::from_view(view);
     let mut probe_io = PacketIo::new();
     let mut feed_tick = feed_period.map(|p| {
@@ -1206,8 +1208,8 @@ fn feed_period() -> Option<Duration> {
     sd_notify::watchdog_enabled().map(|d| d / 3)
 }
 
-/// One ingress-prober tick: ask every wire whether the router still answers over it, move the
-/// bond if ingress belongs on a different wire, and publish what was learned into `components`.
+/// One prober tick: read what every wire has heard, ask where asking is warranted, move a bond
+/// that belongs on a different wire, and publish what was learned into `components`.
 ///
 /// No `block_in_place`, unlike the forwarding watchdog: a tick is a handful of non-blocking
 /// socket calls and at most two sysfs writes, sub-millisecond by construction, and the `recv`
@@ -1225,7 +1227,7 @@ fn prober_tick(
     }
     let held = prober.held_primaries();
     let mut st = shared.lock().unwrap();
-    st.ingress = rows;
+    st.probed = rows;
     st.held = held;
 }
 
@@ -2376,10 +2378,11 @@ mod tests {
         );
     }
 
-    /// A leaf carries no ingress leg, so the tick has nothing to probe and publishes no rows —
-    /// no branch, just an empty prober.
+    /// A leaf carries no ingress leg, so the tick publishes no ingress row and — the passive
+    /// channel being passive — sends nothing at all, even though it does run the leaf's three
+    /// fallback legs.
     #[test]
-    fn the_prober_tick_is_a_no_op_on_a_leaf() {
+    fn the_prober_tick_sends_nothing_on_a_leaf() {
         let f = example_fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut prober = Prober::from_view(&view);
@@ -2387,7 +2390,6 @@ mod tests {
         let mut sys = crate::sys::mock::MockSys::default();
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         prober_tick(&mut sys, &mut prober, &mut io, &shared);
-        assert!(prober.is_empty());
         assert!(
             shared
                 .lock()
@@ -2395,6 +2397,16 @@ mod tests {
                 .components(Instant::now())
                 .ingress
                 .is_empty()
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .components(Instant::now())
+                .fallback
+                .len(),
+            3,
+            "the leaf's own fallback legs are probed"
         );
         assert!(io.sent.is_empty(), "{:?}", io.sent);
     }
@@ -2496,7 +2508,7 @@ mod tests {
         );
         // ...but never ahead of a member that failed closed or had something amputated.
         assert_eq!(
-            rebuilt(|r| r.downed.push("fallback storage down".to_string())).0,
+            rebuilt(|r| r.downed.push("storage fallback down".to_string())).0,
             "actuated"
         );
         assert_eq!(
