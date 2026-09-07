@@ -255,6 +255,11 @@ pub mod mock {
         /// external state "while time passes" (e.g. a peer ack appearing mid-window).
         #[allow(clippy::type_complexity)]
         pub on_sleep: Option<Box<dyn FnMut(usize)>>,
+        /// (sleep count, path, content): a file that comes into existence after that many
+        /// sleeps. `on_sleep` cannot do this — it borrows nothing of the sys it would have to
+        /// write to — and a poll loop that waits for something to appear (a run dir written by
+        /// a restarting supervisor) has no other way to be tested.
+        pub appear_after: Vec<(usize, String, String)>,
     }
 
     impl MockSys {
@@ -327,6 +332,14 @@ pub mod mock {
                     stderr: stderr.to_string(),
                 },
             )
+        }
+
+        /// `path` exists only from the `n`th sleep on: state a test needs to arrive while the
+        /// code under test is waiting for it.
+        pub fn appears_after(mut self, n: usize, path: &str, content: &str) -> Self {
+            self.appear_after
+                .push((n, path.to_string(), content.to_string()));
+            self
         }
 
         /// Make `write` to this path fail, as a read-only or EPERM path does.
@@ -441,6 +454,15 @@ pub mod mock {
         fn sleep(&mut self, d: Duration) {
             self.slept.push(d);
             let n = self.slept.len();
+            let due: Vec<(String, String)> = self
+                .appear_after
+                .iter()
+                .filter(|(at, _, _)| *at == n)
+                .map(|(_, p, c)| (p.clone(), c.clone()))
+                .collect();
+            for (p, c) in due {
+                self.files.insert(p, c);
+            }
             if let Some(hook) = &mut self.on_sleep {
                 hook(n);
             }
