@@ -138,6 +138,10 @@ struct ProbeSlave {
     grace_until: Option<Instant>,
     /// The ARP escalation is running on this slave.
     escalating: bool,
+    /// The reason this slave's tap could not be opened, as it was last reported. `None` once it
+    /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
+    /// has been failing the same way for an hour is said once.
+    deaf: Option<String>,
 }
 
 /// At most this many peers are asked when one wire is escalated. Four is the point past which
@@ -165,6 +169,7 @@ impl ProbeSlave {
             recent: Vec::new(),
             grace_until: None,
             escalating: false,
+            deaf: None,
         }
     }
 
@@ -494,6 +499,13 @@ impl Leg {
         }
     }
 
+    /// Can this leg be heard at all? A leg whose every tap failed to open knows nothing about
+    /// any of its wires, so it is not a leg to move: `status` names the missing capability and
+    /// the bond is left to the kernel.
+    fn probed(&self) -> bool {
+        !matches!(self.kind, Kind::Fallback(ref f) if f.noted_deaf)
+    }
+
     /// Has this leg heard nothing at all, on any wire, this tick? Only a fallback leg can: an
     /// ingress leg asks rather than listens, and "nobody answered" is already reported per wire.
     fn quiet(&self) -> bool {
@@ -514,7 +526,7 @@ impl Leg {
         // guess about a netdev that is not a bond, and nothing would be done with the answer.
         let active = self.actuates.then(|| self.read_active(sys)).flatten();
         self.observe(sys, io, now, active.as_deref(), log);
-        if active.is_some() {
+        if active.is_some() && self.probed() {
             self.actuate(sys, active.as_deref(), now, log);
         }
         self.ask(io, now);
@@ -544,21 +556,36 @@ impl Leg {
         log: &mut Vec<String>,
     ) {
         let mut deaf = 0usize;
+        // Wires whose tap has just started failing, and why. Held until the loop ends, because
+        // whether this is "one wire cannot be judged" or "the leg is not probed at all" is not
+        // known until every slave has been tried.
+        let mut newly_deaf: Vec<(String, String)> = Vec::new();
         for s in &mut self.slaves {
+            // Carrier is read for every slave, a deaf one included: whether the tap opened and
+            // whether the cable is in are different facts, and reporting a tap failure as lost
+            // carrier would send an operator to the wrong end of it.
+            let present = has_carrier(&*sys, &s.ifname);
+            s.carrier = present.unwrap_or(false);
+            // A netdev that has just come back is a slave the kernel has just re-enslaved (F5).
+            // Judging it before a hello can arrive on it would confirm it dead for being new.
+            if present.is_some() && !s.present {
+                s.grace_until = Some(now + grace_of(&self.kind));
+            }
+            s.present = present.is_some();
             // A fallback leg never sends in steady state, so the tap has to be asked for.
-            if let Kind::Fallback(_) = self.kind
-                && let Err(e) = io.listen(&s.ifname)
-            {
-                deaf += 1;
-                if !matches!(self.kind, Kind::Fallback(ref f) if f.noted_deaf) {
-                    log.push(format!(
-                        "cfab: {} fallback: cannot listen on {} ({}) — the leg is not probed",
-                        self.zone,
-                        s.wire,
-                        without_fatal(&e)
-                    ));
+            if let Kind::Fallback(_) = self.kind {
+                match io.listen(&s.ifname) {
+                    Err(e) => {
+                        deaf += 1;
+                        let why = without_fatal(&e);
+                        if s.deaf.as_deref() != Some(why.as_str()) {
+                            newly_deaf.push((s.wire.clone(), why.clone()));
+                            s.deaf = Some(why);
+                        }
+                        continue;
+                    }
+                    Ok(()) => s.deaf = None,
                 }
-                continue;
             }
             let frames = io.recv(&s.ifname).unwrap_or_default();
             let mut replied = false;
@@ -621,23 +648,28 @@ impl Leg {
                     }
                 }
             }
-            let present = has_carrier(&*sys, &s.ifname);
-            s.carrier = present.unwrap_or(false);
-            // A netdev that has just come back is a slave the kernel has just re-enslaved (F5).
-            // Judging it before a hello can arrive on it would confirm it dead for being new.
-            if present.is_some() && !s.present {
-                s.grace_until = Some(now + grace_of(&self.kind));
-            }
-            s.present = present.is_some();
         }
+        let zone = self.zone.clone();
+        let total = deaf > 0 && deaf == self.slaves.len();
         let Kind::Fallback(f) = &mut self.kind else {
             return;
         };
-        if deaf == self.slaves.len() && deaf > 0 {
-            f.noted_deaf = true;
+        for (wire, why) in newly_deaf {
+            // One spelling per condition, and each says what is true: a leg whose other wires
+            // still hear the fabric IS being probed — this one wire simply cannot be judged.
+            let consequence = if total {
+                "the leg is not probed".to_string()
+            } else {
+                format!("{wire} is not judged")
+            };
+            log.push(format!(
+                "cfab: {zone} fallback: cannot listen on {wire} ({why}) — {consequence}"
+            ));
+        }
+        f.noted_deaf = total;
+        if total {
             return;
         }
-        f.noted_deaf = false;
         let evidence: Vec<Evidence> = self.slaves.iter().map(|s| s.evidence(active)).collect();
         let verdicts = passive::verdicts(now, &evidence, &f.windows, !f.peers.is_empty());
         let mut all_quiet = !self.slaves.is_empty();
@@ -1850,6 +1882,74 @@ mod tests {
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
             "{:?}",
             sys.calls
+        );
+    }
+
+    /// One wire's tap fails while its siblings work. The leg is still probed — the other two
+    /// wires judge it — so the line says what is true about the wire, and says it ONCE: repeated
+    /// every 500 ms it would be a stuck container's whole log.
+    #[test]
+    fn one_deaf_wire_is_named_once_per_failure_not_per_tick() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        io.deaf = [FB_A.to_string()].into_iter().collect();
+        let t0 = Instant::now();
+        for tick in 0..4u64 {
+            hear(&mut io, FB_B, &[hello(2)]);
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
+        }
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter().filter(|l| l.contains("cannot listen")).count(),
+            1,
+            "once, not once per tick: {log:?}"
+        );
+        assert!(
+            log[0].ends_with(" — eth9 is not judged"),
+            "the leg IS probed; only this wire is not: {:?}",
+            log[0]
+        );
+
+        // The tap comes back, then fails again: that is a new fact and is said again.
+        io.deaf.clear();
+        for tick in 4..8u64 {
+            hear(&mut io, FB_A, &[hello(2)]);
+            hear(&mut io, FB_B, &[hello(2)]);
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
+        }
+        assert!(
+            p.drain_log().is_empty(),
+            "a working tap says nothing at all"
+        );
+        io.deaf = [FB_A.to_string()].into_iter().collect();
+        for tick in 8..12u64 {
+            hear(&mut io, FB_B, &[hello(2)]);
+            fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            );
+        }
+        assert_eq!(
+            p.drain_log()
+                .iter()
+                .filter(|l| l.contains("cannot listen"))
+                .count(),
+            1,
+            "the second failure is a second line"
         );
     }
 
