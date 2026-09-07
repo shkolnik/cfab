@@ -8,6 +8,41 @@ const OSPFV2: &str = "ietf-ospf:ospfv2";
 const BFDV1: &str = "ietf-bfd-types:bfdv1";
 const BGP: &str = "ietf-bgp:bgp";
 
+/// ietf-ospf `nbr-state-type`, in its enum order. The fallback bar is 2-Way: on a broadcast LAN
+/// two DROthers never go past it, so Full would be a bar a healthy fallback LAN cannot clear.
+pub const NBR_STATES: [&str; 8] = [
+    "down", "attempt", "init", "2-way", "exstart", "exchange", "loading", "full",
+];
+
+/// Is this neighbor state at or past 2-Way — the bar an adjacency that carries traffic clears?
+pub fn at_least_two_way(state: &str) -> bool {
+    NBR_STATES
+        .iter()
+        .position(|s| *s == state)
+        .is_some_and(|i| i >= 3)
+}
+
+/// The neighbor list one OSPF interface carries in the document, or `None` when the engine does
+/// not carry that interface at all. The distinction is load-bearing for both readers: an absent
+/// interface is a fault of its own, never an empty neighbor list.
+pub fn ospf_neighbors<'a>(doc: &'a Value, zone: &str, ifname: &str) -> Option<&'a Value> {
+    doc["ospf"][zone]["interfaces"]
+        .get(ifname)
+        .map(|i| &i["neighbors"])
+}
+
+/// One neighbor's state by Router ID, module prefix stripped; `"absent"` when the engine lists
+/// no neighbor with that Router ID, which reads as below 2-Way exactly like `down`.
+pub fn neighbor_state<'a>(nbrs: &'a Value, router_id: &str) -> &'a str {
+    nbrs.as_array()
+        .into_iter()
+        .flatten()
+        .find(|n| n["router_id"] == router_id)
+        .and_then(|n| n["state"].as_str())
+        .map(|s| s.rsplit(':').next().unwrap_or(s))
+        .unwrap_or("absent")
+}
+
 /// Build the document. `cfg` is `emit::engine::generate`'s tree (cost/passive per OSPF
 /// interface); `state_trees` are the providers' operational trees as libyang printed them.
 pub fn document(ready: bool, cfg: &Value, state_trees: &[Value]) -> Value {

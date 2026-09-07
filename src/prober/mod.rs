@@ -74,6 +74,13 @@ struct Fallback {
     /// be. The environment is an undeclared dependency: a container without the privileges for
     /// `AF_PACKET` must refuse the leg by name, not report every wire quiet forever.
     noted_deaf: bool,
+    /// The engine's state socket, asked ONLY when the F27 rule is being evaluated — the active
+    /// slave has been hello-silent past the dead interval while a sibling still hears the
+    /// fabric. A healthy leg adds no socket traffic at all.
+    engine_sock: String,
+    /// The engine could not be read the last time the rule needed it; said once, so a member
+    /// with no engine does not repeat itself twice a second. Cleared by a readable answer.
+    noted_engine_unreadable: bool,
 }
 
 /// One leg's probe state.
@@ -138,6 +145,13 @@ struct ProbeSlave {
     grace_until: Option<Instant>,
     /// The ARP escalation is running on this slave.
     escalating: bool,
+    /// Condemned by F27: the peers' hellos stopped on this slave past the dead interval while a
+    /// sibling still heard them and the engine confirmed no peer is adjacent over this bond.
+    /// The wire is unusable however readily it answers ARP, and — this is the whole point — an
+    /// ARP reply must never clear it, or the demoted wire looks reachable again within a tick,
+    /// wins on preference, takes the bond back and dies again one dead interval later. Only a
+    /// hello (a peer's, or our own reflection once this slave is a backup) clears it.
+    hello_dead: bool,
     /// The reason this slave's tap could not be opened, as it was last reported. `None` once it
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
@@ -169,6 +183,7 @@ impl ProbeSlave {
             recent: Vec::new(),
             grace_until: None,
             escalating: false,
+            hello_dead: false,
             deaf: None,
         }
     }
@@ -356,6 +371,8 @@ impl Prober {
                     quiet_now: false,
                     noted_quiet: false,
                     noted_deaf: false,
+                    engine_sock: format!("{}/{}", view.fabric.run_dir, crate::engine::SOCK_NAME),
+                    noted_engine_unreadable: false,
                 }),
             ));
         }
@@ -430,7 +447,7 @@ impl Prober {
                         // A wire with no carrier reaches nothing, whatever the last three probes
                         // said; reporting it reachable would have `status` blame the far end for
                         // an unplugged cable.
-                        reachable: s.state.reachable() && s.carrier,
+                        reachable: s.state.reachable() && s.carrier && !s.hello_dead,
                         // Silent, being asked, not yet answered for: a fact `status` renders as
                         // a settling line rather than a standing verdict.
                         suspect: s.escalating,
@@ -640,6 +657,15 @@ impl Leg {
                     // the moment a wire is demoted to backup: its window widens from a hello
                     // and a half to the whole dead interval, and a stale timestamp would
                     // rehabilitate the very wire we had just confirmed dead.
+                    if heard_now {
+                        // A hello — and only a hello — rehabilitates a wire F27 condemned. An
+                        // ARP reply cannot reach this point on such a wire anyway (its
+                        // escalation is stopped below, and a reply is only counted while one is
+                        // running), but the clearing condition is written to the rule and not to
+                        // that reachability: the wire is condemned for hearing no hellos, so it
+                        // is a hello that must un-condemn it.
+                        s.hello_dead = false;
+                    }
                     if heard_now || replied {
                         s.state.heard();
                         s.escalating = false;
@@ -650,6 +676,7 @@ impl Leg {
             }
         }
         let zone = self.zone.clone();
+        let bond = self.bond.clone();
         let total = deaf > 0 && deaf == self.slaves.len();
         let Kind::Fallback(f) = &mut self.kind else {
             return;
@@ -672,6 +699,51 @@ impl Leg {
         }
         let evidence: Vec<Evidence> = self.slaves.iter().map(|s| s.evidence(active)).collect();
         let verdicts = passive::verdicts(now, &evidence, &f.windows, !f.peers.is_empty());
+        // F27. On the ACTIVE slave, silence past the dead interval is no longer a matter of
+        // opinion: OSPF has given up on the adjacency by then. A wire that still answers ARP
+        // would otherwise clear its own escalation every other tick forever (measured on pve1
+        // 2026-09-07 with OSPF dropped on the active wire and unicast left alone: storm
+        // control, snooping bugs and one-way optics all produce it), and the bond never moves
+        // while the fallback adjacencies stay down. The engine's own neighbor table is the
+        // second witness, and it is asked ONLY here — never on a healthy leg.
+        let condemn: Vec<bool> = self
+            .slaves
+            .iter()
+            .zip(&verdicts)
+            .map(|(s, v)| {
+                *v == Verdict::Suspect
+                    && !s.hello_dead
+                    && active == Some(s.ifname.as_str())
+                    && s.peer_heard
+                        .is_none_or(|t| now.saturating_duration_since(t) > f.windows.dead)
+            })
+            .collect();
+        if condemn.iter().any(|c| *c) {
+            let sock = f.engine_sock.clone();
+            match peers_all_below_two_way(sys, &sock, &zone, &bond, &f.peers) {
+                // A peer still adjacent over this bond is the wire working: the verdict stays
+                // the ARP escalation's, exactly as it was before F27.
+                Some(down) => {
+                    f.noted_engine_unreadable = false;
+                    if down {
+                        for (s, c) in self.slaves.iter_mut().zip(&condemn) {
+                            if *c {
+                                s.hello_dead = true;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if !f.noted_engine_unreadable {
+                        f.noted_engine_unreadable = true;
+                        log.push(format!(
+                            "cfab: {zone} fallback: the engine's ospf state for {bond} cannot be read — hello \
+                             silence on the active wire is left to the arp escalation"
+                        ));
+                    }
+                }
+            }
+        }
         let mut all_quiet = !self.slaves.is_empty();
         for (s, v) in self.slaves.iter_mut().zip(verdicts) {
             match v {
@@ -684,7 +756,12 @@ impl Leg {
                 }
                 Verdict::Suspect => {
                     all_quiet = false;
-                    if !s.escalating {
+                    // A condemned wire is not asked again: the answer cannot change the verdict
+                    // (only a hello can), and re-asking it every tick would be the F28 storm.
+                    if s.hello_dead {
+                        s.escalating = false;
+                        s.probed = false;
+                    } else if !s.escalating {
                         s.escalating = true;
                         s.probed = false;
                         s.state.precharge();
@@ -792,7 +869,7 @@ impl Leg {
             .map(|s| Candidate {
                 ifname: s.ifname.clone(),
                 wire: s.wire.clone(),
-                reachable: s.state.reachable(),
+                reachable: s.state.reachable() && !s.hello_dead,
                 carrier: s.carrier,
             })
             .collect();
@@ -846,6 +923,7 @@ impl Leg {
         let from_wire = from.map(|f| f.wire.clone());
         let from_carrier = from.map(|f| f.carrier);
         let from_reachable = from.map(|f| f.state.reachable());
+        let from_hello_dead = from.is_some_and(|f| f.hello_dead);
         // The slave that has just been promoted gets its grace period here: it was chosen after
         // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
         // interval. Without it a two-slave ping-pong could move once per tick.
@@ -853,24 +931,31 @@ impl Leg {
         if let Some(s) = self.slaves.iter_mut().find(|s| s.ifname == target) {
             s.grace_until = Some(now + grace);
         }
-        match (from_wire, from_carrier, from_reachable) {
+        match (from_wire, from_carrier, from_reachable, from_hello_dead) {
             // Carrier is tested FIRST, and not only because it is the actionable end of a wire
             // that has both faults: the carrier fast path moves the bond while the hysteresis
             // still calls the wire reachable, so keying on `reachable()` alone would announce a
             // move AWAY from a dead wire as a move back to a live one.
-            (Some(w), Some(false), _) => log.push(format!(
+            (Some(w), Some(false), _, _) => log.push(format!(
                 "cfab: {} {family}: {w} lost carrier, moved {} to {to}",
                 self.zone, self.bond
             )),
-            (Some(w), _, Some(false)) => log.push(format!(
+            // F27, and it is a different sentence from the ARP one on purpose: the wire is
+            // answering, which is exactly what an operator will see when they go and test it.
+            (Some(w), _, _, true) => log.push(format!(
+                "cfab: {} {family}: {noun} silent on {w} (adjacency down, arp still answers), \
+                 moved {} to {to}",
+                self.zone, self.bond
+            )),
+            (Some(w), _, Some(false), _) => log.push(format!(
                 "cfab: {} {family}: {noun} unreachable on {w}, moved {} to {to}",
                 self.zone, self.bond
             )),
-            (Some(w), _, _) => log.push(format!(
+            (Some(w), _, _, _) => log.push(format!(
                 "cfab: {} {family}: {noun} reachable on {to} again, moved {} back from {w}",
                 self.zone, self.bond
             )),
-            (None, _, _) => log.push(format!(
+            (None, _, _, _) => log.push(format!(
                 "cfab: {} {family}: no slave of ours was active on {}, moved it to {to}",
                 self.zone, self.bond
             )),
@@ -931,6 +1016,28 @@ fn grace_of(kind: &Kind) -> Duration {
         Kind::Ingress { .. } => Duration::ZERO,
         Kind::Fallback(f) => f.windows.grace,
     }
+}
+
+/// Does the engine report EVERY expected peer below 2-Way on this leg's bond? `None` when the
+/// question cannot be answered — the socket did not reply, the reply was not the state document,
+/// or the engine does not carry this interface at all — and a `None` never condemns a wire: the
+/// leg then behaves exactly as it did before F27.
+fn peers_all_below_two_way(
+    sys: &mut dyn Sys,
+    sock: &str,
+    zone: &str,
+    ifname: &str,
+    peers: &BTreeSet<u32>,
+) -> Option<bool> {
+    let reply = sys.unix_request(sock, "state\n").ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&reply).ok()?;
+    let nbrs = crate::engine::state::ospf_neighbors(&doc, zone, ifname)?;
+    Some(!peers.iter().any(|rid| {
+        crate::engine::state::at_least_two_way(crate::engine::state::neighbor_state(
+            nbrs,
+            &Ipv4Addr::from(*rid).to_string(),
+        ))
+    }))
 }
 
 /// The address of the peer whose Router ID is `rid`. Both are built from the member's node
@@ -1989,6 +2096,250 @@ mod tests {
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
             "a leg it cannot hear is a leg it does not move: {:?}",
             sys.calls
+        );
+    }
+
+    // ---- F27: hello silence on the active wire outranks a wire that still answers ARP ------
+
+    /// The engine's state socket, as `Prober::from_view` builds its path from `[runtime]`.
+    const ENGINE_SOCK: &str = "/run/cfab/engine.sock";
+
+    /// The engine's ospf state document with each named peer's neighbor on the storage
+    /// fallback bond in the given state. A peer left out of `states` is absent from the
+    /// neighbor list, which reads the same as `down`.
+    fn engine_state(states: &[(u8, &str)]) -> String {
+        let nbrs: Vec<String> = states
+            .iter()
+            .map(|(node, st)| format!(r#"{{"router_id":"10.99.0.{node}","state":"{st}"}}"#))
+            .collect();
+        format!(
+            r#"{{"ready":true,"ospf":{{"storage":{{"interfaces":{{"{FB}":{{"neighbors":[{}]}}}}}}}}}}"#,
+            nbrs.join(",")
+        )
+    }
+
+    /// The fallback bond on `active`, with an engine answering `state` as `states` says.
+    fn fb_bonding_with_engine(active: &str, states: &[(u8, &str)]) -> MockSys {
+        fb_bonding(active).socket(ENGINE_SOCK, &engine_state(states))
+    }
+
+    /// Four ticks of every wire hearing both peers: the steady state every F27 case starts in.
+    fn fb_steady(p: &mut Prober, sys: &mut MockSys, io: &mut ScriptedIo, t0: Instant) {
+        for tick in 0..4u64 {
+            for s in FB_SLAVES {
+                hear(io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(p, sys, io, t0 + Duration::from_millis(tick * 500));
+        }
+    }
+
+    /// F27, measured on pve1 2026-09-07 with an nft rule dropping only OSPF on the active wire:
+    /// the peers' hellos stop on the active slave while its ARP still answers, so the escalation
+    /// clears itself every other tick and the bond never moves — while OSPF tears the adjacency
+    /// down at the dead interval and leaves it down. Once the engine agrees the adjacency is
+    /// gone, silence outranks the ARP reply.
+    #[test]
+    fn hello_silence_with_the_adjacency_down_moves_the_bond_though_arp_still_answers() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        // The wire still answers ARP: that is the whole defect.
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("unix_request")),
+            "a healthy leg asks the engine nothing: {:?}",
+            sys.calls
+        );
+        p.drain_log();
+
+        // OSPF is dropped on eth9 only. The siblings keep hearing the peers.
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B),
+            "the bond left the wire the peers went silent on"
+        );
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/primary")),
+            Some(FB_B)
+        );
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains(&format!("moved {FB}")))
+                .count(),
+            1,
+            "one move line: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l
+                == "cfab: storage fallback: peers silent on eth9 (adjacency down, arp still \
+                    answers), moved cfab-st-fb to eth1"),
+            "and it says why this move is not the ARP one: {log:?}"
+        );
+    }
+
+    /// The guard: the prober's opinion alone never condemns a wire that answers. While the
+    /// engine still has an adjacency over the bond, hello silence on the active slave is left
+    /// to the ARP escalation exactly as it was in 0.4.7.
+    #[test]
+    fn hello_silence_with_a_peer_still_adjacent_never_moves_the_bond() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "full"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            sys.calls
+                .iter()
+                .any(|c| c == "unix_request /run/cfab/engine.sock state"),
+            "the engine was asked — this case is the guard, not a leg that never got there: {:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "one peer still adjacent over the bond is the wire working: {:?}",
+            sys.calls
+        );
+    }
+
+    /// The Suspect precondition still gates the rule: with nothing heard on any wire the fault
+    /// is not per-wire, so nothing is condemned and the engine is never asked.
+    #[test]
+    fn hello_silence_on_every_wire_condemns_none_and_asks_the_engine_nothing() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "nowhere to move to: {:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("unix_request")),
+            "and no reason to ask the engine: {:?}",
+            sys.calls
+        );
+    }
+
+    /// Anti-ping-pong. The demoted wire keeps answering ARP, which is the very thing that made
+    /// it look reachable — so ARP alone must never rehabilitate it, or it is more preferred,
+    /// pulls the bond home, and dies again one dead interval later, forever. Only a hello
+    /// brings it back.
+    #[test]
+    fn a_wire_condemned_by_hello_silence_is_revived_only_by_a_hello() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B)
+        );
+        p.drain_log();
+        let sent_before = io.sent_on(FB_A).len();
+
+        // Twelve more ticks — four dead intervals — of eth9 answering ARP and hearing nothing.
+        for tick in 14..26u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B),
+            "an ARP reply on the condemned wire never pulls the bond back"
+        );
+        assert_eq!(
+            io.sent_on(FB_A).len(),
+            sent_before,
+            "and it is not re-asked every tick either"
+        );
+        assert!(
+            p.drain_log().iter().all(|l| !l.contains("moved")),
+            "no second move"
+        );
+
+        // The multicast comes back: one hello revives the wire, and it is the preferred one.
+        for tick in 26..30u64 {
+            for s in FB_SLAVES {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_A),
+            "a hello, and only a hello, brings the wire back"
+        );
+    }
+
+    /// Fail safe: an engine that cannot be read leaves the leg behaving exactly as 0.4.7 did,
+    /// and says so once rather than twice a second.
+    #[test]
+    fn an_unreadable_engine_never_condemns_a_wire_and_is_said_once() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        // No socket registered on the mock: `unix_request` fails, as it does with no engine.
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        p.drain_log();
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "without the engine's word the wire still answers ARP and is kept: {:?}",
+            sys.calls
+        );
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.as_str()
+                    == "cfab: storage fallback: the engine's ospf state for cfab-st-fb cannot be \
+                        read — hello silence on the active wire is left to the arp escalation")
+                .count(),
+            1,
+            "said once, in full: {log:?}"
         );
     }
 }

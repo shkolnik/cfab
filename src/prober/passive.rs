@@ -22,6 +22,11 @@ pub struct Windows {
     /// re-enumerated USB NIC (F5) would otherwise be confirmed dead before the first hello can
     /// arrive on it.
     pub grace: Duration,
+    /// The declared dead interval itself: the moment OSPF stops believing in an adjacency, and
+    /// so the moment hello silence on the active slave stops being a matter of opinion (F27).
+    /// Numerically the same as `backup`; kept as its own name because the two are answers to
+    /// different questions and only one of them is about a backup slave.
+    pub dead: Duration,
 }
 
 impl Windows {
@@ -32,6 +37,7 @@ impl Windows {
             active: hello + hello / 2,
             backup: dead,
             grace: dead,
+            dead,
         }
     }
 

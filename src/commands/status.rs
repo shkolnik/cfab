@@ -991,19 +991,6 @@ fn posture(
     Ok(())
 }
 
-/// ietf-ospf `nbr-state-type`, in its enum order. The fallback bar is 2-Way: on a broadcast LAN
-/// two DROthers never go past it, so Full would be a bar a healthy fallback LAN cannot clear.
-const NBR_STATES: [&str; 8] = [
-    "down", "attempt", "init", "2-way", "exstart", "exchange", "loading", "full",
-];
-
-fn at_least_two_way(state: &str) -> bool {
-    NBR_STATES
-        .iter()
-        .position(|s| *s == state)
-        .is_some_and(|i| i >= 3)
-}
-
 /// One active-backup leg to grade. The two migrating legs cfab builds — a zone's universal
 /// segment and an ingress leg on gw scope `any` — are the SAME netdev shape built by the same
 /// builder, so they are read by the same code and every condition has one spelling. Only three
@@ -1261,9 +1248,7 @@ fn fallback(
         // An interface the engine does not carry indexes to Null here, and Null reads as an
         // empty neighbor list — every declared peer would be reported absent, which names the
         // wrong fault. The missing interface IS the fault; say that instead.
-        let nbrs = doc
-            .and_then(|d| d["ospf"][zone]["interfaces"].get(r.ifname.as_str()))
-            .map(|i| &i["neighbors"]);
+        let nbrs = doc.and_then(|d| crate::engine::state::ospf_neighbors(d, zone, &r.ifname));
         let Some(nbrs) = nbrs else {
             if doc.is_some() {
                 c.settling(format!(
@@ -1279,15 +1264,8 @@ fn fallback(
         };
         for m in &peer_members {
             let rid = format!("{}.0.{}", z.block(), m.node);
-            let state = nbrs
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|n| n["router_id"] == rid.as_str())
-                .and_then(|n| n["state"].as_str())
-                .map(|s| s.rsplit(':').next().unwrap_or(s))
-                .unwrap_or("absent");
-            if at_least_two_way(state) {
+            let state = crate::engine::state::neighbor_state(nbrs, &rid);
+            if crate::engine::state::at_least_two_way(state) {
                 counts.fallbacks_up += 1;
                 peers_up.insert(m.node);
                 two_way.insert((m.node, zone.clone()));
@@ -2548,10 +2526,10 @@ mod tests {
     #[test]
     fn two_way_is_the_adjacency_bar() {
         for s in ["2-way", "exstart", "exchange", "loading", "full"] {
-            assert!(at_least_two_way(s), "{s}");
+            assert!(crate::engine::state::at_least_two_way(s), "{s}");
         }
         for s in ["down", "attempt", "init", "absent", ""] {
-            assert!(!at_least_two_way(s), "{s}");
+            assert!(!crate::engine::state::at_least_two_way(s), "{s}");
         }
     }
 
