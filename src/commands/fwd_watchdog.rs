@@ -1575,6 +1575,45 @@ pub(crate) mod tests {
         );
     }
 
+    /// F20, the same rule on a fallback bond: a USB wire that re-enumerates is re-enslaved
+    /// LAST, so the bond's backup order is enslave order and the prober will have moved it to
+    /// the preferred wire. Re-asserting the DECLARED home on the rebuild would undo that move
+    /// on every blip — which is how a 1G island came to carry a fallback segment while the 5G
+    /// one sat idle (pve1/pve2, 2026-09-07).
+    #[test]
+    fn a_rebuild_re_asserts_the_primary_the_prober_holds_on_a_fallback_bond_too() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // storage's fallback bond is homed on eth9 (island a). The prober has moved it to
+        // eth1's slave for cause, and eth1 is the wire that re-enumerates.
+        let mut held = HeldPrimaries::default();
+        held.hold("cfab-st-fb", "cfab-st-fb-b");
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth1");
+        let report = run(&mut sys, &view, &held).unwrap();
+        assert!(
+            report
+                .rebuilt
+                .contains(&"rebuilt storage/cfab-st-fb-b on eth1".to_string()),
+            "{:?}",
+            report.rebuilt
+        );
+        assert!(
+            calls_for(&sys, "primary").contains(
+                &"ip link set cfab-st-fb type bond primary cfab-st-fb-b primary_reselect always"
+                    .to_string()
+            ),
+            "the rebuild must put primary back on the slave the prober holds: {:?}",
+            calls_for(&sys, "primary")
+        );
+        assert!(
+            !calls_for(&sys, "primary")
+                .iter()
+                .any(|c| c.contains("cfab-st-fb type bond primary cfab-st-fb-a")),
+            "and never on the declared home while the prober holds another: {:?}",
+            calls_for(&sys, "primary")
+        );
+    }
+
     /// The example with `driver_features` on every member's eth9.
     fn fixture_with_driver_features() -> Fabric {
         let text =

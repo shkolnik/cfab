@@ -4419,6 +4419,196 @@ mod tests {
         );
     }
 
+    /// The `components` document with the fallback prober's rows for storage's leg on a leaf.
+    /// `dark` names wires the peers are confirmed unreachable over, `suspect` wires that are
+    /// silent and being asked, and `quiet` says no wire heard anything at all.
+    fn components_with_fallback(
+        view: &View,
+        active: &str,
+        dark: &[&str],
+        suspect: &[&str],
+        quiet: bool,
+    ) -> String {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&healthy_components(view)).expect("the healthy fixture");
+        let slaves: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
+            .iter()
+            .map(|(wire, island)| {
+                serde_json::json!({
+                    "wire": wire, "island": island,
+                    "reachable": !dark.contains(wire),
+                    "suspect": suspect.contains(wire),
+                    "last_reply_ms": if dark.contains(wire) { serde_json::Value::Null }
+                                     else { serde_json::json!(400) },
+                })
+            })
+            .collect();
+        doc["fallback"] = serde_json::json!([{
+            "zone": "storage", "bond": "cfab-st-fb", "active": active,
+            "quiet": quiet, "slaves": slaves,
+        }]);
+        doc.to_string()
+    }
+
+    /// The migration this whole mechanism exists to make: the home wire keeps carrier, its
+    /// island's uplink is dead, and the leg has moved. The cause is named, and it STANDS —
+    /// it holds until somebody fixes the uplink.
+    #[test]
+    fn a_fallback_leg_moved_off_a_peer_dead_home_names_the_peers() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-c\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_fallback(&view, "cfab-st-fb-c", &["eth9"], &[], false),
+            );
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  storage fallback via eth0 (home eth9: peers unreachable)\n"),
+            "{}",
+            report.output
+        );
+        // STANDING (F22): a member living on a dead island uplink would otherwise spend every
+        // deadline of every `status --wait` on a line that is not going to change by itself.
+        assert!(
+            sys.slept.is_empty(),
+            "a verdict must not hold the wait:\n{}",
+            report.output
+        );
+    }
+
+    /// A suspicion is not a verdict: the home wire is silent and being asked, and the line says
+    /// so in the settling voice, so `status --wait` rides it out instead of declaring it.
+    #[test]
+    fn a_silent_home_wire_is_settling_not_a_verdict() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-c\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_fallback(&view, "cfab-st-fb-c", &[], &["eth9"], false),
+            );
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  storage fallback via eth0 (home eth9: no peers heard)\n"),
+            "{}",
+            report.output
+        );
+        // Settling (F22): `--wait` rides it out rather than returning on the UP headline. The
+        // next tick or two turns it into either silence or a standing verdict.
+        assert_eq!(
+            sys.slept.len(),
+            3,
+            "a suspicion must hold the wait:\n{}",
+            report.output
+        );
+    }
+
+    /// Nobody is heard on any wire. The fault is not per-wire, so the line does not name one —
+    /// and nothing was moved.
+    #[test]
+    fn a_fallback_leg_that_hears_nobody_anywhere_says_so_once() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).socket(
+            "/run/cfab/cfab.sock",
+            &components_with_fallback(&view, "cfab-st-fb-a", &[], &["eth9", "eth1", "eth0"], true),
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  storage fallback: no peers heard on any wire\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("storage fallback via "),
+            "where the bond sits explains nothing here: {}",
+            report.output
+        );
+    }
+
+    /// Every wire confirmed dead: the same shape as the ingress leg's, with the noun swapped.
+    #[test]
+    fn a_fallback_leg_no_wire_reaches_its_peers_over_says_exactly_that() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).socket(
+            "/run/cfab/cfab.sock",
+            &components_with_fallback(
+                &view,
+                "cfab-st-fb-a",
+                &["eth9", "eth1", "eth0"],
+                &[],
+                false,
+            ),
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  storage fallback: peers unreachable on every wire\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// A prober reporting every wire live adds nothing: a healthy fallback leg is silent.
+    #[test]
+    fn a_healthy_fallback_leg_with_the_prober_reporting_stays_silent() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).socket(
+            "/run/cfab/cfab.sock",
+            &components_with_fallback(&view, "cfab-st-fb-a", &[], &[], false),
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "{}", report.output);
+        assert!(
+            !report.output.contains("storage fallback"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// A supervisor from before the fallback prober publishes no rows at all, and every line
+    /// then reads exactly as it did before it existed — the carrier wording, not a verdict
+    /// about peers nobody asked about.
+    #[test]
+    fn an_older_supervisor_falls_back_to_the_carrier_wording() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view)
+            .file(
+                "/sys/class/net/cfab-st-fb/bonding/active_slave",
+                "cfab-st-fb-c\n",
+            )
+            .file("/sys/class/net/eth9/carrier", "1\n");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  storage fallback via eth0 (home eth9 has carrier)\n"),
+            "{}",
+            report.output
+        );
+    }
+
     /// Row 19's actuated end: a bond cfab owns is down with a stranger still enslaved in it.
     /// That reads exactly like a dark bond, and "no carrier" would send an operator to the
     /// wrong end of the cable. The line reports what was READ — `status` cannot know whether
