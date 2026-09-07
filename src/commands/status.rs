@@ -4097,6 +4097,103 @@ mod tests {
         assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps");
     }
 
+    /// F22 (VERIFIED on the rack 2026-09-07): the headline goes UP as soon as the sessions are
+    /// up, seconds before the engine has installed the routes the identities answer on — and
+    /// `--wait` returned on the headline alone, so the role's deployment gate passed ~3 s before
+    /// the fabric could carry anything. A settling reason line holds the wait.
+    #[test]
+    fn wait_holds_while_a_settle_line_is_present() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // The cluster route to pve1-tb is not installed yet: `ip route get` answers nothing.
+        let mut sys = healthy_leaf(&view).on_stdout(&["ip", "route", "get", "10.199.0.1"], "");
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(
+            sys.slept.len(),
+            3,
+            "the wait must ride out the settle, not return on the headline:\n{}",
+            report.output
+        );
+    }
+
+    /// The other half: the wait ends the moment the settle lines are gone, not at the deadline.
+    /// The rp_filter one stands in for every line the fabric installs after `up` — it is the one
+    /// a `MockSys` can make arrive while the loop is sleeping.
+    #[test]
+    fn wait_ends_as_soon_as_the_settle_lines_clear() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let path = "/proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter";
+        let mut sys = healthy_leaf(&view)
+            .file(path, "1\n")
+            .appears_after(1, path, "2\n");
+        let report = run(&mut sys, &view, 30, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            !report.output.contains("rp_filter"),
+            "the settled fabric is what gets reported:\n{}",
+            report.output
+        );
+        assert_eq!(
+            sys.slept,
+            vec![Duration::from_secs(2)],
+            "one 2 s sleep, then the settle line was gone"
+        );
+    }
+
+    /// Standing lines are what a healthy fabric prints by design (the mark backend on every
+    /// member, an operator's edited file here). They must never hold the gate: a member with one
+    /// would wait the whole deadline out on every single `status --wait`.
+    #[test]
+    fn wait_ends_at_once_when_only_standing_lines_are_present() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let text = example_text().replace("node = 3", "node = 7");
+        let mut sys = healthy_leaf(&view).file(CONFIG, &text);
+        let report = run(&mut sys, &view, 30, false, Some(cfg())).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert!(
+            report.output.contains("changed since apply") && report.output.contains("mark: nft"),
+            "the standing lines must still be reported:\n{}",
+            report.output
+        );
+        assert!(
+            sys.slept.is_empty(),
+            "a standing line is not something to wait for:\n{}",
+            report.output
+        );
+    }
+
+    /// F22, the second half: with no route at all `ip route get` names no device, and the line
+    /// read `cluster to pve1-tb via , expected cfab-cl` — an empty name where a device belongs.
+    /// One spelling per condition: no route is its own line, and it stands in for the src-pin
+    /// line too (there is no route to pin a source on).
+    #[test]
+    fn a_peer_with_no_route_says_so_instead_of_an_empty_device() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).on_stdout(&["ip", "route", "get", "10.199.0.1"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("cluster to pve1-tb: no route yet, expected cfab-cl"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("via ,"),
+            "an empty device name is not a spelling:\n{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("src not pinned"),
+            "no route is one condition, not two:\n{}",
+            report.output
+        );
+    }
+
     /// The bond is active on a wire that is not the home while the home still has carrier — a
     /// stuck reselect. Ruled a warn: it is a reason line, and the state does not move.
     #[test]
