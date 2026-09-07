@@ -643,10 +643,9 @@ fn socket_inodes(sys: &dyn Sys, pid: &str) -> Vec<u64> {
 /// vanish under a running fabric — a USB NIC unplugged, a driver removed — and the kernel takes
 /// every path under it away at the same instant: `/sys/class/net/<wire>`,
 /// `/proc/sys/net/ipv4/conf/<wire>` and every VLAN leg tagged on it. That is a graded state
-/// (the peers still grade this member UP-DEGRADED), never a refusal — F15, hardware
-/// 2026-09-07: one `/proc/sys/net/ipv4/conf/<wire>/forwarding` read propagated ENOENT and the
-/// whole report became `No such file or directory (os error 2)`. One set, so every per-interface
-/// read degrades the same way and the wire earns exactly one reason line (`link_speeds`).
+/// (the peers still grade this member UP-DEGRADED), never a refusal. One set, so every
+/// per-interface read degrades the same way and the wire earns exactly one reason line
+/// (`link_speeds`).
 ///
 /// A bond outlives its slaves: only the slave on a vanished wire goes, never the leg itself.
 fn absent_ifs(sys: &dyn Sys, view: &View) -> BTreeSet<String> {
@@ -3830,6 +3829,37 @@ mod tests {
                 report.output
             );
         }
+    }
+
+    /// The absent set is exactly the vanished wire's interfaces: a sibling wire's own drift
+    /// is still read and still named while eth9 is gone.
+    #[test]
+    fn a_sibling_wire_is_still_checked_while_eth9_is_absent() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let sibling = view
+            .class_rows()
+            .into_iter()
+            .find(|r| r.wire == "eth1")
+            .map(|r| r.ifname)
+            .expect("a class row on eth1");
+        let mut sys = host_without_eth9(&f, &view).file(
+            &format!("/proc/sys/net/ipv4/conf/{sibling}/rp_filter"),
+            "1\n",
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains(&format!("rp_filter {sibling}=1 (want 2 = loose)")),
+            "{}",
+            report.output
+        );
+        assert!(
+            report.output.contains("wire eth9 absent (no such netdev)"),
+            "{}",
+            report.output
+        );
     }
 
     /// The other half of the class: a file `status` expected to read and could not, on an
