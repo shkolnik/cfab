@@ -1038,9 +1038,15 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
     // unattached). A slave whose wire has vanished is skipped: the wire's own line accounts
     // for it, and its leg cannot exist at all.
     let path = format!("/sys/class/net/{ifname}/bonding/slaves");
-    let Ok(listed) = sys.read(&path) else {
-        c.note(format!("{path} unreadable"));
-        return;
+    let listed = match sys.read(&path) {
+        Ok(v) => v,
+        // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
+        // the slave list is the only thing that can say a slave went missing, so losing it is
+        // a named gap in the diagnosis, never silence.
+        Err(e) => {
+            c.note(format!("{subject}: {path} unreadable ({e})"));
+            return;
+        }
     };
     let listed: Vec<&str> = listed.split_whitespace().collect();
     for s in slaves.iter().filter(|s| !absent.contains(&s.ifname)) {
@@ -1270,6 +1276,9 @@ fn return_path_and_ingress(
         if view.kind() == MemberKind::Leaf {
             continue;
         }
+        // Bound before the table is read: a MIGRATING leg owns its own carrier diagnosis
+        // below, and the `linkdown` clause must not say the same thing a second time.
+        let leg = view.gw_rows().into_iter().find(|r| r.zone == z.name);
         let table = sys.run(&["ip", "route", "show", "table", &id])?.stdout;
         // Two distinct failures, each with its own wording (neither reachable for the other):
         // no default line at all, versus a default line the kernel has marked inactive. A
@@ -1285,15 +1294,16 @@ fn return_path_and_ingress(
                 "{} gw {} unreachable (table {id} has no default)",
                 z.name, gw.router
             ));
-        } else if default_lines
-            .iter()
-            // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
-            // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
-            // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
-            // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
-            // degraded the zone; cfab must not read healthier than the FRR build did. If E3
-            // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
-            .any(|l| l.contains("linkdown") || l.contains("dead"))
+        } else if leg.as_ref().is_none_or(|l| !l.migrates())
+            && default_lines
+                .iter()
+                // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
+                // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
+                // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
+                // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
+                // degraded the zone; cfab must not read healthier than the FRR build did. If E3
+                // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
+                .any(|l| l.contains("linkdown") || l.contains("dead"))
         {
             c.note(format!(
                 "{} gw {} unreachable (table {id} default is linkdown - the ingress leg has no \
@@ -1303,9 +1313,7 @@ fn return_path_and_ingress(
         }
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
-        let Some(leg) = view.gw_rows().into_iter().find(|r| r.zone == z.name) else {
-            continue;
-        };
+        let Some(leg) = leg else { continue };
         // A leg on gw scope `any` is an active-backup bond: the same reader the universal
         // segments get, so the ONE leg the outside depends on is graded like every other
         // migrating leg — a dark bond, a stranger active on it, a migration to a backup wire,
@@ -3358,6 +3366,13 @@ mod tests {
     /// eth0 and its home slave is `cfab-gw249-c`.
     const GW_BOND: &str = "cfab-gw249";
 
+    /// The same declaration with the ingress leg pinned to one domain — the example ships
+    /// scope `any`, the migrating leg.
+    fn fabric_with_a_domain_gw() -> Fabric {
+        let text = crate::decl::fixtures::with_a_domain_gw(&example_text());
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
     /// A migrating ingress leg sitting on its home wire with every slave enslaved is health:
     /// not one bond line about it.
     #[test]
@@ -3403,6 +3418,66 @@ mod tests {
                 "  mgmt gw 192.168.249.254 unreachable (ingress leg cfab-gw249 has no live \
                  slave)\n"
             ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// ONE event, ONE line. A leg with no live slave also makes the kernel flag the zone's
+    /// default `linkdown`, so the route check and the bond reader both saw the same darkness
+    /// and an operator got two reason lines for one cable. The bond reader owns it on a
+    /// migrating leg: it reads the CAUSE (no slave of ours is live under the leg) rather than
+    /// the kernel's consequence, it names the leg, and the `linkdown` clause is an INFERRED
+    /// kernel behavior that may not fire at all. `table has no default` is a different
+    /// condition and still reported.
+    #[test]
+    fn a_dark_migrating_ingress_leg_is_reported_once() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .file(
+                &format!("/sys/class/net/{GW_BOND}/bonding/mii_status"),
+                "down\n",
+            )
+            .file(
+                &format!("/sys/class/net/{GW_BOND}/bonding/active_slave"),
+                "\n",
+            )
+            .on_stdout(
+                &["ip", "route", "show", "table", "249"],
+                "default via 192.168.249.254 dev cfab-gw249 proto 205 linkdown\n",
+            );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  mgmt gw 192.168.249.254 unreachable (ingress leg cfab-gw249 has no live \
+                 slave)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("default is linkdown"),
+            "one event, one line:\n{}",
+            report.output
+        );
+    }
+
+    /// The slave list is the only thing that can say a slave went missing, so a leg whose
+    /// `bonding/slaves` cannot be read is a gap in the diagnosis, not silence — and the line
+    /// carries the leg's subject like every other line this reader emits.
+    #[test]
+    fn an_unreadable_slave_list_is_named_with_its_leg() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        sys.files
+            .remove(&format!("/sys/class/net/{GW_BOND}/bonding/slaves"));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  mgmt ingress: /sys/class/net/cfab-gw249/bonding/slaves unreadable ("),
             "{}",
             report.output
         );
@@ -3560,9 +3635,12 @@ mod tests {
     /// A default line the kernel has flagged `linkdown` is a DISTINCT failure from no default
     /// at all, with its own wording (ignore_routes_with_linkdown=1 keeps the line but makes it
     /// inactive for lookups). INFERRED (task E2.2): the exact flag string is settled live in E3.
+    /// On a leg PINNED to one domain this flag is the only carrier signal there is, so it is
+    /// the shape these two tests use; a migrating leg's bond speaks for itself
+    /// (`a_dark_migrating_ingress_leg_is_reported_once`).
     #[test]
     fn a_linkdown_default_is_a_distinct_reason() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let host = View::new(&f, "pve1-tb").unwrap();
         let mut sys = ingress_host_sys(
             &host,
@@ -3597,7 +3675,7 @@ mod tests {
     /// degraded return path.
     #[test]
     fn a_second_default_line_flagged_linkdown_still_degrades() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let host = View::new(&f, "pve1-tb").unwrap();
         let mut sys = ingress_host_sys(
             &host,
