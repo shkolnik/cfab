@@ -137,46 +137,51 @@ pub fn run(
     {
         base.note(note);
     }
-    // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not desired,
-    // and there is nothing to wait for.
-    if !sys.exists(&f.run_dir) {
-        // No fabric applied: there is nothing to describe and no supervisor to ask, so the
-        // always-printed components line is suppressed here alone.
-        return Ok(finish(
-            view,
-            State::Down,
-            "fabric not applied".to_string(),
-            &base,
-            permissive,
-            None,
-            false,
-        ));
-    }
-
     let expected = expected_links(view)?;
     let mut t = 0u64;
-    let (mut counts, mut c, mut comps);
     loop {
-        c = base.clone();
-        comps = read_components(sys, f);
-        counts = read(sys, view, &expected, &mut c, comps.as_ref())?;
+        // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
+        // desired *right now* — which a restarting supervisor passes through, so this is
+        // re-read on every poll like every other input to the verdict.
+        let applied = sys.exists(&f.run_dir);
+        let mut c = base.clone();
+        let comps = applied.then(|| read_components(sys, f)).flatten();
+        let counts = if applied {
+            Some(read(sys, view, &expected, &mut c, comps.as_ref())?)
+        } else {
+            None
+        };
         // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
-        // A degraded or failed member waits the full deadline and then reports what it reached.
-        if counts.state() == State::Up || t >= wait_s {
-            break;
+        // Every other state — degraded, failed, not applied — waits the full deadline and then
+        // reports what it reached.
+        let done = counts.as_ref().is_some_and(|n| n.state() == State::Up) || t >= wait_s;
+        if done {
+            return Ok(match counts {
+                Some(n) => finish(
+                    view,
+                    n.state(),
+                    n.fields(),
+                    &c,
+                    permissive,
+                    comps.as_ref(),
+                    true,
+                ),
+                // No fabric applied: there is nothing to describe and no supervisor to ask, so
+                // the always-printed components line is suppressed here alone.
+                None => finish(
+                    view,
+                    State::Down,
+                    "fabric not applied".to_string(),
+                    &c,
+                    permissive,
+                    None,
+                    false,
+                ),
+            });
         }
         t += POLL_SECS;
         sys.sleep(Duration::from_secs(POLL_SECS));
     }
-    Ok(finish(
-        view,
-        counts.state(),
-        counts.fields(),
-        &c,
-        permissive,
-        comps.as_ref(),
-        true,
-    ))
 }
 
 /// The fabric the supervisor applied, if it is still on disk: `<run_dir>/fabric.toml.applied`,
@@ -2187,6 +2192,8 @@ mod tests {
         assert_never_writes("healthy leaf", &mut healthy_leaf(&leaf), &leaf, 0);
         assert_never_writes("engine absent (FAILED)", &mut leaf_env(&leaf), &leaf, 0);
         assert_never_writes("no run dir (DOWN)", &mut MockSys::default(), &leaf, 0);
+        // A not-applied fabric now rides out the deadline too: no pass may write.
+        assert_never_writes("no run dir, --wait 6", &mut MockSys::default(), &leaf, 6);
 
         let mut bfd = all_bfd_up(&f);
         bfd[0].1 = "down";
@@ -3845,15 +3852,61 @@ mod tests {
         assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps: FAILED waited it out");
     }
 
-    /// DOWN does short-circuit: there is no intent, so there is nothing to wait for.
+    /// F18: "not applied" is a state a fabric passes THROUGH, not only one it never left. The
+    /// ruled SIGHUP-changed path tears the fabric down, exits 6 and lets systemd restart the
+    /// unit, so the run dir is gone for a couple of seconds — exactly what an operator's
+    /// `--wait` is for. The wait must ride it out and report the fabric that came back.
     #[test]
-    fn wait_short_circuits_on_down() {
+    fn wait_rides_out_a_fabric_that_is_not_applied_yet() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&view).appears_after(1, &f.run_dir, "");
+        sys.files.remove(&f.run_dir);
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        assert_eq!(report.code, 0);
+        assert_eq!(
+            headline(&report),
+            "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)"
+        );
+        assert_eq!(
+            sys.slept,
+            vec![Duration::from_secs(2)],
+            "one 2 s sleep, then the run dir was back"
+        );
+    }
+
+    /// A fabric that never comes up waits the deadline out like FAILED and DEGRADED do, then
+    /// reports the same verdict it reports today.
+    #[test]
+    fn wait_runs_to_the_deadline_on_a_fabric_that_is_never_applied() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = MockSys::default();
-        let report = run(&mut sys, &view, 600, false, None).unwrap();
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
         assert_eq!(report.state, State::Down);
-        assert!(sys.slept.is_empty(), "DOWN never waits");
+        assert_eq!(report.code, 3);
+        assert_eq!(
+            headline(&report),
+            "DOWN (fabric not applied) on pve3-tb (leaf)"
+        );
+        assert_eq!(sys.slept.len(), 3, "6 s in 2 s steps");
+    }
+
+    /// `--wait 0` stays one instant read on a fabric that is not applied: the poll loop is
+    /// entered, the deadline is already spent, nothing sleeps.
+    #[test]
+    fn wait_zero_on_a_fabric_that_is_not_applied_is_one_instant_read() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = MockSys::default();
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.state, State::Down);
+        assert_eq!(
+            headline(&report),
+            "DOWN (fabric not applied) on pve3-tb (leaf)"
+        );
+        assert!(sys.slept.is_empty(), "--wait 0 is one instant read");
     }
 
     /// The wait is for the post-`up` settle, not a verdict: a member that stays degraded waits
