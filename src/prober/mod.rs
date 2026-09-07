@@ -1473,6 +1473,60 @@ mod tests {
         );
     }
 
+    /// F24, seen on the rack 2026-09-07 23:02 UTC: the home wire's cable is plugged back in
+    /// (carrier 1, router answering) but the bonding driver holds the port below up for
+    /// `updelay` — `bonding_slave/mii_status` reads `going_back`, not `up` — and the kernel's
+    /// `active_slave` write wants BOTH carrier and this file `up` (`bond_option_active_slave_set`
+    /// → `bond_slave_is_up`, VERIFIED against the kernel source 2026-09-07). Writing anyway is
+    /// exactly the "cannot move … Invalid argument" line the fabric logged. The prober must
+    /// leave the bond alone (and log nothing) until `mii_status` itself says `up`, then move on
+    /// the very next tick.
+    #[test]
+    fn a_port_going_back_is_not_a_move_target_until_mii_status_says_up() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP)
+            .file(&format!("/sys/class/net/{HOME}/carrier"), "1\n")
+            .file(
+                &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
+                "going_back\n",
+            );
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 4);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "a port the bonding driver has not brought up is never written as active_slave: {:?}",
+            sys.calls
+        );
+        let home = rows[0]
+            .ports
+            .iter()
+            .find(|s| s.wire == "eth0")
+            .expect("the home wire has a row");
+        assert!(home.reachable, "the router answers over it, mii_status is a move-eligibility fact, not a reachability one: {rows:?}");
+
+        // Now the bonding driver finishes updelay.
+        sys = sys.file(
+            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
+            "up\n",
+        );
+        p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
+        assert!(
+            sys.calls
+                .iter()
+                .any(|c| c == &format!("write /sys/class/net/{BOND}/bonding/active_slave")),
+            "up is up: the very next tick writes active_slave: {:?}",
+            sys.calls
+        );
+        assert_eq!(
+            sys.read(&format!("/sys/class/net/{BOND}/bonding/active_slave"))
+                .unwrap(),
+            HOME,
+            "and it names the home wire"
+        );
+    }
+
     /// Carrier is believed at once, not three ticks later. The probe answers can even still be
     /// arriving — a switch that has just lost the link to this host answers nothing new, but the
     /// hysteresis remembers the last three that did — and the wire is still no longer one the
