@@ -161,10 +161,30 @@ impl Prober {
     /// the alternative (send, then read immediately) would score every wire as dark.
     pub fn tick(
         &mut self,
-        _sys: &mut dyn Sys,
-        _io: &mut dyn ProbeIo,
+        sys: &mut dyn Sys,
+        io: &mut dyn ProbeIo,
         now: Instant,
     ) -> Vec<IngressLeg> {
+        for leg in &mut self.legs {
+            for s in &mut leg.slaves {
+                let frames = io.recv(&s.ifname).unwrap_or_default();
+                let replied = frames
+                    .iter()
+                    .any(|f| frame::reply_from(f, s.mac, leg.router).is_some());
+                if replied {
+                    s.last_reply = Some(now);
+                }
+                // A tick that asked nothing learns nothing. A failed `recv` is a miss, not a
+                // gap: the tap is on the slave, so losing it IS the wire being unusable.
+                if s.probed {
+                    s.state.observe(replied);
+                }
+            }
+            leg.actuate(sys);
+            for s in &mut leg.slaves {
+                s.probed = io.send(&s.ifname, &frame::probe(s.mac, leg.router)).is_ok();
+            }
+        }
         self.report(now)
     }
 
@@ -208,7 +228,68 @@ impl Prober {
 
 impl Leg {
     /// Move the bond if the decision says it belongs elsewhere. Reads only on a healthy leg.
-    fn actuate(&mut self, _sys: &mut dyn Sys) {}
+    fn actuate(&mut self, sys: &mut dyn Sys) {
+        if !self.migrates {
+            return;
+        }
+        let base = format!("/sys/class/net/{}/bonding", self.bond);
+        // An unreadable `bonding/` means the bond is not there (or is not a bond). Writing into
+        // it would be a guess about a netdev we cannot see; `status` and the forwarding watchdog
+        // own that fault.
+        let Ok(active) = sys.read(&format!("{base}/active_slave")) else {
+            return;
+        };
+        let active = active.trim();
+        let active = (!active.is_empty()).then_some(active);
+        let cands: Vec<Candidate> = self
+            .slaves
+            .iter()
+            .map(|s| Candidate {
+                ifname: s.ifname.clone(),
+                wire: s.wire.clone(),
+                reachable: s.state.reachable(),
+            })
+            .collect();
+        let Some(target) = decide(active, &cands, &self.prefs) else {
+            return;
+        };
+        let to = self
+            .slaves
+            .iter()
+            .find(|s| s.ifname == target)
+            .map(|s| s.wire.clone())
+            .unwrap_or_else(|| target.clone());
+        let from = active.and_then(|a| self.slaves.iter().find(|s| s.ifname == a));
+        // `primary` FIRST, then `active_slave`, and both every time (VERIFIED on the rack
+        // 2026-09-07): an `active_slave` write alone holds only until the next link event, at
+        // which point `primary_reselect=always` hands the bond straight back to the primary the
+        // declaration set. Writing `primary` is therefore not bookkeeping — it is what makes the
+        // move survive.
+        for file in ["primary", "active_slave"] {
+            if let Err(e) = sys.write(&format!("{base}/{file}"), &target) {
+                eprintln!(
+                    "cfab: {} ingress: cannot move {} to {to}: {e}",
+                    self.zone, self.bond
+                );
+                return;
+            }
+        }
+        self.held = target;
+        match from {
+            Some(f) if !f.state.reachable() => eprintln!(
+                "cfab: {} ingress: router unreachable on {}, moved {} to {to}",
+                self.zone, f.wire, self.bond
+            ),
+            Some(f) => eprintln!(
+                "cfab: {} ingress: router reachable on {to} again, moved {} back from {}",
+                self.zone, self.bond, f.wire
+            ),
+            None => eprintln!(
+                "cfab: {} ingress: no slave of ours was active on {}, moved it to {to}",
+                self.zone, self.bond
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -364,7 +445,7 @@ mod tests {
     #[test]
     fn a_bond_with_no_reachable_wire_is_left_to_the_kernel() {
         let f = fabric();
-        let (mut p, names) = prober(&f);
+        let (mut p, _) = prober(&f);
         let mut sys = bonding(HOME);
         let mut io = ScriptedIo::answering_on(ROUTER, &[]);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 8);
@@ -416,7 +497,7 @@ mod tests {
     #[test]
     fn the_first_tick_counts_no_miss() {
         let f = fabric();
-        let (mut p, names) = prober(&f);
+        let (mut p, _) = prober(&f);
         let mut sys = bonding(HOME);
         let mut io = ScriptedIo::answering_on(ROUTER, &[]);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 3);
