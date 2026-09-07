@@ -1604,9 +1604,11 @@ fn ceiling_counters(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The daemon must be alive, and every wire with carrier must carry exactly the tree the shape
-/// derivation gives for the current up-set. A wire without carrier may hold a stale tree
-/// (left alone).
+/// The daemon must be alive, and every wire it says it shaped must still carry exactly the tree
+/// it recorded installing. Status does NOT derive the shape: it did once, from its own carrier
+/// read, and reported drift on correctly shaped wires whenever its reading or its instant
+/// differed from the daemon's across the debounce window (F19). The daemon's record
+/// (`<run_dir>/shape.applied`) is the single expectation.
 fn shape_posture(
     sys: &mut dyn Sys,
     view: &View,
@@ -1628,51 +1630,57 @@ fn shape_posture(
             sd.state.as_str(),
             sd.restarts
         ));
+        // No expectation to check, exactly as for an absent record: a daemon that is not
+        // running maintains nothing, so after a crash its record can describe floors the
+        // kernel no longer holds. Calling that standing drift would say waiting changes
+        // nothing, when the daemon coming back is the whole remedy.
+        return Ok(());
     }
-    let wires = view.wires();
-    let carrier_up: Vec<bool> = wires
-        .iter()
-        .map(|w| {
-            sys.read(&format!("/sys/class/net/{w}/carrier"))
-                .map(|s| s.trim() == "1")
-                .unwrap_or(false)
-        })
-        .collect();
-    for (dev, up_now) in wires.iter().zip(&carrier_up) {
-        if !up_now {
-            continue;
+    let path = crate::shape_applied_path(&view.fabric.run_dir);
+    // Absent and unparseable are one condition — no expectation to compare against — and a
+    // half-written record parses as neither, so both land here as "not applied yet".
+    let record = match sys
+        .read(&path)
+        .ok()
+        .and_then(|t| emit::shape::ShapeApplied::parse(&t).ok())
+    {
+        Some(r) => r,
+        None => {
+            c.settling(format!(
+                "no shape record yet at {path} — shape-daemon has not applied"
+            ));
+            return Ok(());
         }
-        let measured = read_cap(sys, view, dev);
-        let carrier = |w: &str| {
-            sys.read(&format!("/sys/class/net/{w}/carrier"))
-                .map(|s| s.trim() == "1")
-                .unwrap_or(true)
-        };
-        let derivation = match emit::shape::derive(view, dev, measured, &carrier) {
-            Ok(d) => d,
-            Err(e) => {
+    };
+    for dev in view.wires() {
+        match record.wires.get(&dev) {
+            // In the declaration but not in the record: the daemon has not reached this wire
+            // yet. Settling — its next reconverge decides.
+            None => c.settling(format!(
+                "shape not applied on {dev} yet — shape-daemon has no record for it"
+            )),
+            // A wire the daemon deliberately left alone: whatever tc holds on it is stale by
+            // design, and the wire being down is already graded on the links axis.
+            Some(emit::shape::AppliedWire::NoCarrier) => {}
+            Some(emit::shape::AppliedWire::Failed(e)) => {
                 // Standing: the derivation is a pure function of the declaration.
                 c.standing(format!("shape derivation for {dev} failed: {e}"));
-                continue;
             }
-        };
-        let live = sys.run(&["tc", "class", "show", "dev", dev])?.stdout;
-        for b in &derivation.bands {
-            let want = if b.eff >= 1000 && b.eff % 1000 == 0 {
-                format!("rate {}Gbit", b.eff / 1000)
-            } else if b.eff >= 1 {
-                format!("rate {}Mbit", b.eff)
-            } else {
-                "rate 1Kbit".to_string()
-            };
-            let cid = format!("1:{}", b.minor);
-            let hit = live.lines().any(|l| {
-                l.contains(&format!("class htb {cid} ")) && l.contains(&format!(" {want} "))
-            });
-            if !hit {
-                // Standing: drift against the derived tree, which only a re-apply installs
-                // (F19 is open on exactly these lines).
-                c.standing(format!("shape drift on {dev}: class {cid} want {want}"));
+            Some(emit::shape::AppliedWire::Shaped(classes)) => {
+                let live = sys.run(&["tc", "class", "show", "dev", &dev])?.stdout;
+                for (cid, rate) in classes {
+                    let hit = live.lines().any(|l| {
+                        l.contains(&format!("class htb {cid} "))
+                            && l.contains(&format!(" rate {rate} "))
+                    });
+                    if !hit {
+                        // Standing: the kernel disagrees with what the daemon says it installed,
+                        // and no amount of waiting re-applies it.
+                        c.standing(format!(
+                            "shape drift on {dev}: class {cid} want rate {rate}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1765,18 +1773,6 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
         return None;
     }
     words.get(i + 2)?.parse().ok()
-}
-
-/// The cap the shape derivation prefers over the declared link speed: the shared chain (local
-/// cap file → cluster-published cap, cached back locally → declared).
-fn read_cap(sys: &mut dyn Sys, view: &View, dev: &str) -> Option<u64> {
-    crate::caps::read_cap(
-        sys,
-        &crate::cluster::Pmxcfs::new(),
-        &view.member.name,
-        &view.fabric.run_dir,
-        dev,
-    )
 }
 
 #[cfg(test)]
@@ -2241,7 +2237,7 @@ mod tests {
                 &format!("{}/policy.applied", f.run_dir),
                 "table inet cfab-fwd\n",
             );
-        mark_env(sys, view)
+        let sys = mark_env(sys, view)
             .on_stdout(
                 &["nft", "-s", "list", "table", "inet", "cfab-fwd"],
                 "table inet cfab-fwd\n",
@@ -2261,7 +2257,42 @@ mod tests {
         .on_stdout(&["ip", "rule", "show", "pref", "2002"],
             "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
         .on_stdout(&["ip", "route", "show", "table", "249"],
-            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
+        shaped(sys, view)
+    }
+
+    /// The shape-daemon's record plus the matching kernel state on every wire: a healthy host
+    /// IS shaped, so the fixture says so rather than leaving `tc class show` silent.
+    fn shaped(mut sys: MockSys, view: &View) -> MockSys {
+        let mut wires = std::collections::BTreeMap::new();
+        for w in view.wires() {
+            let classes = emit::shape::derive(view, &w, None, &|_| true)
+                .unwrap()
+                .applied_classes();
+            sys = sys.on_stdout(
+                &["tc", "class", "show", "dev", &w],
+                &tc_class_show(&classes),
+            );
+            wires.insert(w, emit::shape::AppliedWire::Shaped(classes));
+        }
+        let rec = emit::shape::ShapeApplied { tick: 1, wires };
+        sys.file(
+            &crate::shape_applied_path(&view.fabric.run_dir),
+            &rec.render(),
+        )
+    }
+
+    /// `tc class show` output for a set of classes, as the kernel prints it.
+    fn tc_class_show(classes: &[(String, String)]) -> String {
+        classes
+            .iter()
+            .map(|(cid, rate)| {
+                format!(
+                    "class htb {cid} parent 1:1 leaf 10: prio 0 rate {rate} ceil 5Gbit \
+                     burst 64Kb cburst 64Kb\n"
+                )
+            })
+            .collect()
     }
 
     fn headline(report: &StatusReport) -> &str {
@@ -5290,5 +5321,203 @@ mod tests {
         assert!(is_read_only("unix_request /run/cfab/engine.sock state"));
         assert!(!is_read_only("unix_request /run/cfab/cfab.sock reapply"));
         assert!(!is_read_only("write /run/cfab/cfab.sock"));
+    }
+
+    /// Just the shape row's reason lines, with the classification `--wait` reads.
+    fn shape_reasons(sys: &mut MockSys, view: &View) -> Vec<(Class, String)> {
+        let mut c = Ctx::default();
+        shape_posture(sys, view, None, &mut c).unwrap();
+        c.reasons
+    }
+
+    /// F19's teeth. The daemon applied eth1's tree while eth9 was DOWN (storage promoted to its
+    /// full floor there), then eth9 came back and the daemon has not reconverged yet. Status
+    /// must report the fabric it is looking at — the kernel matches what the daemon recorded —
+    /// and NOT re-derive from its own carrier read, which with eth9 up wants storage demoted to
+    /// its token on eth1 and called every correctly shaped fallback wire "drift" on the rack.
+    #[test]
+    fn no_drift_when_the_kernel_matches_the_record_but_a_fresh_derivation_would_not() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // The up-set at apply time: eth9 down. Every wire's tree comes from THAT derivation.
+        let at_apply = |w: &str| w != "eth9";
+        let mut wires = std::collections::BTreeMap::new();
+        let mut sys = healthy_host(&f, &view);
+        for w in view.wires() {
+            let classes = emit::shape::derive(&view, &w, None, &at_apply)
+                .unwrap()
+                .applied_classes();
+            sys = sys.on_stdout(
+                &["tc", "class", "show", "dev", &w],
+                &tc_class_show(&classes),
+            );
+            wires.insert(w, emit::shape::AppliedWire::Shaped(classes));
+        }
+        // A fresh derivation with eth9 back up wants a different rate on eth1 — the disagreement
+        // this test is about. If it ever stops differing, the test has lost its teeth.
+        let now = emit::shape::derive(&view, "eth1", None, &|_| true)
+            .unwrap()
+            .applied_classes();
+        assert_ne!(
+            now,
+            emit::shape::derive(&view, "eth1", None, &at_apply)
+                .unwrap()
+                .applied_classes(),
+            "fixture no longer distinguishes the two derivations"
+        );
+        sys = sys.file(
+            &crate::shape_applied_path(&f.run_dir),
+            &emit::shape::ShapeApplied { tick: 7, wires }.render(),
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            !report.output.contains("shape drift"),
+            "the kernel is exactly what the daemon recorded:\n{}",
+            report.output
+        );
+        assert_eq!(report.state, State::Up, "{}", report.output);
+    }
+
+    /// No record: the daemon has not applied yet. One settling line — `--wait` is for exactly
+    /// this window — and never a drift line about a shape nobody has installed.
+    #[test]
+    fn an_absent_shape_record_is_settling_not_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        sys.files.remove(&crate::shape_applied_path(&f.run_dir));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  no shape record yet at /run/cfab/shape.applied — shape-daemon has not applied\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert!(!report.output.contains("shape drift"), "{}", report.output);
+        // Settling, so `--wait` holds for it instead of returning on the UP headline.
+        assert_eq!(
+            shape_reasons(&mut sys, &view),
+            vec![(
+                Class::Settling,
+                "no shape record yet at /run/cfab/shape.applied — shape-daemon has not applied"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// A half-written record parses as nothing, and "nothing" is the same condition as absent:
+    /// status never invents an expectation out of a truncated file.
+    #[test]
+    fn an_unparseable_shape_record_reads_as_no_record() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            healthy_host(&f, &view).file(&crate::shape_applied_path(&f.run_dir), "cfab-shape-a");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains(
+                "  no shape record yet at /run/cfab/shape.applied — shape-daemon has not applied\n"
+            ),
+            "{}",
+            report.output
+        );
+    }
+
+    /// The kernel really does disagree with what the daemon recorded installing: that is drift,
+    /// and it is STANDING — no reconverge is coming to fix a tree the daemon believes it wrote,
+    /// so `--wait` must not spend its deadline on it.
+    #[test]
+    fn a_kernel_that_disagrees_with_the_record_is_standing_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).on_stdout(
+            &["tc", "class", "show", "dev", "eth9"],
+            "class htb 1:40 parent 1:1 leaf 40: prio 2 rate 3Mbit ceil 5Gbit burst 64Kb\n",
+        );
+        let report = run(&mut sys, &view, 6, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  shape drift on eth9: class 1:40 want rate 2Gbit\n"),
+            "{}",
+            report.output
+        );
+        assert_eq!(
+            shape_reasons(&mut sys, &view),
+            vec![
+                (
+                    Class::Standing,
+                    "shape drift on eth9: class 1:10 want rate 200Mbit".to_string()
+                ),
+                (
+                    Class::Standing,
+                    "shape drift on eth9: class 1:20 want rate 100Mbit".to_string()
+                ),
+                (
+                    Class::Standing,
+                    "shape drift on eth9: class 1:30 want rate 100Mbit".to_string()
+                ),
+                (
+                    Class::Standing,
+                    "shape drift on eth9: class 1:40 want rate 2Gbit".to_string()
+                ),
+            ],
+            "standing: waiting re-applies nothing"
+        );
+    }
+
+    /// A wire the daemon recorded skipping (no carrier) holds a stale tree by design, and the
+    /// wire being down is graded on the links axis — status says nothing about its shape.
+    #[test]
+    fn a_wire_the_daemon_skipped_is_never_called_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut rec = emit::shape::ShapeApplied::parse(
+            &healthy_host(&f, &view)
+                .read(&crate::shape_applied_path(&f.run_dir))
+                .unwrap(),
+        )
+        .unwrap();
+        rec.wires
+            .insert("eth1".to_string(), emit::shape::AppliedWire::NoCarrier);
+        let mut sys = healthy_host(&f, &view)
+            .file(&crate::shape_applied_path(&f.run_dir), &rec.render())
+            .on_stdout(&["tc", "class", "show", "dev", "eth1"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(!report.output.contains("eth1: class"), "{}", report.output);
+        assert!(!report.output.contains("shape drift"), "{}", report.output);
+    }
+
+    /// A shape-daemon that is not running leaves a record no one is maintaining: after a crash
+    /// it describes floors the kernel may no longer hold. That is not standing drift — the
+    /// daemon coming back IS the remedy — so the shaping-down line is the whole story and the
+    /// record is not diffed at all.
+    #[test]
+    fn a_shape_daemon_that_is_down_earns_one_line_and_no_drift() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).on_stdout(
+            &["tc", "class", "show", "dev", "eth9"],
+            "class htb 1:40 parent 1:1 leaf 40: prio 2 rate 3Mbit ceil 5Gbit burst 64Kb\n",
+        );
+        let comps: Components = serde_json::from_str(&healthy_components(&view)).unwrap();
+        let mut cc = comps;
+        for k in &mut cc.components {
+            if k.name == "shape-daemon" {
+                k.state = CompState::Restarting;
+                k.restarts = 2;
+            }
+        }
+        let mut c = Ctx::default();
+        shape_posture(&mut sys, &view, Some(&cc), &mut c).unwrap();
+        assert_eq!(
+            c.reasons,
+            vec![(
+                Class::Settling,
+                "shaping down: shape-daemon is restarting, 2 restart(s)".to_string()
+            )],
+            "the record of a daemon that is not running is not an expectation"
+        );
     }
 }

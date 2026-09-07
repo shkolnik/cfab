@@ -35,6 +35,16 @@ pub fn applied_decl_path(run_dir: &str) -> String {
     format!("{}/{APPLIED_DECL_NAME}", run_dir.trim_end_matches('/'))
 }
 
+/// The shape-daemon's record of its last reconverge, kept in the run dir. `cfab status`
+/// compares the kernel's tc state against THIS instead of deriving the shape a second time:
+/// two derivations from two carrier reads across the daemon's debounce window reported drift on
+/// correctly shaped wires (finding F19).
+pub const SHAPE_APPLIED_NAME: &str = "shape.applied";
+
+pub fn shape_applied_path(run_dir: &str) -> String {
+    format!("{}/{SHAPE_APPLIED_NAME}", run_dir.trim_end_matches('/'))
+}
+
 /// Load + type + validate the declaration. An unknown key is an ERROR from the parser, not a
 /// warning: the declaration is the whole input, so a key nothing consumes is a mistake.
 pub fn load_fabric(path: &Path) -> Result<model::Fabric> {
