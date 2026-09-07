@@ -1473,6 +1473,8 @@ pub(crate) mod tests {
                 "rebuilt storage/cfab-st on eth9",
                 "rebuilt cluster/cfab-cl-bk on eth9",
                 "rebuilt mgmt/cfab-mg-b2 on eth9",
+                // the migrating ingress leg's slave on this wire, rebuilt like any other
+                "rebuilt mgmt/cfab-gw249-a on eth9",
                 "rebuilt storage/cfab-st-fb-a on eth9",
                 "rebuilt cluster/cfab-cl-fb-a on eth9",
                 "rebuilt mgmt/cfab-mg-fb-a on eth9",

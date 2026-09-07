@@ -447,7 +447,7 @@ mod tests {
         assert_eq!(d.zones[0].segments.len(), 3);
         assert_eq!(d.zones[0].universal.as_ref().unwrap().vid, 300);
         assert!(d.zones[0].gw.is_none());
-        assert_eq!(d.zones[2].gw.as_ref().unwrap().domain, "c");
+        assert_eq!(d.zones[2].gw.as_ref().unwrap().domain, "any");
         assert!(d.forward.enabled);
     }
 
@@ -643,6 +643,19 @@ pub(crate) mod fixtures {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// The example with the ingress leg pinned to ONE physical domain. It ships on scope
+    /// `any` — the migrating leg — so every test of the pinned shape edits it here, and the
+    /// assert means a change to the example's gw line cannot leave a caller silently testing
+    /// the shipped scope instead of the one it names.
+    pub fn with_a_domain_gw(text: &str) -> String {
+        let needle = "gw = { domain = \"any\"";
+        assert!(
+            text.contains(needle),
+            "the example's gw is no longer on scope `any`"
+        );
+        text.replace(needle, "gw = { domain = \"c\"")
     }
 
     /// Replace one member's whole wire set (and, with it, any `driver_features` those wires

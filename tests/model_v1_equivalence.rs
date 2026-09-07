@@ -27,6 +27,11 @@
 //!      a packet sent to its fabric identity (James 2026-09-06: unsupported by design). The
 //!      shape is pinned by `emit::engine`'s own tests; here it is only subtracted, so the rest
 //!      of the policy tree stays under byte comparison.
+//!   7. The ingress leg's slaves in the nft `cfab` (owned-interface) set. The v1 example puts
+//!      the gw on scope `any` — the leg MIGRATES, so it is an active-backup bond with one
+//!      tagged sub-interface per wire — and those three netdevs are this host's, exactly as a
+//!      universal segment's slaves are. v0 had no such scope: its gw was always one wire's
+//!      sub-interface. Nothing else about the policy moves.
 
 use std::collections::BTreeMap;
 
@@ -488,6 +493,12 @@ fn the_forward_policy_differs_only_by_the_slave_rename_and_the_admin_set() {
         want = want.replace(
             "set admin { type ifname; elements = { \"eth0\" } }",
             "set admin { type ifname; elements = { \"eth9\",\"eth1\",\"eth0\" } }",
+        );
+        // Allowed diff 7: the ingress leg migrates in the v1 example, so this host owns one
+        // tagged slave of it per wire. A leaf carries no ingress leg and no such name.
+        want = want.replace(
+            "\"cfab-gw249\",",
+            "\"cfab-gw249\",\"cfab-gw249-a\",\"cfab-gw249-b\",\"cfab-gw249-c\",",
         );
         // The set is emitted sorted; the rename reorders three names inside it.
         let sort_set = |s: &str| {

@@ -1608,11 +1608,10 @@ mod tests {
         );
     }
 
-    fn fabric_with_a_migrating_gw() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-                .unwrap()
-                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
+    /// The same declaration with the ingress leg pinned to one domain — the example ships
+    /// scope `any`, the migrating leg.
+    fn fabric_with_a_domain_gw() -> Fabric {
+        let text = crate::decl::fixtures::with_a_domain_gw(&crate::decl::fixtures::example());
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
@@ -1622,7 +1621,7 @@ mod tests {
     /// cheapest segment is on the mg domain, so `primary` names the mg SLAVE.
     #[test]
     fn a_migrating_gw_leg_is_built_as_a_bond() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
         let o = opts();
@@ -1674,7 +1673,7 @@ mod tests {
     /// — and the refusal names the remedy that `down` really performs.
     #[test]
     fn up_refuses_an_ingress_leg_the_previous_declaration_built_as_a_bond() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view)
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -1697,7 +1696,7 @@ mod tests {
     /// not a bond") and named no remedy at all.
     #[test]
     fn up_refuses_an_ingress_leg_the_previous_declaration_built_as_a_sub_interface() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view)
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -1719,7 +1718,7 @@ mod tests {
     /// own refusals, which do not offer a remedy `down` cannot perform on a stranger.
     #[test]
     fn up_still_refuses_a_stranger_wearing_the_ingress_legs_name() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view)
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -1754,7 +1753,7 @@ mod tests {
     /// explicitly rather than inheriting conf/default.
     #[test]
     fn a_migrating_gw_bond_forwards_and_its_slaves_never_do() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
         let o = opts();
@@ -1776,7 +1775,7 @@ mod tests {
     /// condition for it as well.
     #[test]
     fn a_down_migrating_gw_bond_is_reported_as_no_wire_with_carrier() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let got = describe_down(&view, &["mgmt/cfab-gw249".to_string()]);
         assert_eq!(
@@ -1829,7 +1828,7 @@ mod tests {
     /// leg must still produce exactly the argv they produced before it — this pins them.
     #[test]
     fn class_and_gw_sub_interfaces_are_created_exactly_as_before() {
-        let f = fabric();
+        let f = fabric_with_a_domain_gw();
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
         let mut sys = up_sys(&view);

@@ -135,7 +135,11 @@ the point of use, with identical single-host behavior when absent:
   at the leaf's own IPs. Ingress to a leaf's fabric identity is unsupported by design (the
   leaf answers such a packet with a local unreachable, never a leak), not a gap. So leaf
   identities are never advertised to the router: every gw zone's iBGP policy rejects them,
-  and the router is never given a route to an address the fabric cannot answer.
+  and the router is never given a route to an address the fabric cannot answer. The shipped
+  example declares that leg on `gw = { domain = "any" }`, which makes it MIGRATE — an
+  active-backup bond with one tagged sub-interface per wire, so ingress survives losing a whole
+  switch — and asks of the rack what a universal segment does: the ingress vid must be carried
+  on every island's uplink, or the leg is dark on the wires whose switch does not trunk it.
 - **Fail loud, never degrade silently.** A missing capability, absent interface, or unmet
   precondition is a clear, actionable error, never a partial apply.
 - **Detectors actuate, `status` reports.** A condition that makes a link unsafe is brought down

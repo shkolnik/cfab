@@ -3354,21 +3354,6 @@ mod tests {
 
     // ---- the migrating ingress leg (gw scope `any`) -------------------------------------
 
-    /// The packaged declaration with the ingress leg on gw scope `any`: the MIGRATING leg — an
-    /// active-backup bond with one tagged slave per wire, exactly the shape a universal segment
-    /// has. The replacement is asserted so that flipping the shipped example to `any` cannot
-    /// leave this fixture silently reading the same fabric as `fabric()`.
-    fn fabric_with_a_migrating_gw() -> Fabric {
-        let text = example_text();
-        let needle = "gw = { domain = \"c\"";
-        assert!(
-            text.contains(needle),
-            "the example's gw is no longer on a single domain"
-        );
-        let text = text.replace(needle, "gw = { domain = \"any\"");
-        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
-    }
-
     /// pve1-tb's ingress bond. mgmt's cheapest segment is on domain c, so the leg homes on
     /// eth0 and its home slave is `cfab-gw249-c`.
     const GW_BOND: &str = "cfab-gw249";
@@ -3377,7 +3362,7 @@ mod tests {
     /// not one bond line about it.
     #[test]
     fn a_healthy_migrating_ingress_leg_is_silent() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
         let report = run(&mut sys, &view, 0, false, None).unwrap();
@@ -3400,7 +3385,7 @@ mod tests {
     /// outside cannot use — the existing `gw <router> unreachable (...)` grade, naming the leg.
     #[test]
     fn a_dark_migrating_ingress_leg_is_the_gw_unreachable_grade() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
         sys = sys
@@ -3427,7 +3412,7 @@ mod tests {
     /// with the wire it moved to — the same sentence a migrated fallback bond earns.
     #[test]
     fn a_migrated_ingress_leg_names_the_wire_it_moved_to() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view).file(
             &format!("/sys/class/net/{GW_BOND}/bonding/active_slave"),
@@ -3447,7 +3432,7 @@ mod tests {
     /// the wire (an operator must know the ingress moved), without the stuck-reselect clause.
     #[test]
     fn a_migrated_ingress_leg_off_a_dark_home_drops_the_carrier_clause() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view)
             .file(
@@ -3467,7 +3452,7 @@ mod tests {
     /// the ingress leg says so in the fallback leg's words.
     #[test]
     fn an_ingress_bond_with_a_foreign_slave_active_is_named() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view)
             .file(
@@ -3492,7 +3477,7 @@ mod tests {
     /// one spelling the fallback leg already uses.
     #[test]
     fn an_ingress_leg_that_is_not_a_bond_says_re_run_cfab_up() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
         sys.files
@@ -3513,7 +3498,7 @@ mod tests {
     /// it). The bond's own `mii_status` reads healthy, so only the slave list can say it.
     #[test]
     fn an_ingress_slave_that_is_not_enslaved_is_named() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view).file(
             &format!("/sys/class/net/{GW_BOND}/bonding/slaves"),
@@ -3555,7 +3540,7 @@ mod tests {
     /// reads must keep happening. F15's set, on the shape F15 never saw.
     #[test]
     fn a_vanished_wire_takes_the_ingress_slave_and_not_the_bond() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
         sys.files.remove("/sys/class/net/eth1");

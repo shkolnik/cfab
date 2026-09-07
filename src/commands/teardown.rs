@@ -524,21 +524,12 @@ mod tests {
         assert_eq!(dels, ["ip link del cfab-st-fb", "ip link del cfab-st-fb-a"]);
     }
 
-    /// The same declaration with the ingress leg on domain `any`.
-    fn fabric_with_a_migrating_gw() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-                .unwrap()
-                .replace("gw = { domain = \"c\"", "gw = { domain = \"any\"");
-        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
-    }
-
     /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
     /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
     /// ("not a vlan") and strand the leg on a `cfab down`.
     #[test]
     fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg()
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -571,17 +562,11 @@ mod tests {
         );
     }
 
-    /// The same declaration with the ingress leg back on ONE domain, for the reverse flip.
+    /// The same declaration with the ingress leg pinned to one domain — the example ships
+    /// scope `any`, the migrating leg.
     fn fabric_with_a_domain_gw() -> Fabric {
-        let f = fabric();
-        assert!(
-            !f.zones
-                .iter()
-                .filter_map(|z| z.gw.as_ref())
-                .any(|g| matches!(g.scope, crate::model::SegScope::Universal)),
-            "the example's gw is already on scope `any`"
-        );
-        f
+        let text = crate::decl::fixtures::with_a_domain_gw(&crate::decl::fixtures::example());
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
     /// A live ingress BOND named by a declaration that now puts the gw on one domain, plus its
@@ -646,7 +631,7 @@ mod tests {
     /// the previous one built. The bond loop refused it ("not a bond"); it must be deleted.
     #[test]
     fn down_removes_a_plain_ingress_leg_after_a_flip_to_any() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg()
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -674,7 +659,7 @@ mod tests {
     /// netdev that is neither of the ingress leg's two shapes is still refused.
     #[test]
     fn down_refuses_a_stranger_wearing_the_ingress_legs_name() {
-        let f = fabric_with_a_migrating_gw();
+        let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg()
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")

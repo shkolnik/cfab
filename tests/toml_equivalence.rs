@@ -5,7 +5,7 @@
 //! subcommand that reads the declaration. `examples/fabric.toml` must reproduce it byte for
 //! byte, stdout and stderr.
 //!
-//! TWO transforms are applied, and they are the whole of the allowed difference:
+//! THREE transforms are applied, and they are the whole of the allowed difference:
 //!   1. The summary line of `check` (and every error) names the declaration file, which is now
 //!      `fabric.toml` (§11.2 rule 5).
 //!   2. `gen engine` now filters LEAF identities out of every gw zone's BGP policy — the
@@ -14,6 +14,12 @@
 //!      is never offered to the router (James 2026-09-06: unsupported by design). The capture
 //!      predates that, so the filter is SUBTRACTED from the new output and everything else in
 //!      the tree stays compared. Its own shape is pinned by `emit::engine`'s tests.
+//!
+//!   3. `gen policy`'s `cfab` (owned-interface) set gains the ingress leg's three slaves. The
+//!      example now puts the gw on scope `any`, so the leg MIGRATES — an active-backup bond
+//!      with one tagged sub-interface per wire — and a host owns those netdevs exactly as it
+//!      owns a universal segment's slaves. The capture predates the scope, so the names are
+//!      ADDED to it and every other byte of the policy stays compared.
 //!
 //! The fixture is left verbatim because it is a CAPTURE — evidence of what the old binary
 //! printed, not a file to keep in sync.
@@ -147,6 +153,18 @@ fn without_leaf_filter(file: &str, stdout: &str) -> String {
     format!("{}{trailing}", serde_json::to_string_pretty(&t).unwrap())
 }
 
+/// Enumerated transform 3: add the migrating ingress leg's slaves to the captured owned set.
+/// A no-op on every other artifact, and on a leaf (which carries no ingress leg at all).
+fn with_gw_slaves(file: &str, fixture: &str) -> String {
+    if file != "gen-policy.txt" {
+        return fixture.to_string();
+    }
+    fixture.replace(
+        "\"cfab-gw249\",",
+        "\"cfab-gw249\",\"cfab-gw249-a\",\"cfab-gw249-b\",\"cfab-gw249-c\",",
+    )
+}
+
 fn diff(label: &str, want: &str, got: &str) -> Option<String> {
     if want == got {
         return None;
@@ -174,7 +192,7 @@ fn every_artifact_matches_the_shell_format_capture() {
             let (stdout, stderr) = run(&config, member, &argv);
             if let Some(d) = diff(
                 &format!("{member} {file} (stdout)"),
-                &renamed(&fixture(member, &file)),
+                &with_gw_slaves(&file, &renamed(&fixture(member, &file))),
                 &without_leaf_filter(&file, &stdout),
             ) {
                 panic!("{d}");
@@ -299,7 +317,7 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
         ),
         (
             "a gw domain that is not a token or `any`",
-            edited(&[("gw = { domain = \"c\"", "gw = { domain = \"cc\"")]),
+            edited(&[("gw = { domain = \"any\"", "gw = { domain = \"cc\"")]),
             "zone mgmt: gw domain",
         ),
         (
@@ -377,7 +395,7 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
         ),
         (
             "a gw on an undeclared domain",
-            edited(&[("gw = { domain = \"c\"", "gw = { domain = \"d\"")]),
+            edited(&[("gw = { domain = \"any\"", "gw = { domain = \"d\"")]),
             "zone mgmt: gw domain d is not in [domains]",
         ),
         (
