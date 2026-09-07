@@ -113,6 +113,8 @@ pub(crate) struct Shared {
     wd_result: String,
     wd_detail: Option<String>,
     wd_last_tick: Option<Instant>,
+    /// The ingress prober's latest rows, republished on every probe tick.
+    ingress: Vec<report::IngressLeg>,
 }
 
 impl Shared {
@@ -132,6 +134,7 @@ impl Shared {
             wd_result: "ok".to_string(),
             wd_detail: None,
             wd_last_tick: None,
+            ingress: Vec::new(),
         }
     }
 
@@ -188,6 +191,7 @@ impl Shared {
                 result: self.wd_result.clone(),
                 detail: self.wd_detail.clone(),
             },
+            ingress: self.ingress.clone(),
         }
     }
 

@@ -12,6 +12,35 @@ pub struct Components {
     pub supervisor: SupervisorInfo,
     pub components: Vec<Component>,
     pub watchdog: WatchdogInfo,
+    /// One row per ingress leg this member carries, from the router prober. Empty on a leaf
+    /// (which carries none) and `#[serde(default)]` so a supervisor from before the prober
+    /// existed still answers a newer `cfab status`.
+    #[serde(default)]
+    pub ingress: Vec<IngressLeg>,
+}
+
+/// What the ingress prober knows about one zone's leg: where the bond sits, and whether the
+/// router answers over each wire under it. Carrier is not the question — an island whose uplink
+/// is dead keeps carrier and keeps switching locally (finding F21) — so reachability is reported
+/// per wire and named by island, which is the thing an operator can go look at.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IngressLeg {
+    pub zone: String,
+    /// The leg netdev: a bond on gw scope `any`, a plain sub-interface on a single domain.
+    pub bond: String,
+    /// The slave the prober is holding the bond on; `null` for a leg that cannot migrate.
+    pub active: Option<String>,
+    pub slaves: Vec<IngressSlave>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IngressSlave {
+    pub wire: String,
+    /// The switch domain this wire lands in — which switch to go look at.
+    pub island: String,
+    pub reachable: bool,
+    /// Milliseconds since the router last answered over this wire; `null` = never, this run.
+    pub last_reply_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
