@@ -137,46 +137,51 @@ pub fn run(
     {
         base.note(note);
     }
-    // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not desired,
-    // and there is nothing to wait for.
-    if !sys.exists(&f.run_dir) {
-        // No fabric applied: there is nothing to describe and no supervisor to ask, so the
-        // always-printed components line is suppressed here alone.
-        return Ok(finish(
-            view,
-            State::Down,
-            "fabric not applied".to_string(),
-            &base,
-            permissive,
-            None,
-            false,
-        ));
-    }
-
     let expected = expected_links(view)?;
     let mut t = 0u64;
-    let (mut counts, mut c, mut comps);
     loop {
-        c = base.clone();
-        comps = read_components(sys, f);
-        counts = read(sys, view, &expected, &mut c, comps.as_ref())?;
+        // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
+        // desired *right now* — which a restarting supervisor passes through, so this is
+        // re-read on every poll like every other input to the verdict.
+        let applied = sys.exists(&f.run_dir);
+        let mut c = base.clone();
+        let comps = applied.then(|| read_components(sys, f)).flatten();
+        let counts = if applied {
+            Some(read(sys, view, &expected, &mut c, comps.as_ref())?)
+        } else {
+            None
+        };
         // The wait exists for the post-`up` settle, not as a verdict: only UP ends it early.
-        // A degraded or failed member waits the full deadline and then reports what it reached.
-        if counts.state() == State::Up || t >= wait_s {
-            break;
+        // Every other state — degraded, failed, not applied — waits the full deadline and then
+        // reports what it reached.
+        let done = counts.as_ref().is_some_and(|n| n.state() == State::Up) || t >= wait_s;
+        if done {
+            return Ok(match counts {
+                Some(n) => finish(
+                    view,
+                    n.state(),
+                    n.fields(),
+                    &c,
+                    permissive,
+                    comps.as_ref(),
+                    true,
+                ),
+                // No fabric applied: there is nothing to describe and no supervisor to ask, so
+                // the always-printed components line is suppressed here alone.
+                None => finish(
+                    view,
+                    State::Down,
+                    "fabric not applied".to_string(),
+                    &c,
+                    permissive,
+                    None,
+                    false,
+                ),
+            });
         }
         t += POLL_SECS;
         sys.sleep(Duration::from_secs(POLL_SECS));
     }
-    Ok(finish(
-        view,
-        counts.state(),
-        counts.fields(),
-        &c,
-        permissive,
-        comps.as_ref(),
-        true,
-    ))
 }
 
 /// The fabric the supervisor applied, if it is still on disk: `<run_dir>/fabric.toml.applied`,
