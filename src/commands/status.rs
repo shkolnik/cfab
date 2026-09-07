@@ -382,12 +382,13 @@ fn read(
         // the engine and the remedy is to start the service — one spelling each.
         c.note(engine_down_reason(f, comps));
     }
-    posture(sys, view, doc.as_ref(), comps, c)?;
+    let absent = absent_ifs(&*sys, view);
+    posture(sys, view, doc.as_ref(), comps, c, &absent)?;
     return_path_and_ingress(sys, view, doc.as_ref(), c)?;
     mark_drift(sys, view, c)?;
     ceiling_counters(sys, view, c)?;
     shape_posture(sys, view, comps, c)?;
-    link_speeds(sys, view, c)?;
+    link_speeds(sys, view, c, &absent)?;
 
     let mut counts = Counts::default();
     let mut peers: BTreeSet<u8> = BTreeSet::new();
@@ -638,12 +639,81 @@ fn socket_inodes(sys: &dyn Sys, pid: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Interfaces that cannot exist right now because the wire under them is gone. A wire can
+/// vanish under a running fabric — a USB NIC unplugged, a driver removed — and the kernel takes
+/// every path under it away at the same instant: `/sys/class/net/<wire>`,
+/// `/proc/sys/net/ipv4/conf/<wire>` and every VLAN leg tagged on it. That is a graded state
+/// (the peers still grade this member UP-DEGRADED), never a refusal — F15, hardware
+/// 2026-09-07: one `/proc/sys/net/ipv4/conf/<wire>/forwarding` read propagated ENOENT and the
+/// whole report became `No such file or directory (os error 2)`. One set, so every per-interface
+/// read degrades the same way and the wire earns exactly one reason line (`link_speeds`).
+///
+/// A bond outlives its slaves: only the slave on a vanished wire goes, never the leg itself.
+fn absent_ifs(sys: &dyn Sys, view: &View) -> BTreeSet<String> {
+    let wires: BTreeSet<String> = view
+        .wires()
+        .into_iter()
+        .filter(|w| !sys.exists(&format!("/sys/class/net/{w}")))
+        .collect();
+    let mut out = wires.clone();
+    out.extend(
+        view.class_rows()
+            .into_iter()
+            .filter(|r| wires.contains(&r.wire))
+            .map(|r| r.ifname),
+    );
+    for r in view.gw_rows() {
+        if r.migrates() {
+            out.extend(
+                r.slaves
+                    .into_iter()
+                    .filter(|s| wires.contains(&s.wire))
+                    .map(|s| s.ifname),
+            );
+        } else if wires.contains(&r.home) {
+            out.insert(r.ifname);
+        }
+    }
+    out.extend(
+        view.fallback_rows()
+            .into_iter()
+            .flat_map(|r| r.slaves)
+            .filter(|s| wires.contains(&s.wire))
+            .map(|s| s.ifname),
+    );
+    out
+}
+
+/// One per-interface sysfs/procfs read. `None` means there is nothing left to check and the
+/// condition has already been reported: silently when the interface went with its wire (the
+/// wire's own `absent` line is the account of it), otherwise in its own reason line. `status`
+/// never fails on a file the kernel can take away underneath it.
+fn if_file(
+    sys: &dyn Sys,
+    c: &mut Ctx,
+    absent: &BTreeSet<String>,
+    ifname: &str,
+    path: &str,
+) -> Option<String> {
+    if absent.contains(ifname) {
+        return None;
+    }
+    match sys.read(path) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            c.note(format!("{path} unreadable ({e})"));
+            None
+        }
+    }
+}
+
 fn posture(
     sys: &mut dyn Sys,
     view: &View,
     doc: Option<&Value>,
     comps: Option<&Components>,
     c: &mut Ctx,
+    absent: &BTreeSet<String>,
 ) -> Result<()> {
     let f = view.fabric;
     // The fallback bond is a segment here: it carries L3 and takes the same loose rp_filter.
@@ -655,6 +725,9 @@ fn posture(
         .chain(view.fallback_rows().into_iter().map(|r| r.ifname))
         .collect();
     for ifname in &l3 {
+        if absent.contains(ifname) {
+            continue;
+        }
         let got = sys
             .read(&format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter"))
             .map(|s| s.trim().to_string())
@@ -673,10 +746,16 @@ fn posture(
                 ifs.push(format!("{id}-peer"));
             }
             for ifn in ifs {
-                let v = sys
-                    .read(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
+                let Some(v) = if_file(
+                    &*sys,
+                    c,
+                    absent,
+                    &ifn,
+                    &format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"),
+                ) else {
+                    continue;
+                };
+                let v = v.trim();
                 if v != "0" {
                     c.note(format!("{ifn} forwarding!=0 (a leaf never transits)"));
                 }
@@ -799,8 +878,8 @@ fn posture(
                     }
                 }
                 for a in view.admin_ifs() {
-                    let v = sys.read(&format!("/proc/sys/net/ipv4/conf/{a}/forwarding"))?;
-                    if v.trim() != "0" {
+                    let path = format!("/proc/sys/net/ipv4/conf/{a}/forwarding");
+                    if if_file(&*sys, c, absent, a, &path).is_some_and(|v| v.trim() != "0") {
                         c.note(format!("{a} forwarding=1"));
                     }
                 }
@@ -810,7 +889,15 @@ fn posture(
                 if !present.contains(&ifn) {
                     continue;
                 }
-                let v = sys.read(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"))?;
+                let Some(v) = if_file(
+                    &*sys,
+                    c,
+                    absent,
+                    &ifn,
+                    &format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"),
+                ) else {
+                    continue;
+                };
                 let v = v.trim();
                 if fwd && v != "1" {
                     c.note(format!(
@@ -843,7 +930,7 @@ fn posture(
                     continue;
                 }
                 let path = format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding");
-                if sys.read(&path)?.trim() != "0" {
+                if if_file(&*sys, c, absent, &ifn, &path).is_some_and(|v| v.trim() != "0") {
                     c.note(format!("{path} = 1 with `[forward] enabled`=0"));
                 }
             }
@@ -1359,11 +1446,18 @@ fn shape_posture(
     Ok(())
 }
 
-fn link_speeds(sys: &mut dyn Sys, view: &View, c: &mut Ctx) -> Result<()> {
+fn link_speeds(
+    sys: &mut dyn Sys,
+    view: &View,
+    c: &mut Ctx,
+    absent: &BTreeSet<String>,
+) -> Result<()> {
     for wire in view.wires() {
         // Task 5b (RULED, James 2026-09-05): an absent wire gets its own spelling, distinct
         // from a present-but-carrierless one — an operator must tell "unplugged" from "gone".
-        if !sys.exists(&format!("/sys/class/net/{wire}")) {
+        // This is the one place it is said: every other per-interface read in `status` goes
+        // silent for what the wire took with it (`absent_ifs`).
+        if absent.contains(&wire) {
             c.note(format!(
                 "wire {wire} absent (no such netdev) — its segments are not configured"
             ));
@@ -3647,6 +3741,140 @@ mod tests {
         assert_eq!(
             report.code, 1,
             "UP-DEGRADED: graded by adjacency, as today: {}",
+            report.output
+        );
+    }
+
+    /// A forwarding host whose eth9 has vanished the way a USB NIC does: the netdev, its
+    /// procfs directory and every VLAN leg on it are gone together. The fallback bonds stay —
+    /// a bond survives losing a slave — and so do the peers, which still grade this member.
+    fn host_without_eth9(f: &Fabric, view: &View) -> MockSys {
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    let dark = (z.name == "storage" && seg == 1)
+                        || (z.name == "cluster" && seg == 2)
+                        || (z.name == "mgmt" && seg == 3);
+                    bfd.push((
+                        format!("{}.{seg}.{p}", z.block()),
+                        if dark { "down" } else { "up" },
+                    ));
+                }
+            }
+        }
+        let mut sys = healthy_host(f, view);
+        let mut gone: BTreeSet<String> = BTreeSet::new();
+        gone.insert("eth9".to_string());
+        for r in view.class_rows().into_iter().filter(|r| r.wire == "eth9") {
+            gone.insert(r.ifname);
+        }
+        for s in view
+            .fallback_rows()
+            .into_iter()
+            .flat_map(|r| r.slaves)
+            .chain(view.gw_rows().into_iter().flat_map(|r| r.slaves))
+            .filter(|s| s.wire == "eth9")
+        {
+            gone.insert(s.ifname);
+        }
+        sys.files.retain(|k, _| {
+            !gone.iter().any(|g| {
+                *k == format!("/sys/class/net/{g}")
+                    || k.starts_with(&format!("/sys/class/net/{g}/"))
+                    || k.starts_with(&format!("/proc/sys/net/ipv4/conf/{g}/"))
+            })
+        });
+        sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
+    }
+
+    /// Every interface a vanished wire carried is gone with it — a real USB unplug takes
+    /// `/sys/class/net/eth9` AND `/proc/sys/net/ipv4/conf/eth9`, plus every VLAN leg on it.
+    /// F15 (observed on hardware 2026-09-07, 0.4.4): `status` then exited 1 printing only
+    /// `No such file or directory (os error 2)`. Status grades a vanished wire; it never fails
+    /// on a read the kernel can take away underneath it.
+    #[test]
+    fn an_absent_wire_takes_its_procfs_with_it_and_status_still_grades() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_without_eth9(&f, &view);
+        let report = match run(&mut sys, &view, 0, false, None) {
+            Ok(r) => r,
+            Err(e) => panic!("F15: status must grade a vanished wire, not fail with [{e}]"),
+        };
+        assert!(
+            report.output.contains(
+                "  wire eth9 absent (no such netdev) — its segments are not configured\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert_eq!(
+            headline(&report),
+            "UP-DEGRADED (2/2 | 12/18 | 6/6) on pve1-tb (host)",
+            "{}",
+            report.output
+        );
+        assert_eq!(report.code, 1, "{}", report.output);
+        // No read the wire took with it may reach the output as a raw io error, and the
+        // interfaces that went with the wire are covered by its one line, not named again.
+        assert!(
+            !report.output.contains("os error") && !report.output.contains("unreadable"),
+            "{}",
+            report.output
+        );
+        for gone in ["cfab-st", "cfab-cl-bk", "cfab-mg-b2"] {
+            assert!(
+                !report.output.contains(&format!("rp_filter {gone}=")),
+                "{gone} went with eth9: {}",
+                report.output
+            );
+        }
+    }
+
+    /// The other half of the class: a file `status` expected to read and could not, on an
+    /// interface whose wire is still there. That is not the vanished-wire case and gets no
+    /// silence — it is named in its own reason line, and it is still not a bare io error.
+    #[test]
+    fn an_unreadable_interface_file_is_a_reason_line_not_a_failure() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        sys.files
+            .remove("/proc/sys/net/ipv4/conf/cfab-st/forwarding");
+        let report = match run(&mut sys, &view, 0, false, None) {
+            Ok(r) => r,
+            Err(e) => panic!("status must report an unreadable file, not fail with [{e}]"),
+        };
+        assert!(
+            report.output.contains(
+                "  /proc/sys/net/ipv4/conf/cfab-st/forwarding unreadable (FATAL: mock: no file \
+                 /proc/sys/net/ipv4/conf/cfab-st/forwarding)\n"
+            ),
+            "{}",
+            report.output
+        );
+        assert_eq!(report.state, State::Up, "{}", report.output);
+    }
+
+    /// `--wait` over a vanished wire behaves like any other degraded member: it polls to the
+    /// deadline and reports the state it reached, never a bare io error.
+    #[test]
+    fn wait_over_an_absent_wire_runs_to_the_deadline() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_without_eth9(&f, &view);
+        let report = match run(&mut sys, &view, 4, false, None) {
+            Ok(r) => r,
+            Err(e) => panic!("F15: --wait must grade a vanished wire, not fail with [{e}]"),
+        };
+        assert_eq!(report.state, State::UpDegraded, "{}", report.output);
+        assert_eq!(sys.slept.len(), 2, "4 s in 2 s steps");
+        assert!(
+            report.output.contains(
+                "  wire eth9 absent (no such netdev) — its segments are not configured\n"
+            ),
+            "{}",
             report.output
         );
     }
