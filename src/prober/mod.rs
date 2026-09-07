@@ -53,6 +53,10 @@ struct Leg {
     /// `primary_reselect=always` hands the bond back to the old primary (VERIFIED on the rack,
     /// 2026-09-07). It starts as the leg's home and only ever moves with the bond.
     held: String,
+    /// The slave the KERNEL has active, as of this tick's read — which is not always the one we
+    /// hold: with nothing reachable the prober leaves the bond alone and the kernel's own
+    /// carrier reselect moves it. `None` before the first read, and for a leg that has none.
+    active_now: Option<String>,
     slaves: Vec<ProbeSlave>,
 }
 
@@ -170,6 +174,7 @@ impl Prober {
                 router,
                 prefs,
                 held,
+                active_now: None,
                 slaves,
             });
         }
@@ -232,7 +237,7 @@ impl Prober {
             .map(|l| IngressLeg {
                 zone: l.zone.clone(),
                 bond: l.bond.clone(),
-                active: l.migrates.then(|| l.held.clone()),
+                active: l.active_now.clone(),
                 slaves: l
                     .slaves
                     .iter()
@@ -265,6 +270,7 @@ impl Leg {
         };
         let active = active.trim();
         let active = (!active.is_empty()).then_some(active);
+        self.active_now = active.map(str::to_string);
         let cands: Vec<Candidate> = self
             .slaves
             .iter()
@@ -298,7 +304,8 @@ impl Leg {
                 return;
             }
         }
-        self.held = target;
+        self.held = target.clone();
+        self.active_now = Some(target);
         match from {
             Some(f) if !f.state.reachable() => eprintln!(
                 "cfab: {} ingress: router unreachable on {}, moved {} to {to}",
