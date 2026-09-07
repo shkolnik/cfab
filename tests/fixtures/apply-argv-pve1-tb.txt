@@ -14,6 +14,10 @@ ip link set eth1 up
 ip link show eth9
 ip link set eth9 up
 ethtool -i eth9
+ethtool -i eth1
+ethtool -i eth0
+write /run/cfab/wire-drivers
+write /run/cfab/wire-driver-features
 write /proc/sys/net/ipv4/conf/all/ignore_routes_with_linkdown
 write /proc/sys/net/ipv4/conf/all/send_redirects
 write /proc/sys/net/ipv4/conf/default/send_redirects

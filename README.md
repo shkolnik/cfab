@@ -59,10 +59,14 @@ either way because it sources a fallback-segment control storm exactly as a host
 containment it escaped would be half a containment. (This member's OWN control marking is not
 in that table: the engine sets DSCP CS6 and skb-priority `[marking] pcp_ctrl` on its OSPF and BFD
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
-The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc` and
-`ethtool` for its shaping trees and per-NIC offload posture; a **leaf** shapes nothing, its
-wires' qdiscs being its own OS's business. Anything missing is refused by name before `up`
-applies a thing. The Debian package's `Depends` covers all of it.
+The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc`
+for its shaping trees; a **leaf** shapes nothing, its wires' qdiscs being its own OS's business.
+Every kind needs `ethtool`: link speed is cross-checked with it, and a wire may declare
+`driver_features` — a string of `<feature> on|off` pairs handed to `ethtool -K <nic>` as written
+(the case that motivates it: USB adapters that lock up under load with scatter-gather on).
+cfab names no adapter and no driver; it validates the string at `check`, records the value each
+named feature had, and `down` puts those values back. Anything missing is refused by name before
+`up` applies a thing. The Debian package's `Depends` covers all of it.
 
 ## Running it as a service
 

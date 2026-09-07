@@ -12,13 +12,16 @@ c = "1G admin switch"
 # kind = host (transits, shapes, every wire's untagged path is the admin plane) | leaf (own
 # identity + OSPF/BFD, never transits, no shaping, its untagged L3 is not ours).
 # Wire order is the fan-out order of the universal (fallback) bond. speed_mbps = DECLARED link
-# speed (ethtool is only cross-checked). usb = true → offload safe mode on `up`.
+# speed (ethtool is only cross-checked). driver_features = optional `ethtool -K` words.
 [[member]]
 name = "pve1-tb"
 node = 1
 kind = "host"
 wires = [
-  { nic = "eth9", domain = "a", speed_mbps = 5000, usb = true },
+# USB adapters: some lock up under sustained load with scatter-gather on (seen on RTL8157).
+# Uncomment to run a wire with offloads off; the words go to `ethtool -K <nic>` as written.
+#{ nic = "eth9", domain = "a", speed_mbps = 5000, driver_features = "sg off tso off gso off" },
+  { nic = "eth9", domain = "a", speed_mbps = 5000 },
   { nic = "eth1", domain = "b", speed_mbps = 1000 },
   { nic = "eth0", domain = "c", speed_mbps = 1000 },
 ]
@@ -30,7 +33,7 @@ name = "pve2-tb"
 node = 2
 kind = "host"
 wires = [
-  { nic = "eth9", domain = "a", speed_mbps = 5000, usb = true },
+  { nic = "eth9", domain = "a", speed_mbps = 5000 },
   { nic = "eth1", domain = "b", speed_mbps = 1000 },
   { nic = "eth0", domain = "c", speed_mbps = 1000 },
 ]
