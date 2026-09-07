@@ -1019,7 +1019,7 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         slaves,
         home,
         dark,
-        reach: _,
+        reach,
     } = leg;
     let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
     let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
@@ -1046,6 +1046,12 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                 c.note(dark.clone());
             }
         }
+        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
+        // the active slave explains nothing an operator can act on, and the wire whose uplink
+        // to fix is every one of them.
+        (Ok(_), Ok(_)) if *reach == RouterReach::AllDark => {
+            c.note(format!("{subject}: router unreachable on every wire"));
+        }
         (Ok(_), Ok(active)) => {
             let active = active.trim();
             match slaves
@@ -1064,6 +1070,13 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                     // job. An unreadable carrier is neither and is never assumed healthy —
                     // the file returns EINVAL on a down interface, so this is a field state.
                     match sys.read(&format!("/sys/class/net/{home}/carrier")) {
+                        // Carrier and forwarding are not the same fact (finding F21). When the
+                        // prober knows the home wire cannot reach the router, THAT is the cause
+                        // and the carrier is a detail — the operator's next move is the uplink,
+                        // not the bond.
+                        Ok(s) if s.trim() == "1" && *reach == RouterReach::HomeDark => c.note(
+                            format!("{subject} via {wire} (home {home}: router unreachable)"),
+                        ),
                         Ok(s) if s.trim() == "1" => {
                             c.note(format!("{subject} via {wire} (home {home} has carrier)"))
                         }

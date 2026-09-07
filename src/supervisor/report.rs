@@ -177,6 +177,34 @@ mod tests {
         );
     }
 
+    /// The prober's rows (spec §2), and the compatibility they must keep: the fixture above
+    /// carries no `ingress` key at all and still parses, so a supervisor from before the prober
+    /// existed keeps answering a newer `cfab status`.
+    #[test]
+    fn the_ingress_rows_round_trip_and_are_optional() {
+        let c: Components = serde_json::from_str(FIXTURE).unwrap();
+        assert!(c.ingress.is_empty(), "an absent ingress key is no rows");
+        let with_rows = r#"{
+          "supervisor": {"pid": 1, "uptime_s": 1, "applying": false, "applies": 1, "last_apply_error": null},
+          "components": [],
+          "watchdog": {"last_tick_s_ago": 1, "result": "ok", "detail": null},
+          "ingress": [{"zone": "mgmt", "bond": "cfab-gw249", "active": "cfab-gw249-a", "slaves": [
+            {"wire": "eth9", "island": "a", "reachable": true,  "last_reply_ms": 2},
+            {"wire": "eth0", "island": "c", "reachable": false, "last_reply_ms": null}
+          ]}]
+        }"#;
+        let c: Components = serde_json::from_str(with_rows).unwrap();
+        assert_eq!(c.ingress[0].zone, "mgmt");
+        assert_eq!(c.ingress[0].active.as_deref(), Some("cfab-gw249-a"));
+        assert_eq!(c.ingress[0].slaves[1].island, "c");
+        assert!(!c.ingress[0].slaves[1].reachable);
+        assert_eq!(c.ingress[0].slaves[1].last_reply_ms, None);
+        let back: Components = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.ingress[0].slaves[0].last_reply_ms, Some(2));
+        // The rows are their own document: nothing about them reaches the components line.
+        assert_eq!(render_line(&back), render_line(&c));
+    }
+
     /// `cfab status` deserializes what the supervisor serializes: the document must survive
     /// the round trip unchanged, `why` included.
     #[test]
