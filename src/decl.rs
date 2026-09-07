@@ -104,7 +104,7 @@ pub struct WireDecl {
     /// and a declaration that still carries it is refused by name (`model::Fabric::from_decl`)
     /// rather than by `deny_unknown_fields`' generic "unknown field". Kept out of the emitted
     /// schema: it is a tombstone for a good error message, not a key anyone may write.
-    #[serde(default, rename = "usb", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
     pub usb: Option<bool>,
 }

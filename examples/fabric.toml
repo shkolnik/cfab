@@ -18,13 +18,13 @@ name = "pve1-tb"
 node = 1
 kind = "host"
 wires = [
+# USB adapters: some lock up under sustained load with scatter-gather on (seen on RTL8157).
+# Uncomment to run a wire with offloads off; the words go to `ethtool -K <nic>` as written.
+#{ nic = "eth9", domain = "a", speed_mbps = 5000, driver_features = "sg off tso off gso off" },
   { nic = "eth9", domain = "a", speed_mbps = 5000 },
   { nic = "eth1", domain = "b", speed_mbps = 1000 },
   { nic = "eth0", domain = "c", speed_mbps = 1000 },
 ]
-# USB adapters: some lock up under sustained load with scatter-gather on (seen on RTL8157).
-# Uncomment to run a wire with offloads off; the words go to `ethtool -K <nic>` as written.
-#{ nic = "eth9", domain = "a", speed_mbps = 5000, driver_features = "sg off tso off gso off" },
 # Optional per-zone preference OVERRIDE: COMPLETE wire order for that zone (partial = error).
 # prefs = { storage = ["eth1", "eth9", "eth0"] }
 

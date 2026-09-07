@@ -12,7 +12,7 @@ use crate::derive::{Slave, View};
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
-use crate::sys::{Sys, UnixProbe, have_tool, run_ignore, run_ok, run_optional};
+use crate::sys::{Sys, UnixProbe, have_tool, run_ignore, run_ok};
 
 /// Stage one of the teardown, callable alone: forwarding OFF, the forward policy off, and the
 /// foreign-stack accept removed. Run before anything that can fail or block — this is what
@@ -180,26 +180,12 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             lock_path.display()
         )));
     }
-    // Driver features go back to what `up` FOUND, from the record `up` wrote — only the
-    // features it really changed, and only on the wires it changed them on. Last read of the
-    // run dir, so it happens after the refusal above and before the dir is removed.
-    // `run_optional`: the netdev may already be gone (a wire pulled before the teardown) and
-    // ethtool may not even be installed any more — neither is a reason to leave the fabric
-    // half torn down.
-    let restored_features = crate::driver_features::recorded_changes(sys, &f.run_dir);
-    for c in &restored_features {
-        run_optional(sys, &["ethtool", "-K", &c.wire, &c.feature, &c.prior]);
-    }
-    if !restored_features.is_empty() {
-        notes.push(format!(
-            "note: driver features put back: {}",
-            restored_features
-                .iter()
-                .map(|c| format!("{} {} {}", c.wire, c.feature, c.prior))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
+    // Driver features go back to what `up` FOUND, from the record cfab wrote — only the
+    // features it really changed, and only on the wires it changed them on, one `ethtool -K`
+    // per wire. Last read of the run dir, so it happens after the refusal above and before the
+    // dir is removed. Never fails the teardown (the wire may already be gone), but a restore
+    // that did not happen comes back as a WARNING line rather than a success note.
+    notes.extend(crate::driver_features::restore(sys, &f.run_dir));
     sys.remove(&f.run_dir)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
@@ -357,9 +343,9 @@ mod tests {
             )
     }
 
-    /// `down` puts each feature back at the value `up` RECORDED — not at some default, and not
-    /// at whatever the wire happens to read now — one `ethtool -K` per recorded change, and it
-    /// says so in the teardown message.
+    /// `down` puts each feature back at the value cfab RECORDED — not at some default, and not
+    /// at whatever the wire happens to read now — in ONE `ethtool -K` per wire, and it says so
+    /// in the teardown message.
     #[test]
     fn down_restores_every_driver_feature_up_changed() {
         let f = fabric();
@@ -376,11 +362,34 @@ mod tests {
                 .iter()
                 .filter(|c| c.starts_with("ethtool"))
                 .collect::<Vec<_>>(),
-            ["ethtool -K eth9 sg on", "ethtool -K eth9 tso on"]
+            ["ethtool -K eth9 sg on tso on"],
+            "one call per wire: ethtool resolves the dependencies between features inside it"
         );
         assert!(
-            msg.contains("driver features put back: eth9 sg on, eth9 tso on"),
+            msg.contains("note: driver features put back on eth9: sg on, tso on"),
             "{msg}"
+        );
+    }
+
+    /// A restore that FAILED is never reported as one: the teardown still completes (the fabric
+    /// must come down), and the operator is told which wire kept cfab's settings.
+    #[test]
+    fn down_warns_about_a_driver_feature_it_could_not_put_back() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = sys_with_a_storage_fallback_leg()
+            .file("/run/cfab/mark.backend", "nft\n")
+            .file("/run/cfab/wire-driver-features", "eth9 sg on\n")
+            .on_fail(&["ethtool", "-K", "eth9"], 1, "no such device");
+        let msg = run(&mut sys, &view).unwrap();
+        assert!(
+            msg.contains("WARNING: eth9: driver features could not be put back (sg on)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("put back on eth9"), "{msg}");
+        assert!(
+            msg.contains("teardown OK"),
+            "the teardown still finished: {msg}"
         );
     }
 

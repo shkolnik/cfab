@@ -1252,9 +1252,9 @@ mod tests {
         let err = parse_fabric(|t| {
             *t = t.replace(
                 "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
-                 domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
                 "{ nic = \"eth1\", domain = \"d\", speed_mbps = 1000 },\n  { nic = \"eth0\", \
-                 domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
+                 domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
             )
         })
         .unwrap_err()
@@ -1305,9 +1305,9 @@ mod tests {
                     "c = \"1G admin switch\"\nd = \"a fourth switch\"",
                 )
                 .replace(
-                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
                     "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n  { nic = \"eth2\", \
-                     domain = \"d\", speed_mbps = 1000 },\n]\n# USB",
+                     domain = \"d\", speed_mbps = 1000 },\n]\n# Optional",
                 )
                 .replace("weight = 4\nprimary = \"a\"", "weight = 4\nprimary = \"d\"");
         })
@@ -1326,11 +1326,11 @@ mod tests {
             *t = t.replace(
                 "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \
                  \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \
-                 \"c\", speed_mbps = 1000 },\n]\n# USB",
+                 \"c\", speed_mbps = 1000 },\n]\n# Optional",
                 "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \
                  \"eth8\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \"eth1\", domain = \
                  \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = \
-                 1000 },\n]\n# USB",
+                 1000 },\n]\n# Optional",
             )
         })
         .unwrap_err()

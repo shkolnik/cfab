@@ -431,9 +431,22 @@ fn returned_wire(
     }
     if let Some(spec) = &w.driver_features {
         let mut warnings = Vec::new();
-        driver_features::apply_to_wire(sys, wire, spec, &mut warnings)?;
+        let changes = driver_features::apply_to_wire(sys, wire, spec, &mut warnings)?;
         rebuilt.push(format!("re-applied driver_features on {wire}: {spec}"));
         unrestored.extend(warnings);
+        // A change made HERE is as much cfab's doing as one `up` made, so it goes in the same
+        // record — otherwise `down` would put back only what `up` touched and leave this
+        // wire's features exactly as the watchdog set them. Merging keeps the prior `up`
+        // recorded for a feature already there: that is the value the NIC had before cfab
+        // first touched it, not the driver default a re-created netdev came up with.
+        if !changes.is_empty()
+            && let Err(e) = driver_features::merge_changes(sys, &view.fabric.run_dir, &changes)
+        {
+            unrestored.push(format!(
+                "could not record the driver features re-applied on {wire} ({e}) — `down` will \
+                 not put them back"
+            ));
+        }
     }
     Ok(())
 }
@@ -1513,6 +1526,66 @@ pub(crate) mod tests {
             report.unrestored.is_empty(),
             "the same driver is not a finding: {:?}",
             report.unrestored
+        );
+    }
+
+    /// A change the watchdog made must reach the record, or the operator's NIC keeps cfab's
+    /// settings after `cfab down`. Proved end to end through the very function `down` calls:
+    /// the watchdog re-applies, then `driver_features::restore` — `down`'s own restore step —
+    /// puts it back on the same `Sys`.
+    #[test]
+    fn a_driver_feature_the_watchdog_re_applied_is_restored_by_down() {
+        let f = fixture_with_driver_features();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
+            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
+            .on_stdout(
+                &["ethtool", "-k", "eth9"],
+                "Features for eth9:\nscatter-gather: on\n",
+            )
+            .file("/run/cfab/wire-drivers", "eth9 r8152\n");
+        run(&mut sys, &view).unwrap();
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-driver-features"),
+            Some("eth9 sg on\n"),
+            "the watchdog's change reached the record"
+        );
+        let calls_before = sys.calls.len();
+        let notes = driver_features::restore(&mut sys, &view.fabric.run_dir);
+        assert_eq!(
+            sys.calls[calls_before..],
+            ["ethtool -K eth9 sg on".to_string()]
+        );
+        assert_eq!(notes, ["note: driver features put back on eth9: sg on"]);
+    }
+
+    /// The prior `up` recorded survives a watchdog re-apply: `down` owes the operator the
+    /// value the NIC had before cfab touched it, not the driver default the returned netdev
+    /// came up with.
+    #[test]
+    fn a_re_apply_keeps_the_prior_up_recorded() {
+        let f = fixture_with_driver_features();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
+            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
+            .on_stdout(
+                &["ethtool", "-k", "eth9"],
+                "Features for eth9:\nscatter-gather: on\n",
+            )
+            .file("/run/cfab/wire-drivers", "eth9 r8152\n")
+            // `up` found sg OFF on this NIC and turned it on... then the wire re-enumerated
+            // with the driver default (on) and the watchdog set it off again.
+            .file("/run/cfab/wire-driver-features", "eth9 sg off\n");
+        run(&mut sys, &view).unwrap();
+        assert!(
+            sys.ran("write /run/cfab/wire-driver-features"),
+            "the record was rewritten, not merely left alone: {:?}",
+            sys.calls
+        );
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-driver-features"),
+            Some("eth9 sg off\n"),
+            "the original prior stands"
         );
     }
 

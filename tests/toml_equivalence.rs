@@ -273,8 +273,16 @@ fn err_of(text: &str) -> String {
 
 #[test]
 fn every_surviving_validation_has_a_declaration_that_trips_it() {
-    // A wire's whole set, so a member can be given more or fewer of them.
-    let pve1_wires = "wires = [\n  { nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },\n  { nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]";
+    // pve1's whole wire set, so a member can be given more or fewer of them. Taken from the
+    // file rather than spelled out: pve2 declares an IDENTICAL set of wires and `edited`
+    // replaces every match, so a hard-coded array would edit both members and the error would
+    // name whichever comes first. pve1's array is the only one carrying the commented
+    // `driver_features` alternative, which is what makes this slice unique.
+    let ex = example();
+    let start = ex.find("wires = [").expect("the example declares wires");
+    let end = start + ex[start..].find("\n]").expect("the array ends") + 2;
+    let pve1_wires = &ex[start..end];
+    assert_eq!(ex.matches(pve1_wires).count(), 1, "pve1's array is unique");
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "a domain token that is not one letter",
@@ -341,8 +349,8 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
         (
             "a wire on an undeclared domain",
             edited(&[(
-                "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
-                "{ nic = \"eth1\", domain = \"d\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
+                "{ nic = \"eth1\", domain = \"b\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                "{ nic = \"eth1\", domain = \"d\", speed_mbps = 1000 },\n  { nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
             )]),
             "is not in [domains] (a b c)",
         ),
@@ -435,8 +443,8 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
                     "c = \"1G admin switch\"\nd = \"a fourth switch\"",
                 ),
                 (
-                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# USB",
-                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n  { nic = \"eth2\", domain = \"d\", speed_mbps = 1000 },\n]\n# USB",
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n]\n# Optional",
+                    "{ nic = \"eth0\", domain = \"c\", speed_mbps = 1000 },\n  { nic = \"eth2\", domain = \"d\", speed_mbps = 1000 },\n]\n# Optional",
                 ),
                 ("weight = 4\nprimary = \"a\"", "weight = 4\nprimary = \"d\""),
             ]),

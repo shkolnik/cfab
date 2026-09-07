@@ -46,6 +46,9 @@ pub fn parse(spec: &str) -> Result<Vec<(&str, &str)>> {
         )));
     }
     let mut pairs = Vec::new();
+    // Keyed by the name `ethtool -k` REPORTS, so `sg` and `scatter-gather` collide: they are
+    // one feature, and a string carrying both would set one word and record the other's prior.
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for pair in words.chunks(2) {
         let (feature, value) = (pair[0], pair[1]);
         if !is_feature_name(feature) {
@@ -57,6 +60,17 @@ pub fn parse(spec: &str) -> Result<Vec<(&str, &str)>> {
         if value != "on" && value != "off" {
             return Err(Error::config(format!(
                 "driver_features \"{spec}\": '{value}' is not on or off (feature {feature})"
+            )));
+        }
+        // A feature named twice is refused, not resolved by "last one wins": `apply_to_wire`
+        // diffs every pair against ONE `ethtool -k` snapshot, so the second pair would be
+        // compared against a value the first pair has already invalidated and the prior
+        // recorded for `down` would be wrong. There is no correct guess here — say so.
+        let reported = reported_name(feature);
+        if let Some(first) = seen.insert(reported, feature) {
+            return Err(Error::config(format!(
+                "driver_features \"{spec}\": '{reported}' is set twice (as '{first}' and \
+                 '{feature}') — one setting per feature"
             )));
         }
         pairs.push((feature, value));
@@ -239,6 +253,238 @@ pub fn recorded_changes(sys: &mut dyn Sys, run_dir: &str) -> Vec<Change> {
         .collect()
 }
 
+/// Recorded changes grouped by wire, each group in record order, wires in first-appearance
+/// order. One group is one `ethtool -K` call.
+fn by_wire(changes: &[Change]) -> Vec<(&str, Vec<&Change>)> {
+    let mut out: Vec<(&str, Vec<&Change>)> = Vec::new();
+    for c in changes {
+        match out.iter_mut().find(|(w, _)| *w == c.wire) {
+            Some((_, group)) => group.push(c),
+            None => out.push((c.wire.as_str(), vec![c])),
+        }
+    }
+    out
+}
+
+/// Put every recorded feature back — `down`'s half of the bargain `up` made.
+///
+/// ONE `ethtool -K` per wire, carrying that wire's whole batch. Feature dependencies are
+/// resolved by ethtool WITHIN a call (`sg off` clears `tso`), so restoring `tso on` in a call
+/// of its own, before `sg` is back on, is refused or silently undone — the same reason
+/// `apply_to_wire` sets a wire's features in one call.
+///
+/// Never fails the teardown: a wire may be gone, and ethtool may not even be installed any
+/// more. But a restore that did not happen is never reported as one — it returns a `WARNING:`
+/// naming the wire and every feature/value in the batch that did not go back.
+pub fn restore(sys: &mut dyn Sys, run_dir: &str) -> Vec<String> {
+    let recorded = recorded_changes(sys, run_dir);
+    let mut notes = Vec::new();
+    for (wire, group) in by_wire(&recorded) {
+        let mut argv = vec!["ethtool", "-K", wire];
+        for c in &group {
+            argv.push(&c.feature);
+            argv.push(&c.prior);
+        }
+        let listed = group
+            .iter()
+            .map(|c| format!("{} {}", c.feature, c.prior))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let flat = group
+            .iter()
+            .map(|c| format!("{} {}", c.feature, c.prior))
+            .collect::<Vec<_>>()
+            .join(" ");
+        notes.push(match sys.run(&argv) {
+            Ok(out) if out.ok() => format!("note: driver features put back on {wire}: {listed}"),
+            Ok(out) => format!(
+                "WARNING: {wire}: driver features could not be put back ({listed}): {}",
+                Error::Cmd {
+                    cmd: format!("ethtool -K {wire} {flat}"),
+                    status: out.status,
+                    stderr: out.stderr,
+                }
+            ),
+            Err(_) => format!(
+                "WARNING: {wire}: driver features could not be put back ({listed}): ethtool \
+                 could not be run"
+            ),
+        });
+    }
+    notes
+}
+
+/// Add changes to the record. The forwarding watchdog re-applies a returned wire's declared
+/// features, and those changes are as much cfab's doing as `up`'s — without this they would
+/// never reach the record and `down` would leave the NIC as cfab left it.
+///
+/// A (wire, feature) already recorded keeps its ORIGINAL prior: that is the value the NIC had
+/// before cfab first touched it, and the one `down` owes the operator. The value a re-created
+/// netdev came up with is the driver's default, not the operator's state.
+pub fn merge_changes(sys: &mut dyn Sys, run_dir: &str, new: &[Change]) -> Result<()> {
+    let mut all = recorded_changes(sys, run_dir);
+    for c in new {
+        if !all
+            .iter()
+            .any(|e| e.wire == c.wire && e.feature == c.feature)
+        {
+            all.push(c.clone());
+        }
+    }
+    sys.write(&changed_path(run_dir), &render_changes(&all))
+}
+
+#[cfg(test)]
+mod restore_and_merge_tests {
+    use super::*;
+    use crate::sys::mock::MockSys;
+
+    /// Finding 3: ethtool resolves feature DEPENDENCIES inside one call. Restoring `tso on`
+    /// in a call of its own, while `sg` is still off, is refused or silently re-cleared — so a
+    /// wire's whole batch goes back in one `ethtool -K`, exactly as `apply_to_wire` sets it.
+    #[test]
+    fn a_child_feature_is_restored_in_the_same_call_as_its_parent() {
+        let mut sys = MockSys::default().file(
+            &changed_path("/run/cfab"),
+            "eth9 tso on\neth9 sg on\neth1 gro on\n",
+        );
+        let notes = restore(&mut sys, "/run/cfab");
+        assert_eq!(
+            sys.calls,
+            ["ethtool -K eth9 tso on sg on", "ethtool -K eth1 gro on"],
+            "one call per wire, record order inside it"
+        );
+        assert_eq!(
+            notes,
+            [
+                "note: driver features put back on eth9: tso on, sg on",
+                "note: driver features put back on eth1: gro on",
+            ]
+        );
+    }
+
+    /// Finding 2: a restore that FAILED must not be reported as one. The warning names the
+    /// wire and every feature/value in the batch that did not go back.
+    #[test]
+    fn a_failed_restore_warns_instead_of_claiming_success() {
+        let mut sys = MockSys::default()
+            .file(&changed_path("/run/cfab"), "eth9 sg on\n")
+            .on_fail(&["ethtool", "-K", "eth9"], 1, "Operation not supported");
+        let notes = restore(&mut sys, "/run/cfab");
+        assert_eq!(
+            notes,
+            [
+                "WARNING: eth9: driver features could not be put back (sg on): ethtool -K eth9 \
+                 sg on: exit 1 — Operation not supported"
+            ]
+        );
+    }
+
+    /// ethtool itself gone (an unusual but possible teardown environment): still a warning,
+    /// never a silent success and never a failed teardown.
+    #[test]
+    fn a_restore_that_cannot_run_ethtool_warns_too() {
+        struct NoEthtool(MockSys);
+        impl Sys for NoEthtool {
+            fn run(&mut self, argv: &[&str]) -> Result<crate::sys::Output> {
+                if argv[0] == "ethtool" {
+                    return Err(Error::fatal("cannot exec ethtool"));
+                }
+                self.0.run(argv)
+            }
+            fn read(&self, p: &str) -> Result<String> {
+                self.0.read(p)
+            }
+            fn write(&mut self, p: &str, c: &str) -> Result<()> {
+                self.0.write(p, c)
+            }
+            fn exists(&self, p: &str) -> bool {
+                self.0.exists(p)
+            }
+            fn is_writable(&self, p: &str) -> bool {
+                self.0.is_writable(p)
+            }
+            fn list_dir(&self, p: &str) -> Result<Vec<String>> {
+                self.0.list_dir(p)
+            }
+            fn read_link(&self, p: &str) -> Result<String> {
+                self.0.read_link(p)
+            }
+            fn mkdir_p(&mut self, p: &str) -> Result<()> {
+                self.0.mkdir_p(p)
+            }
+            fn remove(&mut self, p: &str) -> Result<()> {
+                self.0.remove(p)
+            }
+            fn rename(&mut self, a: &str, b: &str) -> Result<()> {
+                self.0.rename(a, b)
+            }
+            fn sleep(&mut self, d: std::time::Duration) {
+                self.0.sleep(d);
+            }
+            fn unix_request(&mut self, p: &str, l: &str) -> Result<String> {
+                self.0.unix_request(p, l)
+            }
+        }
+        let mut sys =
+            NoEthtool(MockSys::default().file(&changed_path("/run/cfab"), "eth9 sg on\n"));
+        let notes = restore(&mut sys, "/run/cfab");
+        assert_eq!(
+            notes,
+            [
+                "WARNING: eth9: driver features could not be put back (sg on): ethtool could not be run"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_dir_with_no_record_restores_nothing_and_says_nothing() {
+        let mut sys = MockSys::default();
+        assert!(restore(&mut sys, "/run/cfab").is_empty());
+        assert!(sys.calls.is_empty());
+    }
+
+    /// Finding 4: a change the WATCHDOG made must reach the record, or `down` cannot put it
+    /// back. A feature already recorded keeps the prior `up` found — that is the value the NIC
+    /// had before cfab touched it, and the one `down` owes the operator.
+    #[test]
+    fn merged_changes_are_added_without_overwriting_an_earlier_prior() {
+        let mut sys = MockSys::default().file(&changed_path("/run/cfab"), "eth9 sg on\n");
+        merge_changes(
+            &mut sys,
+            "/run/cfab",
+            &[
+                Change {
+                    wire: "eth9".into(),
+                    feature: "sg".into(),
+                    prior: "off".into(),
+                },
+                Change {
+                    wire: "eth9".into(),
+                    feature: "tso".into(),
+                    prior: "on".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            recorded_changes(&mut sys, "/run/cfab"),
+            [
+                Change {
+                    wire: "eth9".into(),
+                    feature: "sg".into(),
+                    prior: "on".into()
+                },
+                Change {
+                    wire: "eth9".into(),
+                    feature: "tso".into(),
+                    prior: "on".into()
+                },
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +527,38 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// Finding 1: `apply_to_wire` compares every pair against ONE `ethtool -k` snapshot, so a
+    /// feature named twice would be diffed twice against the same stale value and the recorded
+    /// prior would be wrong. The string is refused at load instead — there is no reading of
+    /// "set it off, then on" that cfab should guess at.
+    #[test]
+    fn the_same_feature_set_twice_is_refused() {
+        let err = parse("sg off sg on").unwrap_err().to_string();
+        assert!(err.contains("'scatter-gather' is set twice"), "{err}");
+        assert!(err.contains("as 'sg' and 'sg'"), "{err}");
+        assert!(err.contains("one setting per feature"), "{err}");
+    }
+
+    /// The abbreviation and the long name are the SAME feature: `-K` takes `sg`, `-k` reports
+    /// `scatter-gather`, and a string carrying both would set one and record the other.
+    #[test]
+    fn an_abbreviation_and_its_long_name_count_as_one_feature() {
+        let err = parse("tso off sg off scatter-gather on")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'scatter-gather' is set twice"), "{err}");
+        assert!(err.contains("as 'sg' and 'scatter-gather'"), "{err}");
+    }
+
+    /// Different features that merely share a prefix are not duplicates.
+    #[test]
+    fn distinct_features_are_not_mistaken_for_duplicates() {
+        assert_eq!(
+            parse("rx off rx-fcs off rxvlan off").unwrap(),
+            [("rx", "off"), ("rx-fcs", "off"), ("rxvlan", "off")]
+        );
     }
 
     /// Permissive by ruling: a feature cfab has never heard of is the operator's business.
