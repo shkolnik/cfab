@@ -498,7 +498,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
 
 /// The two lines `cfab check` prints: the fabric as declared, then what THIS member gets.
 /// The second line is the last thing an operator sees before `up` creates the netdevs, so it
-/// names every leg `up` will build — the fallback legs included: their slaves fan out per wire,
+/// names every leg `up` will build — the fallback legs included: their ports fan out per wire,
 /// so their count is member-dependent and not derivable from the fabric-wide line.
 fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
     let kind = match view.kind() {
@@ -573,7 +573,7 @@ mod tests {
     }
 
     /// The per-member line is the only output that says what THIS host will get, and `up`
-    /// builds one bond per fallback leg with one slave per wire under it. It must say so.
+    /// builds one bond per fallback leg with one port per wire under it. It must say so.
     #[test]
     fn check_names_this_members_fallback_legs() {
         let f = fabric_from(&example());

@@ -18,7 +18,7 @@ use crate::decl::Declaration;
 use crate::error::{Error, Result};
 
 /// A physical switch domain: an opaque DECLARED token, so a typo in a wire's or a segment's
-/// domain is an error and not a phantom domain. One letter — the bond-slave suffix
+/// domain is an error and not a phantom domain. One letter — the bond-port suffix
 /// `-<domain>` must fit inside IFNAMSIZ (see `MAX_BOND_IFNAME`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DomainId(String);
@@ -113,10 +113,10 @@ pub struct Wire {
 }
 
 /// The widest ifname a bond leg (a universal segment, or a migrating ingress leg) may carry.
-/// Its slaves are named `<ifname>-<domain>`: a separator plus a domain token inside IFNAMSIZ 15.
+/// Its ports are named `<ifname>-<domain>`: a separator plus a domain token inside IFNAMSIZ 15.
 pub const MAX_BOND_IFNAME: usize = 15 - 1 - MAX_DOMAIN_TOKEN;
 
-/// Does this bond-leg name leave room for the `-<domain>` suffix its slaves need? One
+/// Does this bond-leg name leave room for the `-<domain>` suffix its ports need? One
 /// predicate for both legs, so the rule cannot drift between them.
 fn bond_ifname_too_long(ifname: &str) -> bool {
     ifname.len() > MAX_BOND_IFNAME
@@ -640,7 +640,7 @@ impl Fabric {
             if bond_ifname_too_long(&r.ifname) {
                 return Err(Error::config(format!(
                     "zone {}: the universal leg's ifname must be \
-                     {MAX_BOND_IFNAME} characters or fewer (slaves are named <ifname>-<domain>, \
+                     {MAX_BOND_IFNAME} characters or fewer (ports are named <ifname>-<domain>, \
                      IFNAMSIZ 15)",
                     r.ifname
                 )));
@@ -692,12 +692,12 @@ impl Fabric {
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
             // scope `any` = a migrating ingress leg: a bond over one tagged sub-interface
-            // per wire, named like a universal segment's slaves, so the derived bond name must
+            // per wire, named like a universal segment's ports, so the derived bond name must
             // leave room for the `-<domain>` suffix.
             if gw.scope.is_universal() && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
                 return Err(Error::config(format!(
                     "zone {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
-                     characters or fewer (slaves are named <ifname>-<domain>, IFNAMSIZ 15)",
+                     characters or fewer (ports are named <ifname>-<domain>, IFNAMSIZ 15)",
                     z.name, z.id
                 )));
             }
@@ -1207,7 +1207,7 @@ mod tests {
         );
     }
 
-    /// The slave-name budget, at the predicate: a bond leg's slaves are `<ifname>-<domain>`,
+    /// The port-name budget, at the predicate: a bond leg's ports are `<ifname>-<domain>`,
     /// so with one-letter tokens 13 characters fit IFNAMSIZ and 14 do not.
     #[test]
     fn bond_ifname_longer_than_the_budget_is_refused() {
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     /// ...and no zone declaration can reach it today: a zone id is a u8, so the widest
-    /// derived ingress bond is `cfab-gw255` (10) and its widest slave `cfab-gw255-a` (12).
+    /// derived ingress bond is `cfab-gw255` (10) and its widest port `cfab-gw255-a` (12).
     #[test]
     fn every_zone_id_yields_an_ingress_bond_name_that_fits() {
         for id in u8::MIN..=u8::MAX {

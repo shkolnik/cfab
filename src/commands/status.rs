@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::commands::common::{conf_interfaces, foreign_forward_remedy, unresolved_forward_drops};
 use crate::commands::engine_ctl;
-use crate::derive::{Slave, View, segments_of};
+use crate::derive::{Port, View, segments_of};
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
@@ -695,7 +695,7 @@ fn socket_inodes(sys: &dyn Sys, pid: &str) -> Vec<u64> {
 /// per-interface read degrades the same way and the wire earns exactly one reason line
 /// (`link_speeds`).
 ///
-/// A bond outlives its slaves: only the slave on a vanished wire goes, never the leg itself.
+/// A bond outlives its ports: only the port on a vanished wire goes, never the leg itself.
 fn absent_ifs(sys: &dyn Sys, view: &View) -> BTreeSet<String> {
     let wires: BTreeSet<String> = view
         .wires()
@@ -712,7 +712,7 @@ fn absent_ifs(sys: &dyn Sys, view: &View) -> BTreeSet<String> {
     for r in view.gw_rows() {
         if r.migrates() {
             out.extend(
-                r.slaves
+                r.ports
                     .into_iter()
                     .filter(|s| wires.contains(&s.wire))
                     .map(|s| s.ifname),
@@ -724,7 +724,7 @@ fn absent_ifs(sys: &dyn Sys, view: &View) -> BTreeSet<String> {
     out.extend(
         view.fallback_rows()
             .into_iter()
-            .flat_map(|r| r.slaves)
+            .flat_map(|r| r.ports)
             .filter(|s| wires.contains(&s.wire))
             .map(|s| s.ifname),
     );
@@ -764,7 +764,7 @@ fn posture(
 ) -> Result<()> {
     let f = view.fabric;
     // The fallback bond is a segment here: it carries L3 and takes the same loose rp_filter.
-    // Its slaves never appear — they are L2 only.
+    // Its ports never appear — they are L2 only.
     let l3: Vec<String> = view
         .class_rows()
         .into_iter()
@@ -996,7 +996,7 @@ fn posture(
 /// builder, so they are read by the same code and every condition has one spelling. Only three
 /// things differ per caller, and all of them are here rather than in a branch: the `subject`
 /// each line opens with (`<zone> fallback` / `<zone> ingress`), the `noun` for what is on the
-/// far end (`peers` / `router`), and the `dark` line, because a leg with no live slave means
+/// far end (`peers` / `router`), and the `dark` line, because a leg with no live port means
 /// "the safety net is gone" on a fallback and "the outside cannot reach this zone" on the
 /// ingress.
 struct BondCheck<'a> {
@@ -1005,7 +1005,7 @@ struct BondCheck<'a> {
     /// condition: the two families' reason lines differ by this word and nothing else.
     noun: &'a str,
     ifname: &'a str,
-    slaves: &'a [Slave],
+    ports: &'a [Port],
     home: &'a str,
     dark: String,
     /// What the prober says about the far end under this leg.
@@ -1040,16 +1040,16 @@ fn reach(rows: Option<&[ProbedLeg]>, zone: &str, home: &str) -> Reach {
     let Some(row) = rows.and_then(|r| r.iter().find(|i| i.zone == zone)) else {
         return Reach::Unknown;
     };
-    if row.slaves.is_empty() {
+    if row.ports.is_empty() {
         return Reach::Unknown;
     }
-    if row.slaves.iter().all(|s| !s.reachable) {
+    if row.ports.iter().all(|s| !s.reachable) {
         return Reach::AllDark;
     }
     if row.quiet {
         return Reach::Quiet;
     }
-    match row.slaves.iter().find(|s| s.wire == home) {
+    match row.ports.iter().find(|s| s.wire == home) {
         Some(s) if !s.reachable => Reach::HomeDark,
         Some(s) if s.suspect => Reach::HomeSuspect,
         // A home wire the prober does not list at all cannot be called dark.
@@ -1058,13 +1058,13 @@ fn reach(rows: Option<&[ProbedLeg]>, zone: &str, home: &str) -> Reach {
 }
 
 /// What one leg's `bonding/` sysfs says, as reason lines. Reads only — a leg that has migrated
-/// or lost a slave is the watchdog's business to actuate on; here it is named.
+/// or lost a port is the watchdog's business to actuate on; here it is named.
 fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, leg: &BondCheck) {
     let BondCheck {
         subject,
         noun,
         ifname,
-        slaves,
+        ports,
         home,
         dark,
         reach,
@@ -1073,8 +1073,8 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
     let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
     match (mii, active) {
         (Err(_), _) | (_, Err(_)) => {
-            // Nothing under `bonding/` can be read, the slave list included: one line, and the
-            // per-slave check below would only repeat it.
+            // Nothing under `bonding/` can be read, the port list included: one line, and the
+            // per-port check below would only repeat it.
             c.settling(format!(
                 "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
                  — re-run cfab up"
@@ -1082,20 +1082,20 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
             return;
         }
         (Ok(mii), Ok(active)) if mii.trim() != "up" => {
-            // A dark bond whose active slave is a stranger is not the same fault as a dark
+            // A dark bond whose active port is a stranger is not the same fault as a dark
             // bond, and "no carrier" would send an operator to the wrong end of the cable.
             // The line says what was READ, not what the watchdog did with it: `status`
             // cannot know whether an eviction was attempted (on a leaf the watchdog is not
             // even scheduled), and a confident wrong diagnosis is worse than a plain one.
             let active = active.trim().to_string();
-            if !active.is_empty() && !slaves.iter().any(|s| s.ifname == active) {
-                c.settling(format!("{subject} down with foreign slave {active} active"));
+            if !active.is_empty() && !ports.iter().any(|s| s.ifname == active) {
+                c.settling(format!("{subject} down with foreign port {active} active"));
             } else {
                 c.settling(dark.clone());
             }
         }
         // The prober's verdict outranks where the bond sits: with no wire reaching the router,
-        // the active slave explains nothing an operator can act on, and the wire whose uplink
+        // the active port explains nothing an operator can act on, and the wire whose uplink
         // to fix is every one of them.
         (Ok(_), Ok(_)) if *reach == Reach::AllDark => {
             c.settling(format!("{subject}: {noun} unreachable on every wire"));
@@ -1107,13 +1107,13 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         }
         (Ok(_), Ok(active)) => {
             let active = active.trim();
-            match slaves
+            match ports
                 .iter()
                 .find(|s| s.ifname == active)
                 .map(|s| s.wire.clone())
             {
                 None => c.settling(format!(
-                    "{subject}: {ifname} is up with no slave of ours active \
+                    "{subject}: {ifname} is up with no port of ours active \
                      (active_slave={active:?})"
                 )),
                 Some(wire) if wire == *home => {}
@@ -1152,16 +1152,16 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
             }
         }
     }
-    // Per slave: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a slave
+    // Per port: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a port
     // entirely, so the leg-level grade above cannot see it — and losing one is not theoretical
     // (F5: a re-enumerated USB NIC comes back with a fresh ifindex and its leg is re-created
-    // unattached). A slave whose wire has vanished is skipped: the wire's own line accounts
+    // unattached). A port whose wire has vanished is skipped: the wire's own line accounts
     // for it, and its leg cannot exist at all.
     let path = format!("/sys/class/net/{ifname}/bonding/slaves");
     let listed = match sys.read(&path) {
         Ok(v) => v,
         // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
-        // the slave list is the only thing that can say a slave went missing, so losing it is
+        // the port list is the only thing that can say a port went missing, so losing it is
         // a named gap in the diagnosis, never silence.
         Err(e) => {
             c.settling(format!("{subject}: {path} unreadable ({e})"));
@@ -1169,22 +1169,22 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         }
     };
     let listed: Vec<&str> = listed.split_whitespace().collect();
-    for s in slaves.iter().filter(|s| !absent.contains(&s.ifname)) {
+    for s in ports.iter().filter(|s| !absent.contains(&s.ifname)) {
         if !listed.contains(&s.ifname.as_str()) {
             // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
             // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
             c.settling(format!(
-                "{subject}: slave {} on {} is not enslaved to {ifname} — re-run cfab up",
+                "{subject}: port {} on {} is not a port of {ifname} — re-run cfab up",
                 s.ifname, s.wire
             ));
         }
     }
     for name in listed
         .iter()
-        .filter(|n| !slaves.iter().any(|s| s.ifname == **n))
+        .filter(|n| !ports.iter().any(|s| s.ifname == **n))
     {
-        // Standing: nothing of ours enslaved it, so nothing of ours takes it back.
-        c.standing(format!("{subject}: {ifname} has a foreign slave {name}"));
+        // Standing: nothing of ours added it, so nothing of ours takes it back.
+        c.standing(format!("{subject}: {ifname} has a foreign port {name}"));
     }
 }
 
@@ -1214,7 +1214,7 @@ fn fallback(
         let z = f.zone(&r.zone)?;
         let zone = &r.zone;
 
-        // ---- the leg: bonding/{mii_status,active_slave,slaves} -----------------------
+        // ---- the leg: bonding/{mii_status,active_slave,ports} -----------------------
         bond_leg_health(
             sys,
             c,
@@ -1223,7 +1223,7 @@ fn fallback(
                 subject: format!("{zone} fallback"),
                 noun: "peers",
                 ifname: &r.ifname,
-                slaves: &r.slaves,
+                ports: &r.ports,
                 home: &r.home,
                 dark: format!("{zone} fallback no carrier"),
                 reach: reach(comps.map(|c| c.fallback.as_slice()), zone, &r.home),
@@ -1450,7 +1450,7 @@ fn return_path_and_ingress(
         // A leg on gw scope `any` is an active-backup bond: the same reader the universal
         // segments get, so the ONE leg the outside depends on is graded like every other
         // migrating leg — a dark bond, a stranger active on it, a migration to a backup wire,
-        // a slave that never re-attached. A leg on a single domain is a plain sub-interface
+        // a port that never re-attached. A leg on a single domain is a plain sub-interface
         // and has none of this state.
         if leg.migrates() {
             bond_leg_health(
@@ -1461,13 +1461,13 @@ fn return_path_and_ingress(
                     subject: format!("{} ingress", z.name),
                     noun: "router",
                     ifname: &leg.ifname,
-                    slaves: &leg.slaves,
+                    ports: &leg.ports,
                     home: &leg.home,
-                    // A leg with no live slave IS the ingress being unreachable, and that
+                    // A leg with no live port IS the ingress being unreachable, and that
                     // already has a grade in this function: keep its spelling, name the leg
                     // as the reason.
                     dark: format!(
-                        "{} gw {} unreachable (ingress leg {} has no live slave)",
+                        "{} gw {} unreachable (ingress leg {} has no live port)",
                         z.name, gw.router, leg.ifname
                     ),
                     reach: reach(comps.map(|c| c.ingress.as_slice()), &z.name, &leg.home),
@@ -1911,10 +1911,10 @@ mod tests {
     fn fallback_sysfs(mut sys: MockSys, view: &View, forwarding: &str) -> MockSys {
         for r in view.fallback_rows() {
             let home = r
-                .slaves
+                .ports
                 .iter()
                 .find(|s| s.wire == r.home)
-                .expect("the home wire is one of the slaves");
+                .expect("the home wire is one of the ports");
             sys = sys
                 .file(
                     &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
@@ -1926,7 +1926,7 @@ mod tests {
                 )
                 .file(
                     &format!("/sys/class/net/{}/bonding/slaves", r.ifname),
-                    &format!("{}\n", slave_list(&r.slaves)),
+                    &format!("{}\n", port_list(&r.ports)),
                 )
                 .file(
                     &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
@@ -1940,10 +1940,10 @@ mod tests {
         sys
     }
 
-    /// `bonding/slaves` as the kernel prints it: the enslaved netdevs, space separated, in
-    /// enslavement order.
-    fn slave_list(slaves: &[crate::derive::Slave]) -> String {
-        slaves
+    /// `bonding/slaves` as the kernel prints it: the port netdevs, space separated, in join
+    /// order.
+    fn port_list(ports: &[crate::derive::Port]) -> String {
+        ports
             .iter()
             .map(|s| s.ifname.as_str())
             .collect::<Vec<_>>()
@@ -2154,10 +2154,10 @@ mod tests {
         }
         for r in view.fallback_rows() {
             let home = r
-                .slaves
+                .ports
                 .iter()
                 .find(|s| s.wire == r.home)
-                .expect("the home wire is one of the slaves");
+                .expect("the home wire is one of the ports");
             sys = sys
                 .file(
                     &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
@@ -2169,7 +2169,7 @@ mod tests {
                 )
                 .file(
                     &format!("/sys/class/net/{}/bonding/slaves", r.ifname),
-                    &format!("{}\n", slave_list(&r.slaves)),
+                    &format!("{}\n", port_list(&r.ports)),
                 )
                 .file(
                     &format!("/proc/sys/net/ipv4/conf/{}/rp_filter", r.ifname),
@@ -2186,13 +2186,13 @@ mod tests {
                 "1\n",
             );
             // An ingress leg on gw scope `any` is the same bond a universal segment is, with
-            // the same `bonding/` sysfs and the same L2-only slaves.
+            // the same `bonding/` sysfs and the same L2-only ports.
             if r.migrates() {
                 let home = r
-                    .slaves
+                    .ports
                     .iter()
                     .find(|s| s.wire == r.home)
-                    .expect("the home wire is one of the slaves");
+                    .expect("the home wire is one of the ports");
                 sys = sys
                     .file(
                         &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
@@ -2204,9 +2204,9 @@ mod tests {
                     )
                     .file(
                         &format!("/sys/class/net/{}/bonding/slaves", r.ifname),
-                        &format!("{}\n", slave_list(&r.slaves)),
+                        &format!("{}\n", port_list(&r.ports)),
                     );
-                for s in &r.slaves {
+                for s in &r.ports {
                     sys = sys.file(
                         &format!("/proc/sys/net/ipv4/conf/{}/forwarding", s.ifname),
                         "0\n",
@@ -2214,7 +2214,7 @@ mod tests {
                 }
             }
         }
-        for s in view.fallback_rows().into_iter().flat_map(|r| r.slaves) {
+        for s in view.fallback_rows().into_iter().flat_map(|r| r.ports) {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{}/forwarding", s.ifname),
                 "0\n",
@@ -2411,7 +2411,7 @@ mod tests {
             0,
         );
         assert_never_writes(
-            "foreign active slave (row 19)",
+            "foreign active port (row 19)",
             &mut healthy_leaf(&leaf).file(
                 "/sys/class/net/cfab-st-fb/bonding/active_slave",
                 "someone-elses0\n",
@@ -2420,7 +2420,7 @@ mod tests {
             0,
         );
         assert_never_writes(
-            "bond downed over a foreign slave (row 19, actuated)",
+            "bond downed over a foreign port (row 19, actuated)",
             &mut healthy_leaf(&leaf)
                 .file("/sys/class/net/cfab-st-fb/bonding/mii_status", "down\n")
                 .file(
@@ -3547,7 +3547,7 @@ mod tests {
     // ---- the migrating ingress leg (gw scope `any`) -------------------------------------
 
     /// pve1-tb's ingress bond. mgmt's cheapest segment is on domain c, so the leg homes on
-    /// eth0 and its home slave is `cfab-gw249-c`.
+    /// eth0 and its home port is `cfab-gw249-c`.
     const GW_BOND: &str = "cfab-gw249";
 
     /// The same declaration with the ingress leg pinned to one domain — the example ships
@@ -3557,7 +3557,7 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// A migrating ingress leg sitting on its home wire with every slave enslaved is health:
+    /// A migrating ingress leg sitting on its home wire with every port attached is health:
     /// not one bond line about it.
     #[test]
     fn a_healthy_migrating_ingress_leg_is_silent() {
@@ -3567,10 +3567,10 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         for needle in [
             "mgmt ingress via ",
-            "no live slave",
+            "no live port",
             "is not a bond",
-            "not enslaved",
-            "with no slave of ours active",
+            "not a port",
+            "with no port of ours active",
         ] {
             assert!(
                 !report.output.contains(needle),
@@ -3580,7 +3580,7 @@ mod tests {
         }
     }
 
-    /// Every slave dark: the bond is up with nothing under it, and that is the ingress the
+    /// Every port dark: the bond is up with nothing under it, and that is the ingress the
     /// outside cannot use — the existing `gw <router> unreachable (...)` grade, naming the leg.
     #[test]
     fn a_dark_migrating_ingress_leg_is_the_gw_unreachable_grade() {
@@ -3600,17 +3600,17 @@ mod tests {
         assert!(
             report.output.contains(
                 "  mgmt gw 192.168.249.254 unreachable (ingress leg cfab-gw249 has no live \
-                 slave)\n"
+                 port)\n"
             ),
             "{}",
             report.output
         );
     }
 
-    /// ONE event, ONE line. A leg with no live slave also makes the kernel flag the zone's
+    /// ONE event, ONE line. A leg with no live port also makes the kernel flag the zone's
     /// default `linkdown`, so the route check and the bond reader both saw the same darkness
     /// and an operator got two reason lines for one cable. The bond reader owns it on a
-    /// migrating leg: it reads the CAUSE (no slave of ours is live under the leg) rather than
+    /// migrating leg: it reads the CAUSE (no port of ours is live under the leg) rather than
     /// the kernel's consequence, it names the leg, and the `linkdown` clause is an INFERRED
     /// kernel behavior that may not fire at all. `table has no default` is a different
     /// condition and still reported.
@@ -3635,7 +3635,7 @@ mod tests {
         assert!(
             report.output.contains(
                 "  mgmt gw 192.168.249.254 unreachable (ingress leg cfab-gw249 has no live \
-                 slave)\n"
+                 port)\n"
             ),
             "{}",
             report.output
@@ -3647,11 +3647,11 @@ mod tests {
         );
     }
 
-    /// The slave list is the only thing that can say a slave went missing, so a leg whose
+    /// The port list is the only thing that can say a port went missing, so a leg whose
     /// `bonding/slaves` cannot be read is a gap in the diagnosis, not silence — and the line
     /// carries the leg's subject like every other line this reader emits.
     #[test]
-    fn an_unreadable_slave_list_is_named_with_its_leg() {
+    fn an_unreadable_port_list_is_named_with_its_leg() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
@@ -3712,7 +3712,7 @@ mod tests {
     fn components_with_ingress(view: &View, dark: &[&str]) -> String {
         let mut doc: serde_json::Value =
             serde_json::from_str(&healthy_components(view)).expect("the healthy fixture");
-        let slaves: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
+        let ports: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
             .iter()
             .map(|(wire, island)| {
                 serde_json::json!({
@@ -3724,7 +3724,7 @@ mod tests {
             })
             .collect();
         doc["ingress"] = serde_json::json!([{
-            "zone": "mgmt", "bond": GW_BOND, "active": "cfab-gw249-c", "slaves": slaves,
+            "zone": "mgmt", "bond": GW_BOND, "active": "cfab-gw249-c", "ports": ports,
         }]);
         doc.to_string()
     }
@@ -3760,7 +3760,7 @@ mod tests {
         );
     }
 
-    /// F23: the ingress prober reports a slave with no carrier as router-unreachable, because a
+    /// F23: the ingress prober reports a port with no carrier as router-unreachable, because a
     /// wire with no carrier reaches nothing and the kernel will not put ingress on it either.
     /// The reason an operator reads must still be the carrier, never the router: the home wire
     /// being dark is the bond doing its job, and it keeps the plain spelling it has always had.
@@ -3833,7 +3833,7 @@ mod tests {
         );
         assert!(
             !report.output.contains("mgmt ingress via "),
-            "the active slave explains nothing here: {}",
+            "the active port explains nothing here: {}",
             report.output
         );
     }
@@ -3855,10 +3855,10 @@ mod tests {
         }
     }
 
-    /// A dark bond whose active slave is a stranger is not the same fault as a dark bond, and
+    /// A dark bond whose active port is a stranger is not the same fault as a dark bond, and
     /// the ingress leg says so in the fallback leg's words.
     #[test]
-    fn an_ingress_bond_with_a_foreign_slave_active_is_named() {
+    fn an_ingress_bond_with_a_foreign_port_active_is_named() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view)
@@ -3874,7 +3874,7 @@ mod tests {
         assert!(
             report
                 .output
-                .contains("  mgmt ingress down with foreign slave bond0 active\n"),
+                .contains("  mgmt ingress down with foreign port bond0 active\n"),
             "{}",
             report.output
         );
@@ -3900,11 +3900,11 @@ mod tests {
         );
     }
 
-    /// The F5 class, on the ingress leg: the bond is up on its home wire but one slave never
+    /// The F5 class, on the ingress leg: the bond is up on its home wire but one port never
     /// came back (a re-enumerated USB NIC leaves the leg unattached until something rebuilds
-    /// it). The bond's own `mii_status` reads healthy, so only the slave list can say it.
+    /// it). The bond's own `mii_status` reads healthy, so only the port list can say it.
     #[test]
-    fn an_ingress_slave_that_is_not_enslaved_is_named() {
+    fn an_ingress_port_that_is_not_attached_is_named() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view).file(
@@ -3914,7 +3914,7 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
-                "  mgmt ingress: slave cfab-gw249-b on eth1 is not enslaved to cfab-gw249 — \
+                "  mgmt ingress: port cfab-gw249-b on eth1 is not a port of cfab-gw249 — \
                  re-run cfab up\n"
             ),
             "{}",
@@ -3924,7 +3924,7 @@ mod tests {
 
     /// The same check on a universal segment: one reader, one spelling, both legs.
     #[test]
-    fn a_fallback_slave_that_is_not_enslaved_is_named() {
+    fn a_fallback_port_that_is_not_attached_is_named() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view).file(
@@ -3934,7 +3934,7 @@ mod tests {
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
             report.output.contains(
-                "  storage fallback: slave cfab-st-fb-b on eth1 is not enslaved to cfab-st-fb \
+                "  storage fallback: port cfab-st-fb-b on eth1 is not a port of cfab-st-fb \
                  — re-run cfab up\n"
             ),
             "{}",
@@ -3942,11 +3942,11 @@ mod tests {
         );
     }
 
-    /// A wire that vanished under a running fabric takes its ingress SLAVE and nothing else:
+    /// A wire that vanished under a running fabric takes its ingress PORT and nothing else:
     /// the bond outlives it (that is the whole point of the migrating leg), so the leg's own
     /// reads must keep happening. F15's set, on the shape F15 never saw.
     #[test]
-    fn a_vanished_wire_takes_the_ingress_slave_and_not_the_bond() {
+    fn a_vanished_wire_takes_the_ingress_port_and_not_the_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_host(&f, &view);
@@ -3954,11 +3954,11 @@ mod tests {
         let absent = absent_ifs(&sys, &view);
         assert!(absent.contains("cfab-gw249-b"), "{absent:?}");
         assert!(!absent.contains("cfab-gw249"), "{absent:?}");
-        // and the slave on a vanished wire is not then reported unenslaved: the wire's own
+        // and the port on a vanished wire is not then reported as missing: the wire's own
         // line is the account of it.
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert!(
-            !report.output.contains("cfab-gw249-b is not enslaved"),
+            !report.output.contains("cfab-gw249-b is not a port"),
             "{}",
             report.output
         );
@@ -4353,7 +4353,7 @@ mod tests {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view)
-            // storage homes on eth9 (cfab-st, cost 10); the bond sits on the mg slave
+            // storage homes on eth9 (cfab-st, cost 10); the bond sits on the mg port
             .file(
                 "/sys/class/net/cfab-st-fb/bonding/active_slave",
                 "cfab-st-fb-c\n",
@@ -4412,7 +4412,7 @@ mod tests {
         );
     }
 
-    /// Every slave dark: one spelling, `fallback <zone> no carrier`.
+    /// Every port dark: one spelling, `fallback <zone> no carrier`.
     #[test]
     fn a_dark_fallback_bond_says_no_carrier() {
         let f = fabric();
@@ -4440,7 +4440,7 @@ mod tests {
     ) -> String {
         let mut doc: serde_json::Value =
             serde_json::from_str(&healthy_components(view)).expect("the healthy fixture");
-        let slaves: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
+        let ports: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
             .iter()
             .map(|(wire, island)| {
                 serde_json::json!({
@@ -4454,7 +4454,7 @@ mod tests {
             .collect();
         doc["fallback"] = serde_json::json!([{
             "zone": "storage", "bond": "cfab-st-fb", "active": active,
-            "quiet": quiet, "slaves": slaves,
+            "quiet": quiet, "ports": ports,
         }]);
         doc.to_string()
     }
@@ -4612,12 +4612,12 @@ mod tests {
         );
     }
 
-    /// Row 19's actuated end: a bond cfab owns is down with a stranger still enslaved in it.
+    /// Row 19's actuated end: a bond cfab owns is down with a stranger still attached to it.
     /// That reads exactly like a dark bond, and "no carrier" would send an operator to the
     /// wrong end of the cable. The line reports what was READ — `status` cannot know whether
     /// the watchdog ever tried to evict the intruder, and on a leaf it is not even scheduled.
     #[test]
-    fn a_bond_downed_over_a_foreign_slave_says_so_not_no_carrier() {
+    fn a_bond_downed_over_a_foreign_port_says_so_not_no_carrier() {
         let f = fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf(&view)
@@ -4630,7 +4630,7 @@ mod tests {
         assert!(
             report
                 .output
-                .contains("  storage fallback down with foreign slave someone-elses0 active\n"),
+                .contains("  storage fallback down with foreign port someone-elses0 active\n"),
             "{}",
             report.output
         );
@@ -4823,7 +4823,7 @@ mod tests {
 
     /// A forwarding host whose eth9 has vanished the way a USB NIC does: the netdev, its
     /// procfs directory and every VLAN leg on it are gone together. The fallback bonds stay —
-    /// a bond survives losing a slave — and so do the peers, which still grade this member.
+    /// a bond survives losing a port — and so do the peers, which still grade this member.
     fn host_without_eth9(f: &Fabric, view: &View) -> MockSys {
         let mut bfd = Vec::new();
         for p in [2u8, 3u8] {
@@ -4848,8 +4848,8 @@ mod tests {
         for s in view
             .fallback_rows()
             .into_iter()
-            .flat_map(|r| r.slaves)
-            .chain(view.gw_rows().into_iter().flat_map(|r| r.slaves))
+            .flat_map(|r| r.ports)
+            .chain(view.gw_rows().into_iter().flat_map(|r| r.ports))
             .filter(|s| s.wire == "eth9")
         {
             gone.insert(s.ifname);

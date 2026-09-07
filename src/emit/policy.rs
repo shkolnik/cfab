@@ -90,13 +90,13 @@ mod tests {
     /// gives it — no policy.rs code changed for this task. The bond belongs in the zone's set
     /// (so ``[forward] allow` storage>storage` covers domain-disjoint transit through it) and in
     /// the `cfab` owned set (`owned_forwarding()`, which the watchdog and scoped posture read).
-    /// A slave is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
+    /// A port is L2 only: it must NOT be in the zone set (it carries no zone traffic of its
     /// own — the bond does), but it IS in `owned_forwarding()` (Task 2, `false`/never-transit)
     /// and so correctly appears in the `cfab` owned set too — that set means "an interface cfab
-    /// owns," not "an interface that transits," and a slave's own traffic (the bond's frames on
+    /// owns," not "an interface that transits," and a port's own traffic (the bond's frames on
     /// the wire) must not fall into the blanket `iifname != @cfab` foreign-transit accept.
     #[test]
-    fn zone_set_carries_the_fallback_bond_never_a_slave_owned_set_carries_both() {
+    fn zone_set_carries_the_fallback_bond_never_a_port_owned_set_carries_both() {
         for member in ["pve1-tb", "pve3-tb"] {
             let f = fabric();
             let v = View::new(&f, member).unwrap();
@@ -120,20 +120,20 @@ mod tests {
                     cfab_line.contains(&want),
                     "{member}: cfab owned set missing the fallback bond: {cfab_line}"
                 );
-                for slave in &row.slaves {
-                    let slave_tag = format!("\"{}\"", slave.ifname);
+                for port in &row.ports {
+                    let port_tag = format!("\"{}\"", port.ifname);
                     assert!(
-                        !set_line.contains(&slave_tag),
-                        "{member}: zone set for {} names a fallback slave {}: it carries no zone \
+                        !set_line.contains(&port_tag),
+                        "{member}: zone set for {} names a fallback port {}: it carries no zone \
                          traffic of its own, the bond does",
                         row.zone,
-                        slave.ifname
+                        port.ifname
                     );
                     assert!(
-                        cfab_line.contains(&slave_tag),
-                        "{member}: cfab owned set missing the fallback slave {} \
+                        cfab_line.contains(&port_tag),
+                        "{member}: cfab owned set missing the fallback port {} \
                          (owned_forwarding lists it with transit=false)",
-                        slave.ifname
+                        port.ifname
                     );
                 }
             }

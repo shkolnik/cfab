@@ -8,7 +8,7 @@ use crate::commands::common::{
     conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
 };
 use crate::commands::engine_ctl;
-use crate::derive::{Slave, View};
+use crate::derive::{Port, View};
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
@@ -87,8 +87,8 @@ fn supervisor_refusal(pid: &str) -> Error {
 /// about a leg the previous one built — and both `down` and `up` remove it through this one
 /// function, so the flip can always be undone and always be applied.
 ///
-/// Bond before slaves: `ip link del <bond>` RELEASES its slaves, it does not delete them, and
-/// the slave names come from this member's wires because the declaration stops listing them the
+/// Bond before ports: `ip link del <bond>` RELEASES its ports, it does not delete them, and
+/// the port names come from this member's wires because the declaration stops listing them the
 /// moment the scope flips. A netdev of neither shape is a stranger wearing our name and is
 /// refused, never deleted.
 ///
@@ -104,7 +104,7 @@ pub(crate) fn remove_gw_leg(
     }
     if link_kind_is(sys, ifname, " bond ")? {
         run_ok(sys, &["ip", "link", "del", ifname])?;
-        for s in crate::derive::slaves_of(member, ifname) {
+        for s in crate::derive::ports_of(member, ifname) {
             if !link_exists(sys, &s.ifname)? {
                 continue;
             }
@@ -235,13 +235,13 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     sys.remove(&f.run_dir)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
-    // Fallback legs, bonds before slaves: `ip link del <bond>` RELEASES its slaves, it does not
+    // Fallback legs, bonds before ports: `ip link del <bond>` RELEASES its ports, it does not
     // delete them, which is why the second loop exists. The engine is already stopped and its
     // routes swept above, so this order is ownership-proof clarity, nothing more.
     let fallback_rows = view.fallback_rows();
-    let bond_legs: Vec<(&str, &[Slave])> = fallback_rows
+    let bond_legs: Vec<(&str, &[Port])> = fallback_rows
         .iter()
-        .map(|r| (r.ifname.as_str(), r.slaves.as_slice()))
+        .map(|r| (r.ifname.as_str(), r.ports.as_slice()))
         .collect();
     for (ifname, _) in &bond_legs {
         if link_exists(sys, ifname)? {
@@ -253,7 +253,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             run_ok(sys, &["ip", "link", "del", ifname])?;
         }
     }
-    for s in bond_legs.iter().flat_map(|(_, slaves)| *slaves) {
+    for s in bond_legs.iter().flat_map(|(_, ports)| *ports) {
         if link_exists(sys, &s.ifname)? {
             if !link_kind_is(sys, &s.ifname, " vlan ")? {
                 return Err(Error::fatal(format!(
@@ -265,7 +265,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         }
     }
     // The ingress leg, in whatever shape the box has it — see `remove_gw_leg`. After the
-    // universal segments, so each leg reads as one unit: the bond, then the slaves deleting it
+    // universal segments, so each leg reads as one unit: the bond, then the ports deleting it
     // released.
     for r in &view.gw_rows() {
         remove_gw_leg(sys, view.member, &r.ifname)?;
@@ -531,11 +531,11 @@ mod tests {
         assert!(!sys.ran("iptables-legacy -t"), "{:?}", sys.calls);
     }
 
-    /// `ip link del <bond>` RELEASES its slaves, it does not delete them — so the slaves get
+    /// `ip link del <bond>` RELEASES its ports, it does not delete them — so the ports get
     /// their own deletes, and the bond goes first (ownership-proof clarity: the engine is
     /// already stopped and swept before any netdev is touched).
     #[test]
-    fn down_deletes_a_fallback_bond_before_its_slaves() {
+    fn down_deletes_a_fallback_bond_before_its_ports() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg();
@@ -549,13 +549,13 @@ mod tests {
     }
 
     /// Task 9: a migrating ingress leg is a bond, so it is torn down as one — bond first,
-    /// then its slaves. Deleting it in the plain sub-interface loop would REFUSE it
+    /// then its ports. Deleting it in the plain sub-interface loop would REFUSE it
     /// ("not a vlan") and strand the leg on a `cfab down`. The ingress leg is now removed as
     /// one unit after the universal segments (`remove_gw_leg`, shared with `up`) rather than
     /// interleaved with them; the ordering was always "ownership-proof clarity, nothing more"
     /// — the engine is stopped and its routes swept long before any netdev is touched.
     #[test]
-    fn down_deletes_a_migrating_gw_bond_before_its_slaves() {
+    fn down_deletes_a_migrating_gw_bond_before_its_ports() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg()
@@ -597,7 +597,7 @@ mod tests {
     }
 
     /// A live ingress BOND named by a declaration that now puts the gw on one domain, plus its
-    /// three slaves: what an operator has after flipping `any` -> a domain.
+    /// three ports: what an operator has after flipping `any` -> a domain.
     fn sys_with_a_migrating_gw_leg() -> MockSys {
         let mut sys = sys_with_a_storage_fallback_leg()
             .on_stdout(&["ip", "link", "show", "cfab-gw249"], "20: cfab-gw249\n")
@@ -605,7 +605,7 @@ mod tests {
                 &["ip", "-d", "link", "show", "cfab-gw249"],
                 "20: cfab-gw249: bond \n",
             );
-        for (i, (slave, wire)) in [
+        for (i, (port, wire)) in [
             ("cfab-gw249-a", "eth9"),
             ("cfab-gw249-b", "eth1"),
             ("cfab-gw249-c", "eth0"),
@@ -615,12 +615,12 @@ mod tests {
         {
             sys = sys
                 .on_stdout(
-                    &["ip", "link", "show", slave],
-                    &format!("{}: {slave}\n", 21 + i),
+                    &["ip", "link", "show", port],
+                    &format!("{}: {port}\n", 21 + i),
                 )
                 .on_stdout(
-                    &["ip", "-d", "link", "show", slave],
-                    &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                    &["ip", "-d", "link", "show", port],
+                    &format!("{}: {port}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
                 );
         }
         sys
@@ -628,7 +628,7 @@ mod tests {
 
     /// The declaration on disk says the gw is on ONE domain; the running fabric wears the bond
     /// the PREVIOUS declaration built. `down` must remove what is really there — bond first,
-    /// then every slave — or the flip can be neither applied nor undone: the plain
+    /// then every port — or the flip can be neither applied nor undone: the plain
     /// sub-interface loop refuses a bond ("not a vlan") and strands the leg.
     #[test]
     fn down_removes_an_ingress_bond_the_previous_declaration_built() {
@@ -703,7 +703,7 @@ mod tests {
     }
 
     /// Prove ownership before destroy: a stranger wearing the bond's name is refused, and a
-    /// slave name carrying something that is not a vlan is refused too.
+    /// port name carrying something that is not a vlan is refused too.
     #[test]
     fn down_refuses_a_fallback_netdev_of_the_wrong_kind() {
         let f = fabric();

@@ -2,7 +2,7 @@
 //!
 //! The question the prober asks is "does the router answer over THIS wire", and the only way to
 //! ask it per wire on an active-backup bond is to bypass the bond entirely: build the Ethernet
-//! frame ourselves and put it on one slave's netdev. So the codec is here, pure, and the raw
+//! frame ourselves and put it on one port's netdev. So the codec is here, pure, and the raw
 //! socket is somebody else's problem (`super::io`).
 //!
 //! The probe is an RFC 5227 *probe*, not a plain ARP request: sender IP 0.0.0.0. That is
@@ -12,9 +12,9 @@
 //! probe teaches nobody anything and is still answered: the UDM replied within 80 µs on the
 //! rack.
 //!
-//! The source MAC is synthetic and per slave for the same reason: three slaves of one bond are
-//! three ports into ONE broadcast domain, so a reply addressed to a MAC that two slaves share
-//! comes back on whichever port last used it. A per-slave locally administered address makes
+//! The source MAC is synthetic and per port for the same reason: three ports of one bond are
+//! three ports into ONE broadcast domain, so a reply addressed to a MAC that two ports share
+//! comes back on whichever port last used it. A per-port locally administered address makes
 //! the reply's landing place unambiguous.
 
 use std::net::Ipv4Addr;
@@ -31,7 +31,7 @@ const PTYPE_IPV4: u16 = 0x0800;
 const OP_REQUEST: u16 = 1;
 const OP_REPLY: u16 = 2;
 
-/// The prober's source address on one slave: `02:cf:ab:<node>:<zone id>:<slave index>`.
+/// The prober's source address on one port: `02:cf:ab:<node>:<zone id>:<port index>`.
 ///
 /// `02` is the locally administered, individual bit pattern, so it can never collide with a
 /// burned-in address; `cf:ab` is the project, there to make the address recognizable in a
@@ -39,8 +39,8 @@ const OP_REPLY: u16 = 2;
 /// the whole fabric, which is what keeps two members' probes on the same broadcast domain from
 /// answering each other's replies. It is never the bond's MAC and never the wire's: those two
 /// belong to the data path, and moving either is exactly the ARP-table damage this frame avoids.
-pub fn synthetic_mac(node: u8, zone_id: u8, slave_index: u8) -> [u8; 6] {
-    [0x02, 0xcf, 0xab, node, zone_id, slave_index]
+pub fn synthetic_mac(node: u8, zone_id: u8, port_index: u8) -> [u8; 6] {
+    [0x02, 0xcf, 0xab, node, zone_id, port_index]
 }
 
 /// One RFC 5227 ARP probe for `router`, broadcast, from `src`.
@@ -61,8 +61,8 @@ pub fn probe(src: [u8; 6], router: Ipv4Addr) -> [u8; PROBE_LEN] {
     f
 }
 
-/// The answering MAC, iff `frame` is a reply to OUR probe on this slave: an ARP reply whose
-/// sender IP is one of `targets` and whose target MAC is this slave's synthetic address.
+/// The answering MAC, iff `frame` is a reply to OUR probe on this port: an ARP reply whose
+/// sender IP is one of `targets` and whose target MAC is this port's synthetic address.
 ///
 /// `targets` is a list because the two probers ask different questions with the same frame: the
 /// ingress prober asks one router, and the fallback prober asks the zone's peers, any one of
@@ -73,7 +73,7 @@ pub fn probe(src: [u8; 6], router: Ipv4Addr) -> [u8; PROBE_LEN] {
 /// exceptional: our own broadcast probe floods back in through the other islands of the same
 /// VLAN (op 1), and the ETH_P_ALL tap sees every frame on the wire.
 pub fn reply_from(frame: &[u8], src: [u8; 6], targets: &[Ipv4Addr]) -> Option<[u8; 6]> {
-    // A VLAN header can still be present: the slave netdev normally hands the frame up
+    // A VLAN header can still be present: the port netdev normally hands the frame up
     // stripped, but a tap on a wire carrying tags (or a driver without hardware stripping)
     // sees it. Skip at most one tag; a doubly tagged frame is not ours.
     let mut arp = 14;
@@ -109,7 +109,7 @@ const IPPROTO_OSPF: u8 = 89;
 
 /// The Router ID of the member that sent `frame`, iff it is an OSPF packet to AllSPFRouters.
 ///
-/// This is the whole of the passive channel's parsing. A hello on a slave means a member that
+/// This is the whole of the passive channel's parsing. A hello on a port means a member that
 /// carries this zone's fallback segment is alive on the far side of that wire — which is the
 /// question the fallback prober asks — and the Router ID is the only field that says WHICH
 /// member, so nothing else is read: not the neighbor list, not the area, not the checksum. A
@@ -219,10 +219,10 @@ mod tests {
         );
     }
 
-    /// The whole point of the per-slave source MAC: a reply addressed to a different slave is
-    /// evidence about that slave, never about this one.
+    /// The whole point of the per-port source MAC: a reply addressed to a different port is
+    /// evidence about that port, never about this one.
     #[test]
-    fn a_reply_to_another_slaves_mac_is_not_ours() {
+    fn a_reply_to_another_ports_mac_is_not_ours() {
         let other = synthetic_mac(0xf2, 0x10, 1);
         assert_eq!(reply_from(&rack_reply(), other, &[ROUTER]), None);
     }
@@ -341,11 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn the_synthetic_mac_is_locally_administered_and_unique_per_slave() {
+    fn the_synthetic_mac_is_locally_administered_and_unique_per_port() {
         let m = synthetic_mac(2, 249, 1);
         assert_eq!(m, [0x02, 0xcf, 0xab, 0x02, 0xf9, 0x01]);
         assert_eq!(m[0] & 0x03, 0x02, "locally administered, individual");
-        assert_ne!(m, synthetic_mac(2, 249, 0), "slave index separates");
+        assert_ne!(m, synthetic_mac(2, 249, 0), "port index separates");
         assert_ne!(m, synthetic_mac(3, 249, 1), "node separates");
         assert_ne!(m, synthetic_mac(2, 248, 1), "zone separates");
     }

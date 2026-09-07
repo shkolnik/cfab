@@ -15,10 +15,10 @@
 //!      predates that, so the filter is SUBTRACTED from the new output and everything else in
 //!      the tree stays compared. Its own shape is pinned by `emit::engine`'s tests.
 //!
-//!   3. `gen policy`'s `cfab` (owned-interface) set gains the ingress leg's three slaves. The
+//!   3. `gen policy`'s `cfab` (owned-interface) set gains the ingress leg's three ports. The
 //!      example now puts the gw on scope `any`, so the leg MIGRATES — an active-backup bond
 //!      with one tagged sub-interface per wire — and a host owns those netdevs exactly as it
-//!      owns a universal segment's slaves. The capture predates the scope, so the names are
+//!      owns a universal segment's ports. The capture predates the scope, so the names are
 //!      ADDED to it and every other byte of the policy stays compared.
 //!
 //! The fixture is left verbatim because it is a CAPTURE — evidence of what the old binary
@@ -153,9 +153,9 @@ fn without_leaf_filter(file: &str, stdout: &str) -> String {
     format!("{}{trailing}", serde_json::to_string_pretty(&t).unwrap())
 }
 
-/// Enumerated transform 3: add the migrating ingress leg's slaves to the captured owned set.
+/// Enumerated transform 3: add the migrating ingress leg's ports to the captured owned set.
 /// A no-op on every other artifact, and on a leaf (which carries no ingress leg at all).
-fn with_gw_slaves(file: &str, fixture: &str) -> String {
+fn with_gw_ports(file: &str, fixture: &str) -> String {
     if file != "gen-policy.txt" {
         return fixture.to_string();
     }
@@ -192,7 +192,7 @@ fn every_artifact_matches_the_shell_format_capture() {
             let (stdout, stderr) = run(&config, member, &argv);
             if let Some(d) = diff(
                 &format!("{member} {file} (stdout)"),
-                &with_gw_slaves(&file, &renamed(&fixture(member, &file))),
+                &with_gw_ports(&file, &renamed(&fixture(member, &file))),
                 &without_leaf_filter(&file, &stdout),
             ) {
                 panic!("{d}");
@@ -436,7 +436,7 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
             "segment ifname cfab-st declared twice",
         ),
         (
-            "a universal leg whose slaves would not fit IFNAMSIZ",
+            "a universal leg whose ports would not fit IFNAMSIZ",
             edited(&[("\"cfab-st-fb\"", "\"cfab-storage-fb\"")]),
             "must be 13 characters or fewer",
         ),

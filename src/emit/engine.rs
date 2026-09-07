@@ -77,7 +77,7 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
         add_if(r.ifname.clone());
     }
     // The fallback bond is an interface like any other here: holo needs only its name, and the
-    // slaves under it are L2, never in the tree.
+    // ports under it are L2, never in the tree.
     for r in &fallback_rows {
         add_if(r.ifname.clone());
     }
@@ -114,7 +114,7 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
             }));
         }
         // The fallback bond: an adjacency interface like a segment, but with NO bfd key at all.
-        // The fallback path exists only when the fabric is already degraded and its active slave
+        // The fallback path exists only when the fabric is already degraded and its active port
         // migrates between wires in ~50 ms; a session would only re-establish per migration.
         // OSPF's dead interval is its detector, as it is for the ingress leg.
         for r in fallback_rows.iter().filter(|r| r.zone == z.name) {
@@ -680,14 +680,14 @@ mod tests {
                     );
                 }
             }
-            // The bond is in the interface list; its slaves are L2 and never in the tree.
+            // The bond is in the interface list; its ports are L2 and never in the tree.
             let ifs = if_names(&t);
             for bond in ["cfab-st-fb", "cfab-cl-fb", "cfab-mg-fb"] {
                 assert!(ifs.contains(&bond.to_string()), "{member}: {ifs:?}");
             }
             let s = serde_json::to_string(&t).unwrap();
-            for slave in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
-                assert!(!s.contains(slave), "{member} carries slave {slave}");
+            for port in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
+                assert!(!s.contains(port), "{member} carries port {port}");
             }
         }
     }

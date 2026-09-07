@@ -1,5 +1,5 @@
 //! The two pure decisions the ingress prober makes: when a wire's router reachability changes,
-//! and which slave the bond should be active on. Both are here, with no clock, no `Sys` and no
+//! and which port the bond should be active on. Both are here, with no clock, no `Sys` and no
 //! socket, because they are the parts that must be provably right — the rest is plumbing.
 
 /// Consecutive observations before `reachable` flips, each way (spec §2). Three at the probe
@@ -78,18 +78,18 @@ impl Hysteresis {
     }
 }
 
-/// One slave the bond could be active on, as the decision sees it.
+/// One port the bond could be active on, as the decision sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    /// The slave netdev (`cfab-gw249-a`), which is what `bonding/active_slave` names.
+    /// The port netdev (`cfab-gw249-a`), which is what `bonding/active_slave` names.
     pub ifname: String,
     /// The physical wire under it, which is what the zone's preference order ranks.
     pub wire: String,
     /// The router answers over this wire (the probe state machine above).
     pub reachable: bool,
-    /// The slave's netdev has carrier. The kernel refuses `bonding/active_slave` on a slave
-    /// whose link is not up — `EINVAL`, "either the slave is down or the link is down"
-    /// (VERIFIED on the rack 2026-09-07, finding F23) — so a carrier-less slave is not a place
+    /// The port's netdev has carrier. The kernel refuses `bonding/active_slave` on a port
+    /// whose link is not up — `EINVAL`, "either the port is down or the link is down"
+    /// (VERIFIED on the rack 2026-09-07, finding F23) — so a carrier-less port is not a place
     /// ingress can be put, however recently the router answered over it. It is also not a wire
     /// the router can be reached over at all, which is why it is excluded here rather than
     /// waited out through the hysteresis: three ticks of "reachable" on a dead wire is three
@@ -99,7 +99,7 @@ pub struct Candidate {
 
 impl Candidate {
     /// Can ingress sit here? Both halves are necessary: the router must answer, and the kernel
-    /// must accept the slave.
+    /// must accept the port.
     fn usable(&self) -> bool {
         self.reachable && self.carrier
     }
@@ -113,8 +113,8 @@ fn rank(prefs: &[String], wire: &str) -> usize {
         .unwrap_or(usize::MAX - 1)
 }
 
-/// The best-preferred slave that only its missing carrier keeps out of the running, when it is
-/// preferred over the slave the bond is `on`. This is the fact worth one log line: the wire the
+/// The best-preferred port that only its missing carrier keeps out of the running, when it is
+/// preferred over the port the bond is `on`. This is the fact worth one log line: the wire the
 /// operator would expect ingress to be on is not one the kernel would take.
 ///
 /// `None` once the bond is already on that wire or a better one — a worse-preferred wire with no
@@ -133,7 +133,7 @@ pub fn skipped_for_carrier<'a>(
         .min_by_key(|c| rank(prefs, &c.wire))
 }
 
-/// Which slave the bond should be active on, or `None` to leave it alone.
+/// Which port the bond should be active on, or `None` to leave it alone.
 ///
 /// `prefs` is the zone's wire order, rank 0 first — the same order OSPF costs are laddered from,
 /// so ingress prefers the wire the fabric already prefers. A wire missing from the order sorts
@@ -142,15 +142,15 @@ pub fn skipped_for_carrier<'a>(
 ///
 /// The rules, in the order they bite:
 /// - nothing usable ⇒ `None`. The kernel's carrier-driven reselect is better than a guess.
-/// - the active slave is usable and nothing better-preferred is ⇒ `None`.
-/// - anything else ⇒ the best usable slave: the active one is dead, or a better-preferred
+/// - the active port is usable and nothing better-preferred is ⇒ `None`.
+/// - anything else ⇒ the best usable port: the active one is dead, or a better-preferred
 ///   wire came back and ingress belongs on it.
 ///
 /// "Usable" is reachable AND with carrier: a wire the kernel would refuse is not a target, so
 /// the prober never asks for a move it knows will fail.
 pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Option<String> {
     let rank_of = |wire: &str| rank(prefs, wire);
-    // Ties (two wires outside the preference order) keep enslave order, which is `[[member]]`
+    // Ties (two wires outside the preference order) keep join order, which is `[[member]]`
     // order: a deterministic answer, so two consecutive ticks never disagree and flap.
     let best = cands
         .iter()
@@ -162,7 +162,7 @@ pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Op
         // Already where we want it, or already on an equally preferred live wire.
         Some(c) if c.usable() && rank_of(&c.wire) <= rank_of(&best.wire) => None,
         // Dead, or worse-preferred than a live wire — and the `None` arm also covers an
-        // active_slave that is not a slave of ours at all (or none at all), which is a bond we
+        // active_slave that is not a port of ours at all (or none at all), which is a bond we
         // should own and do not.
         _ => Some(best.ifname.clone()),
     }
@@ -172,7 +172,7 @@ pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Op
 mod tests {
     use super::*;
 
-    /// Slaves with carrier — the shape every case but the carrier ones is about.
+    /// Ports with carrier — the shape every case but the carrier ones is about.
     fn cands(spec: &[(&str, &str, bool)]) -> Vec<Candidate> {
         spec.iter()
             .map(|(ifname, wire, reachable)| Candidate {
@@ -184,7 +184,7 @@ mod tests {
             .collect()
     }
 
-    /// The same, with the named slaves' carrier taken away.
+    /// The same, with the named ports' carrier taken away.
     fn without_carrier(mut c: Vec<Candidate>, dark: &[&str]) -> Vec<Candidate> {
         for x in &mut c {
             if dark.contains(&x.ifname.as_str()) {
@@ -201,18 +201,18 @@ mod tests {
     /// The escalation's arithmetic: silence has already been observed, so ONE unanswered probe
     /// tick confirms — and one heard frame clears the whole thing.
     /// F20, the defect this decision closes for a FALLBACK bond: after a USB NIC re-enumerates,
-    /// the kernel re-enslaves it last, so the bond's backup order is enslave order and a 1G
+    /// the kernel re-adds it last, so the bond's backup order is join order and a 1G
     /// island can end up carrying the fallback segment while the 5G one sits idle (measured on
     /// pve1/pve2, 2026-09-07). Every wire is healthy here — there is no fault to react to — and
     /// the decision must still say the bond belongs on the preferred wire.
     #[test]
     fn a_healthy_bond_on_the_wrong_wire_is_moved_to_the_preferred_one() {
-        // Enslave order, which is what the bond's backup order is: the 5G wire re-enumerated
+        // Join order, which is what the bond's backup order is: the 5G wire re-enumerated
         // and the kernel put it back LAST.
         let cands = cands(&[
             ("cfab-st-fb-b", "eth1", true), // 1G, and where the bond sits
             ("cfab-st-fb-c", "eth0", true),
-            ("cfab-st-fb-a", "eth9", true), // 5G, re-enslaved last
+            ("cfab-st-fb-a", "eth9", true), // 5G, re-added last
         ]);
         assert_eq!(
             decide(
@@ -221,7 +221,7 @@ mod tests {
                 &prefs(&["eth9", "eth1", "eth0"])
             ),
             Some("cfab-st-fb-a".to_string()),
-            "the preference order, not the enslave order, decides where a healthy bond sits"
+            "the preference order, not the join order, decides where a healthy bond sits"
         );
     }
 
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn an_active_slave_on_the_best_reachable_wire_stays() {
+    fn an_active_port_on_the_best_reachable_wire_stays() {
         let c = cands(&[
             ("cfab-gw249-a", "eth9", true),
             ("cfab-gw249-b", "eth1", true),
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_active_slave_moves_to_the_best_reachable_one() {
+    fn an_unreachable_active_port_moves_to_the_best_reachable_one() {
         let c = cands(&[
             ("cfab-gw249-a", "eth9", false),
             ("cfab-gw249-b", "eth1", true),
@@ -341,14 +341,14 @@ mod tests {
         assert_eq!(
             decide(Some("cfab-gw249-a"), &c, &prefs(&["eth9", "eth1", "eth0"])),
             Some("cfab-gw249-b".to_string()),
-            "the preference order picks the backup, not the enslave order"
+            "the preference order picks the backup, not the join order"
         );
     }
 
     /// F20's other half: the order that decides the backup is the zone's declared preference,
     /// so a `prefs` row that puts the slow wire last is honored here too.
     #[test]
-    fn the_backup_is_chosen_by_preference_not_by_slave_order() {
+    fn the_backup_is_chosen_by_preference_not_by_port_order() {
         let c = cands(&[
             ("cfab-gw249-a", "eth9", false),
             ("cfab-gw249-b", "eth1", true),
@@ -384,10 +384,10 @@ mod tests {
         );
     }
 
-    /// A bond with no active slave, and a bond whose active slave is a stranger, are both bonds
+    /// A bond with no active port, and a bond whose active port is a stranger, are both bonds
     /// we own and are not driving: claim them for the best reachable wire.
     #[test]
-    fn no_active_slave_or_a_stranger_claims_the_best_reachable_wire() {
+    fn no_active_port_or_a_stranger_claims_the_best_reachable_wire() {
         let c = cands(&[
             ("cfab-gw249-a", "eth9", true),
             ("cfab-gw249-b", "eth1", true),
@@ -400,11 +400,11 @@ mod tests {
         );
     }
 
-    /// F23: the home wire's island lost power, so its slave has no carrier while the state
+    /// F23: the home wire's island lost power, so its port has no carrier while the state
     /// machine still calls it reachable. The kernel refuses `active_slave` on it (EINVAL), so
     /// the decision must pass it over rather than ask for a move that cannot happen.
     #[test]
-    fn a_carrier_less_slave_is_never_the_target() {
+    fn a_carrier_less_port_is_never_the_target() {
         let c = without_carrier(
             cands(&[
                 ("cfab-gw249-a", "eth9", true),
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(decide(None, &c, &p), Some("cfab-gw249-a".to_string()));
     }
 
-    /// The other half: a slave that loses carrier UNDER the bond is not somewhere ingress can
+    /// The other half: a port that loses carrier UNDER the bond is not somewhere ingress can
     /// stay, so the move away happens on the carrier alone, without waiting out the hysteresis.
     #[test]
     fn losing_carrier_where_we_sit_moves_the_bond_at_once() {
@@ -439,10 +439,10 @@ mod tests {
         );
     }
 
-    /// Reachable everywhere, carrier nowhere: there is no slave the kernel would accept, so the
+    /// Reachable everywhere, carrier nowhere: there is no port the kernel would accept, so the
     /// bond is left exactly where the kernel's own reselect put it.
     #[test]
-    fn no_slave_with_carrier_leaves_the_bond_to_the_kernel() {
+    fn no_port_with_carrier_leaves_the_bond_to_the_kernel() {
         let c = without_carrier(
             cands(&[
                 ("cfab-gw249-a", "eth9", true),
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(
             skipped_for_carrier(None, &c, &p),
             None,
-            "with no slave of ours active there is no 'staying on' to say"
+            "with no port of ours active there is no 'staying on' to say"
         );
         assert_eq!(
             skipped_for_carrier(

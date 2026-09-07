@@ -1,7 +1,7 @@
 //! The classic-BPF program every prober tap wears.
 //!
 //! The taps are `ETH_P_ALL` sockets (`super::io`) because that is the only way to see the ACTIVE
-//! slave's frames — a socket bound to one protocol sits behind the bond's `rx_handler` and never
+//! port's frames — a socket bound to one protocol sits behind the bond's `rx_handler` and never
 //! does. The cost is that every frame on a busy VLAN is copied to userspace, and the drain cap
 //! (`MAX_DRAIN`) then makes that a starvation risk: a storage VLAN's own traffic can fill the
 //! per-tick budget and hide the one hello or the one ARP reply that is evidence.

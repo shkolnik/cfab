@@ -3,27 +3,27 @@
 
 use crate::error::Result;
 
-/// Layer-2 send and receive on ONE bond slave, bypassing the bond.
+/// Layer-2 send and receive on ONE bond port, bypassing the bond.
 ///
 /// `recv` MUST NOT BLOCK. It runs on the supervisor's main loop, which also feeds the systemd
 /// watchdog and answers `cfab.sock`: a blocking read on a wire nobody is talking on would stall
 /// all three. It returns whatever has arrived since the previous call and nothing else, so a
 /// tick on a silent wire costs one syscall that returns `EWOULDBLOCK`.
 pub trait ProbeIo {
-    /// Open the tap on `slave` if it is not open already, and say so if it cannot be.
+    /// Open the tap on `port` if it is not open already, and say so if it cannot be.
     ///
     /// The fallback prober's steady state SENDS NOTHING, so `send` can no longer be what brings
     /// a tap up. It is also the capability probe the leaf needs: a container without the
     /// privileges for `AF_PACKET` or `SO_ATTACH_FILTER` must refuse the leg naming the reason
     /// rather than report every wire quiet forever (spec §11).
-    fn listen(&mut self, slave: &str) -> Result<()>;
-    /// Put one frame on `slave` exactly as given (no headers added).
-    fn send(&mut self, slave: &str, frame: &[u8]) -> Result<()>;
-    /// Drain every frame received on `slave` since the last call. Never blocks.
-    fn recv(&mut self, slave: &str) -> Result<Vec<Vec<u8>>>;
+    fn listen(&mut self, port: &str) -> Result<()>;
+    /// Put one frame on `port` exactly as given (no headers added).
+    fn send(&mut self, port: &str, frame: &[u8]) -> Result<()>;
+    /// Drain every frame received on `port` since the last call. Never blocks.
+    fn recv(&mut self, port: &str) -> Result<Vec<Vec<u8>>>;
 }
 
-/// Frames drained from one slave in a single tick. With the kernel-side filter attached
+/// Frames drained from one port in a single tick. With the kernel-side filter attached
 /// (`super::bpf`) the queue holds only frames that can be evidence — a handful of hellos and at
 /// most one reply — so the cap bounds a pathological tick without being able to hide one.
 /// Unfiltered, as the 0.4.6 tap was, it was a starvation hole on any wire with real traffic.
@@ -33,8 +33,8 @@ const MAX_DRAIN: usize = 64;
 ///
 /// An `ETH_P_ALL` tap sees this host's own transmitted frames as well as received ones. Counting
 /// our own OSPF hello as evidence that a peer is alive over this wire would make every active
-/// slave look healthy forever, so `PACKET_OUTGOING` is dropped here, at the seam, where nothing
-/// above can forget to. (Our hello REFLECTED back through the backbone onto a backup slave
+/// port look healthy forever, so `PACKET_OUTGOING` is dropped here, at the seam, where nothing
+/// above can forget to. (Our hello REFLECTED back through the backbone onto a backup port
 /// arrives as a received frame and is kept — that is the lone member's self-check, spec §4.)
 ///
 /// An address the kernel did not fill in is treated as received: dropping a frame we cannot
@@ -47,16 +47,16 @@ fn received(pkttype: Option<u8>) -> bool {
 /// needed to know that.
 const RECV_BUF: usize = 256;
 
-/// The real tap: one `AF_PACKET`/`SOCK_RAW` socket per slave netdev, bound to that netdev.
+/// The real tap: one `AF_PACKET`/`SOCK_RAW` socket per port netdev, bound to that netdev.
 ///
 /// The socket is bound with `ETH_P_ALL`, not `ETH_P_ARP`. This is the one fact the whole design
 /// rests on and it is VERIFIED on the rack (2026-09-07): a socket bound to `ETH_P_ARP` sits
-/// behind the bond's `rx_handler`, so it sees the backup slaves' replies but never the ACTIVE
-/// slave's — which is exactly the slave whose reachability matters most. `ETH_P_ALL` taps ahead
+/// behind the bond's `rx_handler`, so it sees the backup ports' replies but never the ACTIVE
+/// port's — which is exactly the port whose reachability matters most. `ETH_P_ALL` taps ahead
 /// of the handler and sees all three. The cost is that everything else on the wire arrives too,
 /// so the filtering is ours (`super::frame::reply_from`).
 ///
-/// Sockets are cached per slave and dropped on the first error. A USB NIC that re-enumerates
+/// Sockets are cached per port and dropped on the first error. A USB NIC that re-enumerates
 /// comes back with a fresh ifindex (finding F5), and a socket bound to the old one is deaf
 /// forever — so an error is always treated as "re-bind next tick", never as a permanent state.
 #[derive(Default)]
@@ -69,17 +69,17 @@ impl PacketIo {
         PacketIo::default()
     }
 
-    /// The socket for `slave`, opened and bound on first use.
-    fn sock(&mut self, slave: &str) -> Result<std::os::fd::BorrowedFd<'_>> {
+    /// The socket for `port`, opened and bound on first use.
+    fn sock(&mut self, port: &str) -> Result<std::os::fd::BorrowedFd<'_>> {
         use std::os::fd::AsFd;
-        if !self.socks.contains_key(slave) {
-            let fd = Self::open(slave)?;
-            self.socks.insert(slave.to_string(), fd);
+        if !self.socks.contains_key(port) {
+            let fd = Self::open(port)?;
+            self.socks.insert(port.to_string(), fd);
         }
-        Ok(self.socks[slave].as_fd())
+        Ok(self.socks[port].as_fd())
     }
 
-    fn open(slave: &str) -> Result<std::os::fd::OwnedFd> {
+    fn open(port: &str) -> Result<std::os::fd::OwnedFd> {
         use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, bind, socket};
         // `getifaddrs` is the one safe way to obtain a bound link-layer address for a netdev:
         // it hands back the kernel's own `sockaddr_ll` for the interface, ifindex filled in.
@@ -87,10 +87,10 @@ impl PacketIo {
         // the socket was created with", which is the ETH_P_ALL below.
         let addr = nix::ifaddrs::getifaddrs()
             .map_err(|e| crate::error::Error::fatal(format!("cannot list interfaces: {e}")))?
-            .filter(|ia| ia.interface_name == slave)
+            .filter(|ia| ia.interface_name == port)
             .find_map(|ia| ia.address.as_ref().and_then(|a| a.as_link_addr().copied()))
             .ok_or_else(|| {
-                crate::error::Error::fatal(format!("{slave}: no link-layer address (no netdev?)"))
+                crate::error::Error::fatal(format!("{port}: no link-layer address (no netdev?)"))
             })?;
         let fd = socket(
             AddressFamily::Packet,
@@ -98,50 +98,50 @@ impl PacketIo {
             SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
             SockProtocol::EthAll,
         )
-        .map_err(|e| crate::error::Error::fatal(format!("{slave}: cannot open AF_PACKET: {e}")))?;
+        .map_err(|e| crate::error::Error::fatal(format!("{port}: cannot open AF_PACKET: {e}")))?;
         // BEFORE the bind: between an open ETH_P_ALL socket and its filter there is a window in
         // which every frame on the wire is queued, and on a busy VLAN that window is exactly the
         // backlog the drain cap then cannot see past.
         let fd = super::bpf::attach(fd).map_err(|e| {
-            crate::error::Error::fatal(format!("{slave}: cannot attach the packet filter: {e}"))
+            crate::error::Error::fatal(format!("{port}: cannot attach the packet filter: {e}"))
         })?;
         bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &addr)
-            .map_err(|e| crate::error::Error::fatal(format!("{slave}: cannot bind socket: {e}")))?;
+            .map_err(|e| crate::error::Error::fatal(format!("{port}: cannot bind socket: {e}")))?;
         Ok(fd)
     }
 }
 
 impl ProbeIo for PacketIo {
-    fn listen(&mut self, slave: &str) -> Result<()> {
-        let r = self.sock(slave).map(drop);
+    fn listen(&mut self, port: &str) -> Result<()> {
+        let r = self.sock(port).map(drop);
         if r.is_err() {
-            self.socks.remove(slave);
+            self.socks.remove(port);
         }
         r
     }
 
-    fn send(&mut self, slave: &str, frame: &[u8]) -> Result<()> {
+    fn send(&mut self, port: &str, frame: &[u8]) -> Result<()> {
         use nix::sys::socket::{MsgFlags, send};
         let r = self
-            .sock(slave)
+            .sock(port)
             .and_then(|fd| {
                 send(
                     std::os::fd::AsRawFd::as_raw_fd(&fd),
                     frame,
                     MsgFlags::empty(),
                 )
-                .map_err(|e| crate::error::Error::fatal(format!("{slave}: cannot send probe: {e}")))
+                .map_err(|e| crate::error::Error::fatal(format!("{port}: cannot send probe: {e}")))
             })
             .map(drop);
         if r.is_err() {
-            self.socks.remove(slave);
+            self.socks.remove(port);
         }
         r
     }
 
-    fn recv(&mut self, slave: &str) -> Result<Vec<Vec<u8>>> {
+    fn recv(&mut self, port: &str) -> Result<Vec<Vec<u8>>> {
         use nix::sys::socket::{LinkAddr, recvfrom};
-        let Some(fd) = self.socks.get(slave) else {
+        let Some(fd) = self.socks.get(port) else {
             // No tap here yet. `listen` is what opens one; a tick that has not asked for it
             // cannot have received anything, and opening one here would hide the failure.
             return Ok(Vec::new());
@@ -160,9 +160,9 @@ impl ProbeIo for PacketIo {
                 Ok((n, _)) => out.push(buf[..n.min(RECV_BUF)].to_vec()),
                 Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => break,
                 Err(e) => {
-                    self.socks.remove(slave);
+                    self.socks.remove(port);
                     return Err(crate::error::Error::fatal(format!(
-                        "{slave}: cannot read probe replies: {e}"
+                        "{port}: cannot read probe replies: {e}"
                     )));
                 }
             }
@@ -173,8 +173,8 @@ impl ProbeIo for PacketIo {
 
 #[cfg(test)]
 pub mod mock {
-    //! A scripted `ProbeIo`: the router answers on the slaves listed in `answering`, and only
-    //! ever to a probe that was actually sent on that slave — so a test injects a fault by
+    //! A scripted `ProbeIo`: the router answers on the ports listed in `answering`, and only
+    //! ever to a probe that was actually sent on that port — so a test injects a fault by
     //! removing a name, exactly as pulling an uplink does.
 
     use std::collections::{BTreeMap, BTreeSet};
@@ -187,15 +187,15 @@ pub mod mock {
         router: Ipv4Addr,
         /// The router's MAC in the replies.
         mac: [u8; 6],
-        /// Slaves the router answers on. Mutate between ticks to inject or clear a fault.
+        /// Ports the router answers on. Mutate between ticks to inject or clear a fault.
         pub answering: BTreeSet<String>,
-        /// Slaves whose `send` fails, as an absent netdev's would.
+        /// Ports whose `send` fails, as an absent netdev's would.
         pub send_fails: BTreeSet<String>,
-        /// Slaves whose tap cannot be opened at all — the unprivileged container (spec §11).
+        /// Ports whose tap cannot be opened at all — the unprivileged container (spec §11).
         pub deaf: BTreeSet<String>,
-        /// Slaves `listen` has been called for, so a test can assert the tap was asked for.
+        /// Ports `listen` has been called for, so a test can assert the tap was asked for.
         pub listening: BTreeSet<String>,
-        /// Frames handed back on the next `recv` of one named slave, then cleared: the passive
+        /// Frames handed back on the next `recv` of one named port, then cleared: the passive
         /// channel's evidence, injected per wire.
         pub heard: BTreeMap<String, Vec<Vec<u8>>>,
         /// Frames handed back on the next `recv` regardless of any probe: other traffic the
@@ -203,18 +203,18 @@ pub mod mock {
         pub noise: Vec<Vec<u8>>,
         /// Every frame sent, in order.
         pub sent: Vec<(String, Vec<u8>)>,
-        /// Probes sent and not yet drained, per slave.
+        /// Probes sent and not yet drained, per port.
         outstanding: BTreeMap<String, Vec<u8>>,
         pub recv_calls: usize,
     }
 
     impl ScriptedIo {
-        /// A router at `router` answering on every slave named.
-        pub fn answering_on(router: &str, slaves: &[&str]) -> ScriptedIo {
+        /// A router at `router` answering on every port named.
+        pub fn answering_on(router: &str, ports: &[&str]) -> ScriptedIo {
             ScriptedIo {
                 router: router.parse().expect("a test router address"),
                 mac: [0x68, 0xd7, 0x9a, 0x66, 0x91, 0xa9],
-                answering: slaves.iter().map(|s| s.to_string()).collect(),
+                answering: ports.iter().map(|s| s.to_string()).collect(),
                 send_fails: BTreeSet::new(),
                 deaf: BTreeSet::new(),
                 listening: BTreeSet::new(),
@@ -226,21 +226,21 @@ pub mod mock {
             }
         }
 
-        /// Stop answering on `slave` — the dead-uplink fault.
-        pub fn dark(&mut self, slave: &str) {
-            self.answering.remove(slave);
+        /// Stop answering on `port` — the dead-uplink fault.
+        pub fn dark(&mut self, port: &str) {
+            self.answering.remove(port);
         }
 
-        /// Answer on `slave` again.
-        pub fn lit(&mut self, slave: &str) {
-            self.answering.insert(slave.to_string());
+        /// Answer on `port` again.
+        pub fn lit(&mut self, port: &str) {
+            self.answering.insert(port.to_string());
         }
 
-        /// Frames sent on `slave`, in order.
-        pub fn sent_on(&self, slave: &str) -> Vec<&[u8]> {
+        /// Frames sent on `port`, in order.
+        pub fn sent_on(&self, port: &str) -> Vec<&[u8]> {
             self.sent
                 .iter()
-                .filter(|(s, _)| s == slave)
+                .filter(|(s, _)| s == port)
                 .map(|(_, f)| f.as_slice())
                 .collect()
         }
@@ -262,33 +262,33 @@ pub mod mock {
     }
 
     impl ProbeIo for ScriptedIo {
-        fn listen(&mut self, slave: &str) -> Result<()> {
-            if self.deaf.contains(slave) {
+        fn listen(&mut self, port: &str) -> Result<()> {
+            if self.deaf.contains(port) {
                 return Err(crate::error::Error::fatal(format!(
-                    "{slave}: cannot open AF_PACKET: Operation not permitted (os error 1)"
+                    "{port}: cannot open AF_PACKET: Operation not permitted (os error 1)"
                 )));
             }
-            self.listening.insert(slave.to_string());
+            self.listening.insert(port.to_string());
             Ok(())
         }
 
-        fn send(&mut self, slave: &str, frame: &[u8]) -> Result<()> {
-            if self.send_fails.contains(slave) {
+        fn send(&mut self, port: &str, frame: &[u8]) -> Result<()> {
+            if self.send_fails.contains(port) {
                 return Err(crate::error::Error::fatal(format!(
-                    "{slave}: no such device"
+                    "{port}: no such device"
                 )));
             }
-            self.sent.push((slave.to_string(), frame.to_vec()));
-            self.outstanding.insert(slave.to_string(), frame.to_vec());
+            self.sent.push((port.to_string(), frame.to_vec()));
+            self.outstanding.insert(port.to_string(), frame.to_vec());
             Ok(())
         }
 
-        fn recv(&mut self, slave: &str) -> Result<Vec<Vec<u8>>> {
+        fn recv(&mut self, port: &str) -> Result<Vec<Vec<u8>>> {
             self.recv_calls += 1;
             let mut out = self.noise.clone();
-            out.extend(self.heard.remove(slave).unwrap_or_default());
-            if let Some(probe) = self.outstanding.remove(slave)
-                && self.answering.contains(slave)
+            out.extend(self.heard.remove(port).unwrap_or_default());
+            if let Some(probe) = self.outstanding.remove(port)
+                && self.answering.contains(port)
             {
                 out.push(self.reply_to(&probe));
             }
@@ -301,9 +301,9 @@ pub mod mock {
 mod tests {
     use super::*;
 
-    /// Our own hello leaves on the active slave and the tap sees it go. It is not evidence that
+    /// Our own hello leaves on the active port and the tap sees it go. It is not evidence that
     /// anyone is out there; the reflection that comes back through the backbone onto a BACKUP
-    /// slave is, and it arrives as a received frame.
+    /// port is, and it arrives as a received frame.
     #[test]
     fn our_own_transmitted_frames_are_not_evidence() {
         assert!(!received(Some(nix::libc::PACKET_OUTGOING)));
