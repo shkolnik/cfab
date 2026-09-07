@@ -417,7 +417,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::FwdWatchdog => {
             let mut sys = RealSys;
-            let report = commands::fwd_watchdog::run(&mut sys, &view)?;
+            // Run by hand or by a timer, with no supervisor and so no ingress prober: nothing
+            // holds a bond's `primary` away from the declared home.
+            let report = commands::fwd_watchdog::run(
+                &mut sys,
+                &view,
+                &cfab::prober::HeldPrimaries::default(),
+            )?;
             for r in &report.restored {
                 eprintln!("cfab fwd-watchdog: restored: {r}");
             }

@@ -389,7 +389,7 @@ fn read(
     }
     let absent = absent_ifs(&*sys, view);
     posture(sys, view, doc.as_ref(), comps, c, &absent)?;
-    return_path_and_ingress(sys, view, doc.as_ref(), c, &absent)?;
+    return_path_and_ingress(sys, view, doc.as_ref(), comps, c, &absent)?;
     mark_drift(sys, view, c)?;
     ceiling_counters(sys, view, c)?;
     shape_posture(sys, view, comps, c)?;
@@ -970,6 +970,44 @@ struct BondCheck<'a> {
     slaves: &'a [Slave],
     home: &'a str,
     dark: String,
+    /// What the ingress prober says about the router under this leg. Always `Unknown` for a
+    /// fallback bond: no router lives on a fallback segment, so nothing probes one.
+    reach: RouterReach,
+}
+
+/// What the supervisor's ingress prober says about the router's reachability under one leg.
+/// Carrier cannot answer this — an island whose uplink is dead keeps carrier and keeps switching
+/// locally (finding F21) — so where the bond SITS and whether the router can be reached over the
+/// wire it sits on are two different facts, and `status` needs both to name a cause.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouterReach {
+    /// No rows: no supervisor answering, a supervisor from before the prober, or a leg nothing
+    /// probes. Every line reads exactly as it did before the prober existed.
+    Unknown,
+    /// The router answers over the home wire.
+    Home,
+    /// The home wire has no router, but another wire does — the migration the prober makes.
+    HomeDark,
+    /// No wire reaches the router.
+    AllDark,
+}
+
+/// The prober's verdict for one zone's leg, from the `components` document.
+fn router_reach(comps: Option<&Components>, zone: &str, home: &str) -> RouterReach {
+    let Some(row) = comps.and_then(|c| c.ingress.iter().find(|i| i.zone == zone)) else {
+        return RouterReach::Unknown;
+    };
+    if row.slaves.is_empty() {
+        return RouterReach::Unknown;
+    }
+    if row.slaves.iter().all(|s| !s.reachable) {
+        return RouterReach::AllDark;
+    }
+    match row.slaves.iter().find(|s| s.wire == home) {
+        Some(s) if !s.reachable => RouterReach::HomeDark,
+        // A home wire the prober does not list at all cannot be called dark.
+        Some(_) | None => RouterReach::Home,
+    }
 }
 
 /// What one leg's `bonding/` sysfs says, as reason lines. Reads only — a leg that has migrated
@@ -981,6 +1019,7 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
         slaves,
         home,
         dark,
+        reach,
     } = leg;
     let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
     let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
@@ -1007,6 +1046,12 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                 c.note(dark.clone());
             }
         }
+        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
+        // the active slave explains nothing an operator can act on, and the wire whose uplink
+        // to fix is every one of them.
+        (Ok(_), Ok(_)) if *reach == RouterReach::AllDark => {
+            c.note(format!("{subject}: router unreachable on every wire"));
+        }
         (Ok(_), Ok(active)) => {
             let active = active.trim();
             match slaves
@@ -1025,6 +1070,13 @@ fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, le
                     // job. An unreadable carrier is neither and is never assumed healthy —
                     // the file returns EINVAL on a down interface, so this is a field state.
                     match sys.read(&format!("/sys/class/net/{home}/carrier")) {
+                        // Carrier and forwarding are not the same fact (finding F21). When the
+                        // prober knows the home wire cannot reach the router, THAT is the cause
+                        // and the carrier is a detail — the operator's next move is the uplink,
+                        // not the bond.
+                        Ok(s) if s.trim() == "1" && *reach == RouterReach::HomeDark => c.note(
+                            format!("{subject} via {wire} (home {home}: router unreachable)"),
+                        ),
                         Ok(s) if s.trim() == "1" => {
                             c.note(format!("{subject} via {wire} (home {home} has carrier)"))
                         }
@@ -1106,6 +1158,7 @@ fn fallback(
                 slaves: &r.slaves,
                 home: &r.home,
                 dark: format!("fallback {zone} no carrier"),
+                reach: RouterReach::Unknown,
             },
         );
 
@@ -1238,10 +1291,12 @@ fn reachability(
 
 /// Return-path rules per zone; a gw zone's table must hold the engine's default, its leg must carry
 /// the address, and the router must be peering.
+#[allow(clippy::too_many_arguments)]
 fn return_path_and_ingress(
     sys: &mut dyn Sys,
     view: &View,
     doc: Option<&Value>,
+    comps: Option<&Components>,
     c: &mut Ctx,
     absent: &BTreeSet<String>,
 ) -> Result<()> {
@@ -1341,6 +1396,7 @@ fn return_path_and_ingress(
                         "{} gw {} unreachable (ingress leg {} has no live slave)",
                         z.name, gw.router, leg.ifname
                     ),
+                    reach: router_reach(comps, &z.name, &leg.home),
                 },
             );
         }
@@ -3528,6 +3584,123 @@ mod tests {
             "{}",
             report.output
         );
+    }
+
+    /// The `components` document with the ingress prober's rows for the mgmt leg: `dark` names
+    /// the wires the router does NOT answer over.
+    fn components_with_ingress(view: &View, dark: &[&str]) -> String {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&healthy_components(view)).expect("the healthy fixture");
+        let slaves: Vec<serde_json::Value> = [("eth9", "a"), ("eth1", "b"), ("eth0", "c")]
+            .iter()
+            .map(|(wire, island)| {
+                serde_json::json!({
+                    "wire": wire, "island": island,
+                    "reachable": !dark.contains(wire),
+                    "last_reply_ms": if dark.contains(wire) { serde_json::Value::Null }
+                                     else { serde_json::json!(2) },
+                })
+            })
+            .collect();
+        doc["ingress"] = serde_json::json!([{
+            "zone": "mgmt", "bond": GW_BOND, "active": "cfab-gw249-c", "slaves": slaves,
+        }]);
+        doc.to_string()
+    }
+
+    /// F21: the home wire has carrier and the bond has moved off it, but the reason is not a
+    /// stuck reselect — the router cannot be reached over it. Same sentence, different cause,
+    /// and the cause is the half an operator can act on.
+    #[test]
+    fn a_migration_off_a_router_dead_home_names_the_router_not_the_carrier() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .file(
+                &format!("/sys/class/net/{GW_BOND}/bonding/active_slave"),
+                "cfab-gw249-a\n",
+            )
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_ingress(&view, &["eth0"]),
+            );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  mgmt ingress via eth9 (home eth0: router unreachable)\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("home eth0 has carrier"),
+            "one spelling per condition: {}",
+            report.output
+        );
+    }
+
+    /// The same migration while the router DOES answer over the home wire is the old fault (a
+    /// stuck reselect), and must keep the old sentence.
+    #[test]
+    fn a_migration_off_a_reachable_home_keeps_the_carrier_sentence() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .file(
+                &format!("/sys/class/net/{GW_BOND}/bonding/active_slave"),
+                "cfab-gw249-a\n",
+            )
+            .socket("/run/cfab/cfab.sock", &components_with_ingress(&view, &[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  mgmt ingress via eth9 (home eth0 has carrier)\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// No wire reaches the router: where the bond sits explains nothing, so that is the only
+    /// thing the line says.
+    #[test]
+    fn an_ingress_leg_no_wire_can_reach_the_router_over_says_exactly_that() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view).socket(
+            "/run/cfab/cfab.sock",
+            &components_with_ingress(&view, &["eth9", "eth1", "eth0"]),
+        );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  mgmt ingress: router unreachable on every wire\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !report.output.contains("mgmt ingress via "),
+            "the active slave explains nothing here: {}",
+            report.output
+        );
+    }
+
+    /// The prober reporting every wire reachable adds nothing to a healthy status.
+    #[test]
+    fn a_healthy_leg_with_the_prober_reporting_stays_silent() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .socket("/run/cfab/cfab.sock", &components_with_ingress(&view, &[]));
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        for needle in ["router unreachable", "mgmt ingress via "] {
+            assert!(
+                !report.output.contains(needle),
+                "{needle}:\n{}",
+                report.output
+            );
+        }
     }
 
     /// A dark bond whose active slave is a stranger is not the same fault as a dark bond, and
