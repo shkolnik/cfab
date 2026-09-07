@@ -1991,4 +1991,239 @@ mod tests {
             sys.calls
         );
     }
+
+    // ---- F27: hello silence on the active wire outranks a wire that still answers ARP ------
+
+    /// The engine's state socket, as `Prober::from_view` builds its path from `[runtime]`.
+    const ENGINE_SOCK: &str = "/run/cfab/engine.sock";
+
+    /// The engine's ospf state document with each named peer's neighbor on the storage
+    /// fallback bond in the given state. A peer left out of `states` is absent from the
+    /// neighbor list, which reads the same as `down`.
+    fn engine_state(states: &[(u8, &str)]) -> String {
+        let nbrs: Vec<String> = states
+            .iter()
+            .map(|(node, st)| format!(r#"{{"router_id":"10.99.0.{node}","state":"{st}"}}"#))
+            .collect();
+        format!(
+            r#"{{"ready":true,"ospf":{{"storage":{{"interfaces":{{"{FB}":{{"neighbors":[{}]}}}}}}}}}}"#,
+            nbrs.join(",")
+        )
+    }
+
+    /// The fallback bond on `active`, with an engine answering `state` as `states` says.
+    fn fb_bonding_with_engine(active: &str, states: &[(u8, &str)]) -> MockSys {
+        fb_bonding(active).socket(ENGINE_SOCK, &engine_state(states))
+    }
+
+    /// Four ticks of every wire hearing both peers: the steady state every F27 case starts in.
+    fn fb_steady(p: &mut Prober, sys: &mut MockSys, io: &mut ScriptedIo, t0: Instant) {
+        for tick in 0..4u64 {
+            for s in FB_SLAVES {
+                hear(io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(p, sys, io, t0 + Duration::from_millis(tick * 500));
+        }
+    }
+
+    /// F27, measured on pve1 2026-09-07 with an nft rule dropping only OSPF on the active wire:
+    /// the peers' hellos stop on the active slave while its ARP still answers, so the escalation
+    /// clears itself every other tick and the bond never moves — while OSPF tears the adjacency
+    /// down at the dead interval and leaves it down. Once the engine agrees the adjacency is
+    /// gone, silence outranks the ARP reply.
+    #[test]
+    fn hello_silence_with_the_adjacency_down_moves_the_bond_though_arp_still_answers() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        // The wire still answers ARP: that is the whole defect.
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("unix_request")),
+            "a healthy leg asks the engine nothing: {:?}",
+            sys.calls
+        );
+        p.drain_log();
+
+        // OSPF is dropped on eth9 only. The siblings keep hearing the peers.
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B),
+            "the bond left the wire the peers went silent on"
+        );
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/primary")),
+            Some(FB_B)
+        );
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains(&format!("moved {FB}")))
+                .count(),
+            1,
+            "one move line: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l
+                == "cfab: storage fallback: peers silent on eth9 (adjacency down, arp still \
+                    answers), moved cfab-st-fb to eth1"),
+            "and it says why this move is not the ARP one: {log:?}"
+        );
+    }
+
+    /// The guard: the prober's opinion alone never condemns a wire that answers. While the
+    /// engine still has an adjacency over the bond, hello silence on the active slave is left
+    /// to the ARP escalation exactly as it was in 0.4.7.
+    #[test]
+    fn hello_silence_with_a_peer_still_adjacent_never_moves_the_bond() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "full"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "one peer still adjacent over the bond is the wire working: {:?}",
+            sys.calls
+        );
+    }
+
+    /// The Suspect precondition still gates the rule: with nothing heard on any wire the fault
+    /// is not per-wire, so nothing is condemned and the engine is never asked.
+    #[test]
+    fn hello_silence_on_every_wire_condemns_none_and_asks_the_engine_nothing() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "nowhere to move to: {:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("unix_request")),
+            "and no reason to ask the engine: {:?}",
+            sys.calls
+        );
+    }
+
+    /// Anti-ping-pong. The demoted wire keeps answering ARP, which is the very thing that made
+    /// it look reachable — so ARP alone must never rehabilitate it, or it is more preferred,
+    /// pulls the bond home, and dies again one dead interval later, forever. Only a hello
+    /// brings it back.
+    #[test]
+    fn a_wire_condemned_by_hello_silence_is_revived_only_by_a_hello() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B)
+        );
+        p.drain_log();
+        let sent_before = io.sent_on(FB_A).len();
+
+        // Twelve more ticks — four dead intervals — of eth9 answering ARP and hearing nothing.
+        for tick in 14..26u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B),
+            "an ARP reply on the condemned wire never pulls the bond back"
+        );
+        assert_eq!(
+            io.sent_on(FB_A).len(),
+            sent_before,
+            "and it is not re-asked every tick either"
+        );
+        assert!(
+            p.drain_log().iter().all(|l| !l.contains("moved")),
+            "no second move"
+        );
+
+        // The multicast comes back: one hello revives the wire, and it is the preferred one.
+        for tick in 26..30u64 {
+            for s in FB_SLAVES {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_A),
+            "a hello, and only a hello, brings the wire back"
+        );
+    }
+
+    /// Fail safe: an engine that cannot be read leaves the leg behaving exactly as 0.4.7 did,
+    /// and says so once rather than twice a second.
+    #[test]
+    fn an_unreadable_engine_never_condemns_a_wire_and_is_said_once() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        // No socket registered on the mock: `unix_request` fails, as it does with no engine.
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        p.drain_log();
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "without the engine's word the wire still answers ARP and is kept: {:?}",
+            sys.calls
+        );
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains("engine's ospf state"))
+                .count(),
+            1,
+            "said once: {log:?}"
+        );
+    }
 }
