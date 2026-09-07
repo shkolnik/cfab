@@ -16,6 +16,7 @@
 //! socket bound to the slave (`io`), and folds the answers with the pure state machine and
 //! decision function in `decide`.
 
+pub mod bpf;
 pub mod decide;
 pub mod frame;
 pub mod io;
