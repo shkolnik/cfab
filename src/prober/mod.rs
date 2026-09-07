@@ -63,6 +63,10 @@ struct Fallback {
     /// with no peer alive anywhere (spec §4).
     self_rid: u32,
     windows: Windows,
+    /// No slave of this leg heard anything within its window on the last tick. Reported, so
+    /// `status` can say the fault is not per-wire; distinct from "has never heard anything",
+    /// which is also true of a leg whose first hello has not arrived yet.
+    quiet_now: bool,
     /// The whole leg has gone quiet and it has been said. Cleared when anything is heard again,
     /// so the next silence is reported.
     noted_quiet: bool,
@@ -151,7 +155,10 @@ impl ProbeSlave {
             state: Hysteresis::default(),
             probed: false,
             carrier: false,
-            present: true,
+            // Not present until a tick has read the netdev, so every slave starts its life in
+            // the grace period a re-enslaved one gets: at leg start no hello has arrived on any
+            // wire yet, and the first one to arrive must not condemn the others.
+            present: false,
             last_reply: None,
             peer_heard: None,
             self_heard: None,
@@ -341,6 +348,7 @@ impl Prober {
                         view.fabric.ospf_hello,
                         view.fabric.ospf_dead,
                     ),
+                    quiet_now: false,
                     noted_quiet: false,
                     noted_deaf: false,
                 }),
@@ -487,14 +495,10 @@ impl Leg {
         }
     }
 
-    /// Has this leg heard nothing at all, on any wire? Only a fallback leg can: an ingress leg
-    /// asks rather than listens, and "nobody answered" is already reported per wire.
+    /// Has this leg heard nothing at all, on any wire, this tick? Only a fallback leg can: an
+    /// ingress leg asks rather than listens, and "nobody answered" is already reported per wire.
     fn quiet(&self) -> bool {
-        matches!(self.kind, Kind::Fallback(ref f) if !f.peers.is_empty())
-            && self
-                .slaves
-                .iter()
-                .all(|s| s.peer_heard.is_none() && s.self_heard.is_none())
+        matches!(self.kind, Kind::Fallback(ref f) if f.quiet_now)
     }
 
     fn tick(&mut self, sys: &mut dyn Sys, io: &mut dyn ProbeIo, now: Instant, log: &mut Vec<String>) {
@@ -550,6 +554,7 @@ impl Leg {
             }
             let frames = io.recv(&s.ifname).unwrap_or_default();
             let mut replied = false;
+            let mut heard_now = false;
             match &self.kind {
                 Kind::Ingress { router } => {
                     replied = frames
@@ -561,9 +566,13 @@ impl Leg {
                         if let Some(rid) = frame::hello_router_id(fr) {
                             if rid == f.self_rid {
                                 s.self_heard = Some(now);
+                                // Our own reflection proves only a BACKUP slave's path to the
+                                // backbone; on the active slave it is not even expected.
+                                heard_now |= active != Some(s.ifname.as_str());
                             } else if f.peers.contains(&rid) {
                                 s.peer_heard = Some(now);
                                 s.saw(rid);
+                                heard_now = true;
                             }
                             // A hello from a Router ID we do not expect on this segment is not
                             // evidence about our fabric: another OSPF speaker on the VLAN would
@@ -592,13 +601,16 @@ impl Leg {
                 // The escalation's counted evidence, and only while it is running: a wire
                 // nobody is asking is judged by the passive channel below, not by a count.
                 Kind::Fallback(_) => {
-                    if s.escalating {
-                        if replied {
-                            s.state.heard();
-                            s.escalating = false;
-                        } else if s.probed {
-                            s.state.observe(false);
-                        }
+                    // A frame that ARRIVED this tick is what makes a wire live again — not
+                    // evidence that merely still sits inside a window. The difference matters
+                    // the moment a wire is demoted to backup: its window widens from a hello
+                    // and a half to the whole dead interval, and a stale timestamp would
+                    // rehabilitate the very wire we had just confirmed dead.
+                    if heard_now || replied {
+                        s.state.heard();
+                        s.escalating = false;
+                    } else if s.escalating && s.probed {
+                        s.state.observe(false);
                     }
                 }
             }
@@ -621,14 +633,12 @@ impl Leg {
         f.noted_deaf = false;
         let evidence: Vec<Evidence> = self.slaves.iter().map(|s| s.evidence(active)).collect();
         let verdicts = passive::verdicts(now, &evidence, &f.windows, !f.peers.is_empty());
-        let mut all_quiet = true;
+        let mut all_quiet = !self.slaves.is_empty();
         for (s, v) in self.slaves.iter_mut().zip(verdicts) {
             match v {
+                // Within its window: nothing to ask. The verdict does not itself declare the
+                // wire live — only a frame that arrived does, above.
                 Verdict::Good => {
-                    // A heard frame outranks any number of unanswered probes: it is one frame
-                    // that traversed the actual path, which is what OSPF itself restarts its
-                    // dead timer on.
-                    s.state.heard();
                     s.escalating = false;
                     s.probed = false;
                     all_quiet = false;
@@ -649,6 +659,7 @@ impl Leg {
                 }
             }
         }
+        f.quiet_now = all_quiet;
         if all_quiet && !f.noted_quiet {
             f.noted_quiet = true;
             log.push(format!(
@@ -1440,5 +1451,390 @@ mod tests {
         io.dark(HOME);
         run_ticks(&mut p, &mut sys, &mut io, 4);
         assert_eq!(p.held_primaries().slave_for(BOND), Some(BACKUP));
+    }
+
+    // ---- the fallback legs (F20 / F21 class on the universal segments) -----------------
+
+    /// The storage zone's universal segment on pve1: a bond over all three wires, homed on the
+    /// 5G wire (`eth9`, island a) because that is where the zone's cheapest segment lives.
+    const FB: &str = "cfab-st-fb";
+    const FB_A: &str = "cfab-st-fb-a";
+    const FB_B: &str = "cfab-st-fb-b";
+    const FB_C: &str = "cfab-st-fb-c";
+    const FB_SLAVES: [&str; 3] = [FB_A, FB_B, FB_C];
+
+    /// One OSPF hello from the member with this node number, in the storage zone (block 10.99,
+    /// so Router ID `10.99.0.<node>`). Only the Router ID is ever read from it.
+    fn hello(node: u8) -> Vec<u8> {
+        let mut f = vec![0u8; 14];
+        f[0..6].copy_from_slice(&[0x01, 0x00, 0x5e, 0x00, 0x00, 0x05]);
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        ip[9] = 89;
+        ip[12..16].copy_from_slice(&[10, 99, 9, node]);
+        ip[16..20].copy_from_slice(&[224, 0, 0, 5]);
+        f.extend_from_slice(&ip);
+        let mut ospf = vec![0u8; 24];
+        ospf[0] = 2;
+        ospf[1] = 1;
+        ospf[4..8].copy_from_slice(&[10, 99, 0, node]);
+        f.extend_from_slice(&ospf);
+        f
+    }
+
+    /// The fallback bond sitting on `active`, every slave with carrier.
+    fn fb_bonding(active: &str) -> MockSys {
+        let mut sys = MockSys::default()
+            .file(&format!("/sys/class/net/{FB}/bonding/active_slave"), active)
+            .file(&format!("/sys/class/net/{FB}/bonding/primary"), active);
+        for s in FB_SLAVES {
+            sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
+        }
+        sys
+    }
+
+    /// Just the storage zone's fallback leg, so a case reads the leg it is about.
+    fn fb_prober(f: &Fabric, member: &str) -> Prober {
+        let view = View::new(f, member).unwrap();
+        let mut p = Prober::from_view(&view);
+        p.legs
+            .retain(|l| matches!(l.kind, Kind::Fallback(_)) && l.bond == FB);
+        p
+    }
+
+    /// A fabric this member is alone in: the other two members are gone, so the zone's universal
+    /// segment has no peers to hear.
+    fn alone(f: &Fabric) -> Fabric {
+        let mut f = fabric_from(f);
+        f.members.retain(|m| m.name == "pve1-tb");
+        f
+    }
+
+    /// `Fabric` is not `Clone`; re-parsing the example is the cheap way to get a second one.
+    fn fabric_from(_: &Fabric) -> Fabric {
+        fabric()
+    }
+
+    /// Deliver `frames` on `slave` for the next tick only.
+    fn hear(io: &mut ScriptedIo, slave: &str, frames: &[Vec<u8>]) {
+        io.heard.insert(slave.to_string(), frames.to_vec());
+    }
+
+    fn fb_tick(p: &mut Prober, sys: &mut MockSys, io: &mut ScriptedIo, now: Instant) -> ProbedLeg {
+        p.tick(sys, io, now).fallback.remove(0)
+    }
+
+    /// The peers of a leg are the members that carry the SAME zone's universal row, self
+    /// excluded, addressed on that segment — leaves included, because a leaf carries the row.
+    #[test]
+    fn a_fallback_legs_expected_peers_are_the_zones_other_members() {
+        let f = fabric();
+        for (member, want_targets, want_rids) in [
+            (
+                "pve1-tb",
+                vec![[10, 99, 9, 2], [10, 99, 9, 3]],
+                vec![[10, 99, 0, 2], [10, 99, 0, 3]],
+            ),
+            (
+                "pve3-tb",
+                vec![[10, 99, 9, 1], [10, 99, 9, 2]],
+                vec![[10, 99, 0, 1], [10, 99, 0, 2]],
+            ),
+        ] {
+            let p = fb_prober(&f, member);
+            let Kind::Fallback(fb) = &p.legs[0].kind else {
+                panic!("the storage fallback leg");
+            };
+            assert_eq!(
+                fb.targets,
+                want_targets
+                    .iter()
+                    .map(|o| Ipv4Addr::from(*o))
+                    .collect::<Vec<_>>(),
+                "{member}: the peers' own addresses on this segment"
+            );
+            assert_eq!(
+                fb.peers,
+                want_rids
+                    .iter()
+                    .map(|o| u32::from(Ipv4Addr::from(*o)))
+                    .collect::<BTreeSet<_>>(),
+                "{member}: the peers' router ids, self excluded"
+            );
+        }
+    }
+
+    /// A member alone in a zone's universal segment expects nobody. It still runs the leg — its
+    /// own reflected hello judges the backup slaves, and the bond can still be on the wrong wire
+    /// — but it never asks, and never says it lost peers it does not have.
+    #[test]
+    fn a_lone_member_never_asks_and_still_fixes_the_wire() {
+        let f = alone(&fabric());
+        let mut p = fb_prober(&f, "pve1-tb");
+        // The kernel re-enslaved the 1G wire last after a re-enumeration, so the bond sits on
+        // it while the 5G wire is idle: F20, with nothing wrong anywhere.
+        let mut sys = fb_bonding(FB_B);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        // Our own hello comes back on the backup slaves, flooded through the backbone.
+        hear(&mut io, FB_B, &[hello(1)]);
+        hear(&mut io, FB_C, &[hello(1)]);
+        let row = fb_tick(&mut p, &mut sys, &mut io, t0);
+        assert!(!row.quiet, "the reflection is evidence, even with no peers");
+        for _ in 1..8 {
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_secs(10));
+        }
+        assert!(io.sent.is_empty(), "a lone member asks nobody: {:?}", io.sent);
+        assert!(
+            !p.drain_log()
+                .iter()
+                .any(|l| l.contains("peers unreachable") || l.contains("no peers heard")),
+            "and never says a word about peers it does not have"
+        );
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_A),
+            "the bond still belongs on the preferred wire"
+        );
+    }
+
+    /// The F21 class on a fallback bond: the active wire's island keeps carrier but its uplink
+    /// is dead, so the peers go quiet on that wire alone. Suspicion, one unanswered escalation
+    /// tick, and the bond moves — inside the dead interval.
+    #[test]
+    fn a_wire_that_goes_quiet_alone_is_asked_and_then_left() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+
+        // Steady state: every wire hears the peers, and nothing at all is sent.
+        for tick in 0..4u64 {
+            for s in FB_SLAVES {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(io.sent.is_empty(), "the steady state sends nothing");
+
+        // Island a's uplink dies: only the other two wires still hear the peers.
+        let mut last = None;
+        for tick in 4..9u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            last = Some(fb_tick(&mut p, &mut sys, &mut io, at(tick * 500)));
+        }
+        let moved = sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave"));
+        assert_eq!(moved, Some(FB_B), "the bond left the wire that went quiet");
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/primary")),
+            Some(FB_B),
+            "primary first, or the next link event hands the bond back"
+        );
+        assert!(
+            io.sent_on(FB_A).len() <= ESCALATION_TARGETS * 2,
+            "the escalation is bounded to the suspect wire: {:?}",
+            io.sent.iter().map(|(s, _)| s).collect::<Vec<_>>()
+        );
+        assert!(io.sent_on(FB_B).is_empty(), "a wire that is heard is not asked");
+        assert!(
+            p.drain_log()
+                .iter()
+                .any(|l| l == "cfab: storage fallback: peers unreachable on eth9, moved cfab-st-fb to eth1"),
+            "the move says which wire lost the peers"
+        );
+        let row = last.unwrap();
+        assert!(!row.quiet);
+        assert!(
+            !row.slaves.iter().find(|s| s.wire == "eth9").unwrap().reachable,
+            "and the row blames that wire, not the bond"
+        );
+    }
+
+    /// Dwell: the slave just promoted gets one dead interval before it can be suspected. Without
+    /// it, a segment nobody can hear would walk the bond around its slaves once per tick.
+    #[test]
+    fn a_just_promoted_slave_is_not_suspected_again_within_the_dead_interval() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        for tick in 0..4u64 {
+            for s in FB_SLAVES {
+                hear(&mut io, s, &[hello(2)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        // eth9 goes quiet, eth1 keeps hearing: the bond moves to eth1.
+        for tick in 4..9u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_B)
+        );
+        sys = fb_bonding(FB_B);
+        p.drain_log();
+        // Now eth1 hears nothing either, but it has only just been promoted.
+        for tick in 9..14u64 {
+            hear(&mut io, FB_C, &[hello(2)]);
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "no second move inside the grace period: {:?}",
+            sys.calls
+        );
+        assert!(
+            io.sent_on(FB_B).is_empty(),
+            "and nothing is asked of it either"
+        );
+    }
+
+    /// Silence vs absence, on the wire: with every slave quiet the fault is not per-wire, so the
+    /// bond is left where it is, nobody is asked, and it is said once.
+    #[test]
+    fn a_leg_that_hears_nothing_anywhere_is_left_alone_and_said_once() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        for tick in 0..3u64 {
+            for s in FB_SLAVES {
+                hear(&mut io, s, &[hello(2)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+        }
+        p.drain_log();
+        let mut row = None;
+        for tick in 3..24u64 {
+            row = Some(fb_tick(
+                &mut p,
+                &mut sys,
+                &mut io,
+                t0 + Duration::from_millis(tick * 500),
+            ));
+        }
+        assert!(row.unwrap().quiet, "the leg says the fault is not per-wire");
+        // The active slave IS asked once on the way down — its window is a hello and a half
+        // and the backups' is the dead interval, so for a moment it is the only silent wire.
+        // What must not happen is asking after the leg has gone quiet, which is the state that
+        // has no per-wire answer at all.
+        // — and the bond may move once for it, which is the design working. What must not
+        // happen is anything at all after the leg has gone quiet: that state has no per-wire
+        // answer, so asking or moving again would be walking the bond around its slaves.
+        let asked = io.sent.len();
+        let written = sys.calls.iter().filter(|c| c.starts_with("write /sys")).count();
+        for tick in 24..40u64 {
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+        }
+        assert_eq!(io.sent.len(), asked, "a quiet leg asks nobody");
+        assert_eq!(
+            sys.calls.iter().filter(|c| c.starts_with("write /sys")).count(),
+            written,
+            "and a quiet leg moves nothing: {:?}",
+            sys.calls
+        );
+        assert!(io.sent_on(FB_C).is_empty(), "the last wire is never asked");
+        assert_eq!(
+            p.drain_log()
+                .iter()
+                .filter(|l| l.contains("no peers heard"))
+                .count(),
+            1,
+            "said once, not twice a second"
+        );
+    }
+
+    /// The kernel refuses `active_slave` on a slave with no carrier (F23), and a slave with no
+    /// carrier reaches nothing anyway. Inherited whole from the ingress prober's decision.
+    #[test]
+    fn a_carrier_less_wire_is_never_a_target_and_never_written() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_B)
+            .file(&format!("/sys/class/net/{FB_A}/carrier"), "0\n")
+            .file(&format!("/sys/class/net/{FB_C}/carrier"), "0\n");
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        for tick in 0..6u64 {
+            hear(&mut io, FB_B, &[hello(2)]);
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "the preferred wire is dark, so there is nowhere better to be: {:?}",
+            sys.calls
+        );
+        assert!(
+            p.drain_log()
+                .iter()
+                .any(|l| l == "cfab: storage fallback: eth9 has no carrier, staying on eth1"),
+            "and the skipped wire is named once"
+        );
+    }
+
+    /// A leg whose `bonding/` cannot be read is a leg we do not own this tick: nothing is
+    /// written into a netdev we cannot see.
+    #[test]
+    fn a_leg_whose_bonding_is_unreadable_is_never_written() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = MockSys::default();
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        for tick in 0..6u64 {
+            hear(&mut io, FB_B, &[hello(2)]);
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// The environment is an undeclared dependency: a container without the privileges for a
+    /// raw tap must refuse the leg by name, not report every wire quiet forever.
+    #[test]
+    fn a_leg_with_no_tap_at_all_refuses_itself_once_by_name() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve3-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.1", &[]);
+        io.deaf = FB_SLAVES.iter().map(|s| s.to_string()).collect();
+        let t0 = Instant::now();
+        for tick in 0..6u64 {
+            fb_tick(&mut p, &mut sys, &mut io, t0 + Duration::from_millis(tick * 500));
+        }
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter().filter(|l| l.contains("cannot listen")).count(),
+            FB_SLAVES.len(),
+            "once per wire, then never again: {log:?}"
+        );
+        assert!(
+            log[0].starts_with(
+                "cfab: storage fallback: cannot listen on eth9 (cfab-st-fb-a: cannot open \
+                 AF_PACKET: Operation not permitted"
+            ),
+            "{:?}",
+            log[0]
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "a leg it cannot hear is a leg it does not move: {:?}",
+            sys.calls
+        );
     }
 }
