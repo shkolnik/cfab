@@ -607,6 +607,10 @@ pub(crate) async fn run_with(
         tokio::time::Instant::now() + Duration::from_secs(3),
         Duration::from_secs(3),
     );
+    // The ingress prober (finding F21). Built from the view, so it is empty on a leaf and on a
+    // host whose zones declare no gw — no branch, an empty prober whose tick does nothing.
+    let mut prober = Prober::from_view(view);
+    let mut probe_io = PacketIo::new();
     let mut feed_tick = feed_period.map(|p| {
         tokio::time::interval_at(
             tokio::time::Instant::now() + p,
@@ -623,6 +627,8 @@ pub(crate) async fn run_with(
         tokio::time::Instant::now() + Duration::from_millis(POLL_MS),
         Duration::from_millis(POLL_MS),
     );
+    let mut probe_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + PROBE_INTERVAL, PROBE_INTERVAL);
 
     // Set by a reload that found a changed declaration: the stop sequence below runs unchanged,
     // and the exit status asks systemd for the restart that applies the new file.
@@ -731,6 +737,12 @@ pub(crate) async fn run_with(
             // reapply, which is why only the reapply gets interior feeds.
             _ = fwd_tick.tick(), if hooks.run_watchdog => {
                 watchdog_tick(sys, view, &shared);
+            }
+            // Same arm shape as the watchdog above, and the same reason it needs no interior
+            // watchdog feed: the tick is bounded by construction (non-blocking reads, at most
+            // two sysfs writes) and nowhere near `WatchdogSec`.
+            _ = probe_tick.tick(), if hooks.run_prober && !prober.is_empty() => {
+                prober_tick(sys, &mut prober, &mut probe_io, &shared);
             }
             _ = feed => {
                 let (apply, engine_state) = {
@@ -1202,11 +1214,16 @@ fn feed_period() -> Option<Duration> {
 /// contract forbids blocking precisely so this arm cannot stall the watchdog feed or the
 /// `cfab.sock` accept loop on a silent wire.
 fn prober_tick(
-    _sys: &mut dyn Sys,
-    _prober: &mut Prober,
-    _io: &mut dyn ProbeIo,
-    _shared: &Arc<Mutex<Shared>>,
+    sys: &mut dyn Sys,
+    prober: &mut Prober,
+    io: &mut dyn ProbeIo,
+    shared: &Arc<Mutex<Shared>>,
 ) {
+    let rows = prober.tick(sys, io, Instant::now());
+    let held = prober.held_primaries();
+    let mut st = shared.lock().unwrap();
+    st.ingress = rows;
+    st.held = held;
 }
 
 /// One forwarding-watchdog tick (spec §5): run the synchronous check with `block_in_place` — on
