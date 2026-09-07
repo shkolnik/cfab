@@ -150,6 +150,14 @@ the point of use, with identical single-host behavior when absent:
   neighbors, identities, source pinning, forward posture) and reports one of four states with
   three counts, `(<peers> | <links> | <fallbacks>)`. Its exit code — 0 UP, 1 UP-DEGRADED,
   2 FAILED, 3 DOWN — is the contract every other mechanism builds on.
+- **`--wait <s>` waits for a *settled* fabric, not for the headline.** The counts go UP as soon
+  as the sessions are up, seconds before the engine has installed the routes, addresses and
+  source pins the identities answer on, so the wait ends early only when the state is UP and no
+  reason line is still settling (a route not installed, an adjacency still forming, a child the
+  supervisor is restarting, a sysctl or rule `up` and the watchdog own). Reason lines a settled
+  fabric prints by design — the mark backend, a leg carrying on a backup wire, drift against
+  generated state, a counter, a hardware fact — never hold the wait. At the deadline `status`
+  reports what it reached, whatever that is. `--wait 0` is one instant read.
 - **`status` describes the fabric that is *running*, not the file.** `cfab run` keeps the
   declaration it applied at `<run_dir>/fabric.toml.applied` (written before the initial apply,
   removed with the run dir by `cfab down`), and `status` prefers that copy — so an operator
