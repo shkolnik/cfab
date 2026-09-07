@@ -91,6 +91,20 @@ pub fn reconverge(
         .cloned()
         .collect();
     let t0 = Instant::now();
+    let mut record = emit::shape::ShapeApplied {
+        tick: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        wires: std::collections::BTreeMap::new(),
+    };
+    for dev in devs {
+        if !up.iter().any(|u| u == dev) {
+            record
+                .wires
+                .insert(dev.clone(), emit::shape::AppliedWire::NoCarrier);
+        }
+    }
     for dev in &up {
         let measured = read_cap(sys, view, dev);
         let up_ref = &up;
@@ -101,9 +115,16 @@ pub fn reconverge(
                 // A wire that cannot derive (e.g. cap file corrupt AND no declared speed) is
                 // skipped loudly rather than killing the daemon: the other wires keep floors.
                 eprintln!("shape-daemon: {dev}: {e}");
+                record
+                    .wires
+                    .insert(dev.clone(), emit::shape::AppliedWire::Failed(e.to_string()));
                 continue;
             }
         };
+        record.wires.insert(
+            dev.clone(),
+            emit::shape::AppliedWire::Shaped(derivation.applied_classes()),
+        );
         for (argv, ignore_err) in derivation.tc_argv() {
             let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             let out = sys.run(&argv_refs)?;
@@ -117,9 +138,34 @@ pub fn reconverge(
             }
         }
     }
+    write_record(sys, view, &record);
     let dt = t0.elapsed().as_millis();
     let msg = format!("shape-daemon: reconverge dt={dt}ms up=[{}]", up.join(" "));
     Ok((msg, up))
+}
+
+/// Publish what this reconverge installed, so `cfab status` compares the kernel against the
+/// daemon's own record instead of deriving the shape a second time (F19). Temp file + rename:
+/// a reader must see the previous record or the new one, never half of either. A failure here
+/// costs status its expectation (it falls back to a settling line), never the floors.
+fn write_record(sys: &mut dyn Sys, view: &View, record: &emit::shape::ShapeApplied) {
+    let path = crate::shape_applied_path(&view.fabric.run_dir);
+    let tmp = format!("{path}.tmp");
+    let res = sys
+        .write(&tmp, &record.render())
+        .and_then(|()| sys.rename(&tmp, &path));
+    if let Err(e) = res {
+        eprintln!("shape-daemon: cannot record the applied shape in {path}: {e}");
+    }
+}
+
+/// The exit path's half of the record: with fq_codel back on every wire there is no applied
+/// shape, and a stale record would have status report drift against floors that are gone.
+fn teardown_record(sys: &mut dyn Sys, view: &View) {
+    let path = crate::shape_applied_path(&view.fabric.run_dir);
+    if let Err(e) = sys.remove(&path) {
+        eprintln!("shape-daemon: cannot remove {path}: {e}");
+    }
 }
 
 /// The shared cap chain (local file → cluster-published → declared). The cluster fallback
@@ -221,6 +267,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, debounce: Duration) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     teardown(sys, &devs)?;
+    teardown_record(sys, view);
     println!(
         "shape-daemon: TEARDOWN — fabric NICs restored to fq_codel ({})",
         devs.join(" ")
@@ -352,5 +399,74 @@ mod tests {
         assert!(sys.ran("tc qdisc del dev eth9 root"));
         assert!(sys.ran("tc qdisc replace dev eth9 root fq_codel"));
         assert!(sys.ran("tc qdisc replace dev eth0 root fq_codel"));
+    }
+
+    #[test]
+    fn reconverge_records_exactly_what_it_applied() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth1/carrier", "0\n")
+            .file("/sys/class/net/eth0/carrier", "1\n");
+        let mut devs = view.wires();
+        devs.push("ethX".to_string()); // a wire the derivation cannot serve
+        sys = sys.file("/sys/class/net/ethX/carrier", "1\n");
+        reconverge(&mut sys, &view, &devs).unwrap();
+
+        let rec = emit::shape::ShapeApplied::parse(
+            &sys.read(&crate::shape_applied_path(&view.fabric.run_dir))
+                .unwrap(),
+        )
+        .unwrap();
+        let up = |w: &str| w != "eth1";
+        let want = emit::shape::derive(&view, "eth9", None, &up)
+            .unwrap()
+            .applied_classes();
+        assert_eq!(
+            rec.wires.get("eth9"),
+            Some(&emit::shape::AppliedWire::Shaped(want))
+        );
+        assert_eq!(
+            rec.wires.get("eth1"),
+            Some(&emit::shape::AppliedWire::NoCarrier),
+            "a wire the daemon deliberately skipped says so"
+        );
+        match rec.wires.get("ethX") {
+            Some(emit::shape::AppliedWire::Failed(m)) => assert!(m.contains("ethX"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_applied_record_is_written_atomically() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth1/carrier", "1\n")
+            .file("/sys/class/net/eth0/carrier", "1\n");
+        reconverge(&mut sys, &view, &view.wires()).unwrap();
+        let path = crate::shape_applied_path(&view.fabric.run_dir);
+        let tmp = format!("{path}.tmp");
+        assert!(sys.ran(&format!("write {tmp}")), "writes the temp file");
+        assert!(sys.ran(&format!("mv {tmp} {path}")), "renames into place");
+        assert!(
+            !sys.calls.iter().any(|c| *c == format!("write {path}")),
+            "never writes the record in place — a reader must not see a partial file"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_the_applied_record() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let path = crate::shape_applied_path(&view.fabric.run_dir);
+        let mut sys = MockSys::default().file(&path, "cfab-shape-applied 1\ntick 1\n");
+        teardown_record(&mut sys, &view);
+        assert!(
+            !sys.exists(&path),
+            "floors are gone; so is the record of them"
+        );
     }
 }
