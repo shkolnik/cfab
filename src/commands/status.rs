@@ -2192,6 +2192,8 @@ mod tests {
         assert_never_writes("healthy leaf", &mut healthy_leaf(&leaf), &leaf, 0);
         assert_never_writes("engine absent (FAILED)", &mut leaf_env(&leaf), &leaf, 0);
         assert_never_writes("no run dir (DOWN)", &mut MockSys::default(), &leaf, 0);
+        // A not-applied fabric now rides out the deadline too: no pass may write.
+        assert_never_writes("no run dir, --wait 6", &mut MockSys::default(), &leaf, 6);
 
         let mut bfd = all_bfd_up(&f);
         bfd[0].1 = "down";
