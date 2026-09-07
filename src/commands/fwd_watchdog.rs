@@ -25,6 +25,7 @@ use crate::driver_features;
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
+use crate::prober::HeldPrimaries;
 use crate::sys::{Sys, run_ignore};
 
 pub struct WatchdogReport {
@@ -60,7 +61,10 @@ pub struct WatchdogReport {
     pub rebuilt: Vec<String>,
 }
 
-pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
+/// `held` is what the ingress prober is holding each migrating gw bond's `primary` on. The
+/// standalone `cfab fwd-watchdog` has no prober and passes an empty map, which restores the
+/// declared home exactly as it always did.
+pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<WatchdogReport> {
     // The forward policy is a transit fact: a leaf never transits and never loads the table, so
     // asking it for `policy drop` would fail it closed on a posture it is not supposed to have.
     // (`up` only schedules this timer on a forwarding host today; the guard makes the command
@@ -126,7 +130,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<WatchdogReport> {
     let mut downed: Vec<String> = Vec::new();
     let mut unrestored: Vec<String> = Vec::new();
     let mut rebuilt: Vec<String> = Vec::new();
-    restore_missing_legs(sys, view, &mut rebuilt, &mut unrestored)?;
+    restore_missing_legs(sys, view, held, &mut rebuilt, &mut unrestored)?;
     restore_rp_filter(sys, view, &mut restored, &mut unrestored)?;
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
     restore_rules(sys, view, &mut restored, &mut downed)?;
@@ -333,6 +337,7 @@ fn restore_gw_return_defaults(
 fn restore_missing_legs(
     sys: &mut dyn Sys,
     view: &View,
+    held: &HeldPrimaries,
     rebuilt: &mut Vec<String>,
     unrestored: &mut Vec<String>,
 ) -> Result<()> {
@@ -363,6 +368,7 @@ fn restore_missing_legs(
                     r.vid,
                     &r.slaves,
                     &r.home,
+                    held.slave_for(&r.ifname),
                     &qos,
                     &gw_bond_leg_cidr(view, r)?,
                     rebuilt,
@@ -383,8 +389,10 @@ fn restore_missing_legs(
             let z = f.zone(&r.zone)?;
             let qos = apply::qos_map(f, z);
             let cidr = format!("{}/24", view.segment_addr(z, r.seg));
+            // A fallback bond carries no router, so nothing probes it and nothing holds its
+            // primary: its home is the declaration's, as it has always been.
             rebuild_bond_slaves(
-                sys, view, &wire, &r.zone, &r.ifname, r.vid, &r.slaves, &r.home, &qos, &cidr,
+                sys, view, &wire, &r.zone, &r.ifname, r.vid, &r.slaves, &r.home, None, &qos, &cidr,
                 rebuilt, unrestored,
             )?;
         }
@@ -495,7 +503,9 @@ fn set_leg_forwarding(sys: &mut dyn Sys, view: &View, ifname: &str) -> Result<()
     Ok(())
 }
 
-/// The slaves of one bond leg that live on `wire`. The bond itself is rebuilt whole when it is
+/// The slaves of one bond leg that live on `wire`. `held` is the slave the ingress prober is
+/// holding this bond's `primary` on, `None` for a leg nothing probes. The bond itself is rebuilt
+/// whole when it is
 /// the thing that is missing — that should not happen when only a wire re-enumerated, but the
 /// invariant is "the declared leg set exists", not "the case we expected".
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +518,7 @@ fn rebuild_bond_slaves(
     vid: u16,
     slaves: &[Slave],
     home: &str,
+    held: Option<&str>,
     qos: &[String; 2],
     cidr: &str,
     rebuilt: &mut Vec<String>,
@@ -799,7 +810,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none());
         assert!(report.corrected.is_empty());
         assert!(!sys.ran("logger"));
@@ -816,7 +827,7 @@ pub(crate) mod tests {
                 1,
                 "no such table",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(
             report
                 .failed
@@ -848,7 +859,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view).file("/proc/sys/net/ipv4/conf/docker0/forwarding", "1\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         assert!(report.corrected.is_empty());
         assert_eq!(
@@ -864,7 +875,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view).file("/proc/sys/net/ipv4/conf/eth0/forwarding", "1\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         assert_eq!(report.corrected, vec!["eth0 forwarding 1->0".to_string()]);
         assert_eq!(
@@ -889,7 +900,7 @@ pub(crate) mod tests {
             &["nft", "-j", "list", "chains"],
             &chains_json(DOCKER_FORWARD),
         );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         assert_eq!(
             report.blocked,
@@ -923,7 +934,7 @@ pub(crate) mod tests {
                 "0\n",
             );
         }
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         for r in view.fallback_rows() {
             assert!(
@@ -960,7 +971,7 @@ pub(crate) mod tests {
         for ifn in &slave_ifs {
             sys = sys.file(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "1\n");
         }
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         for ifn in &slave_ifs {
             assert!(
@@ -1008,7 +1019,7 @@ pub(crate) mod tests {
         let sock = engine_ctl::sock_path(view.fabric);
 
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none());
         assert!(
             sys.ran(&format!("unix_request {sock} transit-cost normal")),
@@ -1023,7 +1034,7 @@ pub(crate) mod tests {
                 &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
                 "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_some());
         assert!(
             sys.ran(&format!("unix_request {sock} transit-cost leaf")),
@@ -1050,7 +1061,7 @@ pub(crate) mod tests {
             "chain forward {\n  type filter hook forward priority filter; policy accept;\n}",
         );
         sys.sockets.clear();
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_some());
         let e = report.transit_cost_error.expect("named");
         assert!(e.contains("transit-cost leaf"), "{e}");
@@ -1068,7 +1079,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(report.transit_cost_error, None);
         assert!(
             !sys.calls.iter().any(|c| c.contains("transit-cost")),
@@ -1085,7 +1096,7 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys =
             healthy_sys(&view).file("/proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter", "1\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.restored,
             vec!["rp_filter cfab-st-fb 1->2 (want 2 = loose)".to_string()]
@@ -1106,7 +1117,7 @@ pub(crate) mod tests {
         let mut sys = healthy_sys(&view);
         sys.files
             .remove("/proc/sys/net/ipv4/conf/cfab-st-fb/rp_filter");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.restored.is_empty(), "{:?}", report.restored);
     }
 
@@ -1125,7 +1136,7 @@ pub(crate) mod tests {
                 "/sys/class/net/cfab-cl-fb/bonding/active_slave",
                 "someone-elses0\n",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(report.unrestored.len(), 1, "{:?}", report.unrestored);
         assert!(
             report.unrestored[0].starts_with("rp_filter cfab-st-fb=1: could not write 2"),
@@ -1158,7 +1169,7 @@ pub(crate) mod tests {
                 2,
                 "RTNETLINK: EPERM",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(
             report
                 .restored
@@ -1186,7 +1197,7 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys =
             healthy_leaf_sys(&view).on_stdout(&["ip", "rule", "show", "pref", "1001"], "");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         for blk in ["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"] {
@@ -1213,7 +1224,7 @@ pub(crate) mod tests {
                 2,
                 "RTNETLINK: EPERM",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(report.downed.len(), 1, "{:?}", report.downed);
         assert!(
             report.downed[0].starts_with("fabric legs down: could not restore pref 1001"),
@@ -1236,7 +1247,7 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
 
         let mut sys = healthy_sys(&view).on_stdout(&["ip", "rule", "show", "pref", "2002"], "");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         assert!(
             sys.ran("ip rule add pref 2002 from 10.99.0.0/16 unreachable"),
@@ -1252,7 +1263,7 @@ pub(crate) mod tests {
                 2,
                 "RTNETLINK: EPERM",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(report.downed.len(), 1, "{:?}", report.downed);
         for ifname in fabric_legs(&view) {
             assert!(sys.ran(&format!("ip link set {ifname} down")), "{ifname}");
@@ -1276,7 +1287,7 @@ pub(crate) mod tests {
         // The leg flapped: the table now has no default (the kernel dropped the dev-scoped route).
         let mut sys = healthy_sys(&view)
             .on_stdout(&["ip", "route", "show", "table", &d.table, "default"], "");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(
             report.downed.is_empty(),
             "a missing return-path default must not down anything: {:?}",
@@ -1315,7 +1326,7 @@ pub(crate) mod tests {
                 2,
                 "RTNETLINK: Nexthop device is down",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         assert!(
             !report
@@ -1337,7 +1348,7 @@ pub(crate) mod tests {
             "/sys/class/net/cfab-st-fb/bonding/active_slave",
             "someone-elses0\n",
         );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.restored,
             vec!["fallback storage: released foreign slave someone-elses0".to_string()]
@@ -1371,7 +1382,7 @@ pub(crate) mod tests {
                 2,
                 "RTNETLINK: EPERM",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.downed,
             vec![
@@ -1396,7 +1407,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.restored.is_empty(), "{:?}", report.restored);
         assert!(!sys.ran("nomaster"), "{:?}", sys.calls);
 
@@ -1405,7 +1416,7 @@ pub(crate) mod tests {
             sys.files
                 .remove(&format!("/sys/class/net/{}/bonding/active_slave", r.ifname));
         }
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.restored.is_empty(), "{:?}", report.restored);
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         assert!(!sys.ran("nomaster"), "{:?}", sys.calls);
@@ -1418,7 +1429,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = healthy_leaf_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
         assert!(
             !sys.ran("nft list chain inet cfab-fwd"),
@@ -1439,7 +1450,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             calls_naming(&sys, &["cfab-st", "cfab-st-fb-a"]),
             [
@@ -1489,6 +1500,44 @@ pub(crate) mod tests {
         );
     }
 
+    /// F21: the prober moves the ingress bond off a wire the router cannot be reached over, and
+    /// `primary` is what makes that move survive the next link event. So a rebuild triggered by
+    /// an unrelated blip on ANOTHER wire must re-assert the slave the PROBER holds — writing the
+    /// declared home instead would hand ingress straight back to the dead wire.
+    #[test]
+    fn a_rebuild_re_asserts_the_primary_the_ingress_prober_holds() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // mgmt's primary domain is c, so the ingress leg's declared home is the eth0 slave.
+        // The prober has moved the bond to eth9's slave for cause.
+        let mut held = HeldPrimaries::default();
+        held.hold("cfab-gw249", "cfab-gw249-a");
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9");
+        let report = run(&mut sys, &view, &held).unwrap();
+        assert!(
+            report
+                .rebuilt
+                .contains(&"rebuilt mgmt/cfab-gw249-a on eth9".to_string()),
+            "{:?}",
+            report.rebuilt
+        );
+        assert!(
+            calls_for(&sys, "primary").contains(
+                &"ip link set cfab-gw249 type bond primary cfab-gw249-a primary_reselect always"
+                    .to_string()
+            ),
+            "the rebuild must put primary back on the slave the prober holds: {:?}",
+            calls_for(&sys, "primary")
+        );
+        assert!(
+            !calls_for(&sys, "primary")
+                .iter()
+                .any(|c| c.contains("cfab-gw249 type bond primary cfab-gw249-c")),
+            "and never on the declared home while the prober holds another: {:?}",
+            calls_for(&sys, "primary")
+        );
+    }
+
     /// The example with `driver_features` on every member's eth9.
     fn fixture_with_driver_features() -> Fabric {
         let text =
@@ -1515,7 +1564,7 @@ pub(crate) mod tests {
                 "Features for eth9:\nscatter-gather: on\n",
             )
             .file("/run/cfab/wire-drivers", "eth9 r8152\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(calls_for(&sys, "ethtool -K"), ["ethtool -K eth9 sg off"]);
         assert!(
             report
@@ -1546,7 +1595,7 @@ pub(crate) mod tests {
                 "Features for eth9:\nscatter-gather: on\n",
             )
             .file("/run/cfab/wire-drivers", "eth9 r8152\n");
-        run(&mut sys, &view).unwrap();
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             sys.writes_to("/run/cfab/wire-driver-features"),
             Some("eth9 sg on\n"),
@@ -1578,7 +1627,7 @@ pub(crate) mod tests {
             // `up` found sg OFF on this NIC and turned it on... then the wire re-enumerated
             // with the driver default (on) and the watchdog set it off again.
             .file("/run/cfab/wire-driver-features", "eth9 sg off\n");
-        run(&mut sys, &view).unwrap();
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(
             sys.ran("write /run/cfab/wire-driver-features"),
             "the record was rewritten, not merely left alone: {:?}",
@@ -1605,7 +1654,7 @@ pub(crate) mod tests {
                 "Features for eth9:\nscatter-gather: on\n",
             )
             .file("/run/cfab/wire-drivers", "eth9 r8152\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.unrestored,
             [
@@ -1631,7 +1680,7 @@ pub(crate) mod tests {
         let f = fixture_with_driver_features();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.rebuilt.is_empty(), "{:?}", report.rebuilt);
         assert!(!sys.ran("ethtool"), "{:?}", sys.calls);
     }
@@ -1644,7 +1693,7 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
             .on_stdout(&["ethtool", "-i", "eth9"], "driver: igb\n");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(calls_for(&sys, "ethtool"), ["ethtool -i eth9"]);
         assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
     }
@@ -1657,7 +1706,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve3-tb").unwrap();
         let mut sys = wire_legs_missing(healthy_leaf_sys(&view), &view, "eth9");
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             calls_naming(&sys, &["cfab-st"]),
             [
@@ -1693,7 +1742,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.rebuilt.is_empty(), "{:?}", report.rebuilt);
         assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
         for c in &sys.calls {
@@ -1721,7 +1770,7 @@ pub(crate) mod tests {
                 &["ip", "-d", "link", "show", "cfab-cl-fb"],
                 "9: cfab-cl-fb: bridge \n",
             );
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.rebuilt.is_empty(), "{:?}", report.rebuilt);
         assert!(
             report
@@ -1810,7 +1859,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
-        let report = run(&mut sys, &view).unwrap();
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.blocked.is_empty(), "{:?}", report.blocked);
     }
 }

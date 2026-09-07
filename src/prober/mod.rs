@@ -69,6 +69,33 @@ struct ProbeSlave {
     last_reply: Option<Instant>,
 }
 
+/// Which slave each migrating ingress bond's `primary` must name: the prober's current choice,
+/// which is the leg's home until the prober has a reason to hold another.
+///
+/// The prober owns `primary` on those bonds — an `active_slave` write alone survives only until
+/// the next link event — so anything else that re-asserts `primary` must ask here first. The
+/// forwarding watchdog rebuilds legs a re-enumerated wire took with it, and writing the DECLARED
+/// home there would snap a bond the prober had deliberately moved straight back onto a
+/// router-dead wire on the next USB blip.
+#[derive(Clone, Debug, Default)]
+pub struct HeldPrimaries(BTreeMap<String, String>);
+
+impl HeldPrimaries {
+    /// The slave this bond's `primary` must name, if the prober is holding one for it.
+    pub fn slave_for(&self, bond: &str) -> Option<&str> {
+        self.0.get(bond).map(String::as_str)
+    }
+
+    /// Record a choice. The prober is the only production caller.
+    pub fn hold(&mut self, bond: &str, slave: &str) {
+        self.0.insert(bond.to_string(), slave.to_string());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Every ingress leg this member carries, probed once per `PROBE_INTERVAL`.
 pub struct Prober {
     legs: Vec<Leg>,
@@ -188,18 +215,15 @@ impl Prober {
         self.report(now)
     }
 
-    /// The slave each migrating ingress bond's `primary` must name right now — the prober's
-    /// current choice, which is the leg's home until the prober has a reason to hold another.
-    ///
-    /// The forwarding watchdog rebuilds legs a re-enumerated wire took with it, and re-asserting
-    /// the DECLARED home there would snap a bond the prober had deliberately moved back onto a
-    /// router-dead wire on the next USB blip. So the watchdog asks here instead.
-    pub fn held_primaries(&self) -> BTreeMap<String, String> {
-        self.legs
-            .iter()
-            .filter(|l| l.migrates)
-            .map(|l| (l.bond.clone(), l.held.clone()))
-            .collect()
+    /// The slave each migrating ingress bond's `primary` must name right now.
+    pub fn held_primaries(&self) -> HeldPrimaries {
+        HeldPrimaries(
+            self.legs
+                .iter()
+                .filter(|l| l.migrates)
+                .map(|l| (l.bond.clone(), l.held.clone()))
+                .collect(),
+        )
     }
 
     fn report(&self, now: Instant) -> Vec<IngressLeg> {
@@ -473,7 +497,7 @@ mod tests {
             sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/primary")),
             Some(HOME)
         );
-        assert_eq!(p.held_primaries().get(BOND), Some(&HOME.to_string()));
+        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
     }
 
     /// The bond is absent (a wire re-enumerated and took the whole leg with it): the prober
@@ -602,10 +626,10 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut sys = bonding(HOME);
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
-        assert_eq!(p.held_primaries().get(BOND), Some(&HOME.to_string()));
+        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
         run_ticks(&mut p, &mut sys, &mut io, 3);
         io.dark(HOME);
         run_ticks(&mut p, &mut sys, &mut io, 4);
-        assert_eq!(p.held_primaries().get(BOND), Some(&BACKUP.to_string()));
+        assert_eq!(p.held_primaries().slave_for(BOND), Some(BACKUP));
     }
 }

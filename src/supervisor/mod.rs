@@ -115,6 +115,9 @@ pub(crate) struct Shared {
     wd_last_tick: Option<Instant>,
     /// The ingress prober's latest rows, republished on every probe tick.
     ingress: Vec<report::IngressLeg>,
+    /// The slave the ingress prober holds each migrating gw bond's `primary` on. Read by the
+    /// forwarding watchdog, which must re-assert THAT and not the declared home.
+    held: crate::prober::HeldPrimaries,
 }
 
 impl Shared {
@@ -135,6 +138,7 @@ impl Shared {
             wd_detail: None,
             wd_last_tick: None,
             ingress: Vec::new(),
+            held: crate::prober::HeldPrimaries::default(),
         }
     }
 
@@ -1190,7 +1194,11 @@ fn feed_period() -> Option<Duration> {
 /// every member kind: `fwd_watchdog::run` guards its own transit-only work internally, so a leaf
 /// ticks too and only reports what a leaf owns.
 fn watchdog_tick(sys: &mut dyn Sys, view: &View, shared: &Arc<Mutex<Shared>>) {
-    let (result, detail) = match tokio::task::block_in_place(|| fwd_watchdog::run(sys, view)) {
+    // Snapshot first: the socket server and the stream readers take this same lock, and the
+    // check below runs for as long as a `block_in_place` needs.
+    let held = shared.lock().unwrap().held.clone();
+    let (result, detail) = match tokio::task::block_in_place(|| fwd_watchdog::run(sys, view, &held))
+    {
         Ok(report) => summarize_watchdog(&report),
         Err(e) => ("error".to_string(), Some(e.to_string())),
     };
