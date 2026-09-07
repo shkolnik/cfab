@@ -617,6 +617,37 @@ mod tests {
         );
     }
 
+    /// With nothing reachable the prober does not touch the bond — but the kernel's own
+    /// carrier-driven reselect may have moved it anyway. The row must then say where the bond
+    /// IS, not where the prober would like it: a row that reported the wish would hide exactly
+    /// the case where the prober's writes are not taking.
+    #[test]
+    fn the_report_names_the_kernels_active_slave_not_the_probers_wish() {
+        let f = fabric();
+        let (mut p, _) = prober(&f);
+        let mut sys = bonding(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &[]);
+        // Nothing answers anywhere, so the prober writes nothing at all...
+        run_ticks(&mut p, &mut sys, &mut io, 4);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "{:?}",
+            sys.calls
+        );
+        // ...and then the kernel's own carrier reselect moves the bond.
+        sys.files.insert(
+            format!("/sys/class/net/{BOND}/bonding/active_slave"),
+            BACKUP.to_string(),
+        );
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 1);
+        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
+        assert_eq!(
+            rows[0].active.as_deref(),
+            Some(BACKUP),
+            "the row reports the kernel, not the prober's wish"
+        );
+    }
+
     /// The held primary is what the forwarding watchdog re-asserts, so it must start at the
     /// leg's home and follow the bond, never the declaration.
     #[test]
