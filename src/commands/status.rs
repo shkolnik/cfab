@@ -1214,7 +1214,7 @@ fn fallback(
         let z = f.zone(&r.zone)?;
         let zone = &r.zone;
 
-        // ---- the leg: bonding/{mii_status,active_slave,ports} -----------------------
+        // ---- the leg: bonding/{mii_status,active_slave,slaves} -----------------------
         bond_leg_health(
             sys,
             c,

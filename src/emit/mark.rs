@@ -296,7 +296,7 @@ mod tests {
         ));
         for r in &rules {
             assert!(!r.contains("3784"), "the ceiling names a BFD port: {r}");
-            assert!(!r.contains("-fb-"), "the ceiling names a port: {r}");
+            assert!(!r.contains("-fb-"), "the ceiling names a bond port: {r}");
             for seg in [
                 "\"cfab-st\"",
                 "\"cfab-st-bk\"",

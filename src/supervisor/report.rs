@@ -42,6 +42,8 @@ pub struct ProbedLeg {
     /// quiet — an ingress leg asks rather than listens.
     #[serde(default)]
     pub quiet: bool,
+    /// `slaves` until 0.4.7: a status binary must still read a running older supervisor.
+    #[serde(default, alias = "slaves")]
     pub ports: Vec<ProbedPort>,
 }
 
@@ -151,6 +153,19 @@ pub fn render_line(c: &Components) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leg as a 0.4.7 supervisor publishes it: the members under `slaves`. A newer status
+    /// binary reading an older running supervisor must still see the wires.
+    #[test]
+    fn a_leg_published_under_the_old_slaves_key_still_reads() {
+        let leg: ProbedLeg = serde_json::from_str(
+            r#"{"zone": "st", "bond": "cfab-st-fb", "active": "cfab-st-fb-a",
+                "slaves": [{"wire": "cfab-st-fb-a", "island": "a", "reachable": true, "last_reply_ms": 12}]}"#,
+        )
+        .unwrap();
+        assert_eq!(leg.ports.len(), 1);
+        assert_eq!(leg.ports[0].wire, "cfab-st-fb-a");
+    }
 
     /// The document a supervisor with one running engine, one crash-looping shape-daemon and
     /// a conf-sync this member does not run would publish (spec §9).

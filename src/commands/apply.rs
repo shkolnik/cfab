@@ -567,7 +567,7 @@ fn mk_identity(sys: &mut dyn Sys, name: &str, cidr: &str) -> Result<()> {
 
 /// A tagged sub-interface on `lower`. `addr` is `None` for a link that carries no L3 of its
 /// own (a fallback bond's port: the bond holds the address), and `bring_up` is false for a link
-/// something else brings up later (enslaving wants the port down first).
+/// something else brings up later (adding a port wants it down first).
 /// The `ip -d link show` marker that proves a netdev is a vlan sub-interface of this vid.
 pub(crate) fn vlan_marker(vid: u16) -> String {
     format!("vlan protocol 802.1Q id {vid} ")
@@ -787,7 +787,7 @@ pub(crate) fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> R
             ],
         )?;
     }
-    // (2) the ports: created DOWN and with no address — the bond holds the L3, and enslaving
+    // (2) the ports: created DOWN and with no address — the bond holds the L3, and adding
     // a link the kernel is bringing up is a race. The egress-qos map lives HERE: the tag is
     // applied on the port, and PCP is per frame, so control on the fallback path is queued like
     // control anywhere.
