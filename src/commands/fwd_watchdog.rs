@@ -503,6 +503,24 @@ fn set_leg_forwarding(sys: &mut dyn Sys, view: &View, ifname: &str) -> Result<()
     Ok(())
 }
 
+/// The slave the ingress prober holds this bond's `primary` on, if it holds one this bond
+/// actually has. A held name that is not a slave of ours is ignored rather than written: the
+/// prober and this function derive their slave lists from the same declaration, so a mismatch
+/// means one of them is running on a stale view, and writing a stranger into `primary` would
+/// take the leg down.
+fn want_primary<'a>(slaves: &'a [Slave], held: Option<&'a str>) -> Option<&'a str> {
+    held.filter(|w| slaves.iter().any(|s| s.ifname == *w))
+}
+
+/// The slave carrying the leg's declared home wire — what owns `primary` when nothing else does.
+fn home_slave_ifname<'a>(slaves: &'a [Slave], home: &str) -> &'a str {
+    slaves
+        .iter()
+        .find(|s| s.wire == home)
+        .map(|s| s.ifname.as_str())
+        .unwrap_or_default()
+}
+
 /// The slaves of one bond leg that live on `wire`. `held` is the slave the ingress prober is
 /// holding this bond's `primary` on, `None` for a leg nothing probes. The bond itself is rebuilt
 /// whole when it is
@@ -543,6 +561,12 @@ fn rebuild_bond_slaves(
             &qos,
         )?;
         set_leg_forwarding(sys, view, bond)?;
+        // `mk_bond_leg` set `primary` to the DECLARED home, which is right for a leg nothing
+        // probes and wrong for one the ingress prober has moved: the whole bond is new, but the
+        // prober's knowledge of which wire the router answers over is not.
+        if let Some(w) = want_primary(slaves, held) {
+            apply::set_bond_primary(sys, bond, w)?;
+        }
         rebuilt.push(rebuilt_line(zone, bond, wire));
         return Ok(());
     }
@@ -550,15 +574,16 @@ fn rebuild_bond_slaves(
         unrestored.push(apply::not_a_bond(bond));
         return Ok(());
     }
+    let want = want_primary(slaves, held).unwrap_or(home_slave_ifname(slaves, home));
     for s in slaves.iter().filter(|s| s.wire == wire) {
         if !leg_absent(sys, &s.ifname, &s.wire, vid, unrestored)? {
             continue;
         }
         apply::add_bond_slave(sys, bond, s, vid, &qos)?;
         // `primary` names a slave, so the kernel dropped it with the netdev: re-assert it when
-        // the slave we just put back is the leg's home (`primary_reselect` is already on the
-        // bond, and `ip link set … type bond` carries both in one command).
-        if s.wire == home {
+        // the slave we just put back is the one that must own it (`primary_reselect` is already
+        // on the bond, and `ip link set … type bond` carries both in one command).
+        if s.ifname == want {
             apply::set_bond_primary(sys, bond, &s.ifname)?;
         }
         rebuilt.push(rebuilt_line(zone, &s.ifname, wire));
