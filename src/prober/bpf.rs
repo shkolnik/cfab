@@ -74,37 +74,30 @@ pub const FILTER: [Insn; 9] = [
     insn(RET_K, 0, 0, 0),
 ];
 
+/// The same program in the shape `socket2` takes. Built from `FILTER` word for word, and the
+/// test below holds the two together — the readable one is what the interpreter proves, and this
+/// one is what the kernel gets.
+const PROGRAM: [socket2::SockFilter; FILTER.len()] = {
+    let mut p = [const { socket2::SockFilter::new(0, 0, 0, 0) }; FILTER.len()];
+    let mut i = 0;
+    while i < FILTER.len() {
+        let Insn { code, jt, jf, k } = FILTER[i];
+        p[i] = socket2::SockFilter::new(code, jt, jf, k);
+        i += 1;
+    }
+    p
+};
+
 /// Attach `FILTER` to a raw socket. Called before `bind`, so the socket is never open and
 /// unfiltered at the same time.
 ///
-/// `nix` has no `SO_ATTACH_FILTER` wrapper (it wraps only the `SO_ATTACH_REUSEPORT_CBPF`
-/// cousin), so this is the one raw `setsockopt` in the tree.
+/// The fd goes in and comes back out through `socket2`'s own safe `OwnedFd` conversions, so the
+/// socket is never owned twice and the tree keeps `#![forbid(unsafe_code)]`.
 #[cfg(target_os = "linux")]
-pub fn attach(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let prog = libc::sock_fprog {
-        len: FILTER.len() as u16,
-        filter: FILTER.as_ptr() as *mut libc::sock_filter,
-    };
-    #[expect(
-        unsafe_code,
-        reason = "SO_ATTACH_FILTER has no safe wrapper in nix; the one unsafe block in the tree"
-    )]
-    // SAFETY: `fd` is an open socket owned by the caller, and `prog` points at a `const` array
-    // that outlives the call. The kernel copies the program in; nothing is retained.
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ATTACH_FILTER,
-            &prog as *const libc::sock_fprog as *const libc::c_void,
-            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+pub fn attach(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os::fd::OwnedFd> {
+    let sock = socket2::Socket::from(fd);
+    sock.attach_filter(&PROGRAM)?;
+    Ok(std::os::fd::OwnedFd::from(sock))
 }
 
 #[cfg(test)]
@@ -174,6 +167,15 @@ mod tests {
         f[12..14].copy_from_slice(&[0x08, 0x06]);
         f[20..22].copy_from_slice(&[0x00, 0x02]);
         f
+    }
+
+    /// The kernel gets the program the interpreter proves, instruction for instruction. Only
+    /// the length can be checked from outside — `socket2::SockFilter`'s field is private — but
+    /// the construction above is a word-for-word copy, so the length is what a dropped or
+    /// duplicated instruction would change.
+    #[test]
+    fn the_program_handed_to_the_kernel_is_the_one_the_tests_run() {
+        assert_eq!(PROGRAM.len(), FILTER.len());
     }
 
     #[test]

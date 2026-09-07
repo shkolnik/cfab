@@ -24,7 +24,7 @@ holo-policy = { path = "../holo/holo-policy" }
 yang5 = { version = "0.3", features = ["bundled"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "process"] }
 nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "net"] }
-libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
 sd-notify = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -73,11 +73,7 @@ stop-on-upgrade = false
 restart-after-upgrade = true
 
 [lints.rust]
-# `deny`, not `forbid`, for exactly one call: `SO_ATTACH_FILTER` on the probers' raw taps
-# (`src/prober/bpf.rs`). `nix` wraps every socket option the tree uses except that one, and the
-# filter is what keeps a busy VLAN from starving the tap's per-tick drain. The exemption is
-# `#[expect]`ed at that call site, so any second unsafe block is still an error.
-unsafe_code = "deny"
+unsafe_code = "forbid"
 
 [lints.clippy]
 # Closed sets are matched exhaustively — a `_ =>` arm on our own enums is the

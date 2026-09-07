@@ -40,7 +40,7 @@ const MAX_DRAIN: usize = 64;
 /// An address the kernel did not fill in is treated as received: dropping a frame we cannot
 /// classify would lose evidence, and the codec above still has to agree it is evidence.
 fn received(pkttype: Option<u8>) -> bool {
-    pkttype != Some(libc::PACKET_OUTGOING)
+    pkttype != Some(nix::libc::PACKET_OUTGOING)
 }
 
 /// The largest frame we will read. Anything longer is not an ARP reply, and the tail is not
@@ -102,7 +102,7 @@ impl PacketIo {
         // BEFORE the bind: between an open ETH_P_ALL socket and its filter there is a window in
         // which every frame on the wire is queued, and on a busy VLAN that window is exactly the
         // backlog the drain cap then cannot see past.
-        super::bpf::attach(std::os::fd::AsRawFd::as_raw_fd(&fd)).map_err(|e| {
+        let fd = super::bpf::attach(fd).map_err(|e| {
             crate::error::Error::fatal(format!("{slave}: cannot attach the packet filter: {e}"))
         })?;
         bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &addr)
@@ -306,10 +306,10 @@ mod tests {
     /// slave is, and it arrives as a received frame.
     #[test]
     fn our_own_transmitted_frames_are_not_evidence() {
-        assert!(!received(Some(libc::PACKET_OUTGOING)));
-        assert!(received(Some(libc::PACKET_HOST)));
-        assert!(received(Some(libc::PACKET_MULTICAST)));
-        assert!(received(Some(libc::PACKET_BROADCAST)));
+        assert!(!received(Some(nix::libc::PACKET_OUTGOING)));
+        assert!(received(Some(nix::libc::PACKET_HOST)));
+        assert!(received(Some(nix::libc::PACKET_MULTICAST)));
+        assert!(received(Some(nix::libc::PACKET_BROADCAST)));
         assert!(received(None), "unclassifiable is kept, not silently lost");
     }
 
