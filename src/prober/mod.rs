@@ -206,15 +206,28 @@ impl Prober {
                 if replied {
                     s.last_reply = Some(now);
                 }
-                // A tick that asked nothing learns nothing. A failed `recv` is a miss, not a
-                // gap: the tap is on the slave, so losing it IS the wire being unusable.
+                // A tick with no probe outstanding learns nothing on the RECEIVE side: the
+                // first tick has asked nobody anything, and a tick whose send failed is
+                // accounted for below instead. A failed `recv` IS a miss, though — the tap is
+                // on the slave, so losing it is the wire being unusable.
                 if s.probed {
                     s.state.observe(replied);
                 }
             }
             leg.actuate(sys);
             for s in &mut leg.slaves {
-                s.probed = io.send(&s.ifname, &frame::probe(s.mac, leg.router)).is_ok();
+                match io.send(&s.ifname, &frame::probe(s.mac, leg.router)) {
+                    Ok(()) => s.probed = true,
+                    // A probe we cannot even put on the wire is evidence about the wire, not a
+                    // gap in our knowledge of it: the netdev went away with a re-enumerated USB
+                    // NIC, or the socket cannot be bound. Fold it in HERE rather than leaving
+                    // the slave un-observed, or its state freezes at whatever it last was and
+                    // ingress stays pinned to a dead wire forever, silently.
+                    Err(_) => {
+                        s.probed = false;
+                        s.state.observe(false);
+                    }
+                }
             }
         }
         self.report(now)
