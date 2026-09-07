@@ -11,7 +11,7 @@ use crate::commands::common::{
     conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::commands::teardown;
-use crate::derive::{GwRow, Slave, View};
+use crate::derive::{GwRow, Port, View};
 use crate::driver_features;
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
@@ -28,7 +28,7 @@ pub struct ApplyOpts {
 }
 
 /// The set of declared wires with no netdev (James's ruling, 2026-09-05): the rest of the
-/// apply consults this set and touches none of them — no sub-if, no bond slave, no
+/// apply consults this set and touches none of them — no sub-if, no bond port, no
 /// per-interface sysctl. `own_wires` is the one place that decides membership.
 pub type AbsentWires = BTreeSet<String>;
 
@@ -205,16 +205,16 @@ fn own_wires(sys: &mut dyn Sys, view: &View) -> Result<AbsentWires> {
     Ok(absent)
 }
 
-/// A bond leg's slaves, minus any on an absent wire; if the leg's declared `home` wire is one
-/// of them, the first surviving slave takes over as home (any survivor is a legal `primary`;
+/// A bond leg's ports, minus any on an absent wire; if the leg's declared `home` wire is one
+/// of them, the first surviving port takes over as home (any survivor is a legal `primary`;
 /// `mk_bond_leg` only needs ONE that matches). `None` when every wire under the leg is absent
 /// — nothing to build, and the caller skips it with a warning of its own.
-fn present_slaves<'a>(
-    slaves: &'a [Slave],
+fn present_ports<'a>(
+    ports: &'a [Port],
     home: &'a str,
     absent: &AbsentWires,
-) -> Option<(Vec<Slave>, String)> {
-    let kept: Vec<Slave> = slaves
+) -> Option<(Vec<Port>, String)> {
+    let kept: Vec<Port> = ports
         .iter()
         .filter(|s| !absent.contains(&s.wire))
         .cloned()
@@ -402,7 +402,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         let qos_map: Vec<&str> = qos_map.iter().map(String::as_str).collect();
         replace_a_wrong_shape_gw_leg(sys, view, r, &mut warnings)?;
         if r.migrates() {
-            let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
+            let Some((ports, home)) = present_ports(&r.ports, &r.home, &absent) else {
                 continue; // every wire under this leg is absent; already warned above
             };
             mk_bond_leg(
@@ -411,7 +411,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                     ifname: &r.ifname,
                     vid: r.vid,
                     home: &home,
-                    slaves: &slaves,
+                    ports: &ports,
                     cidr: &cidr,
                 },
                 &qos_map,
@@ -441,7 +441,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // shaper, the qdisc sweep, status's link-speed checks) ever sees it.
     for r in &view.fallback_rows() {
         let z = f.zone(&r.zone)?;
-        let Some((slaves, home)) = present_slaves(&r.slaves, &r.home, &absent) else {
+        let Some((ports, home)) = present_ports(&r.ports, &r.home, &absent) else {
             continue; // every wire under this fallback leg is absent; already warned above
         };
         mk_bond_leg(
@@ -450,7 +450,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 ifname: &r.ifname,
                 vid: r.vid,
                 home: &home,
-                slaves: &slaves,
+                ports: &ports,
                 cidr: &format!("{}/24", view.segment_addr(z, r.seg)),
             },
             &qos_map(f, z).iter().map(String::as_str).collect::<Vec<_>>(),
@@ -566,8 +566,8 @@ fn mk_identity(sys: &mut dyn Sys, name: &str, cidr: &str) -> Result<()> {
 }
 
 /// A tagged sub-interface on `lower`. `addr` is `None` for a link that carries no L3 of its
-/// own (a fallback bond's slave: the bond holds the address), and `bring_up` is false for a link
-/// something else brings up later (enslaving wants the slave down first).
+/// own (a fallback bond's port: the bond holds the address), and `bring_up` is false for a link
+/// something else brings up later (adding a port wants it down first).
 /// The `ip -d link show` marker that proves a netdev is a vlan sub-interface of this vid.
 pub(crate) fn vlan_marker(vid: u16) -> String {
     format!("vlan protocol 802.1Q id {vid} ")
@@ -672,7 +672,7 @@ pub(crate) fn build_gw_vlan_leg(sys: &mut dyn Sys, view: &View, r: &GwRow) -> Re
 /// three-member testbed): it costs a 0.574 s window after a *legitimate* return in which
 /// `status` reads UP-DEGRADED (0.074 s at 0), with **zero**
 /// packets lost at every value, and it buys a 10x reduction in migrations on a bouncing wire —
-/// 2 versus 20 active-slave switches over ten 250 ms flaps, each avoided switch an avoided GARP
+/// 2 versus 20 active-port switches over ten 250 ms flaps, each avoided switch an avoided GARP
 /// burst and MAC move on every switch in the path. `updelay` never delays the failover AWAY from
 /// a dead wire (0.026-0.042 s at every value), so it cannot lengthen an outage. It takes effect on
 /// an EXISTING member only after a `down`/`up` — `mk_bond_leg` never rewrites a live bond; it
@@ -699,10 +699,10 @@ const FALLBACK_PRIMARY_RESELECT: &str = "always";
 pub(crate) struct BondLeg<'a> {
     pub(crate) ifname: &'a str,
     pub(crate) vid: u16,
-    /// The wire whose slave the bond takes as `primary`.
+    /// The wire whose port the bond takes as `primary`.
     pub(crate) home: &'a str,
-    pub(crate) slaves: &'a [Slave],
-    /// The bond is the L3 interface; its slaves carry no address.
+    pub(crate) ports: &'a [Port],
+    /// The bond is the L3 interface; its ports carry no address.
     pub(crate) cidr: &'a str,
 }
 
@@ -721,7 +721,7 @@ const FALLBACK_BOND_PARAMS: [(&str, &str); 5] = [
 /// parameters, so a changed constant would reach a fresh member and silently miss every member
 /// that already has the leg. Refuse on divergence rather than rewrite — `mode` and
 /// `fail_over_mac` are not writable on a live bond at all, and a partial rewrite is a degraded
-/// leg nobody asked for. `cfab down` deletes the bond before its slaves, so down/up is a proven
+/// leg nobody asked for. `cfab down` deletes the bond before its ports, so down/up is a proven
 /// rebuild.
 ///
 /// sysfs spells the enumerated parameters `<name> <index>` ("active-backup 1", "none 0") and the
@@ -787,16 +787,16 @@ pub(crate) fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> R
             ],
         )?;
     }
-    // (2) the slaves: created DOWN and with no address — the bond holds the L3, and enslaving
+    // (2) the ports: created DOWN and with no address — the bond holds the L3, and adding
     // a link the kernel is bringing up is a race. The egress-qos map lives HERE: the tag is
-    // applied on the slave, and PCP is per frame, so control on the fallback path is queued like
+    // applied on the port, and PCP is per frame, so control on the fallback path is queued like
     // control anywhere.
-    for s in r.slaves {
-        add_bond_slave(sys, r.ifname, s, r.vid, qos_map)?;
+    for s in r.ports {
+        add_bond_port(sys, r.ifname, s, r.vid, qos_map)?;
     }
-    // (4) AFTER the slaves exist: `primary` names a SLAVE, and at `ip link add` time no slave
+    // (4) AFTER the ports exist: `primary` names a PORT, and at `ip link add` time no port
     // exists yet, so setting it there is a silent no-op.
-    let home = home_slave(r.ifname, r.slaves, r.home)?;
+    let home = home_port(r.ifname, r.ports, r.home)?;
     set_bond_primary(sys, r.ifname, &home.ifname)?;
     // (5) the bond is the segment: address, segment sysctls, up.
     run_ok(sys, &["ip", "addr", "replace", r.cidr, "dev", r.ifname])?;
@@ -805,34 +805,34 @@ pub(crate) fn mk_bond_leg(sys: &mut dyn Sys, r: &BondLeg, qos_map: &[&str]) -> R
     Ok(())
 }
 
-/// One slave of a bond leg, exactly as `mk_bond_leg` builds it: the tagged sub-interface DOWN
-/// and address-less with the leg's qos map, enslaved (never re-enslaved — that is EBUSY), up,
-/// and `forwarding=0` written explicitly. Callable for ONE slave so the forwarding watchdog can
+/// One port of a bond leg, exactly as `mk_bond_leg` builds it: the tagged sub-interface DOWN
+/// and address-less with the leg's qos map, added as a port (never re-added — that is EBUSY), up,
+/// and `forwarding=0` written explicitly. Callable for ONE port so the forwarding watchdog can
 /// put back the legs a re-enumerated wire took with it, in the same argv as `apply`.
-pub(crate) fn add_bond_slave(
+pub(crate) fn add_bond_port(
     sys: &mut dyn Sys,
     bond: &str,
-    s: &Slave,
+    s: &Port,
     vid: u16,
     qos_map: &[&str],
 ) -> Result<()> {
     mk_vlan(sys, &s.ifname, &s.wire, vid, None, false, qos_map)?;
-    // (3) `ip link set <slave> master <bond>` on a slave already in that bond is EBUSY, so
-    // the second `up` must not re-issue it. sysfs answers "enslaved at all"; `ip -d` says
+    // (3) `ip link set <port> master <bond>` on a port already in that bond is EBUSY, so
+    // the second `up` must not re-issue it. sysfs answers "a port at all"; `ip -d` says
     // to whom (the master link cannot be read as a file — it is a symlink to a directory).
-    let enslaved_anywhere = sys.exists(&format!("/sys/class/net/{}/master", s.ifname));
-    let enslaved_here =
-        enslaved_anywhere && link_kind_is(sys, &s.ifname, &format!(" master {bond} "))?;
-    if enslaved_anywhere && !enslaved_here {
-        // Enslaved, but not to us. The kernel would answer the `master` set with a bare
+    let is_port_anywhere = sys.exists(&format!("/sys/class/net/{}/master", s.ifname));
+    let is_port_here =
+        is_port_anywhere && link_kind_is(sys, &s.ifname, &format!(" master {bond} "))?;
+    if is_port_anywhere && !is_port_here {
+        // A port already, but not of us. The kernel would answer the `master` set with a bare
         // EBUSY; say what is actually wrong instead.
-        return Err(Error::fatal(enslaved_elsewhere(&s.ifname)));
+        return Err(Error::fatal(port_elsewhere(&s.ifname)));
     }
-    if !enslaved_here {
+    if !is_port_here {
         run_ok(sys, &["ip", "link", "set", &s.ifname, "master", bond])?;
     }
     run_ok(sys, &["ip", "link", "set", &s.ifname, "up"])?;
-    // A slave inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
+    // A port inherits conf/default, and on a kernel whose owner keeps ip_forward=1 that
     // means forwarding=1 — the same hazard `mk_identity` guards against. `up` only zeroes
     // conf/default on a HOST; a LEAF has fallback rows and is deliberately left alone there,
     // so the explicit write is the only thing that holds `owned_forwarding()`'s false.
@@ -840,8 +840,8 @@ pub(crate) fn add_bond_slave(
 }
 
 /// Re-assert the bond's `primary` and `primary_reselect`. Idempotent, and the ONLY way to set
-/// `primary` — it names a slave, so at `ip link add` time it is a silent no-op.
-pub(crate) fn set_bond_primary(sys: &mut dyn Sys, bond: &str, home_slave: &str) -> Result<()> {
+/// `primary` — it names a port, so at `ip link add` time it is a silent no-op.
+pub(crate) fn set_bond_primary(sys: &mut dyn Sys, bond: &str, home_port: &str) -> Result<()> {
     run_ok(
         sys,
         &[
@@ -852,7 +852,7 @@ pub(crate) fn set_bond_primary(sys: &mut dyn Sys, bond: &str, home_slave: &str) 
             "type",
             "bond",
             "primary",
-            home_slave,
+            home_port,
             "primary_reselect",
             FALLBACK_PRIMARY_RESELECT,
         ],
@@ -860,11 +860,11 @@ pub(crate) fn set_bond_primary(sys: &mut dyn Sys, bond: &str, home_slave: &str) 
     Ok(())
 }
 
-/// The slave carrying a bond leg's `home` wire — the one `primary` names.
-pub(crate) fn home_slave<'a>(bond: &str, slaves: &'a [Slave], home: &str) -> Result<&'a Slave> {
-    slaves.iter().find(|s| s.wire == home).ok_or_else(|| {
+/// The port carrying a bond leg's `home` wire — the one `primary` names.
+pub(crate) fn home_port<'a>(bond: &str, ports: &'a [Port], home: &str) -> Result<&'a Port> {
+    ports.iter().find(|s| s.wire == home).ok_or_else(|| {
         Error::fatal(format!(
-            "{bond}: home wire {home} carries no slave of this bond"
+            "{bond}: home wire {home} carries no port of this bond"
         ))
     })
 }
@@ -878,7 +878,7 @@ pub(crate) fn home_slave<'a>(bond: &str, slaves: &'a [Slave], home: &str) -> Res
 /// `RestartPreventExitStatus`, so systemd would never retry it.
 ///
 /// Removal goes through `teardown::remove_gw_leg`, the very code `cfab down` runs — the bond
-/// before the slaves that deleting it RELEASES rather than deletes, so nothing is orphaned, and
+/// before the ports that deleting it RELEASES rather than deletes, so nothing is orphaned, and
 /// one spelling of "what a stale ingress leg is" for both verbs.
 ///
 /// Only the other CFAB shape is handled here. A netdev of neither is a stranger wearing the
@@ -927,8 +927,8 @@ pub(crate) fn not_a_bond(ifname: &str) -> String {
     format!("REFUSING: {ifname} exists but is not a bond")
 }
 
-pub(crate) fn enslaved_elsewhere(ifname: &str) -> String {
-    format!("REFUSING: {ifname} is enslaved to another bond")
+pub(crate) fn port_elsewhere(ifname: &str) -> String {
+    format!("REFUSING: {ifname} is a port on another bond")
 }
 
 /// A netdev holding a cfab VLAN leg's name but of another kind. `apply` DELETES such a netdev
@@ -943,7 +943,7 @@ pub(crate) fn not_our_vlan(ifname: &str, lower: &str, vid: u16) -> String {
 }
 
 /// Render `settled_down_ifs`'s `zone/ifname` entries for the operator. A fallback bond is not a
-/// wire: it is `down` exactly when not one of its slaves has carrier, so the warning must name
+/// wire: it is `down` exactly when not one of its ports has carrier, so the warning must name
 /// that condition — "ip -br link show cfab-st-fb" would only show an interface that is UP.
 pub fn describe_down(view: &View, down: &[String]) -> Vec<String> {
     let fallback: Vec<String> = view
@@ -981,13 +981,13 @@ pub(crate) fn class_sysctls(sys: &mut dyn Sys, ifname: &str) -> Result<()> {
 
 /// Whether a gw or fallback leg was actually built by the per-class-netdevs section above,
 /// given the same `absent` set and the same rule that section used to skip it: a migrating
-/// (bond) leg needs `present_slaves` to find a survivor; a non-migrating leg just needs its
+/// (bond) leg needs `present_ports` to find a survivor; a non-migrating leg just needs its
 /// one `home` wire present. Anything this returns `false` for has no netdev at all — a
 /// per-interface sysctl on it would fail loud on real Linux (`RealSys::write` maps ENOENT to
 /// `Error::fatal`) even though the mock accepts any path unconditionally.
-fn leg_was_built(migrates: bool, slaves: &[Slave], home: &str, absent: &AbsentWires) -> bool {
+fn leg_was_built(migrates: bool, ports: &[Port], home: &str, absent: &AbsentWires) -> bool {
     if migrates {
-        present_slaves(slaves, home, absent).is_some()
+        present_ports(ports, home, absent).is_some()
     } else {
         !absent.contains(home)
     }
@@ -1023,17 +1023,17 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Re
     for r in view
         .gw_rows()
         .iter()
-        .filter(|r| leg_was_built(r.migrates(), &r.slaves, &r.home, absent))
+        .filter(|r| leg_was_built(r.migrates(), &r.ports, &r.home, absent))
     {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
-    // The bond, never its slaves: a slave carries no L3 and the flag on it is meaningless.
+    // The bond, never its ports: a port carries no L3 and the flag on it is meaningless.
     // `status` and the watchdog grade against `owned_forwarding()`, which lists the bond as
     // transit — leaving it out here would make every `up` report UP-DEGRADED three seconds later.
     for r in view
         .fallback_rows()
         .iter()
-        .filter(|r| leg_was_built(true, &r.slaves, &r.home, absent))
+        .filter(|r| leg_was_built(true, &r.ports, &r.home, absent))
     {
         proc_sysctl(sys, &r.ifname, "forwarding", "1")?;
     }
@@ -1117,7 +1117,7 @@ mod tests {
                     fabric is up on the rest"),
             "{warnings:?}"
         );
-        // Nothing else may touch it: no sub-if, no bond slave, no sysctl, no forwarding write —
+        // Nothing else may touch it: no sub-if, no bond port, no sysctl, no forwarding write —
         // checked by exact ifname token, not substring (a zone's `segments` reuses "cfab-st" as a
         // PREFIX for segments that live on other wires entirely: cfab-st-bk is domain cl,
         // cfab-st-b2 is domain mg — only cfab-st itself is eth9's segment).
@@ -1245,12 +1245,12 @@ mod tests {
     }
 
     /// The whole fallback leg for one zone, argv by argv, on a member with three wires: the bond
-    /// first, each slave created DOWN and address-less then enslaved and brought up, `primary`
-    /// only AFTER the slaves exist (at `add` time it is a silent no-op), then the address,
+    /// first, each port created DOWN and address-less then added and brought up, `primary`
+    /// only AFTER the ports exist (at `add` time it is a silent no-op), then the address,
     /// the segment sysctls and the bond up. storage's home wire is eth9 (its cheapest class
-    /// row is on the st domain), so `primary` names the st SLAVE, never the wire.
+    /// row is on the st domain), so `primary` names the st PORT, never the wire.
     #[test]
-    fn a_fallback_leg_is_built_bond_slaves_primary_address() {
+    fn a_fallback_leg_is_built_bond_ports_primary_address() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
@@ -1295,10 +1295,10 @@ mod tests {
         );
     }
 
-    /// A slave already in OUR bond is not re-enslaved: `ip link set <slave> master <bond>` on
-    /// it is EBUSY, so the second `up` would fail outright. A slave that is not gets enslaved.
+    /// A port already in OUR bond is not re-added: `ip link set <port> master <bond>` on
+    /// it is EBUSY, so the second `up` would fail outright. A port that is not gets added.
     #[test]
-    fn a_second_up_does_not_re_enslave_a_slave_already_in_the_bond() {
+    fn a_second_up_does_not_re_add_a_port_already_in_the_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
@@ -1327,14 +1327,14 @@ mod tests {
             calls_for(&sys, "cfab-st-fb-a")
         );
         assert!(!sys.ran("ip link add cfab-st-fb type bond"), "bond kept");
-        // and the ones that are not enslaved still are
+        // and the ones that are not ports yet still are
         assert!(sys.ran("ip link set cfab-st-fb-b master cfab-st-fb"));
     }
 
-    /// A slave name that is already enslaved SOMEWHERE ELSE: the kernel would answer the
+    /// A port name that is already a port SOMEWHERE ELSE: the kernel would answer the
     /// `master` set with a bare "Device or resource busy". Refuse in cfab's own wording.
     #[test]
-    fn up_refuses_a_fallback_slave_enslaved_to_a_foreign_bond() {
+    fn up_refuses_a_fallback_port_already_on_a_foreign_bond() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
@@ -1350,7 +1350,7 @@ mod tests {
             );
         let e = run(&mut sys, &view, &o).unwrap_err().to_string();
         assert!(
-            e.contains("REFUSING: cfab-st-fb-a is enslaved to another bond"),
+            e.contains("REFUSING: cfab-st-fb-a is a port on another bond"),
             "{e}"
         );
         assert!(
@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     /// The steady state: a bond that is already exactly right is accepted, `ip link add` is
-    /// not re-issued, and `up` goes on to the slaves.
+    /// not re-issued, and `up` goes on to the ports.
     #[test]
     fn an_existing_fallback_bond_with_matching_parameters_is_accepted() {
         let f = fabric();
@@ -1508,11 +1508,11 @@ mod tests {
 
     /// 3.1b: `enable_forwarding` loops the rows, not `owned_forwarding()` — a fallback bond left
     /// out of it would leave every `up` UP-DEGRADED and make the watchdog "correct" a flag cfab
-    /// never set. The slaves are written 0 EXPLICITLY: they carry no L3, and inheriting
+    /// never set. The ports are written 0 EXPLICITLY: they carry no L3, and inheriting
     /// conf/default (1 on a leaf whose external owner keeps ip_forward=1) would contradict
     /// `owned_forwarding()` with nothing in `up` to correct it.
     #[test]
-    fn fallback_bonds_forward_and_their_slaves_never_do() {
+    fn fallback_bonds_forward_and_their_ports_never_do() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let o = opts();
@@ -1525,11 +1525,11 @@ mod tests {
                 "{zone_if}"
             );
         }
-        for slave in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
+        for port in ["cfab-st-fb-a", "cfab-st-fb-b", "cfab-st-fb-c"] {
             assert_eq!(
-                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{port}/forwarding")),
                 Some("0"),
-                "{slave} is L2 only"
+                "{port} is L2 only"
             );
         }
     }
@@ -1629,9 +1629,9 @@ mod tests {
     }
 
     /// Task 9: a gw domain of `any` builds the ingress leg as the very same bond a fallback
-    /// leg is — same parameters, same slave-then-enslave order, same `primary`-after-slaves
+    /// leg is — same parameters, same port-add order, same `primary`-after-ports
     /// rule — addressed with the router's /24 leg address, not a segment address. mgmt's
-    /// cheapest segment is on the mg domain, so `primary` names the mg SLAVE.
+    /// cheapest segment is on the mg domain, so `primary` names the mg PORT.
     #[test]
     fn a_migrating_gw_leg_is_built_as_a_bond() {
         let f = fabric();
@@ -1695,7 +1695,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{argv} never ran: {:?}", sys.calls))
     }
 
-    /// A migrating ingress leg with one tagged slave per wire, live on the box — what a
+    /// A migrating ingress leg with one tagged port per wire, live on the box — what a
     /// previous `any` declaration left behind.
     fn a_live_gw_bond(mut sys: MockSys) -> MockSys {
         sys = sys
@@ -1704,7 +1704,7 @@ mod tests {
                 &["ip", "-d", "link", "show", "cfab-gw249"],
                 "20: cfab-gw249: bond \n",
             );
-        for (i, (slave, wire)) in [
+        for (i, (port, wire)) in [
             ("cfab-gw249-a", "eth9"),
             ("cfab-gw249-b", "eth1"),
             ("cfab-gw249-c", "eth0"),
@@ -1714,12 +1714,12 @@ mod tests {
         {
             sys = sys
                 .on_stdout(
-                    &["ip", "link", "show", slave],
-                    &format!("{}: {slave}\n", 21 + i),
+                    &["ip", "link", "show", port],
+                    &format!("{}: {port}\n", 21 + i),
                 )
                 .on_stdout(
-                    &["ip", "-d", "link", "show", slave],
-                    &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                    &["ip", "-d", "link", "show", port],
+                    &format!("{}: {port}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
                 );
         }
         sys
@@ -1731,7 +1731,7 @@ mod tests {
     /// after a clean exit whose teardown partially failed (the supervisor logs that and exits
     /// 0). James 2026-09-07: refusing protects nothing with the daemon already down, and exit
     /// 3 is on `RestartPreventExitStatus`, so systemd would never retry. `up` removes the old
-    /// shape through the same code `cfab down` runs — the bond BEFORE the slaves it releases
+    /// shape through the same code `cfab down` runs — the bond BEFORE the ports it releases
     /// rather than deletes — says so in one line, and builds the declared shape.
     #[test]
     fn up_replaces_an_ingress_leg_the_previous_declaration_built_as_a_bond() {
@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     /// The other direction, in the same words: the box wears the plain sub-interface and the
-    /// declaration now says `any`. The stale leg had no slaves, so exactly one delete.
+    /// declaration now says `any`. The stale leg had no ports, so exactly one delete.
     #[test]
     fn up_replaces_an_ingress_leg_the_previous_declaration_built_as_a_sub_interface() {
         let f = fabric();
@@ -1836,10 +1836,10 @@ mod tests {
         );
     }
 
-    /// The bond forwards (it is the L3 leg); its slaves never do, and `up` writes that
+    /// The bond forwards (it is the L3 leg); its ports never do, and `up` writes that
     /// explicitly rather than inheriting conf/default.
     #[test]
-    fn a_migrating_gw_bond_forwards_and_its_slaves_never_do() {
+    fn a_migrating_gw_bond_forwards_and_its_ports_never_do() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = up_sys(&view);
@@ -1849,11 +1849,11 @@ mod tests {
             sys.writes_to("/proc/sys/net/ipv4/conf/cfab-gw249/forwarding"),
             Some("1")
         );
-        for slave in ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"] {
+        for port in ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"] {
             assert_eq!(
-                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{slave}/forwarding")),
+                sys.writes_to(&format!("/proc/sys/net/ipv4/conf/{port}/forwarding")),
                 Some("0"),
-                "{slave} is L2 only"
+                "{port} is L2 only"
             );
         }
     }
@@ -1946,7 +1946,7 @@ mod tests {
         );
     }
 
-    /// 3.3: a bond with no carrier is a bond whose every slave lost carrier. Naming the bond
+    /// 3.3: a bond with no carrier is a bond whose every port lost carrier. Naming the bond
     /// alone would send the operator to `ip -br link show cfab-st-fb`, which shows it UP.
     #[test]
     fn a_down_fallback_bond_is_reported_as_no_wire_with_carrier() {

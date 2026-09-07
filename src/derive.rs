@@ -21,7 +21,7 @@ pub struct ClassRow {
 
 /// An ingress leg this member carries (hosts only: leaves never peer). Shaped exactly like
 /// `FallbackRow`: on a physical gw domain the leg is a plain sub-interface on `home` and
-/// `slaves` is empty; on scope `any` it is a bond over `slaves`, one per wire, and `home`
+/// `ports` is empty; on scope `any` it is a bond over `ports`, one per wire, and `home`
 /// names the wire the bond takes as `primary` — so the leg survives a domain's isolation
 /// with one leg and one BGP session, not two.
 #[derive(Debug, Clone)]
@@ -30,27 +30,27 @@ pub struct GwRow {
     pub home: String,
     pub zone: String,
     pub vid: u16,
-    pub slaves: Vec<Slave>,
+    pub ports: Vec<Port>,
 }
 
 impl GwRow {
     /// Does this leg migrate between wires (scope `any`)? The one branch every consumer
     /// keys on, so no consumer re-derives it from the declaration.
     pub fn migrates(&self) -> bool {
-        !self.slaves.is_empty()
+        !self.ports.is_empty()
     }
 }
 
-/// One slave of a bond leg (a universal segment, or a migrating ingress leg): a physical wire,
+/// One port of a bond leg (a universal segment, or a migrating ingress leg): a physical wire,
 /// tagged with that leg's vid.
 #[derive(Debug, Clone)]
-pub struct Slave {
+pub struct Port {
     pub ifname: String,
     pub wire: String,
 }
 
 /// A universal segment resolved for one member: an active-backup bond over every wire the
-/// member has, one VLAN sub-interface per wire as a slave. `home` is the wire carrying this
+/// member has, one VLAN sub-interface per wire as a port. `home` is the wire carrying this
 /// zone's cheapest segment this member actually has — derived, never declared.
 #[derive(Debug, Clone)]
 pub struct FallbackRow {
@@ -60,7 +60,7 @@ pub struct FallbackRow {
     pub vid: u16,
     pub ospf_cost: u32,
     pub home: String,
-    pub slaves: Vec<Slave>,
+    pub ports: Vec<Port>,
 }
 
 /// Where a (member, zone) wire order came from: the default producer, or a a member's `prefs` row.
@@ -206,8 +206,8 @@ impl<'a> View<'a> {
     /// Every interface cfab owns on this member with the forwarding flag cfab sets on it:
     /// declared wires (never — they carry the untagged admin plane), segment sub-interfaces,
     /// ingress legs, universal bonds (transit like a segment — a universal leg for one zone can
-    /// carry another zone's domain-disjoint traffic), bond slaves and identity veths (never: a
-    /// slave is L2 only, the bond is the L3 interface). Scoped posture: cfab's forwarding
+    /// carry another zone's domain-disjoint traffic), bond ports and identity veths (never: a
+    /// port is L2 only, the bond is the L3 interface). Scoped posture: cfab's forwarding
     /// authority is exactly this set — it neither reads nor writes the flag on any other
     /// interface, so a foreign forwarder (Docker, a routed bridge, a host-level CNI) is not
     /// cfab's to police. Declared names only; `owns_if` adds the `cfab-` name family.
@@ -225,14 +225,14 @@ impl<'a> View<'a> {
         }
         for r in self.gw_rows() {
             out.push((r.ifname, transit));
-            // A migrating leg's slaves, like a universal leg's: L2 only, never transit.
-            for s in r.slaves {
+            // A migrating leg's ports, like a universal leg's: L2 only, never transit.
+            for s in r.ports {
                 out.push((s.ifname, false));
             }
         }
         for r in self.fallback_rows() {
             out.push((r.ifname, transit));
-            for s in r.slaves {
+            for s in r.ports {
                 out.push((s.ifname, false));
             }
         }
@@ -372,17 +372,17 @@ pub fn class_rows_of(fabric: &Fabric, member: &Member) -> Vec<ClassRow> {
         .collect()
 }
 
-/// The slaves of a bond leg named `ifname`: one tagged sub-interface per wire this member has,
+/// The ports of a bond leg named `ifname`: one tagged sub-interface per wire this member has,
 /// in `[[member]]` order, named `<ifname>-<domain>`. Shared by the universal segment and a
 /// migrating ingress leg — one fan-out, so the two legs cannot drift apart. Reachable from the
 /// rest of the crate because `up` and `down` need these names for a leg the CURRENT declaration
 /// does not describe as a bond at all: an ingress leg whose `gw` scope flipped from `any` to a
-/// domain is still a bond, with these slaves, until it is removed.
-pub(crate) fn slaves_of(member: &Member, ifname: &str) -> Vec<Slave> {
+/// domain is still a bond, with these ports, until it is removed.
+pub(crate) fn ports_of(member: &Member, ifname: &str) -> Vec<Port> {
     member
         .wires
         .iter()
-        .map(|w| Slave {
+        .map(|w| Port {
             ifname: format!("{ifname}-{}", w.domain),
             wire: w.name.clone(),
         })
@@ -430,7 +430,7 @@ pub fn universal_cost(fabric: &Fabric, zone: &str) -> u32 {
 }
 
 /// This member's universal segments (table order): each `any` row fanned out over the member's
-/// wires in `[[member]]` order, one slave per wire, homed on the zone's cheapest wire this
+/// wires in `[[member]]` order, one port per wire, homed on the zone's cheapest wire this
 /// member has. A member always has a wire: `Fabric::validate` refuses a wireless one.
 pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
     fabric
@@ -438,13 +438,13 @@ pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
         .iter()
         .filter(|r| r.scope.is_universal())
         .filter_map(|r| {
-            let slaves = slaves_of(member, &r.ifname);
+            let ports = ports_of(member, &r.ifname);
             // A zone with a universal row but no domain segment on this member has no cheapest
             // wire. Both bond legs then home on the member's FIRST wire rather than vanish
             // (spec §6 D): an ingress or a fallback path that silently does not exist is worse
             // than one that exists unused, and `gw_rows_of` below applies the identical rule.
             let home = home_wire(fabric, member, &r.zone)
-                .or_else(|| slaves.first().map(|s| s.wire.clone()))?;
+                .or_else(|| ports.first().map(|s| s.wire.clone()))?;
             Some(FallbackRow {
                 ifname: r.ifname.clone(),
                 zone: r.zone.clone(),
@@ -452,7 +452,7 @@ pub fn fallback_rows_of(fabric: &Fabric, member: &Member) -> Vec<FallbackRow> {
                 vid: r.vid,
                 ospf_cost: universal_cost(fabric, &r.zone),
                 home,
-                slaves,
+                ports,
             })
         })
         .collect()
@@ -468,16 +468,16 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
         .filter_map(|z| {
             let gw = z.gw.as_ref()?;
             let ifname = format!("cfab-gw{}", z.id);
-            let (home, slaves) = match &gw.scope {
+            let (home, ports) = match &gw.scope {
                 // One domain: the leg is that wire's sub-interface, as it has always been.
                 SegScope::Domain(d) => (member.wire_on(d)?.name.clone(), Vec::new()),
                 // Every wire: a bond, homed like a universal leg on the wire carrying this
                 // zone's cheapest segment, else on the member's first wire (spec §6 D).
                 SegScope::Universal => {
-                    let slaves = slaves_of(member, &ifname);
+                    let ports = ports_of(member, &ifname);
                     let home = home_wire(fabric, member, &z.name)
-                        .or_else(|| slaves.first().map(|s| s.wire.clone()))?;
-                    (home, slaves)
+                        .or_else(|| ports.first().map(|s| s.wire.clone()))?;
+                    (home, ports)
                 }
             };
             Some(GwRow {
@@ -485,7 +485,7 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
                 home,
                 zone: z.name.clone(),
                 vid: gw.vid,
-                slaves,
+                ports,
             })
         })
         .collect()
@@ -865,8 +865,8 @@ mod tests {
         assert_eq!(rows[0].ifname, "cfab-gw249");
         assert_eq!(rows[0].home, "eth0");
         assert_eq!(rows[0].vid, 249);
-        // A domain leg is a plain sub-interface: no bond, no slaves.
-        assert!(rows[0].slaves.is_empty());
+        // A domain leg is a plain sub-interface: no bond, no ports.
+        assert!(rows[0].ports.is_empty());
         assert!(!rows[0].migrates());
         let leaf = View::new(&f, "pve3-tb").unwrap();
         assert!(leaf.gw_rows().is_empty());
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(r.ifname, "cfab-gw249");
         assert_eq!(r.home, "eth0");
         assert_eq!(
-            r.slaves
+            r.ports
                 .iter()
                 .map(|s| (s.ifname.as_str(), s.wire.as_str()))
                 .collect::<Vec<_>>(),
@@ -897,17 +897,17 @@ mod tests {
     }
 
     #[test]
-    fn a_migrating_gw_slave_name_fits_ifnamsiz() {
+    fn a_migrating_gw_port_name_fits_ifnamsiz() {
         let f = fabric();
         for m in &f.members {
-            for s in gw_rows_of(&f, m).iter().flat_map(|r| &r.slaves) {
+            for s in gw_rows_of(&f, m).iter().flat_map(|r| &r.ports) {
                 assert!(s.ifname.len() <= 15, "{}", s.ifname);
             }
         }
     }
 
     #[test]
-    fn owned_forwarding_carries_a_migrating_gw_bond_and_its_slaves() {
+    fn owned_forwarding_carries_a_migrating_gw_bond_and_its_ports() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let owned = v.owned_forwarding();
@@ -980,7 +980,7 @@ mod tests {
                 "cfab-cl-fb-a",
                 "cfab-cl-fb-b",
                 "cfab-cl-fb-c",
-                // the migrating ingress leg's slaves: L2 only, like every other bond slave
+                // the migrating ingress leg's ports: L2 only, like every other bond port
                 "cfab-gw249-a",
                 "cfab-gw249-b",
                 "cfab-gw249-c",
@@ -1048,9 +1048,9 @@ mod tests {
                 let row = &rows[i];
                 assert_eq!(row.ifname, ifname, "{name}");
                 assert_eq!(row.home, home, "{name}: {ifname} home wire");
-                assert_eq!(row.slaves.len(), 3, "{name}: {ifname} slaves");
+                assert_eq!(row.ports.len(), 3, "{name}: {ifname} ports");
                 assert_eq!(
-                    row.slaves
+                    row.ports
                         .iter()
                         .map(|s| s.ifname.as_str())
                         .collect::<Vec<_>>(),
@@ -1061,7 +1061,7 @@ mod tests {
                     ]
                 );
                 assert_eq!(
-                    row.slaves
+                    row.ports
                         .iter()
                         .map(|s| s.wire.as_str())
                         .collect::<Vec<_>>(),
@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn wires_and_segments_of_never_see_the_universal_bond_or_its_slaves() {
+    fn wires_and_segments_of_never_see_the_universal_bond_or_its_ports() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(v.wires(), vec!["eth0", "eth1", "eth9"]);
@@ -1153,7 +1153,7 @@ mod tests {
 
     /// A member with ONE wire is not a special case: it is rank 0 in every zone (the zone's
     /// primary domain when it happens to be there, the only candidate otherwise), so every
-    /// segment it carries costs 10 and it still gets the universal bond — over one slave.
+    /// segment it carries costs 10 and it still gets the universal bond — over one port.
     #[test]
     fn a_one_wire_member_ranks_that_wire_first_in_every_zone() {
         let f = edited(|t| *t = fixtures::with_wires(t, "pve1-tb", "eth9@a:5000"));
@@ -1178,10 +1178,7 @@ mod tests {
         assert_eq!(fb.len(), 3);
         for r in &fb {
             assert_eq!(
-                r.slaves
-                    .iter()
-                    .map(|s| s.ifname.clone())
-                    .collect::<Vec<_>>(),
+                r.ports.iter().map(|s| s.ifname.clone()).collect::<Vec<_>>(),
                 vec![format!("{}-a", r.ifname)],
                 "a one-wire member still gets the bond, over its single wire"
             );

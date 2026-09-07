@@ -271,7 +271,7 @@ mod tests {
     }
 
     /// The rule is emitted with its arithmetic beside it, and it is OSPF on the bond and
-    /// nothing else: never a slave (the bond is the L3 interface), never the zone's domain
+    /// nothing else: never a port (the bond is the L3 interface), never the zone's domain
     /// segments (policing those would police the fabric it is protecting), never BFD (a
     /// fallback leg carries none — `emit/engine.rs` gives the bond no `bfd` key at all).
     #[test]
@@ -296,7 +296,7 @@ mod tests {
         ));
         for r in &rules {
             assert!(!r.contains("3784"), "the ceiling names a BFD port: {r}");
-            assert!(!r.contains("-fb-"), "the ceiling names a slave: {r}");
+            assert!(!r.contains("-fb-"), "the ceiling names a bond port: {r}");
             for seg in [
                 "\"cfab-st\"",
                 "\"cfab-st-bk\"",
@@ -456,11 +456,11 @@ mod tests {
     /// fallback bond, and this generator's `oifname { ifs }` group is built straight from it — no
     /// mark.rs code changed for this task. This is what makes the shaping claim true: the bond
     /// gets the zone's DSCP/PCP output-hook rules, so a fallback frame is marked like any other
-    /// frame in its zone. The on-wire PCP itself then comes from the ACTIVE SLAVE's
+    /// frame in its zone. The on-wire PCP itself then comes from the ACTIVE PORT's
     /// egress-qos-map (set by `up`, not by this generator) mapping the PCP-plane skb-priority
     /// this rule sets — that half is INFERRED here, confirmed on hardware in a later task.
     #[test]
-    fn the_oifname_group_carries_the_fallback_bond_never_a_slave() {
+    fn the_oifname_group_carries_the_fallback_bond_never_a_port() {
         for member in ["pve1-tb", "pve3-tb"] {
             let f = fabric();
             let v = View::new(&f, member).unwrap();
@@ -472,13 +472,13 @@ mod tests {
                     "{member}: no marking rule mentions the fallback bond {}",
                     row.ifname
                 );
-                for slave in &row.slaves {
-                    let slave_tag = format!("\"{}\"", slave.ifname);
+                for port in &row.ports {
+                    let port_tag = format!("\"{}\"", port.ifname);
                     assert!(
-                        !out.contains(&slave_tag),
-                        "{member}: marking rule names a fallback slave {}: it is L2 only, the \
+                        !out.contains(&port_tag),
+                        "{member}: marking rule names a fallback port {}: it is L2 only, the \
                          PCP tag comes from its own egress-qos-map, not a mark rule",
-                        slave.ifname
+                        port.ifname
                     );
                 }
             }

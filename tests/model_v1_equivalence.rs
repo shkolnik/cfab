@@ -3,7 +3,7 @@
 //!
 //! The oracle is `tests/fixtures/model-v0/`, captured from `3ae8213`'s own binary BEFORE any
 //! model change (see that commit for the exact commands). C4 of the spec review makes byte
-//! identity impossible by construction (every bond slave is renamed), so this compares the
+//! identity impossible by construction (every bond port is renamed), so this compares the
 //! SEMANTICS and enumerates every textual difference that is allowed. Anything else fails with
 //! a readable diff.
 //!
@@ -12,7 +12,7 @@
 //!      hand-picked numbers. The rank ORDER must survive; see the mgmt exception below.
 //!   2. The universal (fallback) segment's cost — 5000 declared -> 410 derived (a zone's
 //!      longest host path plus one ladder step), +30000 on the leaf.
-//!   3. Bond-slave names — `<ifname>-<island>` -> `<ifname>-<domain>`, st->a, cl->b, mg->c.
+//!   3. Bond-port names — `<ifname>-<island>` -> `<ifname>-<domain>`, st->a, cl->b, mg->c.
 //!   4. The nft admin set — one nominated NIC -> every wire of a host (James 2026-09-06: the
 //!      untagged path of EVERY host wire is the admin plane). Not a model-v1 consequence; the
 //!      same ruling that removed the admin-wire column.
@@ -27,10 +27,10 @@
 //!      a packet sent to its fabric identity (James 2026-09-06: unsupported by design). The
 //!      shape is pinned by `emit::engine`'s own tests; here it is only subtracted, so the rest
 //!      of the policy tree stays under byte comparison.
-//!   7. The ingress leg's slaves in the nft `cfab` (owned-interface) set. The v1 example puts
+//!   7. The ingress leg's ports in the nft `cfab` (owned-interface) set. The v1 example puts
 //!      the gw on scope `any` — the leg MIGRATES, so it is an active-backup bond with one
 //!      tagged sub-interface per wire — and those three netdevs are this host's, exactly as a
-//!      universal segment's slaves are. v0 had no such scope: its gw was always one wire's
+//!      universal segment's ports are. v0 had no such scope: its gw was always one wire's
 //!      sub-interface. Nothing else about the policy moves.
 
 use std::collections::BTreeMap;
@@ -397,21 +397,21 @@ fn the_mgmt_backup_order_is_the_one_real_behavior_change() {
     }
 }
 
-/// Slave -> wire mapping and bond home, both unchanged apart from the slave rename.
+/// Port -> wire mapping and bond home, both unchanged apart from the port rename.
 #[test]
-fn slave_names_wires_and_bond_homes_survive_the_rename() {
+fn port_names_wires_and_bond_homes_survive_the_rename() {
     let f = fabric();
     let island_of_wire: BTreeMap<&str, &str> =
         [("eth9", "st"), ("eth1", "cl"), ("eth0", "mg")].into();
     for member in MEMBERS {
         let v = View::new(&f, member).unwrap();
-        // The v0 slave names, straight out of the fixture's `set cfab` line.
+        // The v0 port names, straight out of the fixture's `set cfab` line.
         let policy = fixture(member, "gen-policy.txt");
         let cfab_set = policy
             .lines()
             .find(|l| l.trim_start().starts_with("set cfab {"))
             .expect("the cfab owned set");
-        let mut v0_slaves: Vec<String> = cfab_set
+        let mut v0_ports: Vec<String> = cfab_set
             .split('"')
             .filter(|t| t.contains("-fb-"))
             .map(|t| {
@@ -424,17 +424,17 @@ fn slave_names_wires_and_bond_homes_survive_the_rename() {
                 format!("{base}-{d}")
             })
             .collect();
-        v0_slaves.sort();
+        v0_ports.sort();
         let mut got: Vec<String> = v
             .fallback_rows()
             .iter()
-            .flat_map(|r| r.slaves.iter().map(|s| s.ifname.clone()))
+            .flat_map(|r| r.ports.iter().map(|s| s.ifname.clone()))
             .collect();
         got.sort();
-        assert_eq!(got, v0_slaves, "{member}: renamed slave set");
-        // Each slave still sits on the wire its island named.
+        assert_eq!(got, v0_ports, "{member}: renamed port set");
+        // Each port still sits on the wire its island named.
         for r in v.fallback_rows() {
-            for s in &r.slaves {
+            for s in &r.ports {
                 let want = RENAME
                     .iter()
                     .find(|(i, _)| *i == island_of_wire[s.wire.as_str()])
@@ -477,10 +477,10 @@ fn slave_names_wires_and_bond_homes_survive_the_rename() {
 }
 
 /// The nft forward policy is byte-identical to v0 once the two enumerated transforms are
-/// applied: the slave rename, and the admin set widening to every wire of a host. Any other
+/// applied: the port rename, and the admin set widening to every wire of a host. Any other
 /// character difference fails with the line.
 #[test]
-fn the_forward_policy_differs_only_by_the_slave_rename_and_the_admin_set() {
+fn the_forward_policy_differs_only_by_the_port_rename_and_the_admin_set() {
     let f = fabric();
     for member in MEMBERS {
         let v = View::new(&f, member).unwrap();
@@ -495,7 +495,7 @@ fn the_forward_policy_differs_only_by_the_slave_rename_and_the_admin_set() {
             "set admin { type ifname; elements = { \"eth9\",\"eth1\",\"eth0\" } }",
         );
         // Allowed diff 7: the ingress leg migrates in the v1 example, so this host owns one
-        // tagged slave of it per wire. A leaf carries no ingress leg and no such name.
+        // tagged port of it per wire. A leaf carries no ingress leg and no such name.
         want = want.replace(
             "\"cfab-gw249\",",
             "\"cfab-gw249\",\"cfab-gw249-a\",\"cfab-gw249-b\",\"cfab-gw249-c\",",

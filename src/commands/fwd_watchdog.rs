@@ -20,7 +20,7 @@ use crate::commands::common::{
 };
 use crate::commands::common::{link_exists, link_kind_is};
 use crate::commands::{apply, engine_ctl};
-use crate::derive::{Slave, View};
+use crate::derive::{Port, View};
 use crate::driver_features;
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
@@ -55,7 +55,7 @@ pub struct WatchdogReport {
     pub unrestored: Vec<String>,
     /// Legs of a PRESENT wire that had no netdev and were built back exactly as `apply` builds
     /// them: `rebuilt <zone>/<ifname> on <wire>`, one line per leg. The motivating case is a USB
-    /// NIC that re-enumerates with a new ifindex — every sub-interface, bond slave and ingress
+    /// NIC that re-enumerates with a new ifindex — every sub-interface, bond port and ingress
     /// leg on that wire dies with the old netdev and nothing ever re-created them, so the member
     /// sat UP-DEGRADED until an operator reloaded cfab (measured on the testbed, 2026-09-06).
     pub rebuilt: Vec<String>,
@@ -207,7 +207,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
     })
 }
 
-/// The L3 netdevs cfab owns: class segments and the fallback bonds. Their slaves are L2 only.
+/// The L3 netdevs cfab owns: class segments and the fallback bonds. Their ports are L2 only.
 fn fabric_legs(view: &View) -> Vec<String> {
     view.class_rows()
         .into_iter()
@@ -317,7 +317,7 @@ fn restore_gw_return_defaults(
 ///
 /// A wire's netdev can vanish and come back with a new ifindex — a USB NIC re-enumerated by an
 /// unplug/replug or a driver reload, measured on the testbed 2026-09-06. Everything stacked on
-/// it dies with the old netdev: the class-segment sub-interfaces, the fallback bond's slave, the
+/// it dies with the old netdev: the class-segment sub-interfaces, the fallback bond's port, the
 /// ingress leg. Nothing re-created them, so the member sat `UP-DEGRADED 12/18` until an operator
 /// ran `systemctl reload cfab`. The routing engine already rebinds to a re-created netdev
 /// (holo fork `ifindex-rebind`), so a leg put back here is picked up without restarting the
@@ -359,16 +359,16 @@ fn restore_missing_legs(
             if r.migrates() {
                 let z = f.zone(&r.zone)?;
                 let qos = apply::qos_map(f, z);
-                rebuild_bond_slaves(
+                rebuild_bond_ports(
                     sys,
                     view,
                     &wire,
                     &r.zone,
                     &r.ifname,
                     r.vid,
-                    &r.slaves,
+                    &r.ports,
                     &r.home,
-                    held.slave_for(&r.ifname),
+                    held.port_for(&r.ifname),
                     &qos,
                     &gw_bond_leg_cidr(view, r)?,
                     rebuilt,
@@ -390,18 +390,18 @@ fn restore_missing_legs(
             let qos = apply::qos_map(f, z);
             let cidr = format!("{}/24", view.segment_addr(z, r.seg));
             // A fallback bond's primary is the prober's too (F20): a wire that re-enumerates
-            // is re-enslaved last, and re-asserting the DECLARED home here would undo a move
+            // is re-added last, and re-asserting the DECLARED home here would undo a move
             // the prober made for cause on the very next USB blip.
-            rebuild_bond_slaves(
+            rebuild_bond_ports(
                 sys,
                 view,
                 &wire,
                 &r.zone,
                 &r.ifname,
                 r.vid,
-                &r.slaves,
+                &r.ports,
                 &r.home,
-                held.slave_for(&r.ifname),
+                held.port_for(&r.ifname),
                 &qos,
                 &cidr,
                 rebuilt,
@@ -515,38 +515,38 @@ fn set_leg_forwarding(sys: &mut dyn Sys, view: &View, ifname: &str) -> Result<()
     Ok(())
 }
 
-/// The slave the ingress prober holds this bond's `primary` on, if it holds one this bond
-/// actually has. A held name that is not a slave of ours is ignored rather than written: the
-/// prober and this function derive their slave lists from the same declaration, so a mismatch
+/// The port the ingress prober holds this bond's `primary` on, if it holds one this bond
+/// actually has. A held name that is not a port of ours is ignored rather than written: the
+/// prober and this function derive their port lists from the same declaration, so a mismatch
 /// means one of them is running on a stale view, and writing a stranger into `primary` would
 /// take the leg down.
-fn want_primary<'a>(slaves: &'a [Slave], held: Option<&'a str>) -> Option<&'a str> {
-    held.filter(|w| slaves.iter().any(|s| s.ifname == *w))
+fn want_primary<'a>(ports: &'a [Port], held: Option<&'a str>) -> Option<&'a str> {
+    held.filter(|w| ports.iter().any(|s| s.ifname == *w))
 }
 
-/// The slave carrying the leg's declared home wire — what owns `primary` when nothing else does.
-fn home_slave_ifname<'a>(slaves: &'a [Slave], home: &str) -> &'a str {
-    slaves
+/// The port carrying the leg's declared home wire — what owns `primary` when nothing else does.
+fn home_port_ifname<'a>(ports: &'a [Port], home: &str) -> &'a str {
+    ports
         .iter()
         .find(|s| s.wire == home)
         .map(|s| s.ifname.as_str())
         .unwrap_or_default()
 }
 
-/// The slaves of one bond leg that live on `wire`. `held` is the slave the ingress prober is
+/// The ports of one bond leg that live on `wire`. `held` is the port the ingress prober is
 /// holding this bond's `primary` on, `None` for a leg nothing probes. The bond itself is rebuilt
 /// whole when it is
 /// the thing that is missing — that should not happen when only a wire re-enumerated, but the
 /// invariant is "the declared leg set exists", not "the case we expected".
 #[allow(clippy::too_many_arguments)]
-fn rebuild_bond_slaves(
+fn rebuild_bond_ports(
     sys: &mut dyn Sys,
     view: &View,
     wire: &str,
     zone: &str,
     bond: &str,
     vid: u16,
-    slaves: &[Slave],
+    ports: &[Port],
     home: &str,
     held: Option<&str>,
     qos: &[String; 2],
@@ -554,20 +554,20 @@ fn rebuild_bond_slaves(
     rebuilt: &mut Vec<String>,
     unrestored: &mut Vec<String>,
 ) -> Result<()> {
-    if !slaves.iter().any(|s| s.wire == wire) {
+    if !ports.iter().any(|s| s.wire == wire) {
         return Ok(());
     }
     let qos: Vec<&str> = qos.iter().map(String::as_str).collect();
     if !link_exists(sys, bond)? {
         // The whole leg is gone: rebuild it through the same builder `apply` uses, which puts
-        // every slave, the primary, the address and the sysctls back in one go.
+        // every port, the primary, the address and the sysctls back in one go.
         apply::mk_bond_leg(
             sys,
             &apply::BondLeg {
                 ifname: bond,
                 vid,
                 home,
-                slaves,
+                ports,
                 cidr,
             },
             &qos,
@@ -576,7 +576,7 @@ fn rebuild_bond_slaves(
         // `mk_bond_leg` set `primary` to the DECLARED home, which is right for a leg nothing
         // probes and wrong for one the ingress prober has moved: the whole bond is new, but the
         // prober's knowledge of which wire the router answers over is not.
-        if let Some(w) = want_primary(slaves, held) {
+        if let Some(w) = want_primary(ports, held) {
             apply::set_bond_primary(sys, bond, w)?;
         }
         rebuilt.push(rebuilt_line(zone, bond, wire));
@@ -586,14 +586,14 @@ fn rebuild_bond_slaves(
         unrestored.push(apply::not_a_bond(bond));
         return Ok(());
     }
-    let want = want_primary(slaves, held).unwrap_or(home_slave_ifname(slaves, home));
-    for s in slaves.iter().filter(|s| s.wire == wire) {
+    let want = want_primary(ports, held).unwrap_or(home_port_ifname(ports, home));
+    for s in ports.iter().filter(|s| s.wire == wire) {
         if !leg_absent(sys, &s.ifname, &s.wire, vid, unrestored)? {
             continue;
         }
-        apply::add_bond_slave(sys, bond, s, vid, &qos)?;
-        // `primary` names a slave, so the kernel dropped it with the netdev: re-assert it when
-        // the slave we just put back is the one that must own it (`primary_reselect` is already
+        apply::add_bond_port(sys, bond, s, vid, &qos)?;
+        // `primary` names a port, so the kernel dropped it with the netdev: re-assert it when
+        // the port we just put back is the one that must own it (`primary_reselect` is already
         // on the bond, and `ip link set … type bond` carries both in one command).
         if s.ifname == want {
             apply::set_bond_primary(sys, bond, &s.ifname)?;
@@ -603,8 +603,9 @@ fn rebuild_bond_slaves(
     Ok(())
 }
 
-/// Row 19. The hazard is the FOREIGN slave, not the bond: something else enslaved a netdev into
-/// a bond cfab created, and traffic cfab believes is on its own wire is on somebody else's. So
+/// Row 19. The hazard is the FOREIGN port, not the bond: something else added a netdev as a
+/// port into a bond cfab created, and traffic cfab believes is on its own wire is on somebody
+/// else's. So
 /// release the intruder and keep ours running; the bond goes down only if the release fails.
 /// `active_slave` is compared against the names cfab itself created — an unreadable `bonding/`
 /// file is row 17 (a reason line), never this.
@@ -620,18 +621,18 @@ fn restore_bond_membership(
             continue;
         };
         let active = active.trim().to_string();
-        if active.is_empty() || r.slaves.iter().any(|s| s.ifname == active) {
+        if active.is_empty() || r.ports.iter().any(|s| s.ifname == active) {
             continue;
         }
         if sys.run(&["ip", "link", "set", &active, "nomaster"])?.ok() {
             restored.push(format!(
-                "{} fallback: released foreign slave {active}",
+                "{} fallback: released foreign port {active}",
                 r.zone
             ));
         } else {
             run_ignore(sys, &["ip", "link", "set", &r.ifname, "down"])?;
             downed.push(format!(
-                "{} fallback down: foreign slave {active} could not be released",
+                "{} fallback down: foreign port {active} could not be released",
                 r.zone
             ));
         }
@@ -749,7 +750,7 @@ pub(crate) mod tests {
             .file("/proc/sys/net/ipv4/conf/lo/forwarding", "0\n")
             .file("/proc/sys/net/ipv4/conf/all/forwarding", "1\n");
         // Everything the NEW restores read, healthy: the loose rp_filter cfab owns on every L3
-        // leg, every `ip rule` cfab installed, and each bond active on a slave of ours.
+        // leg, every `ip rule` cfab installed, and each bond active on a port of ours.
         for ifname in fabric_legs(view) {
             sys = sys.file(
                 &format!("/proc/sys/net/ipv4/conf/{ifname}/rp_filter"),
@@ -777,7 +778,7 @@ pub(crate) mod tests {
 
     /// Every declared leg of every declared wire present and of the kind cfab created it with —
     /// the shape a healthy member has, and the baseline the rebuild step must find nothing to do
-    /// in. Wires answer `ip link show`; each class leg, gw leg and bond slave answers `ip -d link
+    /// in. Wires answer `ip link show`; each class leg, gw leg and bond port answers `ip -d link
     /// show` with its vlan marker, each bond with " bond ".
     pub(crate) fn legs_present(mut sys: MockSys, view: &View) -> MockSys {
         let mut vlans: Vec<(String, u16)> = view
@@ -788,14 +789,14 @@ pub(crate) mod tests {
         for r in view.gw_rows() {
             if r.migrates() {
                 sys = bond_kind(sys, &r.ifname);
-                vlans.extend(r.slaves.into_iter().map(|s| (s.ifname, r.vid)));
+                vlans.extend(r.ports.into_iter().map(|s| (s.ifname, r.vid)));
             } else {
                 vlans.push((r.ifname, r.vid));
             }
         }
         for r in view.fallback_rows() {
             sys = bond_kind(sys, &r.ifname);
-            vlans.extend(r.slaves.into_iter().map(|s| (s.ifname, r.vid)));
+            vlans.extend(r.ports.into_iter().map(|s| (s.ifname, r.vid)));
         }
         for (ifname, vid) in vlans {
             sys = sys.on_stdout(
@@ -830,10 +831,10 @@ pub(crate) mod tests {
         }
         for r in view.fallback_rows() {
             let home = r
-                .slaves
+                .ports
                 .iter()
                 .find(|s| s.wire == r.home)
-                .expect("the home wire is one of the slaves");
+                .expect("the home wire is one of the ports");
             sys = sys.file(
                 &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
                 &format!("{}\n", home.ifname),
@@ -990,33 +991,33 @@ pub(crate) mod tests {
         }
     }
 
-    /// A fallback slave is L2 only (`owned_forwarding` always pairs it with `false`): even if
+    /// A fallback port is L2 only (`owned_forwarding` always pairs it with `false`): even if
     /// something turned its forwarding sysctl on, the watchdog writes it back to 0, same as
     /// the admin NIC — it is never flagged transit-eligible the way the bond is.
     #[test]
-    fn a_fallback_slave_drifted_to_1_is_corrected_to_0_never_flagged_transit() {
+    fn a_fallback_port_drifted_to_1_is_corrected_to_0_never_flagged_transit() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let slave_ifs: Vec<String> = view
+        let port_ifs: Vec<String> = view
             .fallback_rows()
             .into_iter()
-            .flat_map(|r| r.slaves)
+            .flat_map(|r| r.ports)
             .map(|s| s.ifname)
             .collect();
-        assert!(!slave_ifs.is_empty(), "fixture must carry fallback slaves");
+        assert!(!port_ifs.is_empty(), "fixture must carry fallback ports");
         let mut sys = healthy_sys(&view);
-        for ifn in &slave_ifs {
+        for ifn in &port_ifs {
             sys = sys.file(&format!("/proc/sys/net/ipv4/conf/{ifn}/forwarding"), "1\n");
         }
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.failed.is_none(), "{:?}", report.failed);
-        for ifn in &slave_ifs {
+        for ifn in &port_ifs {
             assert!(
                 report
                     .corrected
                     .iter()
                     .any(|c| c.starts_with(&format!("{ifn} forwarding 1->0"))),
-                "{ifn}: slave was not corrected back to 0: {:?}",
+                "{ifn}: port was not corrected back to 0: {:?}",
                 report.corrected
             );
             assert_eq!(
@@ -1183,7 +1184,7 @@ pub(crate) mod tests {
         // The bond restore behind it still ran.
         assert_eq!(
             report.restored,
-            vec!["cluster fallback: released foreign slave someone-elses0".to_string()]
+            vec!["cluster fallback: released foreign port someone-elses0".to_string()]
         );
         assert!(report.downed.is_empty(), "{:?}", report.downed);
     }
@@ -1210,7 +1211,7 @@ pub(crate) mod tests {
         assert!(
             report
                 .restored
-                .contains(&"storage fallback: released foreign slave someone-elses0".to_string()),
+                .contains(&"storage fallback: released foreign port someone-elses0".to_string()),
             "{:?}",
             report.restored
         );
@@ -1375,10 +1376,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// Row 19, restore. The hazard is the foreign slave, so the intruder is released and ours
+    /// Row 19, restore. The hazard is the foreign port, so the intruder is released and ours
     /// keeps running — the bond is never downed for something an eviction fixes.
     #[test]
-    fn row19_a_foreign_active_slave_is_released_not_the_bond_downed() {
+    fn row19_a_foreign_active_port_is_released_not_the_bond_downed() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view).file(
@@ -1388,7 +1389,7 @@ pub(crate) mod tests {
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
             report.restored,
-            vec!["storage fallback: released foreign slave someone-elses0".to_string()]
+            vec!["storage fallback: released foreign port someone-elses0".to_string()]
         );
         assert!(report.downed.is_empty(), "{:?}", report.downed);
         assert!(
@@ -1406,7 +1407,7 @@ pub(crate) mod tests {
     /// Row 19, actuate. The release fails, so the narrowest thing that removes the hazard is
     /// the bond itself — and only the bond.
     #[test]
-    fn row19_an_unreleasable_foreign_slave_downs_only_that_bond() {
+    fn row19_an_unreleasable_foreign_port_downs_only_that_bond() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view)
@@ -1423,7 +1424,7 @@ pub(crate) mod tests {
         assert_eq!(
             report.downed,
             vec![
-                "storage fallback down: foreign slave someone-elses0 could not be released"
+                "storage fallback down: foreign port someone-elses0 could not be released"
                     .to_string()
             ]
         );
@@ -1440,7 +1441,7 @@ pub(crate) mod tests {
     /// Row 19, false-positive guard: an `active_slave` that IS ours must write nothing at all,
     /// and an unreadable `bonding/` file is row 17 (a reason line in `status`), never this.
     #[test]
-    fn row19_leaves_our_own_active_slave_and_an_unreadable_file_alone() {
+    fn row19_leaves_our_own_active_port_and_an_unreadable_file_alone() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
@@ -1476,10 +1477,10 @@ pub(crate) mod tests {
     }
 
     /// The wire `eth9` present but every leg on it gone — a USB NIC that re-enumerated with a
-    /// new ifindex, which takes every sub-interface and bond slave stacked on it with it. The
+    /// new ifindex, which takes every sub-interface and bond port stacked on it with it. The
     /// watchdog must put back exactly what `apply` built: three class legs (created with the
     /// egress-qos map, addressed, up, segment sysctls, then forwarding=1 because this host
-    /// transits) and three fallback-bond slaves (created DOWN and address-less, enslaved,
+    /// transits) and three fallback-bond ports (created DOWN and address-less, added,
     /// brought up, forwarding=0) — with `primary` re-asserted on the ONE bond whose home wire
     /// is eth9. Argv by argv, so it cannot drift from `apply`'s pinned sequence.
     #[test]
@@ -1504,7 +1505,7 @@ pub(crate) mod tests {
                 "write /proc/sys/net/ipv4/conf/cfab-st/forwarding",
                 // ...then forwarding=1, because `[forward] enabled`=1 on this member
                 "write /proc/sys/net/ipv4/conf/cfab-st/forwarding",
-                // the storage fallback bond's slave on eth9, which is that bond's home wire
+                // the storage fallback bond's port on eth9, which is that bond's home wire
                 "ip link show cfab-st-fb-a",
                 "ip link show cfab-st-fb-a",
                 "ip link show cfab-st-fb-a",
@@ -1521,7 +1522,7 @@ pub(crate) mod tests {
                 "rebuilt storage/cfab-st on eth9",
                 "rebuilt cluster/cfab-cl-bk on eth9",
                 "rebuilt mgmt/cfab-mg-b2 on eth9",
-                // the migrating ingress leg's slave on this wire, rebuilt like any other
+                // the migrating ingress leg's port on this wire, rebuilt like any other
                 "rebuilt mgmt/cfab-gw249-a on eth9",
                 "rebuilt storage/cfab-st-fb-a on eth9",
                 "rebuilt cluster/cfab-cl-fb-a on eth9",
@@ -1530,7 +1531,7 @@ pub(crate) mod tests {
         );
         assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
         // Only eth9's bond takes a new primary: cl and mg are homed on other wires and their
-        // slave there never went away.
+        // port there never went away.
         assert_eq!(
             calls_for(&sys, "primary"),
             ["ip link set cfab-st-fb type bond primary cfab-st-fb-a primary_reselect always"]
@@ -1539,14 +1540,14 @@ pub(crate) mod tests {
 
     /// F21: the prober moves the ingress bond off a wire the router cannot be reached over, and
     /// `primary` is what makes that move survive the next link event. So a rebuild triggered by
-    /// an unrelated blip on ANOTHER wire must re-assert the slave the PROBER holds — writing the
+    /// an unrelated blip on ANOTHER wire must re-assert the port the PROBER holds — writing the
     /// declared home instead would hand ingress straight back to the dead wire.
     #[test]
     fn a_rebuild_re_asserts_the_primary_the_ingress_prober_holds() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
-        // mgmt's primary domain is c, so the ingress leg's declared home is the eth0 slave.
-        // The prober has moved the bond to eth9's slave for cause.
+        // mgmt's primary domain is c, so the ingress leg's declared home is the eth0 port.
+        // The prober has moved the bond to eth9's port for cause.
         let mut held = HeldPrimaries::default();
         held.hold("cfab-gw249", "cfab-gw249-a");
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9");
@@ -1563,7 +1564,7 @@ pub(crate) mod tests {
                 &"ip link set cfab-gw249 type bond primary cfab-gw249-a primary_reselect always"
                     .to_string()
             ),
-            "the rebuild must put primary back on the slave the prober holds: {:?}",
+            "the rebuild must put primary back on the port the prober holds: {:?}",
             calls_for(&sys, "primary")
         );
         assert!(
@@ -1575,8 +1576,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// F20, the same rule on a fallback bond: a USB wire that re-enumerates is re-enslaved
-    /// LAST, so the bond's backup order is enslave order and the prober will have moved it to
+    /// F20, the same rule on a fallback bond: a USB wire that re-enumerates is re-added
+    /// LAST, so the bond's backup order is join order and the prober will have moved it to
     /// the preferred wire. Re-asserting the DECLARED home on the rebuild would undo that move
     /// on every blip — which is how a 1G island came to carry a fallback segment while the 5G
     /// one sat idle (pve1/pve2, 2026-09-07).
@@ -1585,7 +1586,7 @@ pub(crate) mod tests {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         // storage's fallback bond is homed on eth9 (island a). The prober has moved it to
-        // eth1's slave for cause, and eth1 is the wire that re-enumerates.
+        // eth1's port for cause, and eth1 is the wire that re-enumerates.
         let mut held = HeldPrimaries::default();
         held.hold("cfab-st-fb", "cfab-st-fb-b");
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth1");
@@ -1602,7 +1603,7 @@ pub(crate) mod tests {
                 &"ip link set cfab-st-fb type bond primary cfab-st-fb-b primary_reselect always"
                     .to_string()
             ),
-            "the rebuild must put primary back on the slave the prober holds: {:?}",
+            "the rebuild must put primary back on the port the prober holds: {:?}",
             calls_for(&sys, "primary")
         );
         assert!(
@@ -1875,7 +1876,7 @@ pub(crate) mod tests {
         sys
     }
 
-    /// The leg netdevs `apply` builds on one wire: its class segments, its bond slaves, and a
+    /// The leg netdevs `apply` builds on one wire: its class segments, its bond ports, and a
     /// non-migrating ingress leg homed there.
     fn legs_on(view: &View, wire: &str) -> Vec<String> {
         let mut out: Vec<String> = view
@@ -1887,7 +1888,7 @@ pub(crate) mod tests {
         for r in view.gw_rows() {
             if r.migrates() {
                 out.extend(
-                    r.slaves
+                    r.ports
                         .into_iter()
                         .filter(|s| s.wire == wire)
                         .map(|s| s.ifname),
@@ -1898,7 +1899,7 @@ pub(crate) mod tests {
         }
         for r in view.fallback_rows() {
             out.extend(
-                r.slaves
+                r.ports
                     .into_iter()
                     .filter(|s| s.wire == wire)
                     .map(|s| s.ifname),

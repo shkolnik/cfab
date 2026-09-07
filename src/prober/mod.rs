@@ -1,19 +1,19 @@
 //! The ingress router prober (finding F21).
 //!
 //! The migrating ingress leg (`gw = { domain = "any" }`) is an active-backup bond over every
-//! wire, and the kernel judges its slaves by carrier. An island whose uplink is dead — cable,
+//! wire, and the kernel judges its ports by carrier. An island whose uplink is dead — cable,
 //! PoE, upstream port, or a switch still booting — keeps carrier and keeps switching locally,
 //! so the fabric's own BFD stays fully up while the router can no longer reach this member's
 //! identities. Measured on the rack 2026-09-07: goal 3 lost indefinitely, and for ~20 s on
 //! every island boot.
 //!
 //! The kernel's own ARP monitor cannot answer this. VLAN 249 spans the islands through the
-//! backbone, so the bond's slaves are three ports into ONE broadcast domain; the kernel probes
+//! backbone, so the bond's ports are three ports into ONE broadcast domain; the kernel probes
 //! with the bond's MAC, so the router's unicast reply lands on whichever port last learned that
-//! MAC rather than on the slave that asked. Both `fail_over_mac` modes flapped (measured).
+//! MAC rather than on the port that asked. Both `fail_over_mac` modes flapped (measured).
 //!
 //! So cfab asks the question itself, per wire, with a frame of its own (`frame`) on a raw
-//! socket bound to the slave (`io`), and folds the answers with the pure state machine and
+//! socket bound to the port (`io`), and folds the answers with the pure state machine and
 //! decision function in `decide`.
 
 pub mod bpf;
@@ -27,14 +27,14 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use crate::derive::View;
-use crate::supervisor::report::{ProbedLeg, ProbedSlave};
+use crate::supervisor::report::{ProbedLeg, ProbedPort};
 use crate::sys::Sys;
 
 use decide::{Candidate, Hysteresis, decide};
 use io::ProbeIo;
 use passive::{Evidence, Verdict, Windows};
 
-/// How often every slave is asked. Half the 3.3 s BGP hold floor the router's session runs on,
+/// How often every port is asked. Half the 3.3 s BGP hold floor the router's session runs on,
 /// divided again by the 3-observation hysteresis: 1.5 s to call a wire dead, 1.5 s to call it
 /// live, both comfortably inside the hold. Derived, not a knob — the declaration has nothing to
 /// say about it.
@@ -59,11 +59,11 @@ struct Fallback {
     /// this member is alone in the zone's universal segment.
     peers: BTreeSet<u32>,
     /// Our own Router ID in this zone. A hello carrying it is not a peer — it is our own hello
-    /// reflected back through the backbone, which is what makes a BACKUP slave judgeable even
+    /// reflected back through the backbone, which is what makes a BACKUP port judgeable even
     /// with no peer alive anywhere (spec §4).
     self_rid: u32,
     windows: Windows,
-    /// No slave of this leg heard anything within its window on the last tick. Reported, so
+    /// No port of this leg heard anything within its window on the last tick. Reported, so
     /// `status` can say the fault is not per-wire; distinct from "has never heard anything",
     /// which is also true of a leg whose first hello has not arrived yet.
     quiet_now: bool,
@@ -75,7 +75,7 @@ struct Fallback {
     /// `AF_PACKET` must refuse the leg by name, not report every wire quiet forever.
     noted_deaf: bool,
     /// The engine's state socket, asked ONLY when the F27 rule is being evaluated — the active
-    /// slave has been hello-silent past the dead interval while a sibling still hears the
+    /// port has been hello-silent past the dead interval while a sibling still hears the
     /// fabric. A healthy leg adds no socket traffic at all.
     engine_sock: String,
     /// The engine could not be read the last time the rule needed it; said once, so a member
@@ -88,22 +88,22 @@ struct Leg {
     zone: String,
     /// The leg netdev: a bond when the leg migrates, a plain sub-interface otherwise.
     bond: String,
-    /// Only a leg with slaves has anywhere to move to. A single-domain ingress leg is still
+    /// Only a leg with ports has anywhere to move to. A single-domain ingress leg is still
     /// probed — per-wire router reachability is an observable either way — but never actuated
-    /// on. Every fallback leg has slaves by construction.
+    /// on. Every fallback leg has ports by construction.
     actuates: bool,
     /// The zone's wire order, rank 0 first: what decides which live wire the leg belongs on.
     prefs: Vec<String>,
-    /// The slave `bonding/primary` must name. The prober owns `primary` on a leg it actuates:
+    /// The port `bonding/primary` must name. The prober owns `primary` on a leg it actuates:
     /// an `active_slave` write alone survives only until the next link event, after which
     /// `primary_reselect=always` hands the bond back to the old primary (VERIFIED on the rack,
     /// 2026-09-07). It starts as the leg's home and only ever moves with the bond.
     held: String,
-    /// The slave the KERNEL has active, as of this tick's read — which is not always the one we
+    /// The port the KERNEL has active, as of this tick's read — which is not always the one we
     /// hold: with nothing usable the prober leaves the bond alone and the kernel's own carrier
     /// reselect moves it. `None` before the first read, and for a leg that has none.
     active_now: Option<String>,
-    slaves: Vec<ProbeSlave>,
+    ports: Vec<ProbePort>,
     /// The (skipped wire, wire we are on) pair the last no-carrier note named, so the same
     /// sentence is not repeated twice a second for as long as an island stays dark. `None`
     /// re-arms it: the next time the pair exists, it is said again.
@@ -115,7 +115,7 @@ struct Leg {
     kind: Kind,
 }
 
-struct ProbeSlave {
+struct ProbePort {
     /// The netdev the probe goes out of and the tap listens on.
     ifname: String,
     wire: String,
@@ -125,34 +125,34 @@ struct ProbeSlave {
     /// A probe went out on the previous tick, so this tick's silence means something. Without
     /// it the very first tick — which has asked nobody anything — would count as a miss.
     probed: bool,
-    /// This slave's netdev had carrier as of this tick's read. Not folded into `state`: carrier
+    /// This port's netdev had carrier as of this tick's read. Not folded into `state`: carrier
     /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
     /// to believe it is three refused `active_slave` writes (F23).
     carrier: bool,
     /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
-    /// that has just come back is a slave that has just been re-enslaved, which is where the
+    /// that has just come back is a port that has just been re-added, which is where the
     /// grace period comes from.
     present: bool,
     last_reply: Option<Instant>,
     /// Passive evidence, fallback legs only: the last peer packet and the last reflection of our
-    /// own hello heard on this slave.
+    /// own hello heard on this port.
     peer_heard: Option<Instant>,
     self_heard: Option<Instant>,
-    /// Peers heard on this slave, most recent first — the escalation's targets, so it asks the
+    /// Peers heard on this port, most recent first — the escalation's targets, so it asks the
     /// members that were demonstrably reachable over this wire rather than all of them (spec §7).
     recent: Vec<u32>,
-    /// Until when this slave may not be suspected: it has just appeared, or just been promoted.
+    /// Until when this port may not be suspected: it has just appeared, or just been promoted.
     grace_until: Option<Instant>,
-    /// The ARP escalation is running on this slave.
+    /// The ARP escalation is running on this port.
     escalating: bool,
-    /// Condemned by F27: the peers' hellos stopped on this slave past the dead interval while a
+    /// Condemned by F27: the peers' hellos stopped on this port past the dead interval while a
     /// sibling still heard them and the engine confirmed no peer is adjacent over this bond.
     /// The wire is unusable however readily it answers ARP, and — this is the whole point — an
     /// ARP reply must never clear it, or the demoted wire looks reachable again within a tick,
     /// wins on preference, takes the bond back and dies again one dead interval later. Only a
-    /// hello (a peer's, or our own reflection once this slave is a backup) clears it.
+    /// hello (a peer's, or our own reflection once this port is a backup) clears it.
     hello_dead: bool,
-    /// The reason this slave's tap could not be opened, as it was last reported. `None` once it
+    /// The reason this port's tap could not be opened, as it was last reported. `None` once it
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
     deaf: Option<String>,
@@ -163,9 +163,9 @@ struct ProbeSlave {
 /// the fabric-wide worst case to a burst rather than a storm (spec §7).
 const ESCALATION_TARGETS: usize = 4;
 
-impl ProbeSlave {
-    fn new(ifname: String, wire: String, island: String, mac: [u8; 6]) -> ProbeSlave {
-        ProbeSlave {
+impl ProbePort {
+    fn new(ifname: String, wire: String, island: String, mac: [u8; 6]) -> ProbePort {
+        ProbePort {
             ifname,
             wire,
             island,
@@ -173,8 +173,8 @@ impl ProbeSlave {
             state: Hysteresis::default(),
             probed: false,
             carrier: false,
-            // Not present until a tick has read the netdev, so every slave starts its life in
-            // the grace period a re-enslaved one gets: at leg start no hello has arrived on any
+            // Not present until a tick has read the netdev, so every port starts its life in
+            // the grace period a re-added one gets: at leg start no hello has arrived on any
             // wire yet, and the first one to arrive must not condemn the others.
             present: false,
             last_reply: None,
@@ -205,7 +205,7 @@ impl ProbeSlave {
     }
 }
 
-/// Which slave each bond the prober actuates must name as `primary`: its current choice, which
+/// Which port each bond the prober actuates must name as `primary`: its current choice, which
 /// is the leg's home until the prober has a reason to hold another.
 ///
 /// The prober owns `primary` on those bonds — an `active_slave` write alone survives only until
@@ -217,14 +217,14 @@ impl ProbeSlave {
 pub struct HeldPrimaries(BTreeMap<String, String>);
 
 impl HeldPrimaries {
-    /// The slave this bond's `primary` must name, if the prober is holding one for it.
-    pub fn slave_for(&self, bond: &str) -> Option<&str> {
+    /// The port this bond's `primary` must name, if the prober is holding one for it.
+    pub fn port_for(&self, bond: &str) -> Option<&str> {
         self.0.get(bond).map(String::as_str)
     }
 
     /// Record a choice. The prober is the only production caller.
-    pub fn hold(&mut self, bond: &str, slave: &str) {
-        self.0.insert(bond.to_string(), slave.to_string());
+    pub fn hold(&mut self, bond: &str, port: &str) {
+        self.0.insert(bond.to_string(), port.to_string());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -281,12 +281,12 @@ impl Prober {
             let Ok(router) = gw.router.parse::<Ipv4Addr>() else {
                 continue;
             };
-            let slaves: Vec<ProbeSlave> = if r.migrates() {
-                r.slaves
+            let ports: Vec<ProbePort> = if r.migrates() {
+                r.ports
                     .iter()
                     .enumerate()
                     .map(|(i, s)| {
-                        ProbeSlave::new(
+                        ProbePort::new(
                             s.ifname.clone(),
                             s.wire.clone(),
                             island_of(&s.wire),
@@ -295,7 +295,7 @@ impl Prober {
                     })
                     .collect()
             } else {
-                vec![ProbeSlave::new(
+                vec![ProbePort::new(
                     r.ifname.clone(),
                     r.home.clone(),
                     island_of(&r.home),
@@ -308,7 +308,7 @@ impl Prober {
                 r.migrates(),
                 prefs_for(&r.zone),
                 &r.home,
-                slaves,
+                ports,
                 Kind::Ingress { router },
             ));
         }
@@ -337,17 +337,17 @@ impl Prober {
                         .any(|p| p.zone == r.zone)
                 })
                 .collect();
-            let slaves: Vec<ProbeSlave> = r
-                .slaves
+            let ports: Vec<ProbePort> = r
+                .ports
                 .iter()
                 .enumerate()
                 .map(|(i, s)| {
-                    ProbeSlave::new(
+                    ProbePort::new(
                         s.ifname.clone(),
                         s.wire.clone(),
                         island_of(&s.wire),
                         // The same synthetic-MAC scheme as the ingress prober, and it cannot
-                        // collide with one: the two families' slaves are different netdevs, and
+                        // collide with one: the two families' ports are different netdevs, and
                         // the index is per leg within a zone whose id is in the address.
                         frame::synthetic_mac(view.node(), z.id, i as u8),
                     )
@@ -359,7 +359,7 @@ impl Prober {
                 true,
                 prefs_for(&r.zone),
                 &r.home,
-                slaves,
+                ports,
                 Kind::Fallback(Fallback {
                     targets: peer_members
                         .iter()
@@ -405,7 +405,7 @@ impl Prober {
     }
 
     /// One round: read what has arrived, move a bond that belongs elsewhere, then ask again —
-    /// where "ask" is every slave of an ingress leg and only an escalating slave of a fallback
+    /// where "ask" is every port of an ingress leg and only an escalating port of a fallback
     /// leg, whose steady state sends nothing at all.
     ///
     /// Draining BEFORE sending is what gives a reply a whole `PROBE_INTERVAL` to arrive; the
@@ -419,7 +419,7 @@ impl Prober {
         self.report(now)
     }
 
-    /// The slave each bond the prober actuates must name as `primary`.
+    /// The port each bond the prober actuates must name as `primary`.
     pub fn held_primaries(&self) -> HeldPrimaries {
         HeldPrimaries(
             self.legs
@@ -438,10 +438,10 @@ impl Prober {
                 bond: l.bond.clone(),
                 active: l.active_now.clone(),
                 quiet: l.quiet(),
-                slaves: l
-                    .slaves
+                ports: l
+                    .ports
                     .iter()
-                    .map(|s| ProbedSlave {
+                    .map(|s| ProbedPort {
                         wire: s.wire.clone(),
                         island: s.island.clone(),
                         // A wire with no carrier reaches nothing, whatever the last three probes
@@ -493,13 +493,13 @@ impl Leg {
         actuates: bool,
         prefs: Vec<String>,
         home: &str,
-        slaves: Vec<ProbeSlave>,
+        ports: Vec<ProbePort>,
         kind: Kind,
     ) -> Leg {
-        let held = slaves
+        let held = ports
             .iter()
             .find(|s| s.wire == home)
-            .or_else(|| slaves.first())
+            .or_else(|| ports.first())
             .map(|s| s.ifname.clone())
             .unwrap_or_default();
         Leg {
@@ -509,7 +509,7 @@ impl Leg {
             prefs,
             held,
             active_now: None,
-            slaves,
+            ports,
             noted_no_carrier: None,
             refused: None,
             kind,
@@ -537,7 +537,7 @@ impl Leg {
         log: &mut Vec<String>,
     ) {
         // The kernel's own answer to "where is this bond", read once and used by everything
-        // below: the passive channel judges a slave by its role, and the decision compares
+        // below: the passive channel judges a port by its role, and the decision compares
         // against it. A leg whose `bonding/` cannot be read is a leg we do not own this tick.
         // A leg with nowhere to move to is not asked where it sits: the read would be a
         // guess about a netdev that is not a bond, and nothing would be done with the answer.
@@ -550,7 +550,7 @@ impl Leg {
     }
 
     /// `bonding/active_slave`, trimmed, or `None` when the leg is not a bond we can read. The
-    /// empty string — a bond with no active slave — reads as `Some("")`, which no slave matches.
+    /// empty string — a bond with no active port — reads as `Some("")`, which no port matches.
     fn read_active(&mut self, sys: &mut dyn Sys) -> Option<String> {
         let read = sys
             .read(&format!(
@@ -563,7 +563,7 @@ impl Leg {
         Some(active)
     }
 
-    /// Drain every tap, fold in what arrived, and decide what each slave's standing is now.
+    /// Drain every tap, fold in what arrived, and decide what each port's standing is now.
     fn observe(
         &mut self,
         sys: &mut dyn Sys,
@@ -575,15 +575,15 @@ impl Leg {
         let mut deaf = 0usize;
         // Wires whose tap has just started failing, and why. Held until the loop ends, because
         // whether this is "one wire cannot be judged" or "the leg is not probed at all" is not
-        // known until every slave has been tried.
+        // known until every port has been tried.
         let mut newly_deaf: Vec<(String, String)> = Vec::new();
-        for s in &mut self.slaves {
-            // Carrier is read for every slave, a deaf one included: whether the tap opened and
+        for s in &mut self.ports {
+            // Carrier is read for every port, a deaf one included: whether the tap opened and
             // whether the cable is in are different facts, and reporting a tap failure as lost
             // carrier would send an operator to the wrong end of it.
             let present = has_carrier(&*sys, &s.ifname);
             s.carrier = present.unwrap_or(false);
-            // A netdev that has just come back is a slave the kernel has just re-enslaved (F5).
+            // A netdev that has just come back is a port the kernel has just re-added (F5).
             // Judging it before a hello can arrive on it would confirm it dead for being new.
             if present.is_some() && !s.present {
                 s.grace_until = Some(now + grace_of(&self.kind));
@@ -618,8 +618,8 @@ impl Leg {
                         if let Some(rid) = frame::hello_router_id(fr) {
                             if rid == f.self_rid {
                                 s.self_heard = Some(now);
-                                // Our own reflection proves only a BACKUP slave's path to the
-                                // backbone; on the active slave it is not even expected.
+                                // Our own reflection proves only a BACKUP port's path to the
+                                // backbone; on the active port it is not even expected.
                                 heard_now |= active != Some(s.ifname.as_str());
                             } else if f.peers.contains(&rid) {
                                 s.peer_heard = Some(now);
@@ -643,7 +643,7 @@ impl Leg {
                 // A tick with no probe outstanding learns nothing on the RECEIVE side: the
                 // first tick has asked nobody anything, and a tick whose send failed is
                 // accounted for in `ask`. A failed `recv` IS a miss, though — the tap is on
-                // the slave, so losing it is the wire being unusable.
+                // the port, so losing it is the wire being unusable.
                 Kind::Ingress { .. } => {
                     if s.probed {
                         s.state.observe(replied);
@@ -677,7 +677,7 @@ impl Leg {
         }
         let zone = self.zone.clone();
         let bond = self.bond.clone();
-        let total = deaf > 0 && deaf == self.slaves.len();
+        let total = deaf > 0 && deaf == self.ports.len();
         let Kind::Fallback(f) = &mut self.kind else {
             return;
         };
@@ -697,9 +697,9 @@ impl Leg {
         if total {
             return;
         }
-        let evidence: Vec<Evidence> = self.slaves.iter().map(|s| s.evidence(active)).collect();
+        let evidence: Vec<Evidence> = self.ports.iter().map(|s| s.evidence(active)).collect();
         let verdicts = passive::verdicts(now, &evidence, &f.windows, !f.peers.is_empty());
-        // F27. On the ACTIVE slave, silence past the dead interval is no longer a matter of
+        // F27. On the ACTIVE port, silence past the dead interval is no longer a matter of
         // opinion: OSPF has given up on the adjacency by then. A wire that still answers ARP
         // would otherwise clear its own escalation every other tick forever (measured on pve1
         // 2026-09-07 with OSPF dropped on the active wire and unicast left alone: storm
@@ -707,7 +707,7 @@ impl Leg {
         // while the fallback adjacencies stay down. The engine's own neighbor table is the
         // second witness, and it is asked ONLY here — never on a healthy leg.
         let condemn: Vec<bool> = self
-            .slaves
+            .ports
             .iter()
             .zip(&verdicts)
             .map(|(s, v)| {
@@ -726,7 +726,7 @@ impl Leg {
                 Some(down) => {
                     f.noted_engine_unreadable = false;
                     if down {
-                        for (s, c) in self.slaves.iter_mut().zip(&condemn) {
+                        for (s, c) in self.ports.iter_mut().zip(&condemn) {
                             if *c {
                                 s.hello_dead = true;
                             }
@@ -744,8 +744,8 @@ impl Leg {
                 }
             }
         }
-        let mut all_quiet = !self.slaves.is_empty();
-        for (s, v) in self.slaves.iter_mut().zip(verdicts) {
+        let mut all_quiet = !self.ports.is_empty();
+        for (s, v) in self.ports.iter_mut().zip(verdicts) {
             match v {
                 // Within its window: nothing to ask. The verdict does not itself declare the
                 // wire live — only a frame that arrived does, above.
@@ -787,18 +787,18 @@ impl Leg {
         }
     }
 
-    /// Ask, where asking is warranted: every slave of an ingress leg, and only an escalating
-    /// slave of a fallback leg. A healthy fallback leg puts nothing on the wire at all.
+    /// Ask, where asking is warranted: every port of an ingress leg, and only an escalating
+    /// port of a fallback leg. A healthy fallback leg puts nothing on the wire at all.
     fn ask(&mut self, io: &mut dyn ProbeIo, now: Instant) {
         match &self.kind {
             Kind::Ingress { router } => {
-                for s in &mut self.slaves {
+                for s in &mut self.ports {
                     match io.send(&s.ifname, &frame::probe(s.mac, *router)) {
                         Ok(()) => s.probed = true,
                         // A probe we cannot even put on the wire is evidence about the wire, not
                         // a gap in our knowledge of it: the netdev went away with a re-enumerated
                         // USB NIC, or the socket cannot be bound. Fold it in HERE rather than
-                        // leaving the slave un-observed, or its state freezes at whatever it last
+                        // leaving the port un-observed, or its state freezes at whatever it last
                         // was and the leg stays pinned to a dead wire forever, silently.
                         Err(_) => {
                             s.probed = false;
@@ -808,7 +808,7 @@ impl Leg {
                 }
             }
             Kind::Fallback(f) => {
-                for s in &mut self.slaves {
+                for s in &mut self.ports {
                     if !s.escalating {
                         continue;
                     }
@@ -864,7 +864,7 @@ impl Leg {
         let base = format!("/sys/class/net/{}/bonding", self.bond);
         let active = active.filter(|a| !a.is_empty());
         let cands: Vec<Candidate> = self
-            .slaves
+            .ports
             .iter()
             .map(|s| Candidate {
                 ifname: s.ifname.clone(),
@@ -881,12 +881,12 @@ impl Leg {
         };
         self.noted_no_carrier = None;
         let to = self
-            .slaves
+            .ports
             .iter()
             .find(|s| s.ifname == target)
             .map(|s| s.wire.clone())
             .unwrap_or_else(|| target.clone());
-        let from = active.and_then(|a| self.slaves.iter().find(|s| s.ifname == a));
+        let from = active.and_then(|a| self.ports.iter().find(|s| s.ifname == a));
         // `primary` FIRST, then `active_slave`, and both every time (VERIFIED on the rack
         // 2026-09-07): an `active_slave` write alone holds only until the next link event, at
         // which point `primary_reselect=always` hands the bond straight back to the primary the
@@ -924,11 +924,11 @@ impl Leg {
         let from_carrier = from.map(|f| f.carrier);
         let from_reachable = from.map(|f| f.state.reachable());
         let from_hello_dead = from.is_some_and(|f| f.hello_dead);
-        // The slave that has just been promoted gets its grace period here: it was chosen after
+        // The port that has just been promoted gets its grace period here: it was chosen after
         // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
-        // interval. Without it a two-slave ping-pong could move once per tick.
+        // interval. Without it a two-port ping-pong could move once per tick.
         let grace = grace_of(&self.kind);
-        if let Some(s) = self.slaves.iter_mut().find(|s| s.ifname == target) {
+        if let Some(s) = self.ports.iter_mut().find(|s| s.ifname == target) {
             s.grace_until = Some(now + grace);
         }
         match (from_wire, from_carrier, from_reachable, from_hello_dead) {
@@ -956,7 +956,7 @@ impl Leg {
                 self.zone, self.bond
             )),
             (None, _, _, _) => log.push(format!(
-                "cfab: {} {family}: no slave of ours was active on {}, moved it to {to}",
+                "cfab: {} {family}: no port of ours was active on {}, moved it to {to}",
                 self.zone, self.bond
             )),
         }
@@ -1009,7 +1009,7 @@ impl Kind {
     }
 }
 
-/// How long a slave of this leg is left alone after it appears or is promoted. An ingress leg
+/// How long a port of this leg is left alone after it appears or is promoted. An ingress leg
 /// has no passive channel and no grace: it asks, every tick, and the answer is the answer.
 fn grace_of(kind: &Kind) -> Duration {
     match kind {
@@ -1055,10 +1055,10 @@ mod tests {
 
     const ROUTER: &str = "192.168.249.254";
     const BOND: &str = "cfab-gw249";
-    /// mgmt's primary domain is `c`, so the leg homes on eth0 and `primary` names this slave.
+    /// mgmt's primary domain is `c`, so the leg homes on eth0 and `primary` names this port.
     const HOME: &str = "cfab-gw249-c";
     /// mgmt's wire order is eth0, eth9, eth1 (rank 0 = the primary domain, then speed): the
-    /// first backup is the 5G wire on island a, NOT the first-enslaved one.
+    /// first backup is the 5G wire on island a, NOT the first-added one.
     const BACKUP: &str = "cfab-gw249-a";
 
     /// The shipped example: three wires per host (eth9 island a, eth1 island b, eth0 island c)
@@ -1079,11 +1079,11 @@ mod tests {
         Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// Every slave of the mgmt leg, enslave order.
-    const SLAVES: [&str; 3] = ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"];
+    /// Every port of the mgmt leg, join order.
+    const PORTS: [&str; 3] = ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"];
 
-    /// A bond sitting on `active`, with carrier on every slave — the healthy shape. Carrier is
-    /// part of it because the kernel refuses `bonding/active_slave` on a slave whose netdev has
+    /// A bond sitting on `active`, with carrier on every port — the healthy shape. Carrier is
+    /// part of it because the kernel refuses `bonding/active_slave` on a port whose netdev has
     /// none, so a test that wants a move to happen has to say the target can take it.
     fn bonding(active: &str) -> MockSys {
         let mut sys = MockSys::default()
@@ -1093,7 +1093,7 @@ mod tests {
             )
             .file(&format!("/sys/class/net/{BOND}/bonding/primary"), active)
             .file(&format!("/sys/class/net/{active}/carrier"), "1\n");
-        for s in SLAVES {
+        for s in PORTS {
             sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
         }
         sys
@@ -1105,7 +1105,7 @@ mod tests {
         let view = View::new(f, "pve1-tb").unwrap();
         let mut p = Prober::from_view(&view);
         p.legs.retain(|l| matches!(l.kind, Kind::Ingress { .. }));
-        let names = p.legs[0].slaves.iter().map(|s| s.ifname.clone()).collect();
+        let names = p.legs[0].ports.iter().map(|s| s.ifname.clone()).collect();
         (p, names)
     }
 
@@ -1125,13 +1125,13 @@ mod tests {
     }
 
     #[test]
-    fn every_slave_is_probed_with_its_own_source_address() {
+    fn every_port_is_probed_with_its_own_source_address() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let mut sys = bonding(HOME);
         let mut io = ScriptedIo::answering_on(ROUTER, &[]);
         p.tick(&mut sys, &mut io, Instant::now());
-        assert_eq!(io.sent.len(), names.len(), "one probe per slave per tick");
+        assert_eq!(io.sent.len(), names.len(), "one probe per port per tick");
         let mut macs: Vec<[u8; 6]> = io
             .sent
             .iter()
@@ -1140,7 +1140,7 @@ mod tests {
         let n = macs.len();
         macs.sort();
         macs.dedup();
-        assert_eq!(macs.len(), n, "each slave asks with its own MAC");
+        assert_eq!(macs.len(), n, "each port asks with its own MAC");
         for (_, fr) in &io.sent {
             assert_eq!(fr.len(), frame::PROBE_LEN);
             assert_eq!(&fr[0..6], &[0xff; 6], "broadcast");
@@ -1166,9 +1166,9 @@ mod tests {
             "a leaf's fallback path is a real path, and F20 is a real defect on it"
         );
         assert_eq!(
-            p.held_primaries().slave_for("cfab-st-fb"),
+            p.held_primaries().port_for("cfab-st-fb"),
             Some("cfab-st-fb-a"),
-            "and the watchdog must be told which slave to re-assert"
+            "and the watchdog must be told which port to re-assert"
         );
     }
 
@@ -1186,8 +1186,8 @@ mod tests {
             "{:?}",
             sys.calls
         );
-        assert!(rows[0].slaves.iter().all(|s| s.reachable), "{rows:?}");
-        assert!(rows[0].slaves.iter().all(|s| s.last_reply_ms.is_some()));
+        assert!(rows[0].ports.iter().all(|s| s.reachable), "{rows:?}");
+        assert!(rows[0].ports.iter().all(|s| s.last_reply_ms.is_some()));
     }
 
     /// The F21 fault: the active wire keeps carrier but the router stops answering over it.
@@ -1221,7 +1221,7 @@ mod tests {
             order[0].ends_with("/bonding/primary") && order[1].ends_with("/bonding/active_slave"),
             "primary must be written first, else the next link event undoes the move: {order:?}"
         );
-        assert!(!rows[0].slaves[2].reachable, "the home wire, island c");
+        assert!(!rows[0].ports[2].reachable, "the home wire, island c");
         assert_eq!(rows[0].active.as_deref(), Some(want));
     }
 
@@ -1239,7 +1239,7 @@ mod tests {
             "{:?}",
             sys.calls
         );
-        assert!(rows[0].slaves.iter().all(|s| !s.reachable));
+        assert!(rows[0].ports.iter().all(|s| !s.reachable));
     }
 
     #[test]
@@ -1258,7 +1258,7 @@ mod tests {
             sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/primary")),
             Some(HOME)
         );
-        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
+        assert_eq!(p.held_primaries().port_for(BOND), Some(HOME));
     }
 
     /// The bond is absent (a wire re-enumerated and took the whole leg with it): the prober
@@ -1277,12 +1277,12 @@ mod tests {
         );
     }
 
-    /// A slave whose probe cannot even be SENT — the netdev went away with a re-enumerated USB
+    /// A port whose probe cannot even be SENT — the netdev went away with a re-enumerated USB
     /// NIC — is a wire the router cannot be reached over, and must be folded in as a miss like
     /// any other. Freezing its state at "reachable" instead would pin ingress to a dead wire
     /// indefinitely: no move, no log line, and a row that reports the wire healthy.
     #[test]
-    fn a_slave_whose_probe_cannot_be_sent_goes_unreachable_and_the_bond_moves() {
+    fn a_port_whose_probe_cannot_be_sent_goes_unreachable_and_the_bond_moves() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1299,7 +1299,7 @@ mod tests {
             Some(BACKUP)
         );
         let home_row = rows[0]
-            .slaves
+            .ports
             .iter()
             .find(|s| s.wire == "eth0")
             .expect("the home wire has a row");
@@ -1319,11 +1319,11 @@ mod tests {
         let mut io = ScriptedIo::answering_on(ROUTER, &[]);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 3);
         assert!(
-            rows[0].slaves.iter().all(|s| s.reachable),
+            rows[0].ports.iter().all(|s| s.reachable),
             "3 ticks = 2 observations, not yet 3"
         );
         let rows = run_ticks(&mut p, &mut sys, &mut io, 1);
-        assert!(rows[0].slaves.iter().all(|s| !s.reachable));
+        assert!(rows[0].ports.iter().all(|s| !s.reachable));
     }
 
     /// Other traffic on the wire, and our own broadcast probe flooding back in through the
@@ -1341,8 +1341,8 @@ mod tests {
         ];
         io.answering.clear();
         let rows = run_ticks(&mut p, &mut sys, &mut io, 8);
-        assert!(rows[0].slaves.iter().all(|s| !s.reachable));
-        assert!(rows[0].slaves.iter().all(|s| s.last_reply_ms.is_none()));
+        assert!(rows[0].ports.iter().all(|s| !s.reachable));
+        assert!(rows[0].ports.iter().all(|s| s.last_reply_ms.is_none()));
     }
 
     /// A tick where nothing has arrived must return, not block: the supervisor's main loop is
@@ -1357,14 +1357,14 @@ mod tests {
         assert_eq!(
             io.recv_calls,
             names.len(),
-            "one non-blocking drain per slave"
+            "one non-blocking drain per port"
         );
     }
 
-    /// The rows `Components` publishes: one per zone with an ingress leg, every slave named by
+    /// The rows `Components` publishes: one per zone with an ingress leg, every port named by
     /// wire AND island, so an operator reading the JSON knows which switch to look at.
     #[test]
-    fn the_report_names_every_slaves_wire_and_island() {
+    fn the_report_names_every_ports_wire_and_island() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1375,7 +1375,7 @@ mod tests {
         assert_eq!(rows[0].zone, "mgmt");
         assert_eq!(rows[0].bond, BOND);
         let seen: Vec<(&str, &str)> = rows[0]
-            .slaves
+            .ports
             .iter()
             .map(|s| (s.wire.as_str(), s.island.as_str()))
             .collect();
@@ -1401,7 +1401,7 @@ mod tests {
         );
         assert!(
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
-            "a leg with no slaves is never actuated on: {:?}",
+            "a leg with no ports is never actuated on: {:?}",
             sys.calls
         );
         assert!(rows[0].active.is_none());
@@ -1434,7 +1434,7 @@ mod tests {
             BACKUP.to_string(),
         );
         let rows = run_ticks(&mut p, &mut sys, &mut io, 1);
-        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
+        assert_eq!(p.held_primaries().port_for(BOND), Some(HOME));
         assert_eq!(
             rows[0].active.as_deref(),
             Some(BACKUP),
@@ -1442,13 +1442,13 @@ mod tests {
         );
     }
 
-    /// F23, seen on the rack 2026-09-07 21:06:01 UTC: the home island lost power, its slave lost
+    /// F23, seen on the rack 2026-09-07 21:06:01 UTC: the home island lost power, its port lost
     /// carrier, and the kernel failed the bond over on its own. The prober's home wire was still
     /// inside its hysteresis, so the decision named it as the better-preferred target — and the
-    /// kernel refuses `bonding/active_slave` on a slave with no carrier (EINVAL). A slave
+    /// kernel refuses `bonding/active_slave` on a port with no carrier (EINVAL). A port
     /// without carrier is not a place ingress can be put: never a target, never reachable.
     #[test]
-    fn a_carrier_less_slave_is_never_a_move_target() {
+    fn a_carrier_less_port_is_never_a_move_target() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1459,11 +1459,11 @@ mod tests {
         let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
         assert!(
             !sys.calls.iter().any(|c| c.starts_with("write /sys")),
-            "a slave with no carrier is never written as active_slave: {:?}",
+            "a port with no carrier is never written as active_slave: {:?}",
             sys.calls
         );
         let home = rows[0]
-            .slaves
+            .ports
             .iter()
             .find(|s| s.wire == "eth0")
             .expect("the home wire has a row");
@@ -1487,7 +1487,7 @@ mod tests {
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 2);
         let home = rows[0]
-            .slaves
+            .ports
             .iter()
             .find(|s| s.wire == "eth0")
             .expect("the home wire has a row");
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     /// A sysfs write that fails anyway (the kernel has a precondition of its own we did not
-    /// model, or `/sys` is read-only): one WARN naming the slave and the OS error, no retry
+    /// model, or `/sys` is read-only): one WARN naming the port and the OS error, no retry
     /// while nothing has changed, and never the word FATAL — the prober is still running and
     /// the bond is still where it was.
     #[test]
@@ -1597,11 +1597,11 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut sys = bonding(HOME);
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
-        assert_eq!(p.held_primaries().slave_for(BOND), Some(HOME));
+        assert_eq!(p.held_primaries().port_for(BOND), Some(HOME));
         run_ticks(&mut p, &mut sys, &mut io, 3);
         io.dark(HOME);
         run_ticks(&mut p, &mut sys, &mut io, 4);
-        assert_eq!(p.held_primaries().slave_for(BOND), Some(BACKUP));
+        assert_eq!(p.held_primaries().port_for(BOND), Some(BACKUP));
     }
 
     // ---- the fallback legs (F20 / F21 class on the universal segments) -----------------
@@ -1612,7 +1612,7 @@ mod tests {
     const FB_A: &str = "cfab-st-fb-a";
     const FB_B: &str = "cfab-st-fb-b";
     const FB_C: &str = "cfab-st-fb-c";
-    const FB_SLAVES: [&str; 3] = [FB_A, FB_B, FB_C];
+    const FB_PORTS: [&str; 3] = [FB_A, FB_B, FB_C];
 
     /// One OSPF hello from the member with this node number, in the storage zone (block 10.99,
     /// so Router ID `10.99.0.<node>`). Only the Router ID is ever read from it.
@@ -1634,12 +1634,12 @@ mod tests {
         f
     }
 
-    /// The fallback bond sitting on `active`, every slave with carrier.
+    /// The fallback bond sitting on `active`, every port with carrier.
     fn fb_bonding(active: &str) -> MockSys {
         let mut sys = MockSys::default()
             .file(&format!("/sys/class/net/{FB}/bonding/active_slave"), active)
             .file(&format!("/sys/class/net/{FB}/bonding/primary"), active);
-        for s in FB_SLAVES {
+        for s in FB_PORTS {
             sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
         }
         sys
@@ -1667,9 +1667,9 @@ mod tests {
         fabric()
     }
 
-    /// Deliver `frames` on `slave` for the next tick only.
-    fn hear(io: &mut ScriptedIo, slave: &str, frames: &[Vec<u8>]) {
-        io.heard.insert(slave.to_string(), frames.to_vec());
+    /// Deliver `frames` on `port` for the next tick only.
+    fn hear(io: &mut ScriptedIo, port: &str, frames: &[Vec<u8>]) {
+        io.heard.insert(port.to_string(), frames.to_vec());
     }
 
     fn fb_tick(p: &mut Prober, sys: &mut MockSys, io: &mut ScriptedIo, now: Instant) -> ProbedLeg {
@@ -1717,18 +1717,18 @@ mod tests {
     }
 
     /// A member alone in a zone's universal segment expects nobody. It still runs the leg — its
-    /// own reflected hello judges the backup slaves, and the bond can still be on the wrong wire
+    /// own reflected hello judges the backup ports, and the bond can still be on the wrong wire
     /// — but it never asks, and never says it lost peers it does not have.
     #[test]
     fn a_lone_member_never_asks_and_still_fixes_the_wire() {
         let f = alone(&fabric());
         let mut p = fb_prober(&f, "pve1-tb");
-        // The kernel re-enslaved the 1G wire last after a re-enumeration, so the bond sits on
+        // The kernel re-added the 1G wire last after a re-enumeration, so the bond sits on
         // it while the 5G wire is idle: F20, with nothing wrong anywhere.
         let mut sys = fb_bonding(FB_B);
         let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
         let t0 = Instant::now();
-        // Our own hello comes back on the backup slaves, flooded through the backbone.
+        // Our own hello comes back on the backup ports, flooded through the backbone.
         hear(&mut io, FB_B, &[hello(1)]);
         hear(&mut io, FB_C, &[hello(1)]);
         let row = fb_tick(&mut p, &mut sys, &mut io, t0);
@@ -1768,7 +1768,7 @@ mod tests {
 
         // Steady state: every wire hears the peers, and nothing at all is sent.
         for tick in 0..4u64 {
-            for s in FB_SLAVES {
+            for s in FB_PORTS {
                 hear(&mut io, s, &[hello(2), hello(3)]);
             }
             fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
@@ -1807,7 +1807,7 @@ mod tests {
         let row = last.unwrap();
         assert!(!row.quiet);
         assert!(
-            !row.slaves
+            !row.ports
                 .iter()
                 .find(|s| s.wire == "eth9")
                 .unwrap()
@@ -1816,10 +1816,10 @@ mod tests {
         );
     }
 
-    /// Dwell: the slave just promoted gets one dead interval before it can be suspected. Without
-    /// it, a segment nobody can hear would walk the bond around its slaves once per tick.
+    /// Dwell: the port just promoted gets one dead interval before it can be suspected. Without
+    /// it, a segment nobody can hear would walk the bond around its ports once per tick.
     #[test]
-    fn a_just_promoted_slave_is_not_suspected_again_within_the_dead_interval() {
+    fn a_just_promoted_port_is_not_suspected_again_within_the_dead_interval() {
         let f = fabric();
         let mut p = fb_prober(&f, "pve1-tb");
         let mut sys = fb_bonding(FB_A);
@@ -1827,7 +1827,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
         for tick in 0..4u64 {
-            for s in FB_SLAVES {
+            for s in FB_PORTS {
                 hear(&mut io, s, &[hello(2)]);
             }
             fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
@@ -1861,7 +1861,7 @@ mod tests {
         );
     }
 
-    /// Silence vs absence, on the wire: with every slave quiet the fault is not per-wire, so the
+    /// Silence vs absence, on the wire: with every port quiet the fault is not per-wire, so the
     /// bond is left where it is, nobody is asked, and it is said once.
     #[test]
     fn a_leg_that_hears_nothing_anywhere_is_left_alone_and_said_once() {
@@ -1871,7 +1871,7 @@ mod tests {
         let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
         let t0 = Instant::now();
         for tick in 0..3u64 {
-            for s in FB_SLAVES {
+            for s in FB_PORTS {
                 hear(&mut io, s, &[hello(2)]);
             }
             fb_tick(
@@ -1892,13 +1892,13 @@ mod tests {
             ));
         }
         assert!(row.unwrap().quiet, "the leg says the fault is not per-wire");
-        // The active slave IS asked once on the way down — its window is a hello and a half
+        // The active port IS asked once on the way down — its window is a hello and a half
         // and the backups' is the dead interval, so for a moment it is the only silent wire.
         // What must not happen is asking after the leg has gone quiet, which is the state that
         // has no per-wire answer at all.
         // — and the bond may move once for it, which is the design working. What must not
         // happen is anything at all after the leg has gone quiet: that state has no per-wire
-        // answer, so asking or moving again would be walking the bond around its slaves.
+        // answer, so asking or moving again would be walking the bond around its ports.
         let asked = io.sent.len();
         let written = sys
             .calls
@@ -1934,7 +1934,7 @@ mod tests {
         );
     }
 
-    /// The kernel refuses `active_slave` on a slave with no carrier (F23), and a slave with no
+    /// The kernel refuses `active_slave` on a port with no carrier (F23), and a port with no
     /// carrier reaches nothing anyway. Inherited whole from the ingress prober's decision.
     #[test]
     fn a_carrier_less_wire_is_never_a_target_and_never_written() {
@@ -2068,7 +2068,7 @@ mod tests {
         let mut p = fb_prober(&f, "pve3-tb");
         let mut sys = fb_bonding(FB_A);
         let mut io = ScriptedIo::answering_on("10.99.9.1", &[]);
-        io.deaf = FB_SLAVES.iter().map(|s| s.to_string()).collect();
+        io.deaf = FB_PORTS.iter().map(|s| s.to_string()).collect();
         let t0 = Instant::now();
         for tick in 0..6u64 {
             fb_tick(
@@ -2081,7 +2081,7 @@ mod tests {
         let log = p.drain_log();
         assert_eq!(
             log.iter().filter(|l| l.contains("cannot listen")).count(),
-            FB_SLAVES.len(),
+            FB_PORTS.len(),
             "once per wire, then never again: {log:?}"
         );
         assert!(
@@ -2126,7 +2126,7 @@ mod tests {
     /// Four ticks of every wire hearing both peers: the steady state every F27 case starts in.
     fn fb_steady(p: &mut Prober, sys: &mut MockSys, io: &mut ScriptedIo, t0: Instant) {
         for tick in 0..4u64 {
-            for s in FB_SLAVES {
+            for s in FB_PORTS {
                 hear(io, s, &[hello(2), hello(3)]);
             }
             fb_tick(p, sys, io, t0 + Duration::from_millis(tick * 500));
@@ -2134,7 +2134,7 @@ mod tests {
     }
 
     /// F27, measured on pve1 2026-09-07 with an nft rule dropping only OSPF on the active wire:
-    /// the peers' hellos stop on the active slave while its ARP still answers, so the escalation
+    /// the peers' hellos stop on the active port while its ARP still answers, so the escalation
     /// clears itself every other tick and the bond never moves — while OSPF tears the adjacency
     /// down at the dead interval and leaves it down. Once the engine agrees the adjacency is
     /// gone, silence outranks the ARP reply.
@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     /// The guard: the prober's opinion alone never condemns a wire that answers. While the
-    /// engine still has an adjacency over the bond, hello silence on the active slave is left
+    /// engine still has an adjacency over the bond, hello silence on the active port is left
     /// to the ARP escalation exactly as it was in 0.4.7.
     #[test]
     fn hello_silence_with_a_peer_still_adjacent_never_moves_the_bond() {
@@ -2295,7 +2295,7 @@ mod tests {
 
         // The multicast comes back: one hello revives the wire, and it is the preferred one.
         for tick in 26..30u64 {
-            for s in FB_SLAVES {
+            for s in FB_PORTS {
                 hear(&mut io, s, &[hello(2), hello(3)]);
             }
             fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));

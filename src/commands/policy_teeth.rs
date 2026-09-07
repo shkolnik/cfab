@@ -63,7 +63,7 @@ fn run_inner(sys: &mut dyn Sys, view: &View, conf_text: &str) -> Result<TeethRep
     // fixture's router carries a veth stand-in for each — proves the generated ruleset does not
     // special-case them out. No endpoint netns test exercises a fallback ifname directly (no
     // production traffic addresses it in this fixture); the container proof on real hardware is
-    // the only proof of actual fallback transit (Task 7.2(c)). Slaves are NOT added: they carry no
+    // the only proof of actual fallback transit (Task 7.2(c)). Ports are NOT added: they carry no
     // L3 and are not in any forward-policy set.
     ifs.extend(view.fallback_rows().into_iter().map(|r| r.ifname));
     ifs.extend(view.admin_ifs().into_iter().map(|a| a.to_string()));

@@ -1,31 +1,31 @@
-//! The passive channel's arithmetic: how long silence on one slave is allowed to last, and what
-//! that silence means when the slave next to it is hearing the same peers.
+//! The passive channel's arithmetic: how long silence on one port is allowed to last, and what
+//! that silence means when the port next to it is hearing the same peers.
 //!
 //! Pure — no clock of its own, no `Sys`, no socket — because these are the parts that decide
 //! whether a fabric moves its fallback path or leaves it alone.
 
 use std::time::{Duration, Instant};
 
-/// The windows one leg judges its slaves by, all three derived from `[ospf]` (spec §5). Nothing
+/// The windows one leg judges its ports by, all three derived from `[ospf]` (spec §5). Nothing
 /// here is a knob: the fabric already declares how often it says hello and how long it waits
 /// before declaring a neighbor dead, and those two numbers are the whole of the timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Windows {
-    /// Silence on the ACTIVE slave that still counts as healthy: one hello period and a half,
+    /// Silence on the ACTIVE port that still counts as healthy: one hello period and a half,
     /// so a single lost hello is not a verdict.
     pub active: Duration,
-    /// Silence on a BACKUP slave that still counts as healthy. A backup is judged by our own
+    /// Silence on a BACKUP port that still counts as healthy. A backup is judged by our own
     /// reflected hello, which crosses the backbone twice and is the thing a switch is most
     /// likely to delay, so it gets the full dead interval before it is suspected.
     pub backup: Duration,
-    /// How long a slave that has just been created, re-enslaved or promoted is left alone. A
+    /// How long a port that has just been created, re-added, or promoted is left alone. A
     /// re-enumerated USB NIC (F5) would otherwise be confirmed dead before the first hello can
     /// arrive on it.
     pub grace: Duration,
     /// The declared dead interval itself: the moment OSPF stops believing in an adjacency, and
-    /// so the moment hello silence on the active slave stops being a matter of opinion (F27).
+    /// so the moment hello silence on the active port stops being a matter of opinion (F27).
     /// Numerically the same as `backup`; kept as its own name because the two are answers to
-    /// different questions and only one of them is about a backup slave.
+    /// different questions and only one of them is about a backup port.
     pub dead: Duration,
 }
 
@@ -41,7 +41,7 @@ impl Windows {
         }
     }
 
-    /// Does a move still land inside the dead interval? Suspicion on the active slave takes
+    /// Does a move still land inside the dead interval? Suspicion on the active port takes
     /// `active`, the confirming escalation tick takes one more `tick`, and the move is written
     /// on that same tick — so `active + tick` must fit inside the dead interval, or OSPF gives
     /// up on the adjacency before the prober has finished having an opinion about it.
@@ -50,26 +50,26 @@ impl Windows {
     }
 }
 
-/// What one slave has heard, and how it is being used, as this tick sees it.
+/// What one port has heard, and how it is being used, as this tick sees it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Evidence {
-    /// This slave is the one the bond is currently active on.
+    /// This port is the one the bond is currently active on.
     pub active: bool,
-    /// The last time a PEER's OSPF packet arrived on this slave.
+    /// The last time a PEER's OSPF packet arrived on this port.
     pub peer: Option<Instant>,
-    /// The last time OUR OWN hello arrived back on this slave, flooded through the backbone.
-    /// Only a backup slave can see it (the active slave's own hello leaves on that slave and
-    /// never comes back to it), and only that slave's own reachability to the backbone is what
+    /// The last time OUR OWN hello arrived back on this port, flooded through the backbone.
+    /// Only a backup port can see it (the active port's own hello leaves on that port and
+    /// never comes back to it), and only that port's own reachability to the backbone is what
     /// it proves — which is exactly the fault a lone member could otherwise not see at all.
     pub reflected: Option<Instant>,
-    /// Until when this slave is in its grace period, if it is.
+    /// Until when this port is in its grace period, if it is.
     pub grace_until: Option<Instant>,
 }
 
 impl Evidence {
-    /// The last moment this slave showed any life that counts for its current role.
+    /// The last moment this port showed any life that counts for its current role.
     fn last(&self, now: Instant) -> Option<Instant> {
-        // Our reflection is evidence for a BACKUP slave only. On the active slave it is never
+        // Our reflection is evidence for a BACKUP port only. On the active port it is never
         // expected, so its absence must never be read as a miss.
         let candidates = [
             self.peer,
@@ -79,7 +79,7 @@ impl Evidence {
     }
 }
 
-/// One slave's standing for this tick.
+/// One port's standing for this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Heard something within its window: live, and the counted hysteresis is reset.
@@ -87,28 +87,23 @@ pub enum Verdict {
     /// Not heard from recently enough to be called good, and not for long enough — or not with
     /// enough company — to be called suspect. Nothing changes.
     Watch,
-    /// Silent past its window while a sibling slave of the same leg is hearing the fabric: this
+    /// Silent past its window while a sibling port of the same leg is hearing the fabric: this
     /// wire, specifically, is the problem. Escalate.
     Suspect,
-    /// Silent, and so is every other slave of this leg. The fault is not per-wire, so there is
+    /// Silent, and so is every other port of this leg. The fault is not per-wire, so there is
     /// nowhere to move to and nothing to ask: say so once and leave the bond alone.
     Quiet,
 }
 
-/// Every slave of one leg, judged together — because "this wire is dead" is only ever a claim
+/// Every port of one leg, judged together — because "this wire is dead" is only ever a claim
 /// relative to the wires beside it (spec §5, silence vs absence).
 ///
 /// `expect_peers` is false on a member that is alone in a zone's universal segment. Such a
-/// member still runs the leg — its own reflection makes its backup slaves judgeable, and F20
+/// member still runs the leg — its own reflection makes its backup ports judgeable, and F20
 /// (the bond sitting on the wrong wire after a re-enumeration) is a real defect when alone —
 /// but it never suspects a wire of losing peers it does not have, and never says it did.
-pub fn verdicts(
-    now: Instant,
-    slaves: &[Evidence],
-    w: &Windows,
-    expect_peers: bool,
-) -> Vec<Verdict> {
-    let good: Vec<bool> = slaves
+pub fn verdicts(now: Instant, ports: &[Evidence], w: &Windows, expect_peers: bool) -> Vec<Verdict> {
+    let good: Vec<bool> = ports
         .iter()
         .map(|e| {
             e.last(now)
@@ -116,7 +111,7 @@ pub fn verdicts(
         })
         .collect();
     let any_good = good.iter().any(|g| *g);
-    slaves
+    ports
         .iter()
         .zip(&good)
         .map(|(e, g)| {
@@ -206,11 +201,11 @@ mod tests {
         }
     }
 
-    /// The reflection is a BACKUP slave's evidence only. On the active slave it is never
-    /// expected — our own hello leaves on that slave and does not come back to it — so its
-    /// presence must not make the active slave look good, and its absence is never a miss.
+    /// The reflection is a BACKUP port's evidence only. On the active port it is never
+    /// expected — our own hello leaves on that port and does not come back to it — so its
+    /// presence must not make the active port look good, and its absence is never a miss.
     #[test]
-    fn our_reflection_counts_for_a_backup_slave_and_never_for_the_active_one() {
+    fn our_reflection_counts_for_a_backup_port_and_never_for_the_active_one() {
         let t0 = Instant::now();
         let backup = Evidence {
             active: false,
@@ -229,17 +224,17 @@ mod tests {
         assert_ne!(
             verdicts(at(t0, 1000), &[active], &w(), true),
             vec![Verdict::Good],
-            "the active slave cannot be judged by a frame it can never receive"
+            "the active port cannot be judged by a frame it can never receive"
         );
     }
 
-    /// A backup gets the full dead interval before it is suspected; the active slave gets a
+    /// A backup gets the full dead interval before it is suspected; the active port gets a
     /// hello and a half.
     #[test]
     fn the_two_roles_are_suspected_on_different_clocks() {
         let t0 = Instant::now();
-        // The active slave is silent; a backup hears a peer, so there is somewhere to go.
-        let slaves = [
+        // The active port is silent; a backup hears a peer, so there is somewhere to go.
+        let ports = [
             Evidence {
                 active: true,
                 peer: Some(t0),
@@ -251,20 +246,20 @@ mod tests {
                 ..Evidence::default()
             },
         ];
-        let mut late = slaves;
+        let mut late = ports;
         late[1].peer = Some(at(t0, 2000));
         assert_eq!(
             verdicts(at(t0, 2200), &late, &w(), true),
             vec![Verdict::Suspect, Verdict::Good],
-            "the active slave is 2.2 s silent, past its 1.5 s"
+            "the active port is 2.2 s silent, past its 1.5 s"
         );
-        let mut backup_silent = slaves;
+        let mut backup_silent = ports;
         backup_silent[0].peer = Some(at(t0, 2000));
         assert_eq!(
             verdicts(at(t0, 2200), &backup_silent, &w(), true),
             vec![Verdict::Good, Verdict::Good],
             "a backup 2.2 s silent is still good: its window is the 3 s dead interval, and the \
-             same silence on the active slave above was already suspect"
+             same silence on the active port above was already suspect"
         );
         assert_eq!(
             verdicts(at(t0, 3200), &backup_silent, &w(), true),
@@ -275,9 +270,9 @@ mod tests {
     /// Silence vs absence: with nobody hearing anything, the fault is not per-wire. No wire is
     /// suspected, so nothing is asked and nothing is moved.
     #[test]
-    fn a_leg_where_no_slave_hears_anyone_is_quiet_not_suspect() {
+    fn a_leg_where_no_port_hears_anyone_is_quiet_not_suspect() {
         let t0 = Instant::now();
-        let slaves = [
+        let ports = [
             Evidence {
                 active: true,
                 peer: Some(t0),
@@ -290,17 +285,17 @@ mod tests {
             },
         ];
         assert_eq!(
-            verdicts(at(t0, 4000), &slaves, &w(), true),
+            verdicts(at(t0, 4000), &ports, &w(), true),
             vec![Verdict::Quiet, Verdict::Quiet]
         );
     }
 
-    /// A slave that has never heard anything at all is in the same position as one that has
+    /// A port that has never heard anything at all is in the same position as one that has
     /// gone silent — it is not quietly assumed good.
     #[test]
-    fn a_slave_that_has_never_heard_anything_is_judged_too() {
+    fn a_port_that_has_never_heard_anything_is_judged_too() {
         let t0 = Instant::now();
-        let slaves = [
+        let ports = [
             Evidence {
                 active: true,
                 peer: Some(at(t0, 3900)),
@@ -312,17 +307,17 @@ mod tests {
             },
         ];
         assert_eq!(
-            verdicts(at(t0, 4000), &slaves, &w(), true),
+            verdicts(at(t0, 4000), &ports, &w(), true),
             vec![Verdict::Good, Verdict::Suspect]
         );
     }
 
-    /// Grace: a slave that has just come back (a re-enumerated USB NIC, F5) or has just been
+    /// Grace: a port that has just come back (a re-enumerated USB NIC, F5) or has just been
     /// promoted cannot be suspected before a hello has had time to arrive on it.
     #[test]
-    fn a_slave_in_its_grace_period_is_never_suspect() {
+    fn a_port_in_its_grace_period_is_never_suspect() {
         let t0 = Instant::now();
-        let slaves = [
+        let ports = [
             Evidence {
                 active: true,
                 peer: Some(at(t0, 3900)),
@@ -335,11 +330,11 @@ mod tests {
             },
         ];
         assert_eq!(
-            verdicts(at(t0, 4000), &slaves, &w(), true),
+            verdicts(at(t0, 4000), &ports, &w(), true),
             vec![Verdict::Good, Verdict::Watch]
         );
         assert_eq!(
-            verdicts(at(t0, 5100), &slaves, &w(), true),
+            verdicts(at(t0, 5100), &ports, &w(), true),
             vec![Verdict::Good, Verdict::Suspect],
             "and is judged normally once the grace ends"
         );
@@ -351,7 +346,7 @@ mod tests {
     #[test]
     fn a_lone_member_never_suspects_a_wire() {
         let t0 = Instant::now();
-        let slaves = [
+        let ports = [
             Evidence {
                 active: true,
                 ..Evidence::default()
@@ -363,7 +358,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            verdicts(at(t0, 4000), &slaves, &w(), false),
+            verdicts(at(t0, 4000), &ports, &w(), false),
             vec![Verdict::Watch, Verdict::Good],
             "the reflection still marks the backup good; nothing is ever suspected"
         );

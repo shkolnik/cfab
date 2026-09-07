@@ -117,7 +117,7 @@ pub(crate) struct Shared {
     wd_last_tick: Option<Instant>,
     /// The prober's latest rows, republished on every probe tick.
     probed: crate::prober::ProbeRows,
-    /// The slave the prober holds each bond's `primary` on. Read by the forwarding watchdog,
+    /// The port the prober holds each bond's `primary` on. Read by the forwarding watchdog,
     /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
 }
@@ -2047,13 +2047,13 @@ mod tests {
     }
 
     /// The declaration change that moves the most netdevs under a running fabric: the ingress
-    /// leg's `gw` scope flipped between `any` (an active-backup bond with one tagged slave per
+    /// leg's `gw` scope flipped between `any` (an active-backup bond with one tagged port per
     /// wire) and a single domain (one plain sub-interface) — two shapes under the SAME name.
     ///
     /// The claim under test is that the reload path needs no special case for it: the stop
     /// sequence tears down under the declaration the supervisor was STARTED on (finding F2's
-    /// fix), so the bond AND its slaves go, and the restart builds the plain leg from scratch.
-    /// Torn down under the new file instead, the bond's slaves would be nameless and stranded.
+    /// fix), so the bond AND its ports go, and the restart builds the plain leg from scratch.
+    /// Torn down under the new file instead, the bond's ports would be nameless and stranded.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sighup_that_flips_the_gw_scope_tears_down_the_leg_the_old_declaration_built() {
         let o = reload_with(|m, dir| {
@@ -2063,7 +2063,7 @@ mod tests {
             );
             // The leg the OLD (shipped, `any`) declaration built, live on the box: the bond,
             // its parameters as `up` created them (so the initial apply accepts it rather than
-            // refusing an unproven bond), and one tagged slave per wire.
+            // refusing an unproven bond), and one tagged port per wire.
             for (param, value) in [
                 ("mode", "active-backup 1\n"),
                 ("miimon", "100\n"),
@@ -2083,7 +2083,7 @@ mod tests {
                     &["ip", "-d", "link", "show", "cfab-gw249"],
                     "20: cfab-gw249: bond \n",
                 );
-            for (i, (slave, wire)) in [
+            for (i, (port, wire)) in [
                 ("cfab-gw249-a", "eth9"),
                 ("cfab-gw249-b", "eth1"),
                 ("cfab-gw249-c", "eth0"),
@@ -2093,12 +2093,12 @@ mod tests {
             {
                 sys = sys
                     .on_stdout(
-                        &["ip", "link", "show", slave],
-                        &format!("{}: {slave}\n", 21 + i),
+                        &["ip", "link", "show", port],
+                        &format!("{}: {port}\n", 21 + i),
                     )
                     .on_stdout(
-                        &["ip", "-d", "link", "show", slave],
-                        &format!("{}: {slave}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
+                        &["ip", "-d", "link", "show", port],
+                        &format!("{}: {port}@{wire}: vlan protocol 802.1Q id 249 \n", 21 + i),
                     );
             }
             *m = sys;
@@ -2122,7 +2122,7 @@ mod tests {
                 "ip link del cfab-gw249-b",
                 "ip link del cfab-gw249-c",
             ],
-            "the stop sequence removes the leg the OLD declaration built, slaves included: {:?}",
+            "the stop sequence removes the leg the OLD declaration built, ports included: {:?}",
             o.calls
         );
     }
@@ -2349,7 +2349,7 @@ mod tests {
     }
 
     /// The prober tick publishes both things the rest of the supervisor reads from it: the rows
-    /// `cfab status` renders, and the slave the forwarding watchdog must put `primary` back on.
+    /// `cfab status` renders, and the port the forwarding watchdog must put `primary` back on.
     #[test]
     fn the_prober_tick_publishes_its_rows_and_the_primary_it_holds() {
         let f = example_fabric();
@@ -2370,9 +2370,9 @@ mod tests {
         let snap = shared.lock().unwrap().components(Instant::now());
         assert_eq!(snap.ingress.len(), 1, "{:?}", snap.ingress);
         assert_eq!(snap.ingress[0].zone, "mgmt");
-        assert_eq!(snap.ingress[0].slaves.len(), 3);
+        assert_eq!(snap.ingress[0].ports.len(), 3);
         assert_eq!(
-            shared.lock().unwrap().held.slave_for("cfab-gw249"),
+            shared.lock().unwrap().held.port_for("cfab-gw249"),
             Some("cfab-gw249-c"),
             "the watchdog must be told what the prober holds"
         );
@@ -2534,7 +2534,7 @@ mod tests {
 
     /// A healthy leaf forwarding posture for `fwd_watchdog::run` (mirrors its own leaf fixture):
     /// every L3 leg's `rp_filter` loose and `forwarding` off, every `ip rule` cfab installed
-    /// present, and each fallback bond active on a slave of ours.
+    /// present, and each fallback bond active on a port of ours.
     fn healthy_leaf_sys(view: &View) -> MockSys {
         use crate::commands::common;
         let legs: Vec<String> = view
@@ -2570,10 +2570,10 @@ mod tests {
         }
         for r in view.fallback_rows() {
             let home = r
-                .slaves
+                .ports
                 .iter()
                 .find(|s| s.wire == r.home)
-                .expect("the home wire is one of the slaves");
+                .expect("the home wire is one of the ports");
             sys = sys.file(
                 &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
                 &format!("{}\n", home.ifname),

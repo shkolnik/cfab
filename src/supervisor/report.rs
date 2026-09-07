@@ -35,18 +35,20 @@ pub struct ProbedLeg {
     /// The leg netdev: a bond on gw scope `any` or a universal segment, a plain sub-interface on
     /// a single-domain ingress leg.
     pub bond: String,
-    /// The slave the prober is holding the bond on; `null` for a leg that cannot migrate.
+    /// The port the prober is holding the bond on; `null` for a leg that cannot migrate.
     pub active: Option<String>,
     /// No wire of this leg has heard anything at all. The fault is then not per-wire: there is
     /// nowhere to move to, so nothing was moved (spec §5 rule 2). Only a fallback leg can be
     /// quiet — an ingress leg asks rather than listens.
     #[serde(default)]
     pub quiet: bool,
-    pub slaves: Vec<ProbedSlave>,
+    /// `slaves` until 0.4.7: a status binary must still read a running older supervisor.
+    #[serde(default, alias = "slaves")]
+    pub ports: Vec<ProbedPort>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProbedSlave {
+pub struct ProbedPort {
     pub wire: String,
     /// The switch domain this wire lands in — which switch to go look at.
     pub island: String,
@@ -152,6 +154,19 @@ pub fn render_line(c: &Components) -> String {
 mod tests {
     use super::*;
 
+    /// A leg as a 0.4.7 supervisor publishes it: the members under `slaves`. A newer status
+    /// binary reading an older running supervisor must still see the wires.
+    #[test]
+    fn a_leg_published_under_the_old_slaves_key_still_reads() {
+        let leg: ProbedLeg = serde_json::from_str(
+            r#"{"zone": "st", "bond": "cfab-st-fb", "active": "cfab-st-fb-a",
+                "slaves": [{"wire": "cfab-st-fb-a", "island": "a", "reachable": true, "last_reply_ms": 12}]}"#,
+        )
+        .unwrap();
+        assert_eq!(leg.ports.len(), 1);
+        assert_eq!(leg.ports[0].wire, "cfab-st-fb-a");
+    }
+
     /// The document a supervisor with one running engine, one crash-looping shape-daemon and
     /// a conf-sync this member does not run would publish (spec §9).
     const FIXTURE: &str = r#"{
@@ -206,7 +221,7 @@ mod tests {
           "supervisor": {"pid": 1, "uptime_s": 1, "applying": false, "applies": 1, "last_apply_error": null},
           "components": [],
           "watchdog": {"last_tick_s_ago": 1, "result": "ok", "detail": null},
-          "ingress": [{"zone": "mgmt", "bond": "cfab-gw249", "active": "cfab-gw249-a", "slaves": [
+          "ingress": [{"zone": "mgmt", "bond": "cfab-gw249", "active": "cfab-gw249-a", "ports": [
             {"wire": "eth9", "island": "a", "reachable": true,  "last_reply_ms": 2},
             {"wire": "eth0", "island": "c", "reachable": false, "last_reply_ms": null}
           ]}]
@@ -214,11 +229,11 @@ mod tests {
         let c: Components = serde_json::from_str(with_rows).unwrap();
         assert_eq!(c.ingress[0].zone, "mgmt");
         assert_eq!(c.ingress[0].active.as_deref(), Some("cfab-gw249-a"));
-        assert_eq!(c.ingress[0].slaves[1].island, "c");
-        assert!(!c.ingress[0].slaves[1].reachable);
-        assert_eq!(c.ingress[0].slaves[1].last_reply_ms, None);
+        assert_eq!(c.ingress[0].ports[1].island, "c");
+        assert!(!c.ingress[0].ports[1].reachable);
+        assert_eq!(c.ingress[0].ports[1].last_reply_ms, None);
         let back: Components = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
-        assert_eq!(back.ingress[0].slaves[0].last_reply_ms, Some(2));
+        assert_eq!(back.ingress[0].ports[0].last_reply_ms, Some(2));
         // The rows are their own document: nothing about them reaches the components line.
         assert_eq!(render_line(&back), render_line(&c));
     }
