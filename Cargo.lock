@@ -210,6 +210,7 @@ dependencies = [
  "holo-utils",
  "holo-yang",
  "ipnetwork",
+ "libc",
  "nix 0.31.3",
  "schemars 1.2.2",
  "sd-notify",
