@@ -20,6 +20,7 @@ pub mod bpf;
 pub mod decide;
 pub mod frame;
 pub mod io;
+pub mod passive;
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
