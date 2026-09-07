@@ -87,13 +87,17 @@ pub struct Candidate {
     pub wire: String,
     /// The router answers over this wire (the probe state machine above).
     pub reachable: bool,
-    /// The port's netdev has carrier. The kernel refuses `bonding/active_slave` on a port
-    /// whose link is not up — `EINVAL`, "either the port is down or the link is down"
-    /// (VERIFIED on the rack 2026-09-07, finding F23) — so a carrier-less port is not a place
-    /// ingress can be put, however recently the router answered over it. It is also not a wire
-    /// the router can be reached over at all, which is why it is excluded here rather than
-    /// waited out through the hysteresis: three ticks of "reachable" on a dead wire is three
-    /// refused writes.
+    /// The kernel would accept `bonding/active_slave` naming this port: its netdev has carrier
+    /// AND the bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
+    /// Carrier alone is not enough — the driver holds a returning port's `mii_status` at
+    /// `going_back` for `updelay` after carrier comes back, and the kernel refuses the write
+    /// during that window just as it does with no carrier at all (`EINVAL`, "either the port is
+    /// down or the link is down"; both halves VERIFIED on the rack 2026-09-07, findings F23 and
+    /// F24). Named `carrier` for history, not because carrier alone decides it: a port failing
+    /// either half is not a place ingress can be put, however recently the router answered over
+    /// it, and not a wire the router can be reached over at all — which is why it is excluded
+    /// here rather than waited out through the hysteresis: three ticks of "reachable" on it
+    /// would be three refused writes.
     pub carrier: bool,
 }
 

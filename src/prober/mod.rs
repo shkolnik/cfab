@@ -129,6 +129,14 @@ struct ProbePort {
     /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
     /// to believe it is three refused `active_slave` writes (F23).
     carrier: bool,
+    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`), read alongside
+    /// `carrier`. Carrier goes to 1 the instant a cable is plugged back in, but the driver holds
+    /// this file below `up` (`going_back`) for `updelay`, and the kernel's `active_slave` write
+    /// requires BOTH carrier and this file `up` (`bond_option_active_slave_set` ->
+    /// `bond_slave_is_up`, VERIFIED against the kernel source 2026-09-07, F24). Missing or
+    /// unreadable (port not in a bond) reads as NOT up: the kernel would refuse the write either
+    /// way, so treating it as eligible would just trade one refusal for another.
+    bond_link_up: bool,
     /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
     /// that has just come back is a port that has just been re-added, which is where the
     /// grace period comes from.
@@ -173,6 +181,7 @@ impl ProbePort {
             state: Hysteresis::default(),
             probed: false,
             carrier: false,
+            bond_link_up: false,
             // Not present until a tick has read the netdev, so every port starts its life in
             // the grace period a re-added one gets: at leg start no hello has arrived on any
             // wire yet, and the first one to arrive must not condemn the others.
@@ -475,6 +484,18 @@ fn has_carrier(sys: &dyn Sys, ifname: &str) -> Option<bool> {
         .map(|s| s.trim() == "1")
 }
 
+/// Does the bonding driver itself consider this port up? `bonding_slave/mii_status` (per PORT,
+/// not to be confused with the whole-bond `bonding/mii_status` `status` reads) is `up`,
+/// `going_back`, `going_down` or `down`; the kernel refuses `bonding/active_slave` unless this
+/// reads `up`, however healthy carrier already is (F24). A missing or unreadable file — the
+/// netdev is not a bond port, or carrier is already gone — is NOT up, deliberately: the kernel
+/// would refuse the write in that state too.
+fn bond_link_up(sys: &dyn Sys, ifname: &str) -> bool {
+    sys.read(&format!("/sys/class/net/{ifname}/bonding_slave/mii_status"))
+        .map(|s| s.trim() == "up")
+        .unwrap_or(false)
+}
+
 /// One `Sys` error as a line a task that carries on may print. `Sys::write` reports every
 /// failure as `Error::Fatal`, which Displays as `FATAL: …`; the prober's writes are not fatal to
 /// anything — it logs, keeps the bond where it is and ticks again — so the word must not appear.
@@ -583,6 +604,7 @@ impl Leg {
             // carrier would send an operator to the wrong end of it.
             let present = has_carrier(&*sys, &s.ifname);
             s.carrier = present.unwrap_or(false);
+            s.bond_link_up = bond_link_up(&*sys, &s.ifname);
             // A netdev that has just come back is a port the kernel has just re-added (F5).
             // Judging it before a hello can arrive on it would confirm it dead for being new.
             if present.is_some() && !s.present {
@@ -870,7 +892,9 @@ impl Leg {
                 ifname: s.ifname.clone(),
                 wire: s.wire.clone(),
                 reachable: s.state.reachable() && !s.hello_dead,
-                carrier: s.carrier,
+                // The kernel's actual acceptance rule for `active_slave` is carrier AND the
+                // bonding driver's own per-port link state (F24) — not carrier alone.
+                carrier: s.carrier && s.bond_link_up,
             })
             .collect();
         let Some(target) = decide(active, &cands, &self.prefs) else {
@@ -1094,7 +1118,12 @@ mod tests {
             .file(&format!("/sys/class/net/{BOND}/bonding/primary"), active)
             .file(&format!("/sys/class/net/{active}/carrier"), "1\n");
         for s in PORTS {
-            sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
+            sys = sys
+                .file(&format!("/sys/class/net/{s}/carrier"), "1\n")
+                .file(
+                    &format!("/sys/class/net/{s}/bonding_slave/mii_status"),
+                    "up\n",
+                );
         }
         sys
     }
@@ -1504,7 +1533,10 @@ mod tests {
             .iter()
             .find(|s| s.wire == "eth0")
             .expect("the home wire has a row");
-        assert!(home.reachable, "the router answers over it, mii_status is a move-eligibility fact, not a reachability one: {rows:?}");
+        assert!(
+            home.reachable,
+            "the router answers over it, mii_status is a move-eligibility fact, not a reachability one: {rows:?}"
+        );
 
         // Now the bonding driver finishes updelay.
         sys = sys.file(
@@ -1694,7 +1726,12 @@ mod tests {
             .file(&format!("/sys/class/net/{FB}/bonding/active_slave"), active)
             .file(&format!("/sys/class/net/{FB}/bonding/primary"), active);
         for s in FB_PORTS {
-            sys = sys.file(&format!("/sys/class/net/{s}/carrier"), "1\n");
+            sys = sys
+                .file(&format!("/sys/class/net/{s}/carrier"), "1\n")
+                .file(
+                    &format!("/sys/class/net/{s}/bonding_slave/mii_status"),
+                    "up\n",
+                );
         }
         sys
     }
