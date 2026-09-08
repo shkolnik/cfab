@@ -315,8 +315,11 @@ pub struct StatusModel {
     pub fallbacks: Vec<BondLeg>,
     /// One row per gw zone on a host.
     pub ingress: Vec<Ingress>,
-    /// Conditions stated in words, each with what it means for `--wait`. Conditions a row can
-    /// render are not here — they are rendered from the row.
+    /// Every reason line the report prints, in the order the gather found them, each with what
+    /// it means for `--wait`. This is the prose: the lines a row earns are rendered from that
+    /// row and pushed here at the point the gather made it, so the rows below and this list are
+    /// the same facts — one structured, one in words — and neither is derived from the other at
+    /// render time.
     pub conditions: Vec<Condition>,
     /// The supervisor's `components` document; `None` when nothing answered on its socket.
     pub components: Option<Components>,

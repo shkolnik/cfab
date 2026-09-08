@@ -74,36 +74,46 @@ impl Ctx {
     fn standing(&mut self, msg: impl Into<String>) {
         self.reasons.push((Class::Standing, msg.into()));
     }
+
+    /// One expected adjacency, with the line a down one earns pushed where the gather found
+    /// it. Rendered from the row, so the `down …` spelling has one source.
+    fn adjacency(&mut self, a: Adjacency) {
+        if !a.up {
+            // Settling: an adjacency that is still forming is the state `--wait` exists for.
+            self.settling(format!("down {}", a.label()));
+        }
+        self.adjacencies.push(a);
+    }
+
+    /// One zone's fallback leg, with the lines it earns.
+    fn fallback_leg(&mut self, leg: BondLeg) {
+        self.reasons.extend(leg_reasons(&leg));
+        self.fallbacks.push(leg);
+    }
+
+    /// The reasons so far, as the model carries them.
+    fn conditions(&self) -> Vec<Condition> {
+        self.reasons
+            .iter()
+            .map(|(class, text)| Condition {
+                class: *class,
+                text: text.clone(),
+            })
+            .collect()
+    }
+
+    /// One gw zone's ingress, with the lines it earns.
+    fn ingress(&mut self, row: Ingress) {
+        self.reasons.extend(ingress_reasons(&row));
+        self.ingress.push(row);
+    }
 }
 
 impl StatusModel {
-    /// Is this fabric still settling? One settling reason is enough: `--wait` exists for exactly
-    /// the window in which they are still there.
+    /// Is this fabric still settling? One settling condition is enough: `--wait` exists for
+    /// exactly the window in which they are still there.
     pub fn settling(&self) -> bool {
-        self.all_reasons()
-            .iter()
-            .any(|(k, _)| *k == Class::Settling)
-    }
-
-    /// Every reason line this gather carries: the ones stated in words, plus the ones a row
-    /// renders. One list, so the class of a rendered line is decided in exactly one place.
-    fn all_reasons(&self) -> Vec<(Class, String)> {
-        let mut out: Vec<(Class, String)> = self
-            .conditions
-            .iter()
-            .map(|c| (c.class, c.text.clone()))
-            .collect();
-        for a in self.adjacencies.iter().filter(|a| !a.up) {
-            // Settling: an adjacency that is still forming is the state `--wait` exists for.
-            out.push((Class::Settling, format!("down {}", a.label())));
-        }
-        for leg in &self.fallbacks {
-            out.extend(leg_reasons(leg));
-        }
-        for i in &self.ingress {
-            out.extend(ingress_reasons(i));
-        }
-        out
+        self.conditions.iter().any(|c| c.class == Class::Settling)
     }
 }
 
@@ -165,6 +175,7 @@ fn gather(
     } else {
         None
     };
+    let conditions = c.conditions();
     Ok(StatusModel {
         member: MemberInfo {
             name: view.member.name.clone(),
@@ -176,11 +187,7 @@ fn gather(
         adjacencies: c.adjacencies,
         fallbacks: c.fallbacks,
         ingress: c.ingress,
-        conditions: c
-            .reasons
-            .into_iter()
-            .map(|(class, text)| Condition { class, text })
-            .collect(),
+        conditions,
         components,
         prefs: view.prefs(),
         run_dir: f.run_dir.clone(),
@@ -295,7 +302,7 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         m.member.name,
         m.member.kind_word()
     );
-    for r in once_each(&m.all_reasons()) {
+    for r in once_each(&m.conditions) {
         // A TOML parse error arrives as several lines (message, then the caret snippet); its
         // continuation lines are indented one step further so the block still reads as one
         // reason under the headline.
@@ -430,7 +437,7 @@ fn read(
             peers_up.insert(e.node);
             up_legs.insert((e.node, e.zone.clone(), e.seg));
         }
-        c.adjacencies.push(Adjacency {
+        c.adjacency(Adjacency {
             zone: e.zone.clone(),
             seg: Some(e.seg),
             peer_node: e.node,
@@ -1255,7 +1262,7 @@ fn fallback(
         let zone = &r.zone;
 
         // ---- the leg: bonding/{mii_status,active_slave,slaves} -----------------------
-        c.fallbacks.push(read_bond_leg(
+        let leg = read_bond_leg(
             sys,
             absent,
             LegSpec {
@@ -1267,7 +1274,8 @@ fn fallback(
                 ports: &r.ports,
                 reach: reach(comps.map(|c| c.fallback.as_slice()), zone, &r.home),
             },
-        ));
+        );
+        c.fallback_leg(leg);
 
         // ---- adjacency: every peer carrying this zone's fallback row, at least 2-Way ----
         let peer_members: Vec<&crate::model::Member> = f
@@ -1297,7 +1305,7 @@ fn fallback(
                 ));
             }
             for m in &peer_members {
-                c.adjacencies.push(fallback_adjacency(m, zone, false));
+                c.adjacency(fallback_adjacency(m, zone, false));
             }
             continue;
         };
@@ -1310,7 +1318,7 @@ fn fallback(
                 peers_up.insert(m.node);
                 two_way.insert((m.node, zone.clone()));
             }
-            c.adjacencies.push(fallback_adjacency(m, zone, up));
+            c.adjacency(fallback_adjacency(m, zone, up));
         }
     }
     Ok(two_way)
@@ -1496,7 +1504,7 @@ fn return_path_and_ingress(
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
         let Some(leg) = leg else {
-            c.ingress.push(row);
+            c.ingress(row);
             continue;
         };
         row.ifname = Some(leg.ifname.clone());
@@ -1525,7 +1533,7 @@ fn return_path_and_ingress(
             .stdout;
         row.cidr_present = Some(addr.contains(&format!(" {}", row.cidr)));
         let Some(doc) = doc else {
-            c.ingress.push(row);
+            c.ingress(row);
             continue;
         };
         let entry = doc["bgp"]
@@ -1540,7 +1548,7 @@ fn return_path_and_ingress(
                 .to_string(),
         );
         row.bgp_pfx_snt = Some(entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0));
-        c.ingress.push(row);
+        c.ingress(row);
     }
     Ok(())
 }
@@ -1846,8 +1854,8 @@ fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(Option<String>, String)
 
 /// Each condition is named once and the lines are sorted: a zone with two down peers pushes its
 /// line per peer, and this output is read by humans, scripts and agents alike.
-fn once_each(reasons: &[(Class, String)]) -> Vec<String> {
-    let mut sorted: Vec<String> = reasons.iter().map(|(_, m)| m.clone()).collect();
+fn once_each(conditions: &[Condition]) -> Vec<String> {
+    let mut sorted: Vec<String> = conditions.iter().map(|c| c.text.clone()).collect();
     sorted.sort();
     sorted.dedup();
     sorted
@@ -2622,13 +2630,15 @@ mod tests {
 
     #[test]
     fn reasons_are_sorted_and_named_once() {
-        let r = vec![
-            (Class::Settling, "b".to_string()),
-            (Class::Standing, "a".to_string()),
-            (Class::Settling, "b".to_string()),
-            (Class::Standing, "a".to_string()),
-        ];
-        assert_eq!(once_each(&r), vec!["a".to_string(), "b".to_string()]);
+        let mut c = Ctx::default();
+        c.settling("b");
+        c.standing("a");
+        c.settling("b");
+        c.standing("a");
+        assert_eq!(
+            once_each(&c.conditions()),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     /// A forwarding host with every leg up, every route on its primary and every BFD session
@@ -2719,6 +2729,110 @@ mod tests {
             run(&mut sys, &view, 0, false, None).unwrap().output,
             report.output
         );
+    }
+
+    /// One member with every kind of adjacency trouble at once, so the report carries an
+    /// ingress reason, a down BFD link, a migrated fallback leg and a dark one with a peer down
+    /// on it in the same print: a down BFD session in storage, the storage fallback bond off
+    /// its home wire, the cluster fallback bond dark and missing pve2-tb's neighbor, and a gw
+    /// router that is not peering.
+    fn tangled_host(f: &Fabric, view: &View) -> MockSys {
+        let mut sys = healthy_host(f, view);
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    let state = if z.name == "storage" && seg == 1 && p == 2 {
+                        "down"
+                    } else {
+                        "up"
+                    };
+                    bfd.push((format!("{}.{seg}.{p}", z.block()), state));
+                }
+            }
+        }
+        let mut doc = engine_value(view, &bfd);
+        for r in view.fallback_rows() {
+            let z = f.zone(&r.zone).unwrap();
+            if r.zone == "cluster" {
+                doc["ospf"][&r.zone]["interfaces"][&r.ifname]["neighbors"] = serde_json::json!([{
+                    "router_id": format!("{}.0.3", z.block()),
+                    "addr": format!("{}.{}.3", z.block(), r.seg),
+                    "state": "full",
+                }]);
+            }
+        }
+        for n in doc["bgp"].as_array_mut().into_iter().flatten() {
+            n["state"] = serde_json::json!("Idle");
+        }
+        for r in view.fallback_rows() {
+            if r.zone == "storage" {
+                let off = r.ports.iter().find(|s| s.wire != r.home).unwrap();
+                sys = sys.file(
+                    &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                    &format!("{}\n", off.ifname),
+                );
+            }
+            if r.zone == "cluster" {
+                sys = sys.file(
+                    &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
+                    "down\n",
+                );
+            }
+        }
+        sys.socket("/run/cfab/engine.sock", &doc.to_string())
+    }
+
+    /// The report a member carrying every kind of adjacency trouble at once prints, byte for
+    /// byte. The expected text was captured from the pre-model `run` at e3b8623, not from this
+    /// code: it has an ingress reason, a down BFD link, a migrated fallback leg and a dark one
+    /// with a peer down on it, so a renderer that lost a line, reordered the block or dropped a
+    /// row's derivation fails here.
+    #[test]
+    fn a_report_with_ingress_link_and_both_fallback_troubles_matches_the_pre_model_render() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tangled_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.code, 1);
+        assert_eq!(
+            report.output,
+            "UP-DEGRADED (2/2 | 17/18 | 5/6) on pve1-tb (host)\n  \
+             cluster fallback no carrier\n  \
+             down cluster:fallback:.2\n  \
+             down storage:1:.2\n  \
+             mark: nft\n  \
+             mgmt ingress leg cfab-gw249 missing or not 192.168.249.1/24\n  \
+             mgmt ingress: bgp 192.168.249.254 Idle (not Established - the router is not \
+             learning this zone's identities)\n  \
+             storage fallback via eth1 (home eth9 has carrier)\n  \
+             storage to pve2-tb via cfab-st, expected cfab-st-bk\n  \
+             prefs storage: eth9 eth1 eth0 (derived)\n  \
+             prefs cluster: eth1 eth9 eth0 (derived)\n  \
+             prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
+        );
+
+        // The rows carry the same four facts, structured, for the renderers that want numbers.
+        let mut sys = tangled_host(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(render_text(&m, false, true).output, report.output);
+        let down: Vec<String> = m
+            .adjacencies
+            .iter()
+            .filter(|a| !a.up)
+            .map(Adjacency::label)
+            .collect();
+        assert_eq!(down, vec!["storage:1:.2", "cluster:fallback:.2"]);
+        let st = m.fallbacks.iter().find(|l| l.zone == "storage").unwrap();
+        assert!(!st.on_home());
+        assert_eq!(st.active_wire(), Some("eth1"));
+        let cl = m.fallbacks.iter().find(|l| l.zone == "cluster").unwrap();
+        assert_eq!(cl.bonding.as_ref().unwrap().mii_status, "down");
+        let ing = m.ingress.iter().find(|i| i.zone == "mgmt").unwrap();
+        assert_eq!(ing.bgp_state.as_deref(), Some("Idle"));
     }
 
     #[test]
@@ -5265,7 +5379,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            once_each(&c.reasons),
+            once_each(&c.conditions()),
             vec![
                 "cluster to pve2-tb via fallback".to_string(),
                 "mgmt to pve2-tb via fallback".to_string(),
@@ -5297,7 +5411,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            once_each(&c.reasons)
+            once_each(&c.conditions())
                 .contains(&"storage to pve2-tb via cfab-st, expected cfab-st-fb".to_string()),
             "{:?}",
             c.reasons
