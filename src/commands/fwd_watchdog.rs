@@ -26,7 +26,7 @@ use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
 use crate::prober::HeldPrimaries;
-use crate::sys::{Sys, run_ignore};
+use crate::sys::{Sys, run_ignore, run_ok};
 
 pub struct WatchdogReport {
     /// None = healthy; Some(reason) = failed closed.
@@ -135,6 +135,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
     restore_rules(sys, view, &mut restored, &mut downed)?;
     restore_gw_return_defaults(sys, view, &mut restored)?;
+    restore_workloads(sys, view, &mut restored, &mut unrestored)?;
     for line in restored
         .iter()
         .chain(rebuilt.iter())
@@ -309,6 +310,51 @@ fn restore_gw_return_defaults(
                 d.table, d.via
             ));
         }
+    }
+    Ok(())
+}
+
+/// The workload bridge ARP guard table and the shared `arp_ignore` sysctl `up` set for a member
+/// that carries at least one `[[workload]]` row (spec §5.1, ruling 11). Both are member-wide,
+/// not one of `fabric_legs`'s netdevs, so — like the rules above — the whole set is re-checked
+/// once per tick rather than keyed to a leg. No-op on a member with no workload row: `up` never
+/// touched either object there, so there is nothing to watch.
+fn restore_workloads(
+    sys: &mut dyn Sys,
+    view: &View,
+    restored: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
+    let rows = view.workload_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let names = rows
+        .iter()
+        .map(|r| r.wl.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok() {
+        let path = format!("{}/workload-bridge.nft", view.fabric.run_dir);
+        if sys.read(&path).is_ok() {
+            run_ok(sys, &["nft", "-f", &path])?;
+            restored.push(format!("restored bridge table cfab (workload {names})"));
+        } else {
+            unrestored.push(format!(
+                "cannot restore bridge table cfab: {path} missing (run cfab up)"
+            ));
+        }
+    }
+    let arp_path = "/proc/sys/net/ipv4/conf/all/arp_ignore";
+    let v = sys
+        .read(arp_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if v != "1" {
+        sys.write(arp_path, "1")?;
+        restored.push(format!(
+            "restored net.ipv4.conf.all.arp_ignore=1 (workload {names})"
+        ));
     }
     Ok(())
 }
@@ -784,6 +830,75 @@ pub(crate) mod tests {
             );
         }
         legs_present(rules_present(sys, view), view)
+    }
+
+    /// `healthy_sys` plus the workload facts in their healthy state.
+    fn wl_healthy_sys(view: &View) -> MockSys {
+        healthy_sys(view)
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
+            .file("/run/cfab/workload-bridge.nft", "table bridge cfab\n")
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n}\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            )
+    }
+
+    #[test]
+    fn the_watchdog_restores_the_bridge_guard_and_arp_ignore_and_the_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
+        );
+        assert!(sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        let log = report.restored.join("\n");
+        assert!(
+            log.contains("restored bridge table cfab (workload vms)"),
+            "{log}"
+        );
+        assert!(
+            log.contains("restored net.ipv4.conf.all.arp_ignore=1 (workload vms)"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_workload_costs_the_watchdog_no_writes() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view);
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fabric_legs_never_include_the_workload_interface() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(!fabric_legs(&v).contains(&"primary.3".to_string()));
     }
 
     /// Every declared leg of every declared wire present and of the kind cfab created it with —
