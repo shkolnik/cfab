@@ -29,7 +29,10 @@ pub struct NeighEvent {
     /// The bridge port the MAC was seen on (`ndm_ifindex`), not the bridge.
     pub ifindex: u32,
     pub mac: [u8; 6],
-    /// `NUD_PERMANENT`: an entry somebody programmed, not one the bridge learned.
+    /// `NUD_PERMANENT`: the bridge's own address on the port or an entry added with
+    /// `bridge fdb add ... permanent`. An admin `... static` entry is `NUD_NOARP`, so this flag
+    /// does NOT mean "programmed by somebody" (measured on pve3-tb 2026-09-08: static = NOARP,
+    /// permanent/own MAC = PERMANENT, learned = REACHABLE).
     pub permanent: bool,
 }
 
