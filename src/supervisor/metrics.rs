@@ -803,10 +803,12 @@ pub(crate) fn render(s: &Arc<Snapshot>) -> String {
     out
 }
 
-/// How long a connection has to deliver its whole request line. Rule (spec §3.1): a scraper
-/// writes its request at once, so a peer that has not finished in two seconds is not scraping
-/// and must not hold a slot.
-const READ_DEADLINE: Duration = Duration::from_secs(2);
+/// How long one connection may live, covering the read, the write and the shutdown. Rule (spec
+/// §3.1): a scrape body is tens of kilobytes and a scraper reads it at once, so five seconds is
+/// generous on a LAN and short enough that a set of peers which write a request and then stop
+/// reading — the case that pins a task inside `write_all`, not inside the read — frees the
+/// in-flight slots again on its own.
+const CONN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Connections served at once. Rule (spec §3.1): bounded with no queue — a scrape costs one
 /// `Arc` clone, so this is far past any real set of scrapers and still refuses a socket flood.
@@ -832,7 +834,12 @@ pub(crate) fn bind(port: u16) -> std::io::Result<TcpListener> {
 /// snapshot the supervisor's refresh arm publishes: the accept path performs no gather, holds
 /// no lock, and touches no host.
 pub(crate) async fn serve(listener: TcpListener, latest: watch::Receiver<Arc<str>>) {
-    let slots = Arc::new(Semaphore::new(MAX_INFLIGHT));
+    serve_on(listener, latest, Arc::new(Semaphore::new(MAX_INFLIGHT))).await
+}
+
+/// `serve` with the in-flight bound handed in, so a test can watch the slots fill and drain
+/// rather than guess at the timing.
+async fn serve_on(listener: TcpListener, latest: watch::Receiver<Arc<str>>, slots: Arc<Semaphore>) {
     loop {
         let sock = match listener.accept().await {
             Ok((sock, _)) => sock,
@@ -858,20 +865,23 @@ pub(crate) async fn serve(listener: TcpListener, latest: watch::Receiver<Arc<str
     }
 }
 
-/// One connection: read a request line under one deadline, answer, close. No keep-alive.
-async fn serve_one(mut sock: TcpStream, latest: watch::Receiver<Arc<str>>) {
-    // One deadline for the whole read, not per read: a peer dribbling a byte at a time must
-    // still be gone within `READ_DEADLINE`.
-    let deadline = tokio::time::Instant::now() + READ_DEADLINE;
+/// One connection: read a request line, answer, close. No keep-alive. The caller bounds the
+/// whole thing with `CONN_DEADLINE`, so no step of it can pin an in-flight slot.
+async fn serve_one(sock: TcpStream, latest: watch::Receiver<Arc<str>>) {
+    // A timeout drops the socket, which is exactly the right answer to every way this can hang.
+    let _ = tokio::time::timeout(CONN_DEADLINE, converse(sock, latest)).await;
+}
+
+async fn converse(mut sock: TcpStream, latest: watch::Receiver<Arc<str>>) {
     let mut buf = vec![0u8; MAX_REQUEST];
     let mut n = 0;
     let r = loop {
         if n == buf.len() {
             break Response::Close;
         }
-        match tokio::time::timeout_at(deadline, sock.read(&mut buf[n..])).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break Response::Close,
-            Ok(Ok(k)) => {
+        match sock.read(&mut buf[n..]).await {
+            Ok(0) | Err(_) => break Response::Close,
+            Ok(k) => {
                 n += k;
                 if buf[..n].contains(&b'\n') {
                     break respond(&buf[..n]);
@@ -1514,7 +1524,7 @@ mod request_tests {
         stalled.write_all(b"GET").await.unwrap();
         let mut sink = Vec::new();
         let closed = tokio::time::timeout(
-            READ_DEADLINE + Duration::from_secs(1),
+            CONN_DEADLINE + Duration::from_secs(1),
             stalled.read_to_end(&mut sink),
         )
         .await;
@@ -1532,6 +1542,18 @@ mod request_tests {
         server.abort();
     }
 
+    /// Wait until every one of `slots`' permits is taken, so a test that depends on the
+    /// in-flight set being full never races the accept loop.
+    async fn until_full(slots: &Semaphore) {
+        for _ in 0..500 {
+            if slots.available_permits() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the in-flight slots never filled");
+    }
+
     /// The in-flight bound: with `MAX_INFLIGHT` connections open and unanswered, one more is
     /// dropped immediately — closed with no bytes, not queued behind the others.
     #[tokio::test(flavor = "multi_thread")]
@@ -1539,29 +1561,79 @@ mod request_tests {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let (_tx, rx) = watch::channel(Arc::<str>::from("cfab_x 1\n"));
-        let server = tokio::spawn(serve(l, rx));
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT));
+        let server = tokio::spawn(serve_on(l, rx, Arc::clone(&slots)));
 
-        // Each holder occupies a slot for the whole read deadline: connected, silent.
+        // Each holder occupies a slot for the whole connection deadline: connected, silent.
         let mut held = Vec::new();
         for _ in 0..MAX_INFLIGHT {
             let c = TcpStream::connect(addr).await.unwrap();
             c.writable().await.unwrap();
             held.push(c);
         }
-        // Let the accept loop take every one of them before the extra arrives.
-        tokio::task::yield_now().await;
+        until_full(&slots).await;
         let mut extra = TcpStream::connect(addr).await.unwrap();
         let mut sink = Vec::new();
-        let closed = tokio::time::timeout(
-            READ_DEADLINE - Duration::from_millis(500),
-            extra.read_to_end(&mut sink),
-        )
-        .await;
+        let closed =
+            tokio::time::timeout(Duration::from_secs(1), extra.read_to_end(&mut sink)).await;
         assert!(
             closed.is_ok() && sink.is_empty(),
             "the 17th connection must be dropped while 16 are held, got {sink:?}"
         );
         drop(held);
+        server.abort();
+    }
+
+    /// The deadline covers the WRITE, not just the read. A peer that asks properly and then
+    /// stops reading blocks inside `write_all` once the kernel buffers fill; without one
+    /// deadline over the whole connection it would hold its in-flight slot forever, and sixteen
+    /// of them would lock every real scraper out.
+    ///
+    /// The bound is one slot here, so "the slot came back" is directly observable: while the
+    /// stuck peer holds it, a second connection is dropped unanswered; once the deadline fires,
+    /// the same request is served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_stops_reading_loses_its_slot_at_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        // Larger than any socket buffer pair, so `write_all` cannot finish while nobody reads.
+        let big: String = "# x\n".repeat(1024 * 1024);
+        let (_tx, rx) = watch::channel(Arc::<str>::from(big.as_str()));
+        let slots = Arc::new(Semaphore::new(1));
+        let server = tokio::spawn(serve_on(l, rx, Arc::clone(&slots)));
+
+        let mut stuck = TcpStream::connect(addr).await.unwrap();
+        stuck
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        until_full(&slots).await;
+
+        // While the writer is stuck the only slot is taken: the next connection is refused.
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        let mut sink = Vec::new();
+        let dropped =
+            tokio::time::timeout(Duration::from_secs(1), refused.read_to_end(&mut sink)).await;
+        assert!(
+            dropped.is_ok(),
+            "a connection past the bound must be dropped, not queued"
+        );
+        assert!(sink.is_empty());
+
+        // The deadline fires, the task is dropped mid-write, and the slot comes back.
+        let served = tokio::time::timeout(CONN_DEADLINE + Duration::from_secs(1), async {
+            loop {
+                if slots.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            scrape(addr, "GET /nope HTTP/1.1\r\n\r\n").await
+        })
+        .await
+        .expect("the stuck writer never released its in-flight slot");
+        assert!(served.starts_with("HTTP/1.1 404 Not Found\r\n"), "{served}");
+        drop(stuck);
         server.abort();
     }
 }
