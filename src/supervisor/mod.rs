@@ -29,6 +29,7 @@
 
 pub mod child;
 pub mod lock;
+pub(crate) mod metrics;
 pub mod report;
 pub mod sock;
 
@@ -120,6 +121,15 @@ pub(crate) struct Shared {
     /// The port the prober holds each bond's `primary` on. Read by the forwarding watchdog,
     /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
+    /// Why the metrics endpoint is not listening, if it is not: the bind errno, for as long as
+    /// the bind keeps failing. `cfab status` prints it as a standing line.
+    metrics_error: Option<String>,
+    /// Metrics gathers that failed since start. The endpoint keeps serving the previous
+    /// snapshot, so this counter is the only place a failing gather is visible over time.
+    metrics_collect_failures: u64,
+    /// Set while a run of consecutive metrics-gather failures is ongoing, so the journal line
+    /// is printed once per streak rather than once per `metrics::REFRESH` tick.
+    metrics_gather_failing: bool,
 }
 
 impl Shared {
@@ -141,6 +151,9 @@ impl Shared {
             wd_last_tick: None,
             probed: crate::prober::ProbeRows::default(),
             held: crate::prober::HeldPrimaries::default(),
+            metrics_error: None,
+            metrics_collect_failures: 0,
+            metrics_gather_failing: false,
         }
     }
 
@@ -199,6 +212,7 @@ impl Shared {
             },
             ingress: self.probed.ingress.clone(),
             fallback: self.probed.fallback.clone(),
+            metrics_error: self.metrics_error.clone(),
         }
     }
 
@@ -252,6 +266,18 @@ pub(crate) struct Hooks {
     /// the prober directly instead.
     pub run_prober: bool,
     pub serve_socket: bool,
+    /// The `/metrics` endpoint. Off in the unit tests, which neither bind nor scrape it, except
+    /// the two that test the endpoint itself.
+    pub serve_metrics: bool,
+    /// The port `serve_metrics` binds. Production is `metrics::PORT`; a test picks a free one so
+    /// two runs never collide and the sandbox's own listeners are irrelevant.
+    pub metrics_port: u16,
+    /// The channel the refreshed snapshot is published on. Production makes its own; a test
+    /// passes one in so it can read what the endpoint would serve without scraping it.
+    pub metrics_watch: Option<tokio::sync::watch::Sender<Arc<str>>>,
+    /// How often a failed metrics bind is retried. Production is `metrics::BIND_RETRY`; a test
+    /// shrinks it so the retry is exercised without a real minute.
+    pub metrics_bind_retry: Duration,
     pub shared: Option<Arc<Mutex<Shared>>>,
     /// A test recorder the stop sequence appends its signal/wait/kill markers to, in order, so
     /// a test can assert the stop ordering (spec §13) against a single merged trace shared with
@@ -273,6 +299,10 @@ impl Hooks {
             run_watchdog: true,
             run_prober: true,
             serve_socket: true,
+            serve_metrics: true,
+            metrics_port: metrics::PORT,
+            metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: None,
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
@@ -458,6 +488,15 @@ pub(crate) async fn run_with(
         );
     }
 
+    // The snapshot the metrics endpoint serves. Created before the apply so the first refresh
+    // — right after that apply — has somewhere to publish, and the endpoint bound at 5b is
+    // never the thing that decides whether a snapshot exists.
+    let metrics_tx = hooks
+        .metrics_watch
+        .clone()
+        .unwrap_or_else(|| tokio::sync::watch::channel(Arc::<str>::from("")).0);
+    let metrics_rx = metrics_tx.subscribe();
+
     // 2. The initial apply. A refusal is terminal (§10) and has started no child — the whole
     // point of exit 3.
     {
@@ -477,6 +516,10 @@ pub(crate) async fn run_with(
             let mut st = shared.lock().unwrap();
             st.applying = false;
             st.applies += 1;
+            drop(st);
+            // One gather now, so a scrape landing before the first `REFRESH` tick gets the
+            // member's real state rather than an empty body.
+            refresh_snapshot(sys, view, &shared, &metrics_tx);
         }
         Err(e) => {
             eprintln!("{e}");
@@ -593,6 +636,27 @@ pub(crate) async fn run_with(
         });
     }
 
+    // 5b. The metrics endpoint, on its own TCP port. It serves whatever the refresh arm below
+    // last published and gathers nothing itself, so a scrape can never reach `Sys` and a member
+    // with no scraper pays one gather every `REFRESH`.
+    if hooks.serve_metrics {
+        match metrics::bind(hooks.metrics_port) {
+            Ok(l) => {
+                tokio::spawn(metrics::serve(l, metrics_rx));
+            }
+            Err(e) => {
+                // Never fatal (spec §3.1): one warning, a standing `status` line for as long as
+                // it lasts, and a retry every `metrics_bind_retry`. The fabric is unaffected.
+                eprintln!(
+                    "cfab: metrics endpoint not listening on :{} ({e})",
+                    hooks.metrics_port
+                );
+                trace_mark(&trace, format!("metrics bind failed: {e}"));
+                shared.lock().unwrap().metrics_error = Some(e.to_string());
+            }
+        }
+    }
+
     // The watchdog feed (spec §8): only when systemd set WATCHDOG_USEC, so `WatchdogSec` lives
     // in the unit file alone. Absent that, the feed never runs.
     let feed_period = feed_period();
@@ -631,6 +695,18 @@ pub(crate) async fn run_with(
     );
     let mut probe_tick =
         tokio::time::interval_at(tokio::time::Instant::now() + PROBE_INTERVAL, PROBE_INTERVAL);
+    // The metrics snapshot. Same cadence and same thread as the watchdog tick: one gather, on
+    // the main thread, whether or not anybody is scraping.
+    // The bind retry. It only does anything while the bind is failing, so a bound endpoint pays
+    // one lock check a minute.
+    let mut metrics_retry = tokio::time::interval_at(
+        tokio::time::Instant::now() + hooks.metrics_bind_retry,
+        hooks.metrics_bind_retry,
+    );
+    let mut metrics_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + metrics::REFRESH,
+        metrics::REFRESH,
+    );
 
     // Set by a reload that found a changed declaration: the stop sequence below runs unchanged,
     // and the exit status asks systemd for the restart that applies the new file.
@@ -704,6 +780,11 @@ pub(crate) async fn run_with(
                             &exit_tx, &mut exit_rx, &mut pending, &feed_fn,
                         )
                         .await;
+                        // A re-apply is exactly when the member's state changed; refresh at once
+                        // rather than serving the pre-apply snapshot for up to `REFRESH`.
+                        if r.is_ok() {
+                            refresh_snapshot(sys, view, &shared, &metrics_tx);
+                        }
                         if let Some(tx) = reply {
                             let _ = tx.send(r);
                         }
@@ -745,6 +826,18 @@ pub(crate) async fn run_with(
             // two sysfs writes) and nowhere near `WatchdogSec`.
             _ = probe_tick.tick(), if hooks.run_prober && !prober.is_empty() => {
                 prober_tick(sys, &mut prober, &mut probe_io, &shared);
+            }
+            // Same arm shape and the same `block_in_place` reasoning as the watchdog tick: the
+            // gather is read-only and bounded, and it must not pin the runtime thread.
+            _ = metrics_tick.tick() => {
+                refresh_snapshot(sys, view, &shared, &metrics_tx);
+            }
+            _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
+                if let Ok(l) = metrics::bind(hooks.metrics_port) {
+                    tokio::spawn(metrics::serve(l, metrics_tx.subscribe()));
+                    shared.lock().unwrap().metrics_error = None;
+                    eprintln!("cfab: metrics endpoint listening on :{}", hooks.metrics_port);
+                }
             }
             _ = feed => {
                 let (apply, engine_state) = {
@@ -1236,6 +1329,58 @@ fn prober_tick(
 /// child a future spawn forked from it (§7) — and record its outcome into `components`. Runs on
 /// every member kind: `fwd_watchdog::run` guards its own transit-only work internally, so a leaf
 /// ticks too and only reports what a leaf owns.
+/// Gather the member's state once and publish it as the text the metrics endpoint serves.
+///
+/// The `Shared` mutex is never held across the gather: the socket server, the stream readers and
+/// the prober all take it, and the gather runs for as long as a `block_in_place` needs. On a
+/// failure the previous snapshot stays — a scrape that returns stale numbers is worth more than
+/// one that returns nothing — and the failure is counted and logged.
+fn refresh_snapshot(
+    sys: &mut dyn Sys,
+    view: &View,
+    shared: &Arc<Mutex<Shared>>,
+    tx: &tokio::sync::watch::Sender<Arc<str>>,
+) {
+    let t0 = Instant::now();
+    let (comps, probed, failures) = {
+        let st = shared.lock().unwrap();
+        (
+            st.components(Instant::now()),
+            st.probed.clone(),
+            st.metrics_collect_failures,
+        )
+    };
+    match tokio::task::block_in_place(|| {
+        crate::commands::status::snapshot_model(sys, view, Some(comps))
+    }) {
+        Ok(model) => {
+            let snap = metrics::Snapshot {
+                model,
+                probed,
+                collected_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64()),
+                collect_seconds: t0.elapsed().as_secs_f64(),
+                collect_failures: failures,
+            };
+            tx.send_replace(Arc::from(metrics::render(&Arc::new(snap))));
+            let mut st = shared.lock().unwrap();
+            if st.metrics_gather_failing {
+                st.metrics_gather_failing = false;
+                eprintln!("cfab: metrics: gather succeeded again");
+            }
+        }
+        Err(e) => {
+            let mut st = shared.lock().unwrap();
+            st.metrics_collect_failures += 1;
+            if !st.metrics_gather_failing {
+                st.metrics_gather_failing = true;
+                eprintln!("cfab: metrics: gather failed, serving the previous snapshot: {e}");
+            }
+        }
+    }
+}
+
 fn watchdog_tick(sys: &mut dyn Sys, view: &View, shared: &Arc<Mutex<Shared>>) {
     // Snapshot first: the socket server and the stream readers take this same lock, and the
     // check below runs for as long as a `block_in_place` needs.
@@ -1549,6 +1694,10 @@ mod tests {
             run_watchdog: false,
             run_prober: false,
             serve_socket: false,
+            serve_metrics: false,
+            metrics_port: metrics::PORT,
+            metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared),
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
@@ -1583,6 +1732,10 @@ mod tests {
                 run_watchdog: false,
                 run_prober: false,
                 serve_socket: false,
+                serve_metrics: false,
+                metrics_port: metrics::PORT,
+                metrics_watch: None,
+                metrics_bind_retry: metrics::BIND_RETRY,
                 shared: None,
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
@@ -1653,6 +1806,127 @@ mod tests {
         assert_eq!(comp("conf-sync").why.as_deref(), Some("not clustered"));
     }
 
+    /// Spec §3.1: a metrics port somebody else holds is a warning, a standing `status` line and
+    /// a retry — never fatal. The fabric comes up regardless, and the endpoint takes the port
+    /// over as soon as it is free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_metrics_port_warns_and_is_retried_until_it_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        // Hold the exact address the supervisor will ask for — wildcard against wildcard, so the
+        // conflict is a real EADDRINUSE and not a SO_REUSEADDR nicety.
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let held = sh.lock().unwrap().metrics_error.clone();
+            let engine = sh.lock().unwrap().child("engine").state;
+            drop(holder);
+            // The retry is 100 ms in this run; give it twenty tries before failing.
+            let mut freed = None;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                freed = sh.lock().unwrap().metrics_error.clone();
+                if freed.is_none() {
+                    break;
+                }
+            }
+            driver_tx.send(Cmd::Terminate).ok();
+            (held, engine, freed)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.serve_metrics = true;
+        hooks.metrics_port = port;
+        hooks.metrics_bind_retry = Duration::from_millis(100);
+        hooks.trace = Some(trace.clone());
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        let (held, engine, freed) = driver.await.unwrap();
+        assert_eq!(code, 0, "a metrics bind failure is never fatal");
+        assert_eq!(
+            engine,
+            child::State::Running,
+            "the fabric comes up whatever the endpoint does"
+        );
+        let held = held.expect("a held port must be recorded as the reason status prints");
+        assert!(held.contains("in use"), "{held}");
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("metrics bind failed:")),
+            "the failure must be said once, loudly: {:?}",
+            trace.lock().unwrap()
+        );
+        assert_eq!(freed, None, "the retry must take the freed port over");
+    }
+
+    /// Spec §3.2: the endpoint never serves an empty body. One gather runs as soon as the
+    /// initial apply succeeds, so a scrape landing before the first 15 s tick already sees this
+    /// member's state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_snapshot_is_published_as_soon_as_the_apply_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(Arc::<str>::from(""));
+        let driver_tx = cmd_tx.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let body = watch_rx.borrow().clone();
+            driver_tx.send(Cmd::Terminate).ok();
+            body
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.metrics_watch = Some(watch_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let body = driver.await.unwrap();
+        assert!(
+            body.contains("cfab_fabric_state"),
+            "the watch must hold a rendered snapshot by the time the supervisor is ready: {body}"
+        );
+        assert!(body.ends_with("# EOF\n"), "{body}");
+    }
+
     /// F9: the supervisor keeps the declaration it applied beside the fabric, so `cfab status`
     /// can describe the running fabric while the file on disk is mid-edit. It is the TEXT the
     /// supervisor was handed — not a re-read of `CONFIG`, which is what a later edit changes —
@@ -1690,6 +1964,10 @@ mod tests {
                 run_watchdog: false,
                 run_prober: false,
                 serve_socket: false,
+                serve_metrics: false,
+                metrics_port: metrics::PORT,
+                metrics_watch: None,
+                metrics_bind_retry: metrics::BIND_RETRY,
                 shared: None,
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
@@ -2060,6 +2338,62 @@ mod tests {
     /// sequence tears down under the declaration the supervisor was STARTED on (finding F2's
     /// fix), so the bond AND its ports go, and the restart builds the plain leg from scratch.
     /// Torn down under the new file instead, the bond's ports would be nameless and stranded.
+    /// **The exporter reads; it never actuates.** The metrics refresh gathers the same status
+    /// model `cfab status` does, so it inherits that command's read-only allowlist
+    /// (`status::is_read_only`) verbatim: one refresh over the healthy fixture may change no
+    /// file and may make no call outside the allowlist. `metrics::render` is proven to make no
+    /// host call twice over — the call log does not grow across it, and its signature takes no
+    /// `Sys` at all, so it has nothing to call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_metrics_refresh_reads_and_never_actuates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (tx, _rx) = tokio::sync::watch::channel(Arc::<str>::from(""));
+
+        let files_before = sys.files.clone();
+        refresh_snapshot(&mut sys, &view, &shared, &tx);
+
+        let changed: Vec<&String> = files_before
+            .keys()
+            .chain(sys.files.keys())
+            .filter(|k| files_before.get(*k) != sys.files.get(*k))
+            .collect();
+        assert!(changed.is_empty(), "the refresh changed {changed:?}");
+        for call in &sys.calls {
+            assert!(
+                crate::commands::status::is_read_only(call),
+                "the metrics refresh is not read-only: `{call}`"
+            );
+        }
+        assert!(
+            !tx.borrow().is_empty(),
+            "the refresh published no snapshot, so the allowlist proved nothing"
+        );
+
+        // And the render itself: build a snapshot, then watch the call log across `render`.
+        let comps = shared.lock().unwrap().components(Instant::now());
+        let model = crate::commands::status::snapshot_model(&mut sys, &view, Some(comps)).unwrap();
+        let snap = Arc::new(metrics::Snapshot {
+            model,
+            probed: crate::prober::ProbeRows::default(),
+            collected_at_unix: 1_700_000_000.0,
+            collect_seconds: 0.048,
+            collect_failures: 0,
+        });
+        let before = sys.calls.len();
+        let text = metrics::render(&snap);
+        assert_eq!(
+            sys.calls.len(),
+            before,
+            "render made a host call: {:?}",
+            &sys.calls[before..]
+        );
+        assert!(text.contains("cfab_fabric_state"), "{text}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sighup_that_flips_the_gw_scope_tears_down_the_leg_the_old_declaration_built() {
         let o = reload_with(|m, dir| {
@@ -2680,6 +3014,10 @@ mod tests {
             run_watchdog: false,
             run_prober: false,
             serve_socket: false,
+            serve_metrics: false,
+            metrics_port: metrics::PORT,
+            metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared),
             trace: Some(calls.clone()),
             stop_grace: grace,
@@ -2810,6 +3148,10 @@ mod tests {
             run_watchdog: false,
             run_prober: false,
             serve_socket: false,
+            serve_metrics: false,
+            metrics_port: metrics::PORT,
+            metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared.clone()),
             trace: None,
             stop_grace: CHILD_STOP_GRACE,

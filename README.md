@@ -111,6 +111,40 @@ kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `
 204) so `ip route` prints them instead of bare numbers — cosmetic only; cfab's own sweep
 matches the numeric ids.
 
+## Metrics
+
+The supervisor serves the member's state as metrics at
+
+```
+http://<any address of the member>:23232/metrics
+```
+
+The body is OpenMetrics text, which every Prometheus-compatible scraper also reads as
+Prometheus text. The supervisor refreshes it from its own status gather every 15 s, so a scrape
+costs no host reads and never blocks the fabric; the reader sees the same numbers `cfab status`
+prints.
+
+The endpoint is plaintext and unauthenticated, like `node_exporter`. LAN-trust: put it behind a
+proxy or firewall if that is not your posture.
+
+What a scrape shows in each fabric state:
+
+| supervisor | fabric | scrape |
+|---|---|---|
+| not running | — | connection refused (the scraper's `up == 0` is the signal; standard) |
+| running, before first apply | DOWN | `cfab_fabric_state{state="DOWN"} 1`, build/member info, components; no adjacency families |
+| running | UP / UP-DEGRADED / FAILED | full schema |
+| running, port not bound | any | nothing to scrape; `cfab status` shows the standing reason line |
+
+If the port cannot be bound, the supervisor logs one `WARN` naming the port and the errno, adds
+a standing `cfab status` line `metrics endpoint not listening on :23232 (...)` for as long as
+the bind keeps failing, and retries every 60 s. The fabric is unaffected: a bind failure is
+never fatal and never delays the apply.
+
+```
+curl -s http://10.249.0.1:23232/metrics | grep -E 'cfab_fabric_state|cfab_links_up'
+```
+
 ## Cluster coordination (optional, never required)
 
 On a Proxmox cluster, `cfab` additionally coordinates through pmxcfs (`/etc/pve`) — probed at

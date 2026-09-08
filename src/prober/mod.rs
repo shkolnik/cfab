@@ -112,6 +112,8 @@ struct Leg {
     /// while nothing has changed — the kernel refused it for a reason we can no longer see, and
     /// a refusal repeated every 500 ms is noise, not a diagnosis.
     refused: Option<(String, Option<String>)>,
+    /// Successful active-port writes on this leg since the prober started. Published in the row.
+    moves: u64,
     /// Why this leg's port states could not be read the last time a tick tried, so a socket
     /// that has been failing the same way for an hour is one line, not 7 200. `None` re-arms
     /// it, which a tick that reads successfully does.
@@ -498,6 +500,7 @@ impl Prober {
                 bond: l.bond.clone(),
                 active: l.active_now.clone(),
                 quiet: l.quiet(),
+                moves: l.moves,
                 ports: l
                     .ports
                     .iter()
@@ -563,6 +566,7 @@ impl Leg {
             ports,
             noted_no_carrier: None,
             refused: None,
+            moves: 0,
             noted_nl_err: None,
             kind,
         }
@@ -1074,6 +1078,7 @@ impl Leg {
             return;
         }
         self.refused = None;
+        self.moves += 1;
         self.held = target.clone();
         self.active_now = Some(target.clone());
         let family = self.kind.family();
@@ -1948,6 +1953,35 @@ mod tests {
             sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/active_slave")),
             Some(BACKUP)
         );
+    }
+
+    /// The published row counts the moves the prober actually made on that leg: one per
+    /// successful active-port write, and none at all when the kernel refuses the write.
+    #[test]
+    fn the_row_counts_a_move_only_when_the_write_succeeds() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 2);
+        assert_eq!(rows[0].moves, 0, "nothing has moved yet");
+        sys.set_port(HOME, no_carrier());
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 1);
+        assert_eq!(rows[0].moves, 1, "one move, counted once");
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 3);
+        assert_eq!(rows[0].moves, 1, "and not again while the bond stays put");
+
+        // A write the kernel refuses is not a move.
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME).write_fail(&format!("/sys/class/net/{BOND}/bonding/primary"));
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 3);
+        io.dark(HOME);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 8);
+        assert_eq!(rows[0].moves, 0, "a refused write is not a move");
     }
 
     /// F30: the bond leaves a wire the bonding driver has taken down under it. The wire

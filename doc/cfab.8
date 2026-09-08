@@ -593,6 +593,27 @@ stops the unit (correct: the binary is going away) and disables it;
 .B "apt purge"
 also removes
 .IR /etc/default/cfab .
+.SH METRICS
+The supervisor serves this member's state as metrics on
+.B 0.0.0.0:23232
+at
+.IR /metrics .
+The body is OpenMetrics text, which a Prometheus\-compatible scraper also reads as
+Prometheus text; the supervisor refreshes it from its own status gather every 15\ s, so a
+scrape costs no host reads and reports the same numbers as
+.BR "cfab status" .
+The endpoint is plaintext and unauthenticated, like
+.BR node_exporter (1):
+put it behind a proxy or a firewall if LAN\-trust is not your posture. A supervisor that is not
+running refuses the connection; before the first apply the scrape carries
+.BR cfab_fabric_state{state="DOWN"} ,
+the build and member info and the components, and no adjacency families; once applied it
+carries the full schema. If the port cannot be bound, the supervisor logs one warning naming
+the port and the errno, shows the standing
+.B "cfab status"
+line
+.BR "metrics endpoint not listening on :23232 (...)" ,
+and retries every 60\ s \(em the fabric is unaffected.
 .SH SEE ALSO
 .BR ip (8),
 .BR nft (8),

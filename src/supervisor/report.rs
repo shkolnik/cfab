@@ -22,6 +22,10 @@ pub struct Components {
     /// construction: one leg reader, one set of conditions, one spelling each.
     #[serde(default)]
     pub fallback: Vec<ProbedLeg>,
+    /// Why the metrics endpoint is not listening, if it is not. `None` is the normal case —
+    /// bound, or never asked for. `#[serde(default)]` so an older supervisor's document parses.
+    #[serde(default)]
+    pub metrics_error: Option<String>,
 }
 
 /// What the prober knows about one zone's leg: where the bond sits, and whether the far end —
@@ -45,6 +49,11 @@ pub struct ProbedLeg {
     /// `slaves` until 0.4.7: a status binary must still read a running older supervisor.
     #[serde(default, alias = "slaves")]
     pub ports: Vec<ProbedPort>,
+    /// Moves the prober has actuated on this leg since the supervisor started — the flapping
+    /// signal that today needs the journal. `#[serde(default)]` so an older supervisor's
+    /// document still parses.
+    #[serde(default)]
+    pub moves: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -168,13 +168,49 @@ fn gather(
     // desired *right now* — which a restarting supervisor passes through, so this is
     // re-read on every poll like every other input to the verdict.
     let applied = sys.exists(&f.run_dir);
-    let mut c = base.clone();
     let components = applied.then(|| read_components(sys, f)).flatten();
+    gather_with(sys, view, expected, base, applied, components)
+}
+
+/// One gather without the `--wait` loop and without the `cfab.sock` round trip, for the
+/// supervisor: it already holds its own `components` document, and asking itself over its own
+/// socket from its own main thread is a deadlock waiting to be written.
+pub(crate) fn snapshot_model(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<Components>,
+) -> Result<StatusModel> {
+    let expected = expected_links(view)?;
+    let applied = sys.exists(&view.fabric.run_dir);
+    gather_with(sys, view, &expected, &Ctx::default(), applied, comps)
+}
+
+/// The gather itself, once the `components` document is in hand — from the socket for `status`,
+/// from memory for the supervisor. One body, so the two can never describe a member differently.
+fn gather_with(
+    sys: &mut dyn Sys,
+    view: &View,
+    expected: &[ExpectedLink],
+    base: &Ctx,
+    applied: bool,
+    components: Option<Components>,
+) -> Result<StatusModel> {
+    let f = view.fabric;
+    let mut c = base.clone();
     let headline = if applied {
         Some(read(sys, view, expected, &mut c, components.as_ref())?)
     } else {
         None
     };
+    // The supervisor cannot print its own warning where an operator will see it, so the one
+    // place a failed metrics bind is visible without the journal is here. Standing: no amount of
+    // waiting clears a port somebody else is holding.
+    if let Some(e) = components.as_ref().and_then(|k| k.metrics_error.as_ref()) {
+        c.standing(format!(
+            "metrics endpoint not listening on :{} ({e})",
+            crate::supervisor::metrics::PORT
+        ));
+    }
     let conditions = c.conditions();
     Ok(StatusModel {
         member: MemberInfo {
@@ -1876,6 +1912,36 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
     words.get(i + 2)?.parse().ok()
 }
 
+/// Every argv `status` is allowed to run, and the one socket request. This list is the
+/// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
+/// `calls` too, so anything that is not on it fails the test by name. Shared with the
+/// supervisor's metrics-refresh guard, which gathers the same model.
+#[cfg(test)]
+pub(crate) fn is_read_only(call: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "ip route get ",
+        "ip route show table ",
+        "ip rule show pref ",
+        "ip -4 -br addr show dev ",
+        "nft list ",
+        "nft -s list ",
+        "nft -j list ",
+        "systemctl is-active ",
+        "systemctl is-enabled ",
+        "tc class show dev ",
+        "ethtool -i ",
+    ];
+    if let Some(rest) = call.strip_prefix("unix_request ") {
+        // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
+        // `components` / `log` (spec §9). Every other request would be a write.
+        return matches!(
+            rest.split_whitespace().nth(1),
+            Some("state" | "components" | "log")
+        );
+    }
+    ALLOWED.iter().any(|p| call.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2398,34 +2464,6 @@ mod tests {
 
     fn headline(report: &StatusReport) -> &str {
         report.output.lines().next().unwrap_or("")
-    }
-
-    /// Every argv `status` is allowed to run, and the one socket request. This list is the
-    /// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
-    /// `calls` too, so anything that is not on it fails the test by name.
-    fn is_read_only(call: &str) -> bool {
-        const ALLOWED: &[&str] = &[
-            "ip route get ",
-            "ip route show table ",
-            "ip rule show pref ",
-            "ip -4 -br addr show dev ",
-            "nft list ",
-            "nft -s list ",
-            "nft -j list ",
-            "systemctl is-active ",
-            "systemctl is-enabled ",
-            "tc class show dev ",
-            "ethtool -i ",
-        ];
-        if let Some(rest) = call.strip_prefix("unix_request ") {
-            // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
-            // `components` / `log` (spec §9). Every other request would be a write.
-            return matches!(
-                rest.split_whitespace().nth(1),
-                Some("state" | "components" | "log")
-            );
-        }
-        ALLOWED.iter().any(|p| call.starts_with(p))
     }
 
     /// One `status` run over one fixture: nothing in `MockSys.files` may change, and every
@@ -5585,6 +5623,49 @@ mod tests {
     }
 
     // ---- Task 11: the components block and the reworded rows (spec §9) ------------------
+
+    /// The supervisor's metrics endpoint failing to bind is a standing reason line — no amount
+    /// of waiting frees a port somebody else holds — and it is the only place an operator sees
+    /// it without the journal. One spelling, from `metrics::PORT`.
+    #[test]
+    fn a_failed_metrics_bind_is_a_standing_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&healthy_components(&view)).unwrap();
+        doc["metrics_error"] = serde_json::json!("Address already in use (os error 98)");
+        let mut sys = healthy_host(&f, &view).socket("/run/cfab/cfab.sock", &doc.to_string());
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let line = format!(
+            "metrics endpoint not listening on :{} (Address already in use (os error 98))",
+            crate::supervisor::metrics::PORT
+        );
+        let found = m
+            .conditions
+            .iter()
+            .find(|c| c.text == line)
+            .unwrap_or_else(|| panic!("no metrics line in {:?}", m.conditions));
+        assert_eq!(
+            found.class,
+            Class::Standing,
+            "a held port is not something waiting clears"
+        );
+        assert!(
+            render_text(&m, false, true)
+                .output
+                .contains(&format!("  {line}\n")),
+            "{}",
+            render_text(&m, false, true).output
+        );
+        // The healthy fixture carries no error: the line is not printed unconditionally.
+        let mut clean = healthy_host(&f, &view);
+        let m2 = gather(&mut clean, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            m2.conditions
+                .iter()
+                .all(|c| !c.text.starts_with("metrics "))
+        );
+    }
 
     /// A `components:` line is always printed, and last — after every reason line.
     #[test]
