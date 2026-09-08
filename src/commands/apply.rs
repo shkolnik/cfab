@@ -42,6 +42,12 @@ fn absent_wire_warning(dev: &str) -> String {
     )
 }
 
+/// "uplink" for one port, "uplinks" for more than one (a bond uplink of a workload's bridge)
+/// — a message naming a list of ports should agree with it in number.
+fn uplink_word(ports: &[String]) -> &'static str {
+    if ports.len() > 1 { "uplinks" } else { "uplink" }
+}
+
 /// The three legacy binaries, by name. `iptables-legacy-restore` loads the ceiling atomically,
 /// `iptables-legacy-save` is both readback halves (drift and counters), `iptables-legacy` adds
 /// the OUTPUT jump and sweeps stale chains.
@@ -405,23 +411,23 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             .map_err(|e| Error::fatal(format!("workload {name}: {e}")))?;
         for port in &up.ports {
             match uplink::stp_forwarding(sys, &up.bridge, port) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let raw = sys
-                        .read(&format!("/sys/class/net/{}/brif/{port}/state", up.bridge))
-                        .unwrap_or_default();
+                Ok((true, _)) => {}
+                Ok((false, state)) => {
                     return Err(Error::fatal(format!(
                         "workload {name}: uplink {port} of bridge {} is not forwarding (STP \
-                         state {}); wait for forward_delay or set bridge-stp off / bridge-fd 0",
-                        up.bridge,
-                        raw.trim()
+                         state {state}); wait for forward_delay or set bridge-stp off / bridge-fd 0",
+                        up.bridge
                     )));
                 }
                 Err(e) => return Err(Error::fatal(format!("workload {name}: {e}"))),
             }
         }
         run_ok(sys, &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", ifname])?;
-        workload_descs.push(format!("{name} on {ifname} (uplink {})", up.ports.join(", ")));
+        workload_descs.push(format!(
+            "{name} on {ifname} ({} {})",
+            uplink_word(&up.ports),
+            up.ports.join(", ")
+        ));
         workload_uplinks.push((row.wl.gw, up));
     }
     if !workload_uplinks.is_empty() {
@@ -1157,6 +1163,16 @@ pub(crate) mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn uplink_word_agrees_in_number_with_the_port_list() {
+        assert_eq!(uplink_word(&["eth0".to_string()]), "uplink");
+        assert_eq!(
+            uplink_word(&["eth0".to_string(), "eth1".to_string()]),
+            "uplinks"
+        );
+        assert_eq!(uplink_word(&[]), "uplink");
     }
 
     fn wl_fabric() -> Fabric {

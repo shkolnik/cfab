@@ -116,13 +116,16 @@ pub fn identify(sys: &dyn Sys, ifname: &str) -> Result<Uplink, String> {
 }
 
 /// Is `port` (a bridge port of `bridge`) in STP forwarding state (`BR_STATE_FORWARDING` = 3)?
-/// A missing state file names the bridge and port and the sysfs path it expected.
-pub fn stp_forwarding(sys: &dyn Sys, bridge: &str, port: &str) -> Result<bool, String> {
+/// A missing state file names the bridge and port and the sysfs path it expected. Returns the
+/// raw (trimmed) state text alongside the bool so a caller building a "not forwarding yet"
+/// message can name the state without re-reading the same sysfs file a second time.
+pub fn stp_forwarding(sys: &dyn Sys, bridge: &str, port: &str) -> Result<(bool, String), String> {
     let path = format!("/sys/class/net/{bridge}/brif/{port}/state");
     let state = sys
         .read(&path)
         .map_err(|_| format!("bridge {bridge}: port {port} has no {path}"))?;
-    Ok(state.trim() == "3")
+    let state = state.trim().to_string();
+    Ok((state == "3", state))
 }
 
 /// The ifindexes of every port on `up`'s bridge that is NOT one of its uplink ports (the VM taps
@@ -311,9 +314,15 @@ mod tests {
 
     #[test]
     fn stp_state_forwarding_is_3_and_anything_else_is_named() {
-        assert!(stp_forwarding(&pve1(), "primary", "eth0").unwrap());
+        assert_eq!(
+            stp_forwarding(&pve1(), "primary", "eth0").unwrap(),
+            (true, "3".to_string())
+        );
         let listening = pve1().file("/sys/class/net/primary/brif/eth0/state", "1\n");
-        assert_eq!(stp_forwarding(&listening, "primary", "eth0"), Ok(false));
+        assert_eq!(
+            stp_forwarding(&listening, "primary", "eth0"),
+            Ok((false, "1".to_string()))
+        );
         assert_eq!(
             stp_forwarding(&MockSys::default(), "primary", "eth0").unwrap_err(),
             "bridge primary: port eth0 has no /sys/class/net/primary/brif/eth0/state"
