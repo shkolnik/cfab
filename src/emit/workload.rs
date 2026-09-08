@@ -33,12 +33,12 @@ pub fn aggregate(zone_ids: &[u8]) -> Vec<String> {
     out
 }
 
+const HEADER: &str = "# dhcpd.conf (ISC): RFC 3442 classless static routes for the workload VLAN. A client that receives\n";
 /// The RFC 3442 classless-static-routes (option 121) dhcpd.conf snippet for one workload's
 /// gateway: every aggregate prefix routed via `gw`, plus the default route via `router` (RULED,
 /// spec §4 and §10 call 14: `router` is a declared key, refused outside `prefix`, printed only
 /// here). A client that receives option 121 ignores option 3 entirely, so the default route
 /// must be inside 121 or a client loses its existing default when it picks up this VLAN's lease.
-const HEADER: &str = "# dhcpd.conf (ISC): RFC 3442 classless static routes for the workload VLAN. A client that receives\n";
 pub fn dhcp_option_121(aggregate: &[String], gw: Ipv4Addr, router: Ipv4Addr) -> String {
     let g = gw.octets();
     let r = router
@@ -83,7 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aggregate_merges_aligned_neighbouring_16s_and_leaves_the_rest() {
+    fn aggregate_merges_aligned_neighboring_16s_and_leaves_the_rest() {
         assert_eq!(
             aggregate(&[99, 199, 249]),
             ["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]

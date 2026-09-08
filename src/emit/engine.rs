@@ -586,6 +586,13 @@ mod tests {
             "primary.3 in an instance not in allow: {cluster}"
         );
         assert!(if_names(&cfg).contains(&"primary.3".to_string()));
+        // A member that carries no row (the leaf pve3-tb) emits nothing for the ifname.
+        let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
+        assert!(!if_names(&leaf).contains(&"primary.3".to_string()), "{leaf}");
+        assert!(
+            !ospf_ifs(instance(&leaf, "storage")).iter().any(|i| i["name"] == "primary.3"),
+            "primary.3 passive on a non-carrier"
+        );
     }
 
     #[test]
