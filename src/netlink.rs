@@ -40,10 +40,11 @@ use crate::prober::decide::BondLink;
 ///
 /// Per call, not per `recv`: a socket that answers nothing, or answers only other people's
 /// datagrams, would otherwise cost one timeout per iteration without bound. And per call means
-/// per port, so the worst a blind socket can cost one tick is ports x this — 450 ms at nine
-/// ports, inside `PROBE_INTERVAL`, and the first expiry drops the socket so the next call opens
-/// a fresh one rather than inheriting it.
-const CALL_DEADLINE: Duration = Duration::from_millis(50);
+/// per port, so the worst a blind socket can cost one tick is ports x this — 180 ms at nine
+/// ports, leaving most of `PROBE_INTERVAL` for the rest of the tick (the ARP work and, since
+/// F27, a synchronous engine query). The first expiry drops the socket so the next call opens a
+/// fresh one rather than inheriting it. 20 ms is still ~1000x the measured 20.8 µs round trip.
+const CALL_DEADLINE: Duration = Duration::from_millis(20);
 
 /// One bond port as the kernel describes it, in one GETLINK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -263,9 +264,15 @@ fn expired() -> io::Error {
 }
 
 fn set_recv_timeout(sock: &Socket, d: Duration) -> io::Result<()> {
-    let tv = TimeVal::new(d.as_secs() as i64, d.subsec_micros() as i64);
-    setsockopt(&sock.as_fd(), ReceiveTimeout, &tv)?;
+    setsockopt(&sock.as_fd(), ReceiveTimeout, &recv_timeout(d))?;
     Ok(())
+}
+
+/// `SO_RCVTIMEO` of {0, 0} means NO timeout on Linux: a budget under one microsecond rounds up,
+/// never truncates to a recv that blocks forever.
+fn recv_timeout(d: Duration) -> TimeVal {
+    let us = d.subsec_micros().max(if d.as_secs() == 0 { 1 } else { 0 });
+    TimeVal::new(d.as_secs() as i64, us as i64)
 }
 
 /// Is this a failure of the socket rather than of the request? The kernel refusing a request
@@ -305,6 +312,16 @@ fn bond_link(m: MiiStatus) -> BondLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remaining budget under one microsecond must not become {0, 0}, which the kernel reads
+    /// as "block forever".
+    #[test]
+    fn a_sub_microsecond_budget_is_still_a_timeout() {
+        let tv = recv_timeout(Duration::from_nanos(500));
+        assert!(tv.tv_sec() == 0 && tv.tv_usec() == 1, "{tv:?}");
+        let tv = recv_timeout(Duration::from_millis(20));
+        assert!(tv.tv_sec() == 0 && tv.tv_usec() == 20_000, "{tv:?}");
+    }
 
     /// The four states the driver has map to the domain type, and anything else carries its raw
     /// number through rather than becoming a silent default.

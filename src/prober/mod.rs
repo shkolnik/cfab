@@ -2058,6 +2058,26 @@ mod tests {
             !log.iter().any(|l| l.contains("unreadable over netlink")),
             "the netdev being gone is not us failing to read: {log:?}"
         );
+        // The other half of presence: a netdev that comes BACK was re-added, and that re-arms
+        // the grace (unlike an admin-down port returning, tested above).
+        let grace_while_gone = p.legs[0]
+            .ports
+            .iter()
+            .find(|s| s.ifname == HOME)
+            .expect("still a port of the leg")
+            .grace_until;
+        sys.set_port(HOME, up());
+        p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
+        let home = p.legs[0]
+            .ports
+            .iter()
+            .find(|s| s.ifname == HOME)
+            .expect("still a port of the leg");
+        assert!(home.present, "it is back");
+        assert_ne!(
+            home.grace_until, grace_while_gone,
+            "a re-enumerated netdev re-arms the grace"
+        );
     }
 
     /// Fail loud: a port state that cannot be read at all is neither "no carrier" nor "the
