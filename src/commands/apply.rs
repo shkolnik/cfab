@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use crate::commands::common;
 use crate::commands::common::{
-    conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
+    conf_interfaces, ensure_foreign_transit_accept, has_ip_addr, link_exists, link_kind_is,
+    proc_sysctl,
 };
 use crate::commands::teardown;
 use crate::derive::{GwRow, Port, View};
@@ -407,7 +408,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             )));
         }
         let addr_out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
-        if !addr_out.stdout.contains(&row.address) {
+        if !has_ip_addr(&addr_out.stdout, &row.address) {
             return Err(Error::fatal(format!(
                 "workload {name}: interface {ifname} lacks {} (the member address from the \
                  declaration)",
@@ -1442,6 +1443,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             run(&mut noaddr, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
+        );
+    }
+
+    #[test]
+    fn up_refuses_a_substring_collision_on_the_declared_address() {
+        // 192.168.20.2/24 is a SUBSTRING of 1192.168.20.2/24; a `.contains()` check would
+        // wrongly accept it as "the address is present".
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut collision = sys.on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 1192.168.20.2/24\n",
+        );
+        assert_eq!(
+            run(&mut collision, &view, &opts()).unwrap_err().to_string(),
             "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
         );
     }

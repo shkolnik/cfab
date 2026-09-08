@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::common::{
-    conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
+    conf_interfaces, drop_rules, has_ip_addr, link_exists, link_kind_is,
+    remove_foreign_transit_accept,
 };
 use crate::commands::engine_ctl;
 use crate::derive::{Port, View};
@@ -162,7 +163,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             let ifname = &row.wl.ifname;
             let gw_cidr = row.wl.gw_cidr();
             let addr = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
-            if addr.stdout.contains(&gw_cidr) {
+            if has_ip_addr(&addr.stdout, &gw_cidr) {
                 run_ok(sys, &["ip", "addr", "del", &gw_cidr, "dev", ifname])?;
             }
         }
@@ -472,6 +473,20 @@ mod tests {
         assert!(!sys.ran("nft delete table bridge cfab"));
         assert!(!sys.ran("ip addr del 192.168.20.254/24"));
         assert!(!sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24"));
+    }
+
+    #[test]
+    fn down_does_not_mistake_a_substring_collision_for_the_gw_address_being_present() {
+        // 192.168.20.254/24 is a SUBSTRING of 1192.168.20.254/24; a `.contains()` check would
+        // wrongly try to delete an address that was never applied.
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys().on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 192.168.20.2/24 1192.168.20.254/24\n",
+        );
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.

@@ -254,6 +254,14 @@ pub fn conf_interfaces(sys: &mut dyn Sys) -> Result<Vec<String>> {
     sys.list_dir("/proc/sys/net/ipv4/conf")
 }
 
+/// Is `cidr` one of the whitespace-separated tokens of an `ip -br addr show` line? A substring
+/// check false-positives: `10.0.0.1/24` is a substring of `110.0.0.1/24`, and `ip -br addr`
+/// packs every address for the device onto one line with no other separator, so token-exact is
+/// the only correct match.
+pub fn has_ip_addr(stdout: &str, cidr: &str) -> bool {
+    stdout.split_whitespace().any(|tok| tok == cidr)
+}
+
 /// A base chain at the netfilter `forward` hook that cfab does not own and whose policy is
 /// `drop`, or a reason we could not tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,5 +763,18 @@ mod tests {
         let r = foreign_forward_remedy(&["cfab-st".to_string()]);
         assert!(r.contains("-i cfab-st -o cfab-st"), "{r}");
         assert!(foreign_forward_remedy(&[]).contains("<cfab-if>"));
+    }
+
+    #[test]
+    fn has_ip_addr_is_token_exact_not_substring() {
+        assert!(has_ip_addr("primary.3 UP 192.168.20.2/24\n", "192.168.20.2/24"));
+        assert!(has_ip_addr(
+            "primary.3 UP 10.0.0.1/24 192.168.20.2/24\n",
+            "192.168.20.2/24"
+        ));
+        // A substring collision must not false-positive: 10.0.0.1/24 is a substring of
+        // 110.0.0.1/24, and the reverse.
+        assert!(!has_ip_addr("primary.3 UP 110.0.0.1/24\n", "10.0.0.1/24"));
+        assert!(!has_ip_addr("primary.3 UP 10.0.0.1/24\n", "110.0.0.1/24"));
     }
 }
