@@ -30,8 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate the declaration; with [[workload]] rows, also print the fabric aggregate and
-    /// the DHCP option 121 snippet
+    /// Parse and validate fabric.toml; print the resolved view for this member; with
+    /// [[workload]] rows, also print the fabric aggregate and the DHCP option 121 snippet
     Check,
     /// Print the fabric.toml declaration schema as JSON Schema
     Schema,

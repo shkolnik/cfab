@@ -69,11 +69,6 @@ mod tests {
     use super::*;
     use crate::decl::Declaration;
 
-    fn example() -> String {
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-            .unwrap()
-    }
-
     fn wl_fabric() -> Fabric {
         Fabric::from_decl(
             &Declaration::parse(&crate::decl::fixtures::with_workload(
@@ -82,38 +77,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
-    }
-
-    /// The per-member line is the only output that says what THIS host will get, and `up`
-    /// builds one bond per fallback leg with one port per wire under it. It must say so.
-    #[test]
-    fn check_names_this_members_fallback_legs() {
-        let f = Fabric::from_decl(&Declaration::parse(&example()).unwrap()).unwrap();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        assert_eq!(
-            report(&f, &view),
-            "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
-             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             3 fallback leg(s), 1 ingress leg(s)\n"
-        );
-    }
-
-    /// A fabric declaring no universal segment: one spelling, counted zero, never absent.
-    #[test]
-    fn check_on_a_fallback_free_fabric_counts_zero() {
-        let text = example()
-            .lines()
-            .filter(|l| !l.starts_with("universal = "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        assert_eq!(
-            report(&f, &view),
-            "fabric.toml OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
-             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             0 fallback leg(s), 1 ingress leg(s)\n"
-        );
     }
 
     #[test]

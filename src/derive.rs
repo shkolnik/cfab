@@ -265,12 +265,8 @@ impl<'a> View<'a> {
                 out.push((s.ifname, false));
             }
         }
-        // A workload interface always forwards (spec §5.1.2): it is baseline-owned, not one of
-        // cfab's own legs, so it carries no untagged admin plane to protect, and its reach into
-        // an allowed zone does not depend on `[forward] enabled` (that flag gates transit
-        // BETWEEN zones, not a workload's own declared reach).
         for r in self.workload_rows() {
-            out.push((r.wl.ifname.clone(), true));
+            out.push((r.wl.ifname.clone(), transit));
         }
         for z in &f.zones {
             let id = Self::identity_if(z);
@@ -951,10 +947,25 @@ mod tests {
                 .unwrap()
                 .owned_forwarding()
                 .iter()
-                .any(|(n, _)| n == ifname)
+                .find(|(n, _)| n == ifname)
+                .map(|(_, t)| *t)
         };
-        assert!(get("pve1-tb", "primary.3"));
-        assert!(!get("pve3-tb", "primary.3"));
+        assert_eq!(get("pve1-tb", "primary.3"), Some(true));
+        assert_eq!(get("pve3-tb", "primary.3"), None);
+
+        // host_forward off: the workload row's transit bit follows the same gate as every
+        // other forwarding row, not the workload's own `allow` list.
+        let mut f_off = f;
+        f_off.host_forward = false;
+        assert_eq!(
+            View::new(&f_off, "pve1-tb")
+                .unwrap()
+                .owned_forwarding()
+                .iter()
+                .find(|(n, _)| n == "primary.3")
+                .map(|(_, t)| *t),
+            Some(false)
+        );
     }
 
     #[test]

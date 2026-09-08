@@ -331,7 +331,12 @@ impl Ipv4Prefix {
 
     /// The network address plus one — the lowest usable host in the prefix.
     pub fn first_host(&self) -> Ipv4Addr {
-        Ipv4Addr::from(u32::from(self.net) + 1)
+        Ipv4Addr::from(u32::from(self.net).saturating_add(1))
+    }
+
+    /// The broadcast address: every host bit set.
+    pub fn broadcast(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.net) | !Self::mask(self.len))
     }
 }
 
@@ -887,9 +892,33 @@ impl Fabric {
                     wl.name
                 )));
             }
+            // An ifname cfab already creates or owns by declaration: a declared wire, a
+            // declared segment/universal sub-if, or a zone's generated ingress/identity leg.
+            let collides = self
+                .members
+                .iter()
+                .any(|m| m.wires.iter().any(|w| w.name == wl.ifname))
+                || self.segments.iter().any(|s| s.ifname == wl.ifname)
+                || self.zones.iter().any(|z| {
+                    wl.ifname == format!("cfab-gw{}", z.id)
+                        || wl.ifname == format!("cfab-id{}", z.id)
+                        || wl.ifname == format!("cfab-id{}-peer", z.id)
+                });
+            if collides {
+                return Err(Error::config(format!(
+                    "workload {}: ifname '{}' collides with an interface cfab creates",
+                    wl.name, wl.ifname
+                )));
+            }
             if !wl.prefix.contains(wl.gw) {
                 return Err(Error::config(format!(
                     "workload {}: gw {} is outside prefix {}",
+                    wl.name, wl.gw, wl.prefix
+                )));
+            }
+            if wl.gw == wl.prefix.net || wl.gw == wl.prefix.broadcast() {
+                return Err(Error::config(format!(
+                    "workload {}: gw {} is the network or broadcast address of {}",
                     wl.name, wl.gw, wl.prefix
                 )));
             }
@@ -897,6 +926,25 @@ impl Fabric {
                 return Err(Error::config(format!(
                     "workload {}: router {} is outside prefix {}",
                     wl.name, wl.router, wl.prefix
+                )));
+            }
+            if wl.router == wl.prefix.net || wl.router == wl.prefix.broadcast() {
+                return Err(Error::config(format!(
+                    "workload {}: router {} is the network or broadcast address of {}",
+                    wl.name, wl.router, wl.prefix
+                )));
+            }
+            if wl.allow.is_empty() {
+                return Err(Error::config(format!(
+                    "workload {}: allow is empty; a workload must reach at least one zone",
+                    wl.name
+                )));
+            }
+            if !self.host_forward {
+                return Err(Error::config(format!(
+                    "workload {}: allow is non-empty but [forward] enabled = false; enable \
+                     forwarding or remove allow",
+                    wl.name
                 )));
             }
             for z in &wl.allow {
@@ -926,7 +974,14 @@ impl Fabric {
             }
         }
         for m in &self.members {
+            let mut seen_member_workload = BTreeSet::new();
             for mw in &m.workloads {
+                if !seen_member_workload.insert(mw.name.clone()) {
+                    return Err(Error::config(format!(
+                        "member {}: workload {} is declared twice",
+                        m.name, mw.name
+                    )));
+                }
                 let Some(wl) = self.workload(&mw.name) else {
                     let names = self
                         .workloads
@@ -961,6 +1016,25 @@ impl Fabric {
                         wl.name,
                         mw.address_cidr(),
                         wl.prefix.len
+                    )));
+                }
+                if mw.address == wl.gw {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: address {} is the gateway {}",
+                        m.name,
+                        wl.name,
+                        mw.address_cidr(),
+                        wl.gw
+                    )));
+                }
+                if mw.address == wl.prefix.net || mw.address == wl.prefix.broadcast() {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: address {} is the network or broadcast \
+                         address of {}",
+                        m.name,
+                        wl.name,
+                        mw.address_cidr(),
+                        wl.prefix
                     )));
                 }
             }
@@ -1748,6 +1822,22 @@ mod tests {
     }
 
     #[test]
+    fn check_refuses_a_gw_that_is_the_network_or_broadcast_address() {
+        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.20.0\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: gw 192.168.20.0 is the network or broadcast address of \
+             192.168.20.0/24"
+        );
+        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.20.255\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: gw 192.168.20.255 is the network or broadcast address \
+             of 192.168.20.0/24"
+        );
+    }
+
+    #[test]
     fn check_refuses_a_router_outside_the_prefix_or_malformed() {
         let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.30.1\""));
         assert_eq!(
@@ -1759,6 +1849,62 @@ mod tests {
             e,
             "fabric.toml: workload vms: router '192.168.20.1/24' must be a bare IPv4 address \
              (the VLAN's existing default router)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_router_that_is_the_network_or_broadcast_address() {
+        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.0\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: router 192.168.20.0 is the network or broadcast \
+             address of 192.168.20.0/24"
+        );
+        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.255\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: router 192.168.20.255 is the network or broadcast \
+             address of 192.168.20.0/24"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_workload_ifname_colliding_with_an_interface_cfab_creates() {
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"eth9\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'eth9' collides with an interface cfab creates"
+        );
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-st\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'cfab-st' collides with an interface cfab \
+             creates"
+        );
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'cfab-gw249' collides with an interface cfab \
+             creates"
+        );
+    }
+
+    #[test]
+    fn check_refuses_workload_allow_empty() {
+        let e = wl_err(|t| t.replace("allow = [\"storage\"]", "allow = []"));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: allow is empty; a workload must reach at least one zone"
+        );
+    }
+
+    #[test]
+    fn check_refuses_workload_allow_when_forwarding_is_disabled() {
+        let e = wl_err(|t| t.replace("enabled = true", "enabled = false"));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: allow is non-empty but [forward] enabled = false; \
+             enable forwarding or remove allow"
         );
     }
 
@@ -1789,6 +1935,47 @@ mod tests {
             e,
             "fabric.toml: member pve1-tb: workload vms: address 192.168.20.2/32 must carry the \
              prefix's mask /24"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_address_that_is_the_gateway() {
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.20.254/24\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.254/24 is the \
+             gateway 192.168.20.254"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_address_that_is_the_network_or_broadcast_address() {
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.20.0/24\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.0/24 is the network \
+             or broadcast address of 192.168.20.0/24"
+        );
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.20.255/24\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.255/24 is the \
+             network or broadcast address of 192.168.20.0/24"
         );
     }
 
@@ -1834,6 +2021,21 @@ mod tests {
     }
 
     #[test]
+    fn check_refuses_a_member_workload_declared_twice() {
+        let e = wl_err(|t| {
+            t.replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \
+                 \"vms\", address = \"192.168.20.5/24\" }]",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms is declared twice"
+        );
+    }
+
+    #[test]
     fn check_refuses_a_leaf_carrying_a_workload() {
         let e = wl_err(|t| {
             crate::decl::fixtures::with_prefs(
@@ -1860,6 +2062,35 @@ mod tests {
             e,
             "fabric.toml: workload vms: span = \"host\" is phase 2 and not built yet (omit it, \
              or span = \"switch\")"
+        );
+    }
+
+    #[test]
+    fn check_refuses_an_unknown_span_value() {
+        let e = wl_err(|t| {
+            t.replace(
+                "gw = \"192.168.20.254\"",
+                "gw = \"192.168.20.254\"\nspan = \"Switch\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: span 'Switch' is not one of switch, host"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_address_without_a_length() {
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.20.2\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address '192.168.20.2' is not an IPv4 \
+             address with a length"
         );
     }
 
@@ -1902,6 +2133,19 @@ mod tests {
         assert_eq!(
             f.aggregate(),
             vec!["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]
+        );
+    }
+
+    #[test]
+    fn first_host_and_broadcast_are_the_prefixs_edges() {
+        let p = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        assert_eq!(p.first_host(), Ipv4Addr::new(192, 168, 20, 1));
+        assert_eq!(p.broadcast(), Ipv4Addr::new(192, 168, 20, 255));
+        let host_prefix = Ipv4Prefix::parse("255.255.255.255/32").unwrap();
+        assert_eq!(
+            host_prefix.first_host(),
+            Ipv4Addr::new(255, 255, 255, 255),
+            "saturates instead of wrapping at the top of the address space"
         );
     }
 }

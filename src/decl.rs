@@ -41,7 +41,7 @@ pub struct Declaration {
     #[serde(rename = "zone")]
     pub zones: Vec<ZoneDecl>,
     /// `[[workload]]` — a VM workload VLAN and the zones it may reach.
-    #[serde(default, rename = "workload", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workload: Vec<WorkloadDecl>,
     /// Required: whether hosts transit between zones, and which pairs may. Not a tunable
     /// with a default — a default would let an omitted table decide the isolation posture.
@@ -636,7 +636,14 @@ mod tests {
         assert_eq!(json["additionalProperties"], serde_json::json!(false));
         // ...and every property the example states is described.
         let props = json["properties"].as_object().expect("properties");
-        for key in ["dns_domain", "domains", "member", "zone", "forward"] {
+        for key in [
+            "dns_domain",
+            "domains",
+            "member",
+            "zone",
+            "forward",
+            "workload",
+        ] {
             assert!(props.contains_key(key), "{key}");
         }
     }
