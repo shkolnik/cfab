@@ -190,7 +190,42 @@ pub fn generate(view: &View) -> Result<String> {
             ));
         }
     }
-    out.push_str("  }\n}\n");
+    out.push_str("  }\n");
+    // Spec §5 item 7: a forward-hook chain overwrites DSCP toward each allowed zone for a
+    // workload's own traffic, so a DSCP-trusting switch queues VM egress the same way it
+    // queues that zone's own bulk. `policy accept`: this chain only overwrites a field, it
+    // never decides transit — `inet cfab-fwd` (Task 2) already does that. Unconditional, NOT
+    // gated on `[marking] set_dscp` like the bulk clamp above: an untrusted VM must never be
+    // able to reach the control DSCP/queue by tagging its own traffic, clamp or no clamp.
+    // Omitted entirely when there is no workload row, so a fabric without one renders
+    // byte-identical to today.
+    if !view.workload_rows().is_empty() {
+        out.push_str("  chain fwd {\n");
+        out.push_str("    type filter hook forward priority mangle; policy accept;\n");
+        for row in view.workload_rows() {
+            for zname in &row.wl.allow {
+                // Same emptiness as the bulk clamp above: a zone this member has no interface
+                // in (declared reachable elsewhere in the fabric, not here) gets no rule rather
+                // than an empty `oifname { }`, which nft refuses to load.
+                let ifs_list = view.zone_ifs(zname);
+                if ifs_list.is_empty() {
+                    continue;
+                }
+                let z = f.zone(zname)?;
+                let ifs = ifs_list
+                    .iter()
+                    .map(|i| format!("\"{i}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!(
+                    "    iifname \"{}\" oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-{}\"\n",
+                    row.wl.ifname, z.dscp, row.wl.name, zname
+                ));
+            }
+        }
+        out.push_str("  }\n");
+    }
+    out.push_str("}\n");
     Ok(out)
 }
 
@@ -205,6 +240,94 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Spec §5 item 7: a `chain fwd` at the forward hook overwrites DSCP toward each allowed
+    /// zone for a workload's traffic, so a DSCP-trusting switch queues VM egress the same way
+    /// it queues that zone's own bulk. `oifname { … }` is the same `zone_ifs(zone)` spelling
+    /// the `out` chain's guards use, on the shipped example's storage zone (segments +
+    /// fallback: `cfab-st,cfab-st-bk,cfab-st-b2,cfab-st-fb`).
+    #[test]
+    fn a_workload_adds_a_forward_hook_chain_that_overwrites_dscp_toward_each_allowed_zone() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        let fwd = t.split("chain fwd {").nth(1).expect("fwd chain");
+        assert!(
+            fwd.starts_with("\n    type filter hook forward priority mangle; policy accept;\n"),
+            "{fwd}"
+        );
+        assert!(
+            fwd.contains(
+                "iifname \"primary.3\" oifname { \"cfab-st\",\"cfab-st-bk\",\"cfab-st-b2\",\"cfab-st-fb\" } \
+                 ip dscp set cs0 comment \"dscp-vms-storage\""
+            ),
+            "{fwd}"
+        );
+    }
+
+    #[test]
+    fn without_workloads_the_table_has_no_fwd_chain() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(!generate(&v).unwrap().contains("chain fwd"));
+    }
+
+    /// A two-zone, two-domain declaration where the carrying member has a wire (and so a
+    /// segment) on only one of them: `pve1` allows the workload into a zone it has no
+    /// interface in at all (declared reachable from elsewhere in the fabric, not from here).
+    /// `zone_ifs` for that zone is empty, exactly like the bulk clamp's own guard above.
+    fn wl_fabric_with_an_unreachable_allowed_zone() -> Fabric {
+        // `pve2` gives domain `b` a member (a bare `[domains]` token with no wire on it is
+        // refused) without giving `pve1` — the one under test — a wire there.
+        let members = format!(
+            "{}{}",
+            fixtures::member("pve1", 1, "host", "eth0@a:1000"),
+            fixtures::member("pve2", 2, "host", "eth0@b:1000"),
+        );
+        let zones = format!(
+            "{}{}",
+            fixtures::zone("storage", 99, "a", "cfab-st@a:1:100", None, None),
+            fixtures::zone("otherz", 199, "b", "cfab-oz@b:1:200", None, None),
+        );
+        let text = fixtures::declaration(&["a", "b"], &members, &zones, "\"storage>storage\"");
+        let text = fixtures::with_prefs(
+            &text,
+            "pve1",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+        );
+        let text = format!(
+            "{text}\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\n\
+             prefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\n\
+             allow = [\"storage\", \"otherz\"]\n"
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Empty-oifname guard: a rule toward a zone this member has no interface in would render
+    /// `oifname { }`, which nft refuses to load, so it is skipped — the table still renders,
+    /// and the reachable zone still gets its rule.
+    #[test]
+    fn a_workload_gets_no_dscp_rule_toward_a_zone_this_member_has_no_interface_in() {
+        let f = wl_fabric_with_an_unreachable_allowed_zone();
+        let v = View::new(&f, "pve1").unwrap();
+        let t = generate(&v).unwrap();
+        assert!(t.contains("chain fwd"), "the table still renders: {t}");
+        assert!(!t.contains("otherz"), "{t}");
+        assert!(
+            t.contains(
+                "iifname \"primary.3\" oifname { \"cfab-st\" } ip dscp set cs0 \
+                 comment \"dscp-vms-storage\""
+            ),
+            "the reachable zone still gets its rule: {t}"
+        );
     }
 
     /// The same declaration grown to `n` members (node ids 1..=n, all hosts with all three

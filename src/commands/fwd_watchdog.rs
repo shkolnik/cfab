@@ -708,6 +708,16 @@ pub(crate) mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     /// `nft -j list chains` with only cfab's own tables. `extra` appends a foreign chain.
     fn chains_json(extra: &str) -> String {
         format!(
@@ -1226,6 +1236,39 @@ pub(crate) mod tests {
             .position(|c| c == "ip link set cfab-st-fb down")
             .expect("the legs went down");
         assert!(release < amputation, "{:?}", sys.calls);
+    }
+
+    /// The pref-2000 workload sibling (spec §5 item 4) is member-wide like the rest of
+    /// `return_path_rules`, so `restore_rules` restores it the same way: everything else at
+    /// pref 2000 stays present, only the sibling is missing, and only the sibling gets re-added.
+    #[test]
+    fn the_watchdog_restores_a_missing_workload_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        // Same pref-2000 content `rules_present` would build, minus the sibling's own line —
+        // the rest of that pref is healthy, and only the sibling has gone missing.
+        let present_2000: String = common::return_path_rules(&view)
+            .into_iter()
+            .filter(|r| r.pref == "2000" && !r.needle.contains("192.168.20.0/24"))
+            .map(|r| format!("{}: from all {}\n", r.pref, r.needle))
+            .collect();
+        let mut sys = healthy_leaf_sys(&view)
+            .on_stdout(&["ip", "rule", "show", "pref", "2000"], &present_2000);
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(
+            sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            report.restored.contains(
+                &"re-added ip rule pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"
+                    .to_string()
+            ),
+            "{:?}",
+            report.restored
+        );
+        assert!(report.downed.is_empty(), "{:?}", report.downed);
     }
 
     /// Row 5, restore. A leaf's leak guard is re-added, and the fabric stays up.
