@@ -29,6 +29,7 @@
 
 pub mod child;
 pub mod lock;
+pub(crate) mod metrics;
 pub mod report;
 pub mod sock;
 
