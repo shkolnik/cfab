@@ -1146,7 +1146,7 @@ fn leaf_guard(sys: &mut dyn Sys, view: &View) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::decl::Declaration;
     use crate::model::Fabric;
@@ -1316,7 +1316,7 @@ mod tests {
         sys
     }
 
-    fn opts() -> ApplyOpts {
+    pub(crate) fn opts() -> ApplyOpts {
         ApplyOpts {
             pmxcfs_root: "/nonexistent/pve".to_string(),
         }
