@@ -159,6 +159,12 @@ struct ProbePort {
     /// wins on preference, takes the bond back and dies again one dead interval later. Only a
     /// hello (a peer's, or our own reflection once this port is a backup) clears it.
     hello_dead: bool,
+    /// F28: when this port is confirmed dead (`state.reachable()` false) but still escalating,
+    /// the tick before which asking again is pointless — a live decision is asked every tick,
+    /// but a confirmed-dead wire is asked once per hello interval. `None` means the next ask is
+    /// due immediately, which is the state a wire enters the instant it is confirmed dead (the
+    /// first confirmed-dead round is not delayed) and whenever escalation starts or ends.
+    next_ask: Option<Instant>,
     /// The reason this port's tap could not be opened, as it was last reported. `None` once it
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
@@ -201,6 +207,7 @@ impl ProbePort {
             grace_until: None,
             escalating: false,
             hello_dead: false,
+            next_ask: None,
             deaf: None,
             usable_prev: None,
             returned: false,
@@ -724,6 +731,7 @@ impl Leg {
                     if heard_now || replied {
                         s.state.heard();
                         s.escalating = false;
+                        s.next_ask = None;
                     } else if s.escalating && s.probed {
                         s.state.observe(false);
                     }
@@ -817,6 +825,7 @@ impl Leg {
                 Verdict::Good => {
                     s.escalating = false;
                     s.probed = false;
+                    s.next_ask = None;
                     all_quiet = false;
                 }
                 Verdict::Suspect => {
@@ -826,9 +835,11 @@ impl Leg {
                     if s.hello_dead {
                         s.escalating = false;
                         s.probed = false;
+                        s.next_ask = None;
                     } else if !s.escalating {
                         s.escalating = true;
                         s.probed = false;
+                        s.next_ask = None;
                         s.state.precharge();
                     }
                 }
@@ -837,6 +848,7 @@ impl Leg {
                     // Nothing to move to and nothing to ask: whatever is wrong is not this wire.
                     s.escalating = false;
                     s.probed = false;
+                    s.next_ask = None;
                 }
             }
         }
@@ -883,6 +895,19 @@ impl Leg {
                     if !s.escalating {
                         continue;
                     }
+                    // F28: a live decision is asked every tick — that is what makes failover
+                    // fast — but a confirmed-dead wire (the ARP hysteresis has already said so)
+                    // is asked once per hello interval, the same cadence OSPF itself would use
+                    // to notice the wire come back. The first confirmed-dead round is not
+                    // delayed (`next_ask` starts `None`); any reply or hello clears `escalating`
+                    // (and `next_ask` with it) above, so recovery is never slowed by this.
+                    if !s.state.reachable() {
+                        if s.next_ask.is_some_and(|t| now < t) {
+                            s.probed = false;
+                            continue;
+                        }
+                        s.next_ask = Some(now + f.windows.hello);
+                    }
                     // The members demonstrably reachable over this wire until a moment ago, in
                     // preference to the whole segment: any one answer clears the wire, and the
                     // bound is what keeps a fabric-wide event a burst rather than a storm.
@@ -913,7 +938,6 @@ impl Leg {
                         // there — the decision below has already been told.
                         s.escalating = s.state.reachable();
                     }
-                    let _ = now;
                 }
             }
         }
