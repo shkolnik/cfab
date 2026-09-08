@@ -92,9 +92,12 @@ done
 ip -c=never -br link | awk '$1 ~ /^cfab-/ {print "  netdev " $1}'
 
 s workload "(declaration: $CONF)"
-WLIFS=$([ -f "$CONF" ] && awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && $1=="ifname"{gsub(/"/,"",$3); print $3}' "$CONF")
-if [ -z "$WLIFS" ]; then
-  echo "  no [[workload]] rows in $CONF"
+if [ ! -f "$CONF" ]; then
+  echo "  $CONF absent"
+  WLIFS=""
+else
+  WLIFS=$(awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && $1=="ifname"{gsub(/"/,"",$3); print $3}' "$CONF")
+  [ -z "$WLIFS" ] && echo "  no [[workload]] rows in $CONF"
 fi
 for ifn in $WLIFS; do
   echo "  -- $ifn"
@@ -109,21 +112,49 @@ for ifn in $WLIFS; do
   else
     echo "    /proc/net/vlan/$ifn absent (not an 802.1q sub-interface, or 8021q not loaded)"
   fi
-  low=$(ls -d /sys/class/net/"$ifn"/lower_* 2>/dev/null | sed 's|.*/lower_||')
-  echo "    lower: ${low:-none}"
-  if [ -n "$low" ] && [ -d /sys/class/net/"$low"/bridge ]; then
-    echo "    bridge $low: stp=$(cat /sys/class/net/"$low"/bridge/stp_state 2>/dev/null) forward_delay=$(cat /sys/class/net/"$low"/bridge/forward_delay 2>/dev/null)"
-    for p in /sys/class/net/"$low"/brif/*; do
-      [ -e "$p" ] || continue
-      p=${p##*/}
-      dev=no; [ -e /sys/class/net/"$p"/device ] && dev=yes
-      plow=$(ls -d /sys/class/net/"$p"/lower_* 2>/dev/null | sed 's|.*/lower_||' | tr '\n' ' ')
-      # state 3 = forwarding (the port passes traffic); anything else blocks it.
-      echo "    port $p state=$(cat /sys/class/net/"$low"/brif/"$p"/state 2>/dev/null) device=$dev lowers=${plow:-none}"
-    done
-    have bridge && bridge -c=never vlan show dev "$low" 2>&1 | sed 's/^/    /'
+  lowers=$(ls -d /sys/class/net/"$ifn"/lower_* 2>/dev/null | sed 's|.*/lower_||')
+  nlow=$(printf '%s' "$lowers" | grep -c '^.')
+  if [ "$nlow" -ne 1 ]; then
+    echo "    lower: $nlow links, expected exactly one"
+  else
+    low=$(printf '%s' "$lowers" | head -1)
+    if [ ! -d /sys/class/net/"$low"/bridge ]; then
+      echo "    lower $low is not a bridge"
+    else
+      echo "    lower: $low"
+      # stp_state: 0=off, 1=kernel STP, 2=user-space STP (e.g. mstpd).
+      echo "    bridge $low: stp=$(cat /sys/class/net/"$low"/bridge/stp_state 2>/dev/null) (0=off, 1=kernel, 2=user) forward_delay=$(cat /sys/class/net/"$low"/bridge/forward_delay 2>/dev/null)"
+      for p in /sys/class/net/"$low"/brif/*; do
+        [ -e "$p" ] || continue
+        p=${p##*/}
+        pdev=/sys/class/net/"$p"/device
+        dev=no; { [ -e "$pdev" ] || [ -L "$pdev" ]; } && dev=yes
+        plow=$(ls -d /sys/class/net/"$p"/lower_* 2>/dev/null | sed 's|.*/lower_||' | tr '\n' ' ')
+        sfile=/sys/class/net/"$low"/brif/"$p"/state
+        if [ -f "$sfile" ]; then pstate=$(cat "$sfile" 2>/dev/null); else pstate=MISSING; fi
+        # state 3 = forwarding (the port passes traffic); anything else blocks it.
+        echo "    port $p state=$pstate device=$dev lowers=${plow:-none}"
+      done
+      if have bridge; then
+        # Unfiltered: shows the bridge AND every port's own VLAN membership (the uplink port's
+        # tagging is what proves vid 3 actually reaches it, not just the bridge's config).
+        bridge -c=never vlan show 2>&1 | sed 's/^/    /'
+      else
+        echo "    bridge: command absent"
+      fi
+    fi
   fi
 done
 echo "  net.ipv4.conf.all.arp_ignore = $(sysctl -n net.ipv4.conf.all.arp_ignore 2>/dev/null || echo absent)"
-BRTABLES=$(have nft && nft list tables 2>/dev/null | grep -E '^table bridge')
-if [ -n "$BRTABLES" ]; then echo "$BRTABLES" | sed 's/^/  /'; else echo "  no bridge nft tables"; fi
+if have nft; then
+  NFTOUT=$(nft list tables 2>&1)
+  NFTRC=$?
+  if [ "$NFTRC" -ne 0 ]; then
+    echo "  nft: cannot list bridge tables ($NFTOUT)"
+  else
+    BRTABLES=$(printf '%s\n' "$NFTOUT" | grep -E '^table bridge')
+    if [ -n "$BRTABLES" ]; then echo "$BRTABLES" | sed 's/^/  /'; else echo "  no bridge nft tables"; fi
+  fi
+else
+  echo "  nft: command absent"
+fi
