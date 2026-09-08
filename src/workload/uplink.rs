@@ -57,8 +57,9 @@ fn parse_vid(text: &str) -> Option<u16> {
 
 /// Identify the uplink of the bridge that `ifname` (a workload VLAN sub-interface, e.g.
 /// `primary.3`) sits on. Every failure names the object and the remedy (fail loud, never
-/// degrade): a missing lower link, a lower link that is not a bridge, a bridge with no uplink
-/// port, or a workload interface that is not itself an 802.1Q sub-interface.
+/// degrade): a missing or ambiguous lower link, a lower link that is not a bridge, a bridge with
+/// no uplink port, a `/proc/net/vlan` entry without a VID, or a workload interface that is not
+/// itself an 802.1Q sub-interface.
 pub fn identify(sys: &dyn Sys, ifname: &str) -> Result<Uplink, String> {
     let lowers = lower_of(sys, ifname);
     let bridge = match lowers.as_slice() {
@@ -76,18 +77,17 @@ pub fn identify(sys: &dyn Sys, ifname: &str) -> Result<Uplink, String> {
         }
     };
 
-    let brif = sys
+    let ports = sys
         .list_dir(&format!("/sys/class/net/{bridge}/brif/"))
         .unwrap_or_default();
     let is_bridge =
-        !brif.is_empty() || sys.exists(&format!("/sys/class/net/{bridge}/bridge/stp_state"));
+        !ports.is_empty() || sys.exists(&format!("/sys/class/net/{bridge}/bridge/stp_state"));
     if !is_bridge {
         return Err(format!(
             "workload interface {ifname} sits on {bridge}, which is not a bridge (phase 1 needs a bridge port for the VMs)"
         ));
     }
 
-    let ports = brif;
     let uplink_ports: Vec<String> = ports
         .iter()
         .filter(|p| is_uplink_port(sys, p, 0))
@@ -201,15 +201,18 @@ mod tests {
     fn a_port_that_vanished_mid_scan_is_skipped() {
         let sys = MockSys::default()
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .file("/sys/class/net/primary/brif/goner/state", "3\n");
+            .file("/sys/class/net/primary/brif/goner/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .file("/sys/class/net/tap100i0/ifindex", "10\n");
         // "goner" is a bridge port with no /sys/class/net/goner/ifindex at all: it was torn
-        // down between the brif/ listing and the ifindex read.
+        // down between the brif/ listing and the ifindex read. The live tap beside it proves
+        // the skip is surgical, not total.
         let up = Uplink {
             bridge: "primary".into(),
             vid: 3,
             ports: vec!["eth0".into()],
         };
-        assert_eq!(non_uplink_ifindexes(&sys, &up).unwrap(), BTreeSet::new());
+        assert_eq!(non_uplink_ifindexes(&sys, &up).unwrap(), BTreeSet::from([10]));
     }
 
     #[test]
