@@ -175,8 +175,6 @@ fn gather(
 /// One gather without the `--wait` loop and without the `cfab.sock` round trip, for the
 /// supervisor: it already holds its own `components` document, and asking itself over its own
 /// socket from its own main thread is a deadlock waiting to be written.
-// The supervisor's metrics refresh is its only caller and it is not wired yet.
-#[allow(dead_code)]
 pub(crate) fn snapshot_model(
     sys: &mut dyn Sys,
     view: &View,

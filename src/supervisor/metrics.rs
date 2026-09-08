@@ -4,16 +4,17 @@
 //! object outlives the snapshot it describes and a family can disappear when the fact behind it
 //! does — which is what a state that is `None` means.
 
-// Nothing outside the tests renders yet: the supervisor's serve loop is the only caller and it
-// does not exist in this commit.
-#![allow(dead_code)]
-
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeGaugeValue, EncodeMetric};
 use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::ConstCounter;
 use prometheus_client::metrics::gauge::ConstGauge;
 use prometheus_client::registry::Registry;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, watch};
 
 use crate::commands::status::model::{
     BondLeg, Class, Condition, HomeCarrier, Ingress, LegKind, State, StatusModel,
@@ -183,7 +184,7 @@ fn class_word(c: Class) -> &'static str {
 
 #[derive(Debug)]
 struct FabricCollector {
-    snap: Snapshot,
+    snap: Arc<Snapshot>,
 }
 
 impl FabricCollector {
@@ -791,18 +792,110 @@ pub(crate) fn write_response(r: &Response, body: &str) -> Vec<u8> {
 }
 
 /// The member's state as OpenMetrics text, ready to serve.
-pub(crate) fn render(s: &Snapshot) -> String {
+pub(crate) fn render(s: &Arc<Snapshot>) -> String {
     let mut reg = Registry::default();
-    reg.register_collector(Box::new(FabricCollector { snap: s.clone() }));
+    reg.register_collector(Box::new(FabricCollector {
+        snap: Arc::clone(s),
+    }));
     let mut out = String::new();
     prometheus_client::encoding::text::encode(&mut out, &reg)
         .expect("fmt::Write on a String cannot fail");
     out
 }
 
+/// How long a connection has to deliver its whole request line. Rule (spec §3.1): a scraper
+/// writes its request at once, so a peer that has not finished in two seconds is not scraping
+/// and must not hold a slot.
+const READ_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Connections served at once. Rule (spec §3.1): bounded with no queue — a scrape costs one
+/// `Arc` clone, so this is far past any real set of scrapers and still refuses a socket flood.
+const MAX_INFLIGHT: usize = 16;
+
+/// How often the snapshot behind the endpoint is re-gathered. Rule (spec §3.2): Prometheus's
+/// own default scrape interval, so a scrape is never more than one gather stale.
+pub(crate) const REFRESH: Duration = Duration::from_secs(15);
+
+/// The listening socket, on every address. Bound blocking and handed to tokio, so a failure is
+/// an `io::Error` the caller can report rather than a panic inside a task.
+pub(crate) fn bind(port: u16) -> std::io::Result<TcpListener> {
+    let l = std::net::TcpListener::bind(("0.0.0.0", port))?;
+    l.set_nonblocking(true)?;
+    TcpListener::from_std(l)
+}
+
+/// Serve `/metrics` until the listener dies. Every connection is answered from `latest`, the
+/// snapshot the supervisor's refresh arm publishes: the accept path performs no gather, holds
+/// no lock, and touches no host.
+pub(crate) async fn serve(listener: TcpListener, latest: watch::Receiver<Arc<str>>) {
+    let slots = Arc::new(Semaphore::new(MAX_INFLIGHT));
+    loop {
+        let sock = match listener.accept().await {
+            Ok((sock, _)) => sock,
+            Err(e) => {
+                // Per-accept errors (EMFILE and friends) are transient; back off rather than
+                // spin, and never take the endpoint down for one of them.
+                tracing::warn!(%e, "metrics: accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // No queue: past `MAX_INFLIGHT` the socket is dropped at once, which is a closed
+        // connection to the peer and no work at all here.
+        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+            drop(sock);
+            continue;
+        };
+        let latest = latest.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_one(sock, latest).await;
+        });
+    }
+}
+
+/// One connection: read a request line under one deadline, answer, close. No keep-alive.
+async fn serve_one(mut sock: TcpStream, latest: watch::Receiver<Arc<str>>) {
+    // One deadline for the whole read, not per read: a peer dribbling a byte at a time must
+    // still be gone within `READ_DEADLINE`.
+    let deadline = tokio::time::Instant::now() + READ_DEADLINE;
+    let mut buf = vec![0u8; MAX_REQUEST];
+    let mut n = 0;
+    let r = loop {
+        if n == buf.len() {
+            break Response::Close;
+        }
+        match tokio::time::timeout_at(deadline, sock.read(&mut buf[n..])).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break Response::Close,
+            Ok(Ok(k)) => {
+                n += k;
+                if buf[..n].contains(&b'\n') {
+                    break respond(&buf[..n]);
+                }
+            }
+        }
+    };
+    let body: Arc<str> = match r {
+        Response::Metrics { .. } => latest.borrow().clone(),
+        Response::Landing { .. } | Response::NotFound | Response::Close => Arc::from(""),
+    };
+    let bytes = write_response(&r, &body);
+    if !bytes.is_empty() {
+        let _ = sock.write_all(&bytes).await;
+    }
+    let _ = sock.shutdown().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixtures build a `Snapshot` by value; the collector holds one behind an `Arc`, which
+    /// is what the supervisor hands it. One clone here, none per refresh.
+    fn render(s: &Snapshot) -> String {
+        super::render(&Arc::new(s.clone()))
+    }
+
     use crate::commands::status::model::{
         Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach,
     };
@@ -1378,5 +1471,92 @@ mod request_tests {
                 .starts_with("HTTP/1.1 404 Not Found\r\n")
         );
         assert!(write_response(&Response::Close, "").is_empty());
+    }
+
+    // ---- the serve loop -----------------------------------------------------------------
+
+    /// One scrape: connect, ask, read the whole answer to EOF (the endpoint closes).
+    async fn scrape(addr: std::net::SocketAddr, request: &str) -> String {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(request.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    /// The endpoint answers from the watch, sees a replacement without a restart, 404s an
+    /// unknown path, and hangs up on a peer that never finishes its request line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_answers_from_the_latest_snapshot_and_drops_a_stalled_peer() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (tx, rx) = watch::channel(Arc::<str>::from("cfab_x 1\n"));
+        let server = tokio::spawn(serve(l, rx));
+
+        let r = scrape(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+        assert!(r.ends_with("\r\n\r\ncfab_x 1\n"), "{r}");
+
+        assert!(
+            scrape(addr, "GET /nope HTTP/1.1\r\n\r\n")
+                .await
+                .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
+
+        // A peer that sends part of a request line and then nothing: the endpoint must close it
+        // on its own, without an answer, inside the read deadline.
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled.write_all(b"GET").await.unwrap();
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            READ_DEADLINE + Duration::from_secs(1),
+            stalled.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(closed.is_ok(), "a stalled peer was not closed in time");
+        assert!(sink.is_empty(), "a malformed request earns no answer");
+
+        // The next scrape sees a snapshot published after the loop started: nothing is cached
+        // per connection.
+        tx.send_replace(Arc::from("cfab_y 2\n"));
+        assert!(
+            scrape(addr, "GET /metrics HTTP/1.0\r\n\r\n")
+                .await
+                .ends_with("cfab_y 2\n")
+        );
+        server.abort();
+    }
+
+    /// The in-flight bound: with `MAX_INFLIGHT` connections open and unanswered, one more is
+    /// dropped immediately — closed with no bytes, not queued behind the others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_past_the_inflight_bound_is_dropped_at_once() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(Arc::<str>::from("cfab_x 1\n"));
+        let server = tokio::spawn(serve(l, rx));
+
+        // Each holder occupies a slot for the whole read deadline: connected, silent.
+        let mut held = Vec::new();
+        for _ in 0..MAX_INFLIGHT {
+            let c = TcpStream::connect(addr).await.unwrap();
+            c.writable().await.unwrap();
+            held.push(c);
+        }
+        // Let the accept loop take every one of them before the extra arrives.
+        tokio::task::yield_now().await;
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            READ_DEADLINE - Duration::from_millis(500),
+            extra.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(
+            closed.is_ok() && sink.is_empty(),
+            "the 17th connection must be dropped while 16 are held, got {sink:?}"
+        );
+        drop(held);
+        server.abort();
     }
 }
