@@ -4,6 +4,10 @@
 //! that more than one renderer can consume the same gather. Nothing here reads or writes: every
 //! field is a fact a renderer turns into its own words.
 
+use crate::derive::HostZonePref;
+use crate::model::MemberKind;
+use crate::supervisor::report::Components;
+
 /// The member's verdict. `UP` (0) every expected adjacency available · `UP-DEGRADED` (1) up,
 /// some down · `FAILED` (2) no adjacency available while up is desired · `DOWN` (3) up is not
 /// desired.
@@ -275,4 +279,49 @@ impl Ingress {
     pub fn home_wire(&self) -> Option<&str> {
         self.bond.as_ref().map(|b| b.home.as_str())
     }
+}
+
+/// Which member this gather describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInfo {
+    pub name: String,
+    pub kind: MemberKind,
+    /// The cfab that produced this gather.
+    pub version: String,
+}
+
+impl MemberInfo {
+    /// `host` or `leaf`, the word status prints.
+    pub fn kind_word(&self) -> &'static str {
+        match self.kind {
+            MemberKind::Host => "host",
+            MemberKind::Leaf => "leaf",
+        }
+    }
+}
+
+/// One instant read of what this member's fabric is doing, structured. Every renderer consumes
+/// this and nothing else; the gather that fills it is the only code that touches the system.
+#[derive(Debug, Clone)]
+pub struct StatusModel {
+    pub member: MemberInfo,
+    pub state: State,
+    /// The headline counts; `None` when no fabric is applied, which is also what makes the
+    /// components line unprintable — there is no supervisor to ask.
+    pub headline: Option<Headline>,
+    /// Every expected adjacency to a peer, up or down.
+    pub adjacencies: Vec<Adjacency>,
+    /// One row per zone carrying a fallback bond.
+    pub fallbacks: Vec<BondLeg>,
+    /// One row per gw zone on a host.
+    pub ingress: Vec<Ingress>,
+    /// Conditions stated in words, each with what it means for `--wait`. Conditions a row can
+    /// render are not here — they are rendered from the row.
+    pub conditions: Vec<Condition>,
+    /// The supervisor's `components` document; `None` when nothing answered on its socket.
+    pub components: Option<Components>,
+    /// This member's wire order per zone, with where the order came from.
+    pub prefs: Vec<HostZonePref>,
+    /// The run dir, which every "no supervisor answering" line names.
+    pub run_dir: String,
 }

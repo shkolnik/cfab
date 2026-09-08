@@ -40,7 +40,7 @@ pub mod model;
 
 pub use model::{
     Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
-    LegPort, Reach, State,
+    LegPort, MemberInfo, Reach, State, StatusModel,
 };
 
 pub struct StatusReport {
@@ -75,16 +75,23 @@ impl Ctx {
         self.reasons.push((Class::Standing, msg.into()));
     }
 
-    /// Is this fabric still settling? One settling line is enough: `--wait` exists for exactly
+}
+
+impl StatusModel {
+    /// Is this fabric still settling? One settling reason is enough: `--wait` exists for exactly
     /// the window in which they are still there.
-    fn settling_now(&self) -> bool {
+    pub fn settling(&self) -> bool {
         self.all_reasons().iter().any(|(k, _)| *k == Class::Settling)
     }
 
     /// Every reason line this gather carries: the ones stated in words, plus the ones a row
     /// renders. One list, so the class of a rendered line is decided in exactly one place.
     fn all_reasons(&self) -> Vec<(Class, String)> {
-        let mut out = self.reasons.clone();
+        let mut out: Vec<(Class, String)> = self
+            .conditions
+            .iter()
+            .map(|c| (c.class, c.text.clone()))
+            .collect();
         for a in self.adjacencies.iter().filter(|a| !a.up) {
             // Settling: an adjacency that is still forming is the state `--wait` exists for.
             out.push((Class::Settling, format!("down {}", a.label())));
@@ -109,7 +116,6 @@ pub fn run(
     permissive: bool,
     declared: Option<&std::path::Path>,
 ) -> Result<StatusReport> {
-    let f = view.fabric;
     // Read once, before the `--wait` loop: the file on disk is not what the loop is waiting for.
     let mut base = Ctx::default();
     if let Some(cfg) = declared
@@ -121,53 +127,63 @@ pub fn run(
     let expected = expected_links(view)?;
     let mut t = 0u64;
     loop {
-        // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
-        // desired *right now* — which a restarting supervisor passes through, so this is
-        // re-read on every poll like every other input to the verdict.
-        let applied = sys.exists(&f.run_dir);
-        let mut c = base.clone();
-        let comps = applied.then(|| read_components(sys, f)).flatten();
-        let counts = if applied {
-            Some(read(sys, view, &expected, &mut c, comps.as_ref())?)
-        } else {
-            None
-        };
+        let m = gather(sys, view, &expected, &base)?;
         // The wait exists for the post-`up` settle, not as a verdict: only a settled UP ends it
         // early. Every other state — degraded, failed, not applied — and every UP that still
         // carries a settling reason line waits the full deadline and then reports what it
         // reached. The headline alone is not enough: it counts sessions, and a member's routes,
         // addresses and source pins arrive after the sessions do (F22).
-        let done = counts
-            .as_ref()
-            .is_some_and(|n| n.state() == State::Up && !c.settling_now())
-            || t >= wait_s;
-        if done {
-            return Ok(match counts {
-                Some(n) => finish(
-                    view,
-                    n.state(),
-                    n.fields(),
-                    &c,
-                    permissive,
-                    comps.as_ref(),
-                    true,
-                ),
-                // No fabric applied: there is nothing to describe and no supervisor to ask, so
-                // the always-printed components line is suppressed here alone.
-                None => finish(
-                    view,
-                    State::Down,
-                    "fabric not applied".to_string(),
-                    &c,
-                    permissive,
-                    None,
-                    false,
-                ),
-            });
+        if (m.state == State::Up && !m.settling()) || t >= wait_s {
+            // No fabric applied: there is nothing to describe and no supervisor to ask, so
+            // the always-printed components line is suppressed then alone.
+            let with_components = m.headline.is_some();
+            return Ok(render_text(&m, permissive, with_components));
         }
         t += POLL_SECS;
         sys.sleep(Duration::from_secs(POLL_SECS));
     }
+}
+
+/// One instant read of this member's fabric into the model both renderers consume. `base`
+/// carries the reasons that were read once, before the `--wait` loop.
+fn gather(
+    sys: &mut dyn Sys,
+    view: &View,
+    expected: &[ExpectedLink],
+    base: &Ctx,
+) -> Result<StatusModel> {
+    let f = view.fabric;
+    // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
+    // desired *right now* — which a restarting supervisor passes through, so this is
+    // re-read on every poll like every other input to the verdict.
+    let applied = sys.exists(&f.run_dir);
+    let mut c = base.clone();
+    let components = applied.then(|| read_components(sys, f)).flatten();
+    let headline = if applied {
+        Some(read(sys, view, expected, &mut c, components.as_ref())?)
+    } else {
+        None
+    };
+    Ok(StatusModel {
+        member: MemberInfo {
+            name: view.member.name.clone(),
+            kind: view.kind(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        state: headline.as_ref().map_or(State::Down, Headline::state),
+        headline,
+        adjacencies: c.adjacencies,
+        fallbacks: c.fallbacks,
+        ingress: c.ingress,
+        conditions: c
+            .reasons
+            .into_iter()
+            .map(|(class, text)| Condition { class, text })
+            .collect(),
+        components,
+        prefs: view.prefs(),
+        run_dir: f.run_dir.clone(),
+    })
 }
 
 /// The fabric the supervisor applied, if it is still on disk: `<run_dir>/fabric.toml.applied`,
@@ -266,26 +282,19 @@ fn engine_down_reason(f: &Fabric, comps: Option<&Components>) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish(
-    view: &View,
-    state: State,
-    fields: String,
-    c: &Ctx,
-    permissive: bool,
-    comps: Option<&Components>,
-    with_components: bool,
-) -> StatusReport {
-    let kind_s = match view.kind() {
-        MemberKind::Host => "host",
-        MemberKind::Leaf => "leaf",
+/// The prose renderer: the model in the words `cfab status` has always used.
+pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> StatusReport {
+    let fields = match &m.headline {
+        Some(h) => h.fields(),
+        None => "fabric not applied".to_string(),
     };
     let mut out = format!(
-        "{} ({fields}) on {} ({kind_s})\n",
-        state.word(),
-        view.member.name
+        "{} ({fields}) on {} ({})\n",
+        m.state.word(),
+        m.member.name,
+        m.member.kind_word()
     );
-    for r in once_each(&c.all_reasons()) {
+    for r in once_each(&m.all_reasons()) {
         // A TOML parse error arrives as several lines (message, then the caret snippet); its
         // continuation lines are indented one step further so the block still reads as one
         // reason under the headline.
@@ -296,12 +305,12 @@ fn finish(
     // This member's wire order per zone, with the derived/override marker: the one thing an
     // operator cannot infer from the interface names, and what every OSPF cost below comes
     // from. Same spelling as `cfab gen prefs`, minus the member column.
-    for p in view.prefs() {
+    for p in &m.prefs {
         let _ = writeln!(out, "  prefs {}", p.render());
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
-        match comps {
+        match &m.components {
             Some(cc) => {
                 let _ = writeln!(out, "  {}", render_line(cc));
             }
@@ -309,18 +318,18 @@ fn finish(
                 let _ = writeln!(
                     out,
                     "  components: no supervisor answering on {}/cfab.sock",
-                    view.fabric.run_dir
+                    m.run_dir
                 );
             }
         }
     }
-    let code = if permissive && matches!(state, State::Up | State::UpDegraded) {
+    let code = if permissive && matches!(m.state, State::Up | State::UpDegraded) {
         0
     } else {
-        state.code()
+        m.state.code()
     };
     StatusReport {
-        state,
+        state: m.state,
         code,
         output: out,
     }
