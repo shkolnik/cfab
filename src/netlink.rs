@@ -15,7 +15,7 @@
 
 use std::io;
 use std::os::fd::AsFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload,
@@ -33,11 +33,17 @@ use nix::sys::time::TimeVal;
 use crate::error::{Error, Result};
 use crate::prober::decide::BondLink;
 
-/// How long one reply may take before the tick gives up on it. A netlink round trip is tens of
-/// microseconds; anything near this is a socket that has stopped answering, and the sysfs read
-/// this replaces could not hang at all. Well inside `PROBE_INTERVAL`, so a wedged socket costs
-/// one late tick, not a stalled prober.
-const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+/// The wall-clock budget ONE `call` gets: send, and every datagram it has to read and discard
+/// before its own answer, together. A round trip measured 20.8 us on a real bond, so anything
+/// approaching this is a socket that has stopped answering, and the sysfs read it replaces
+/// could not hang at all.
+///
+/// Per call, not per `recv`: a socket that answers nothing, or answers only other people's
+/// datagrams, would otherwise cost one timeout per iteration without bound. And per call means
+/// per port, so the worst a blind socket can cost one tick is ports x this — 450 ms at nine
+/// ports, inside `PROBE_INTERVAL`, and the first expiry drops the socket so the next call opens
+/// a fresh one rather than inheriting it.
+const CALL_DEADLINE: Duration = Duration::from_millis(50);
 
 /// One bond port as the kernel describes it, in one GETLINK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,11 +87,6 @@ impl BondNetlink {
             let mut s = Socket::new(NETLINK_ROUTE)?;
             s.bind_auto()?;
             s.connect(&SocketAddr::new(0, 0))?;
-            setsockopt(
-                &s.as_fd(),
-                ReceiveTimeout,
-                &TimeVal::new(0, RECV_TIMEOUT.as_micros() as i64),
-            )?;
             self.sock = Some(s);
         }
         Ok(self.sock.as_ref().expect("just opened"))
@@ -109,16 +110,26 @@ impl BondNetlink {
         req.finalize();
         let mut buf = vec![0u8; req.buffer_len()];
         req.serialize(&mut buf);
+        let deadline = Instant::now() + CALL_DEADLINE;
         let sock = self.socket()?;
         sock.send(&buf, 0)?;
         loop {
+            // The remaining budget, as this recv's timeout: the deadline covers the discards
+            // too, so a socket handing us other people's datagrams cannot hold the tick.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(expired());
+            }
+            set_recv_timeout(sock, left)?;
             // `recv_from_full` sizes the buffer from a MSG_PEEK|MSG_TRUNC probe, so an ifinfo
             // message larger than any fixed buffer arrives whole rather than truncated.
             let (resp, _) = sock.recv_from_full()?;
             let msg = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&resp)
                 .map_err(io::Error::other)?;
-            if msg.header.sequence_number != seq {
-                continue;
+            match step(seq, msg.header.sequence_number, Instant::now(), deadline) {
+                Step::Expired => return Err(expired()),
+                Step::Discard => continue,
+                Step::Accept => {}
             }
             return match msg.payload {
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(l)) => Ok(Some(l)),
@@ -133,13 +144,13 @@ impl BondNetlink {
         }
     }
 
-    /// `call`, plus the socket hygiene: a failure that is not the kernel's own refusal leaves
-    /// the socket unusable as far as we can tell, so it is dropped and reopened next call.
+    /// `call`, plus the socket hygiene: a failure that says the socket itself is no use to us
+    /// drops it, so the next call opens a fresh one rather than inheriting a wedged fd.
     fn call_fresh(&mut self, m: RouteNetlinkMessage, flags: u16) -> Result<Option<LinkMessage>> {
         match self.call(m, flags) {
             Ok(r) => Ok(r),
             Err(e) => {
-                if e.raw_os_error().is_none() {
+                if drops_socket(&e) {
                     self.sock = None;
                 }
                 Err(Error::Io(e))
@@ -225,6 +236,57 @@ fn set_active_msg(bond_ifindex: u32, port_ifindex: u32) -> RouteNetlinkMessage {
     RouteNetlinkMessage::NewLink(lm)
 }
 
+/// What one arrived datagram is worth, given the clock. Pure, so the rule can be tested without
+/// a socket: the deadline is checked FIRST, because a reply that arrives after the budget is
+/// spent is one this call must not act on however well its sequence number matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Accept,
+    Discard,
+    Expired,
+}
+
+fn step(our_seq: u32, reply_seq: u32, now: Instant, deadline: Instant) -> Step {
+    if now >= deadline {
+        Step::Expired
+    } else if reply_seq == our_seq {
+        Step::Accept
+    } else {
+        Step::Discard
+    }
+}
+
+/// The budget ran out. `ETIMEDOUT` so it carries an errno like every other failure here, and so
+/// `drops_socket` reads it as what it is.
+fn expired() -> io::Error {
+    io::Error::from_raw_os_error(Errno::ETIMEDOUT as i32)
+}
+
+fn set_recv_timeout(sock: &Socket, d: Duration) -> io::Result<()> {
+    let tv = TimeVal::new(d.as_secs() as i64, d.subsec_micros() as i64);
+    setsockopt(&sock.as_fd(), ReceiveTimeout, &tv)?;
+    Ok(())
+}
+
+/// Is this a failure of the socket rather than of the request? The kernel refusing a request
+/// (`EINVAL`, `ENODEV`, `EPERM`) says nothing about the fd. A read that timed out, would have
+/// blocked, or lost datagrams to a full buffer says we no longer know what is in its queue —
+/// and so does an error with no errno at all — so the fd is dropped and reopened.
+///
+/// `EAGAIN` is the one that matters and the one that hid: `SO_RCVTIMEO` expiry arrives as an
+/// errno, so a "has no errno" test would have kept a blind socket for every later tick.
+fn drops_socket(e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        None => true,
+        Some(c) => {
+            c == Errno::EAGAIN as i32
+                || c == Errno::EWOULDBLOCK as i32
+                || c == Errno::ETIMEDOUT as i32
+                || c == Errno::ENOBUFS as i32
+        }
+    }
+}
+
 /// The bonding driver's ladder, as the kernel sends it. `Other` — and any value a future
 /// release of the crate adds to its own non-exhaustive enum — is the loud unknown case: the
 /// prober says the number and treats the port as not up, rather than guessing at a default.
@@ -253,6 +315,47 @@ mod tests {
         assert_eq!(bond_link(MiiStatus::GoingDown), BondLink::GoingDown);
         assert_eq!(bond_link(MiiStatus::Down), BondLink::Down);
         assert_eq!(bond_link(MiiStatus::Other(9)), BondLink::Unknown(9));
+    }
+
+    /// The reply rule, without a socket: ours is taken, anyone else's is dropped, and once the
+    /// budget is spent neither matters — a late reply is not this call's answer.
+    #[test]
+    fn a_reply_is_accepted_only_if_it_is_ours_and_only_before_the_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(50);
+        assert_eq!(step(7, 7, now, deadline), Step::Accept);
+        assert_eq!(step(7, 6, now, deadline), Step::Discard);
+        assert_eq!(step(7, 7, deadline, deadline), Step::Expired);
+        assert_eq!(step(7, 6, deadline, deadline), Step::Expired);
+        assert_eq!(
+            step(7, 7, deadline + Duration::from_millis(1), deadline),
+            Step::Expired
+        );
+    }
+
+    /// A socket that has stopped answering is dropped, not kept for every later tick. The
+    /// timeout arrives as `EAGAIN`/`ETIMEDOUT` — errnos — so classifying only "no errno" as
+    /// fatal would have wedged the prober's read for the life of the process.
+    #[test]
+    fn a_timed_out_socket_is_dropped_but_a_refused_request_is_not() {
+        for c in [
+            Errno::EAGAIN,
+            Errno::EWOULDBLOCK,
+            Errno::ETIMEDOUT,
+            Errno::ENOBUFS,
+        ] {
+            let e = io::Error::from_raw_os_error(c as i32);
+            assert!(drops_socket(&e), "{c:?} leaves the queue unknown");
+        }
+        assert!(drops_socket(&expired()));
+        assert!(drops_socket(&io::Error::other("decode failed")));
+        for c in [Errno::EINVAL, Errno::ENODEV, Errno::EPERM] {
+            let e = io::Error::from_raw_os_error(c as i32);
+            assert!(
+                !drops_socket(&e),
+                "{c:?} is the kernel refusing the request"
+            );
+        }
     }
 
     /// `ENODEV` is a fact about the wire; every other errno is a fault to report.
