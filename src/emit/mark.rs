@@ -190,7 +190,33 @@ pub fn generate(view: &View) -> Result<String> {
             ));
         }
     }
-    out.push_str("  }\n}\n");
+    out.push_str("  }\n");
+    // Spec §5 item 7: a forward-hook chain overwrites DSCP toward each allowed zone for a
+    // workload's own traffic, so a DSCP-trusting switch queues VM egress the same way it
+    // queues that zone's own bulk. `policy accept`: this chain only overwrites a field, it
+    // never decides transit — `inet cfab-fwd` (Task 2) already does that. Omitted entirely
+    // when there is no workload row, so a fabric without one renders byte-identical to today.
+    if !view.workload_rows().is_empty() {
+        out.push_str("    chain fwd {\n");
+        out.push_str("        type filter hook forward priority mangle; policy accept;\n");
+        for row in view.workload_rows() {
+            for zname in &row.wl.allow {
+                let z = f.zone(zname)?;
+                let ifs = view
+                    .zone_ifs(zname)
+                    .iter()
+                    .map(|i| format!("\"{i}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!(
+                    "        iifname \"{}\" oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-{}\"\n",
+                    row.wl.ifname, z.dscp, row.wl.name, zname
+                ));
+            }
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
     Ok(out)
 }
 
@@ -205,6 +231,44 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Spec §5 item 7: a `chain fwd` at the forward hook overwrites DSCP toward each allowed
+    /// zone for a workload's traffic, so a DSCP-trusting switch queues VM egress the same way
+    /// it queues that zone's own bulk. `oifname { … }` is the same `zone_ifs(zone)` spelling
+    /// the `out` chain's guards use, on the shipped example's storage zone (segments +
+    /// fallback: `cfab-st,cfab-st-bk,cfab-st-b2,cfab-st-fb`).
+    #[test]
+    fn a_workload_adds_a_forward_hook_chain_that_overwrites_dscp_toward_each_allowed_zone() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        let fwd = t.split("chain fwd {").nth(1).expect("fwd chain");
+        assert!(
+            fwd.starts_with("\n        type filter hook forward priority mangle; policy accept;\n"),
+            "{fwd}"
+        );
+        assert!(
+            fwd.contains(
+                "iifname \"primary.3\" oifname { \"cfab-st\",\"cfab-st-bk\",\"cfab-st-b2\",\"cfab-st-fb\" } \
+                 ip dscp set cs0 comment \"dscp-vms-storage\""
+            ),
+            "{fwd}"
+        );
+    }
+
+    #[test]
+    fn without_workloads_the_table_has_no_fwd_chain() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(!generate(&v).unwrap().contains("chain fwd"));
     }
 
     /// The same declaration grown to `n` members (node ids 1..=n, all hosts with all three
