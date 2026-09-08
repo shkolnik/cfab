@@ -57,6 +57,88 @@ impl Collector for FabricCollector {
     }
 }
 
+/// The largest request line the endpoint reads. Rule (spec §3.1): a scrape's request line is a
+/// method, a short path and a version; anything larger is not a scraper and is dropped unread.
+const MAX_REQUEST: usize = 1024;
+
+/// What the endpoint answers a connection with. `head` means the request was `HEAD`: the same
+/// headers, no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Response {
+    Metrics { head: bool },
+    Landing { head: bool },
+    NotFound,
+    Close,
+}
+
+/// The page served at `/`: one link, so a browser pointed at the port finds the metrics.
+const LANDING_BODY: &str = "<html><body><a href=\"/metrics\">/metrics</a></body></html>\n";
+
+const NOT_FOUND_BODY: &str = "not found\n";
+
+/// Classify one request by its request line alone. Headers are not read: the endpoint speaks
+/// exactly enough HTTP for a scraper, and everything it does not recognize gets the connection
+/// closed rather than an error page.
+pub(crate) fn respond(request: &[u8]) -> Response {
+    let capped = &request[..request.len().min(MAX_REQUEST)];
+    let Some(end) = capped.iter().position(|&b| b == b'\n') else {
+        return Response::Close;
+    };
+    let line = &capped[..end];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Ok(line) = std::str::from_utf8(line) else {
+        return Response::Close;
+    };
+    let mut tok = line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (tok.next(), tok.next(), tok.next(), tok.next())
+    else {
+        return Response::Close;
+    };
+    if !version.starts_with("HTTP/1.") {
+        return Response::Close;
+    }
+    let head = match method {
+        "GET" => false,
+        "HEAD" => true,
+        _ => return Response::NotFound,
+    };
+    match target {
+        "/metrics" => Response::Metrics { head },
+        "/" => Response::Landing { head },
+        _ => Response::NotFound,
+    }
+}
+
+/// The full HTTP/1.1 bytes for a classified request. `body` is the metrics text; the landing and
+/// not-found bodies are fixed. `Close` writes nothing.
+pub(crate) fn write_response(r: &Response, body: &str) -> Vec<u8> {
+    let (status, content_type, body, head) = match r {
+        Response::Metrics { head } => (
+            "200 OK",
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            body,
+            *head,
+        ),
+        Response::Landing { head } => ("200 OK", "text/html; charset=utf-8", LANDING_BODY, *head),
+        Response::NotFound => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            NOT_FOUND_BODY,
+            false,
+        ),
+        Response::Close => return Vec::new(),
+    };
+    let mut out = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if !head {
+        out.push_str(body);
+    }
+    out.into_bytes()
+}
+
 /// The member's state as OpenMetrics text, ready to serve.
 pub(crate) fn render(s: &Snapshot) -> String {
     let mut reg = Registry::default();
@@ -172,5 +254,115 @@ mod tests {
     #[test]
     fn output_ends_with_the_openmetrics_terminator() {
         assert!(render(&fixture_up()).ends_with("# EOF\n"));
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn get_metrics_10_and_11() {
+        assert!(matches!(
+            respond(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Response::Metrics { head: false }
+        ));
+        assert!(matches!(
+            respond(b"GET /metrics HTTP/1.0\r\n\r\n"),
+            Response::Metrics { head: false }
+        ));
+        assert!(matches!(
+            respond(b"HEAD /metrics HTTP/1.1\r\n\r\n"),
+            Response::Metrics { head: true }
+        ));
+    }
+
+    #[test]
+    fn landing_and_404() {
+        assert!(matches!(
+            respond(b"GET / HTTP/1.1\r\n\r\n"),
+            Response::Landing { head: false }
+        ));
+        assert!(matches!(
+            respond(b"HEAD / HTTP/1.1\r\n\r\n"),
+            Response::Landing { head: true }
+        ));
+        // Query strings are not interpreted: the target is not the path.
+        assert!(matches!(
+            respond(b"GET /metrics?x=1 HTTP/1.1\r\n\r\n"),
+            Response::NotFound
+        ));
+        assert!(matches!(
+            respond(b"GET /other HTTP/1.1\r\n\r\n"),
+            Response::NotFound
+        ));
+        assert!(matches!(
+            respond(b"POST /metrics HTTP/1.1\r\n\r\n"),
+            Response::NotFound
+        ));
+    }
+
+    #[test]
+    fn garbage_and_oversize_close() {
+        assert!(matches!(respond(b"\x16\x03\x01\x00"), Response::Close)); // a TLS hello
+        assert!(matches!(respond(b"GET /metrics"), Response::Close)); // no terminator yet
+        assert!(matches!(respond(&vec![b'A'; 2048]), Response::Close));
+        // A request line longer than the cap, terminator included, is still refused.
+        let mut long = vec![b'A'; MAX_REQUEST + 8];
+        long.extend_from_slice(b"\r\n\r\n");
+        assert!(matches!(respond(&long), Response::Close));
+        // Bare LF is a terminator too.
+        assert!(matches!(
+            respond(b"GET /metrics HTTP/1.1\n\n"),
+            Response::Metrics { head: false }
+        ));
+        // Not UTF-8.
+        assert!(matches!(
+            respond(b"GET /\xff\xfe HTTP/1.1\r\n\r\n"),
+            Response::Close
+        ));
+        // Wrong protocol on a three-token line.
+        assert!(matches!(
+            respond(b"GET /metrics HTTP/2.0\r\n\r\n"),
+            Response::Close
+        ));
+        // Wrong token count.
+        assert!(matches!(respond(b"GET /metrics\r\n\r\n"), Response::Close));
+    }
+
+    #[test]
+    fn response_bytes() {
+        let b = write_response(&Response::Metrics { head: false }, "x 1\n");
+        let s = String::from_utf8(b).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains(
+            "Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n"
+        ));
+        assert!(s.contains("Content-Length: 4\r\n"));
+        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.ends_with("\r\n\r\nx 1\n"));
+
+        // HEAD sends the headers the GET would have sent, and no body.
+        let h =
+            String::from_utf8(write_response(&Response::Metrics { head: true }, "x 1\n")).unwrap();
+        assert!(h.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(h.contains("Content-Length: 4\r\n"));
+        assert!(h.ends_with("\r\n\r\n"));
+
+        let l = String::from_utf8(write_response(&Response::Landing { head: false }, "")).unwrap();
+        assert!(l.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(l.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(l.contains(&format!("Content-Length: {}\r\n", LANDING_BODY.len())));
+        assert!(l.ends_with(LANDING_BODY));
+        let lh = String::from_utf8(write_response(&Response::Landing { head: true }, "")).unwrap();
+        assert!(lh.contains(&format!("Content-Length: {}\r\n", LANDING_BODY.len())));
+        assert!(lh.ends_with("\r\n\r\n"));
+
+        assert!(
+            String::from_utf8(write_response(&Response::NotFound, ""))
+                .unwrap()
+                .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
+        assert!(write_response(&Response::Close, "").is_empty());
     }
 }
