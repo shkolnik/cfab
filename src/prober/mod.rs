@@ -1730,6 +1730,23 @@ mod tests {
             notes[0].contains("eth0") && notes[0].contains("\"bogus\""),
             "names the wire and the raw value: {log:?}"
         );
+        // A known value re-arms the note: the same unknown value seen again is said again.
+        sys = sys.file(
+            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
+            "up\n",
+        );
+        p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
+        sys = sys.file(
+            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
+            "bogus\n",
+        );
+        p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 11);
+        let log = p.drain_log();
+        assert_eq!(
+            log.iter().filter(|l| l.contains("does not know")).count(),
+            1,
+            "said again after the value was known in between: {log:?}"
+        );
     }
 
     /// F25: the bond starts on the backup wire, but the home wire has been usable — reachable,

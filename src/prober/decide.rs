@@ -78,11 +78,10 @@ impl Hysteresis {
     }
 }
 
-/// The bonding driver's own per-port link state, `/sys/class/net/<port>/bonding_slave/mii_status`
-/// (VERIFIED on the rack from bonding.ko: the driver writes exactly these four spellings, never
-/// anything else). This is the ONE place the kernel's strings are parsed or compared — a future
-/// rtnetlink read hands over the same fact as a typed attribute, and everything above this type
-/// stays unchanged.
+/// The bonding driver's own per-port link state, `/sys/class/net/<port>/bonding_slave/mii_status`.
+/// The four spellings are the driver's (read from the strings of bonding.ko, 7.0.14-14-pve;
+/// `up` and `going back` also seen live on the rack). This is the one place the kernel's strings
+/// are parsed or compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BondLink {
     Up,
@@ -92,10 +91,8 @@ pub enum BondLink {
 }
 
 impl BondLink {
-    /// Parse one `mii_status` read, already trimmed of the trailing newline by the caller or
-    /// not — trimming happens here too, so a caller need not remember to. `None` for anything
-    /// the driver is not documented to write; the caller decides what "unknown" means to it
-    /// (the prober treats it as not up, and says so once).
+    /// Parse one `mii_status` read (trimmed here). `None` for anything the driver is not known
+    /// to write; the caller decides what unknown means (the prober: not up, said once).
     pub fn parse(s: &str) -> Option<BondLink> {
         match s.trim() {
             "up" => Some(BondLink::Up),
