@@ -937,6 +937,9 @@ impl Leg {
                         // knowledge of it, so it is folded in as a miss and the escalation stops
                         // there — the decision below has already been told.
                         s.escalating = s.state.reachable();
+                        if !s.escalating {
+                            s.next_ask = None;
+                        }
                     }
                 }
             }
@@ -2131,20 +2134,23 @@ mod tests {
         // wire through the deciding phase (one round, asked the very tick it goes Suspect) and
         // into confirmed dead (one more round, sent immediately — no initial delay), exactly as
         // `a_wire_that_goes_quiet_alone_is_asked_and_then_left` measures.
+        let mut per_tick = Vec::new();
         for tick in 4..9u64 {
             for s in [FB_B, FB_C] {
                 hear(&mut io, s, &[hello(2), hello(3)]);
             }
+            let before = io.sent_on(FB_A).len();
             fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+            per_tick.push(io.sent_on(FB_A).len() - before);
         }
-        let deciding_sent = io.sent_on(FB_A).len();
+        let rounds: Vec<usize> = per_tick.iter().copied().filter(|n| *n > 0).collect();
         assert!(
-            deciding_sent > 0 && deciding_sent.is_multiple_of(2),
+            rounds.len() == 2 && rounds[0] == rounds[1],
             "the deciding phase is unchanged from today: one round on the tick the wire is \
-             suspected, one more sent immediately the tick it is confirmed dead: {deciding_sent} \
-             frames"
+             suspected, one more sent immediately the tick it is confirmed dead: {per_tick:?}"
         );
-        let per_round = deciding_sent / 2;
+        let per_round = rounds[0];
+        let deciding_sent = io.sent_on(FB_A).len();
 
         // N more ticks with the wire still confirmed dead and still Suspect (nothing is ever
         // heard again on it): the backoff caps this to one round per hello interval (two ticks),
