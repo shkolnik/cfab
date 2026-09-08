@@ -112,6 +112,10 @@ struct Leg {
     /// while nothing has changed — the kernel refused it for a reason we can no longer see, and
     /// a refusal repeated every 500 ms is noise, not a diagnosis.
     refused: Option<(String, Option<String>)>,
+    /// Why this leg's port states could not be read the last time a tick tried, so a socket
+    /// that has been failing the same way for an hour is one line, not 7 200. `None` re-arms
+    /// it, which a tick that reads successfully does.
+    noted_nl_err: Option<String>,
     kind: Kind,
 }
 
@@ -137,9 +141,9 @@ struct ProbePort {
     /// covers both "missing or unreadable" (port not in a bond) and "read something the driver
     /// is not documented to write" — the kernel would refuse the write in either state.
     bond_link: Option<BondLink>,
-    /// The raw `mii_status` value the last "does not know" note named, so the same unknown
-    /// value is not logged twice a second for as long as it persists. `None` re-arms it.
-    noted_bond_link: Option<String>,
+    /// The unknown link-state value the last "does not know" note named, so the same value is
+    /// not logged twice a second for as long as it persists. `None` re-arms it.
+    noted_bond_link: Option<u8>,
     /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
     /// that has just come back is a port that has just been re-added, which is where the
     /// grace period comes from.
@@ -520,26 +524,6 @@ impl Prober {
     }
 }
 
-/// Does this netdev have carrier? An unreadable file is NO carrier, deliberately: `carrier`
-/// returns `EINVAL` on an interface that is administratively down and `ENOENT` on one that has
-/// gone away, and the kernel refuses `bonding/active_slave` in both of those states too.
-fn has_carrier(sys: &dyn Sys, ifname: &str) -> Option<bool> {
-    sys.read(&format!("/sys/class/net/{ifname}/carrier"))
-        .ok()
-        .map(|s| s.trim() == "1")
-}
-
-/// The bonding driver's own per-port link state (per PORT, not to be confused with the
-/// whole-bond `bonding/mii_status` `status` reads), raw and trimmed. `None` when the file is
-/// missing or unreadable — the netdev is not a bond port, or carrier is already gone — which is
-/// the normal not-in-a-bond state and stays silent. `Some` of anything the caller's `BondLink`
-/// does not recognize is a kernel value we have not seen before, which is loud, not silent.
-fn read_bond_link(sys: &dyn Sys, ifname: &str) -> Option<String> {
-    sys.read(&format!("/sys/class/net/{ifname}/bonding_slave/mii_status"))
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
 /// One `Sys` error as a line a task that carries on may print. `Sys::write` reports every
 /// failure as `Error::Fatal`, which Displays as `FATAL: …`; the prober's writes are not fatal to
 /// anything — it logs, keeps the bond where it is and ticks again — so the word must not appear.
@@ -577,6 +561,7 @@ impl Leg {
             ports,
             noted_no_carrier: None,
             refused: None,
+            noted_nl_err: None,
             kind,
         }
     }
@@ -642,42 +627,70 @@ impl Leg {
         // whether this is "one wire cannot be judged" or "the leg is not probed at all" is not
         // known until every port has been tried.
         let mut newly_deaf: Vec<(String, String)> = Vec::new();
+        // The first reason a port's state could not be read at all this tick, if any: said once
+        // per leg, because every port of a leg fails the same way when the socket does.
+        let mut nl_err: Option<String> = None;
         for s in &mut self.ports {
             // Carrier is read for every port, a deaf one included: whether the tap opened and
             // whether the cable is in are different facts, and reporting a tap failure as lost
             // carrier would send an operator to the wrong end of it.
-            let present = has_carrier(&*sys, &s.ifname);
-            s.carrier = present.unwrap_or(false);
-            match read_bond_link(&*sys, &s.ifname) {
-                None => {
-                    s.bond_link = None;
-                    s.noted_bond_link = None;
-                }
-                Some(raw) => match BondLink::parse(&raw) {
-                    Some(bl) => {
-                        s.bond_link = Some(bl);
-                        s.noted_bond_link = None;
-                    }
-                    None => {
-                        s.bond_link = None;
-                        if s.noted_bond_link.as_deref() != Some(raw.as_str()) {
-                            log.push(format!(
-                                "cfab: {} {}: {} reports bonding link state \"{raw}\" the prober does not know — treated as not up",
-                                self.zone,
-                                self.kind.family(),
-                                s.wire
-                            ));
-                            s.noted_bond_link = Some(raw);
+            let present = match sys.bond_port_state(&s.ifname) {
+                Ok(st) => {
+                    s.carrier = st.carrier;
+                    match st.link {
+                        // Not a bond port at all: the normal state of a plain sub-interface,
+                        // and nothing to say about it.
+                        None => {
+                            s.bond_link = None;
+                            s.noted_bond_link = None;
+                        }
+                        // A rung of the driver's ladder we do not know. Loud, once per value,
+                        // and never treated as up.
+                        Some(BondLink::Unknown(n)) => {
+                            s.bond_link = None;
+                            if s.noted_bond_link != Some(n) {
+                                log.push(format!(
+                                    "cfab: {} {}: {} reports bonding link state {n} the prober does not know — treated as not up",
+                                    self.zone,
+                                    self.kind.family(),
+                                    s.wire
+                                ));
+                                s.noted_bond_link = Some(n);
+                            }
+                        }
+                        Some(bl) => {
+                            s.bond_link = Some(bl);
+                            s.noted_bond_link = None;
                         }
                     }
-                },
-            }
+                    true
+                }
+                // The netdev is gone (a re-enumerating USB NIC, a port the kernel removed).
+                // A fact about the wire, not a fault: it is already reported as a leg with a
+                // port that is not there.
+                Err(e) if crate::netlink::is_no_device(&e) => {
+                    s.carrier = false;
+                    s.bond_link = None;
+                    s.noted_bond_link = None;
+                    false
+                }
+                // Anything else is us not being able to see: the port is out of the running
+                // (the kernel would refuse a move onto a port we cannot read), and the leg says
+                // so rather than degrading into a silent "no carrier".
+                Err(e) => {
+                    s.carrier = false;
+                    s.bond_link = None;
+                    s.noted_bond_link = None;
+                    nl_err.get_or_insert_with(|| without_fatal(&e));
+                    false
+                }
+            };
             // A netdev that has just come back is a port the kernel has just re-added (F5).
             // Judging it before a hello can arrive on it would confirm it dead for being new.
-            if present.is_some() && !s.present {
+            if present && !s.present {
                 s.grace_until = Some(now + grace_of(&self.kind));
             }
-            s.present = present.is_some();
+            s.present = present;
             // A fallback leg never sends in steady state, so the tap has to be asked for.
             if let Kind::Fallback(_) = self.kind {
                 match io.listen(&s.ifname) {
@@ -764,6 +777,22 @@ impl Leg {
                     }
                 }
             }
+        }
+        // Said once per leg and re-armed by a tick that could read: a socket that cannot be
+        // opened, or a read that fails for any reason other than the netdev being gone, is us
+        // going blind — never a quietly assumed "no carrier".
+        match nl_err {
+            Some(why) => {
+                if self.noted_nl_err.as_deref() != Some(why.as_str()) {
+                    log.push(format!(
+                        "cfab: {} {}: bond state unreadable over netlink: {why}",
+                        self.zone,
+                        self.kind.family()
+                    ));
+                    self.noted_nl_err = Some(why);
+                }
+            }
+            None => self.noted_nl_err = None,
         }
         let zone = self.zone.clone();
         let bond = self.bond.clone();
@@ -1023,22 +1052,24 @@ impl Leg {
         if self.refused.as_ref() == Some(&attempt) {
             return;
         }
-        for file in ["primary", "active_slave"] {
-            if let Err(e) = sys.write(&format!("{base}/{file}"), &target) {
-                // WARN, not FATAL: the supervisor is running, the bond is where it was, and the
-                // next tick with different inputs will try again. `Sys::write` wraps every
-                // failure as `Error::Fatal`, whose Display carries that word, so the message is
-                // taken out of it rather than printed through it.
-                log.push(format!(
-                    "cfab: warn: {} {}: cannot move {} to {to} ({target}): {}",
-                    self.zone,
-                    self.kind.family(),
-                    self.bond,
-                    without_fatal(&e)
-                ));
-                self.refused = Some(attempt);
-                return;
-            }
+        let moved = sys
+            .write(&format!("{base}/primary"), &target)
+            .and_then(|()| sys.set_active_port(&self.bond, &target));
+        if let Err(e) = moved {
+            // WARN, not FATAL: the supervisor is running, the bond is where it was, and the
+            // next tick with different inputs will try again. `Sys::write` wraps every failure
+            // as `Error::Fatal`, whose Display carries that word, so the message is taken out
+            // of it rather than printed through it; the kernel's own refusal of the active port
+            // (`EINVAL`: the port or its link is down) arrives as that errno.
+            log.push(format!(
+                "cfab: warn: {} {}: cannot move {} to {to} ({target}): {}",
+                self.zone,
+                self.kind.family(),
+                self.bond,
+                without_fatal(&e)
+            ));
+            self.refused = Some(attempt);
+            return;
         }
         self.refused = None;
         self.held = target.clone();
@@ -1191,6 +1222,7 @@ mod tests {
     use super::io::mock::ScriptedIo;
     use super::*;
     use crate::model::Fabric;
+    use crate::netlink::PortState;
     use crate::sys::mock::MockSys;
 
     const ROUTER: &str = "192.168.249.254";
@@ -1222,8 +1254,35 @@ mod tests {
     /// Every port of the mgmt leg, join order.
     const PORTS: [&str; 3] = ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"];
 
+    /// A port the kernel would take: cable in, and the bonding driver has its link up.
+    fn up() -> PortState {
+        PortState {
+            link: Some(BondLink::Up),
+            carrier: true,
+            master: Some(1),
+        }
+    }
+
+    /// A port whose cable is out. Carrier gone takes the driver's link with it.
+    fn no_carrier() -> PortState {
+        PortState {
+            link: Some(BondLink::Down),
+            carrier: false,
+            master: Some(1),
+        }
+    }
+
+    /// A port in whatever bonding link state, cable in.
+    fn link(l: BondLink) -> PortState {
+        PortState {
+            link: Some(l),
+            carrier: true,
+            master: Some(1),
+        }
+    }
+
     /// A bond sitting on `active`, with carrier on every port — the healthy shape. Carrier is
-    /// part of it because the kernel refuses `bonding/active_slave` on a port whose netdev has
+    /// part of it because the kernel refuses the active-port write on a port whose netdev has
     /// none, so a test that wants a move to happen has to say the target can take it.
     fn bonding(active: &str) -> MockSys {
         let mut sys = MockSys::default()
@@ -1231,15 +1290,9 @@ mod tests {
                 &format!("/sys/class/net/{BOND}/bonding/active_slave"),
                 active,
             )
-            .file(&format!("/sys/class/net/{BOND}/bonding/primary"), active)
-            .file(&format!("/sys/class/net/{active}/carrier"), "1\n");
+            .file(&format!("/sys/class/net/{BOND}/bonding/primary"), active);
         for s in PORTS {
-            sys = sys
-                .file(&format!("/sys/class/net/{s}/carrier"), "1\n")
-                .file(
-                    &format!("/sys/class/net/{s}/bonding_slave/mii_status"),
-                    "up\n",
-                );
+            sys = sys.port(s, up());
         }
         sys
     }
@@ -1336,7 +1389,8 @@ mod tests {
     }
 
     /// The F21 fault: the active wire keeps carrier but the router stops answering over it.
-    /// The bond must move, `primary` must be written BEFORE `active_slave`, and both must name
+    /// The bond must move, `primary` must be written BEFORE the active port is set, and both
+    /// must name
     /// the wire the zone's preference order puts next.
     #[test]
     fn a_router_dead_active_wire_moves_the_bond_primary_first() {
@@ -1360,10 +1414,11 @@ mod tests {
         let order: Vec<&String> = sys
             .calls
             .iter()
-            .filter(|c| c.starts_with("write /sys"))
+            .filter(|c| c.starts_with("write /sys") || c.starts_with("set_active_port"))
             .collect();
         assert!(
-            order[0].ends_with("/bonding/primary") && order[1].ends_with("/bonding/active_slave"),
+            order[0].ends_with("/bonding/primary")
+                && order[1] == &format!("set_active_port {BOND} {want}"),
             "primary must be written first, else the next link event undoes the move: {order:?}"
         );
         assert!(!rows[0].ports[2].reachable, "the home wire, island c");
@@ -1598,7 +1653,7 @@ mod tests {
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         // The kernel has already moved the bond off the dead island.
-        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut sys = bonding(BACKUP).port(HOME, no_carrier());
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         io.dark(HOME);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
@@ -1630,17 +1685,12 @@ mod tests {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut sys = bonding(BACKUP)
-            .file(&format!("/sys/class/net/{HOME}/carrier"), "1\n")
-            .file(
-                &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-                "going back\n",
-            );
+        let mut sys = bonding(BACKUP).port(HOME, link(BondLink::GoingBack));
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 4);
         assert!(
-            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
-            "a port the bonding driver has not brought up is never written as active_slave: {:?}",
+            !sys.calls.iter().any(|c| c.starts_with("set_active_port")),
+            "a port the bonding driver has not brought up is never made the active port: {:?}",
             sys.calls
         );
         let home = rows[0]
@@ -1663,16 +1713,13 @@ mod tests {
         );
 
         // Now the bonding driver finishes updelay.
-        sys = sys.file(
-            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-            "up\n",
-        );
+        sys.set_port(HOME, up());
         p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
         assert!(
             sys.calls
                 .iter()
-                .any(|c| c == &format!("write /sys/class/net/{BOND}/bonding/active_slave")),
-            "up is up: the very next tick writes active_slave: {:?}",
+                .any(|c| c == &format!("set_active_port {BOND} {HOME}")),
+            "up is up: the very next tick makes it the active port: {:?}",
             sys.calls
         );
         assert_eq!(
@@ -1694,24 +1741,19 @@ mod tests {
         );
     }
 
-    /// An `mii_status` value the driver is not documented to write (a future kernel spelling, a
-    /// corrupted read) must not be silently treated as reachable, and must not be silent about
+    /// A bonding link state the driver is not documented to report (a rung a future kernel
+    /// adds) must not be silently treated as reachable, and must not be silent about
     /// it either: one note per port per distinct value, not one per tick.
     #[test]
     fn an_unknown_bond_link_value_is_never_a_move_target_and_is_said_once() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut sys = bonding(BACKUP)
-            .file(&format!("/sys/class/net/{HOME}/carrier"), "1\n")
-            .file(
-                &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-                "bogus\n",
-            );
+        let mut sys = bonding(BACKUP).port(HOME, link(BondLink::Unknown(7)));
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
         assert!(
-            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            !sys.calls.iter().any(|c| c.starts_with("set_active_port")),
             "an unknown bonding link state is never a move target: {:?}",
             sys.calls
         );
@@ -1727,19 +1769,13 @@ mod tests {
             "said once across several ticks, not once per tick: {log:?}"
         );
         assert!(
-            notes[0].contains("eth0") && notes[0].contains("\"bogus\""),
+            notes[0].contains("eth0") && notes[0].contains("state 7"),
             "names the wire and the raw value: {log:?}"
         );
         // A known value re-arms the note: the same unknown value seen again is said again.
-        sys = sys.file(
-            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-            "up\n",
-        );
+        sys.set_port(HOME, up());
         p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
-        sys = sys.file(
-            &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-            "bogus\n",
-        );
+        sys.set_port(HOME, link(BondLink::Unknown(7)));
         p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 11);
         let log = p.drain_log();
         assert_eq!(
@@ -1774,7 +1810,7 @@ mod tests {
         assert!(
             sys.calls
                 .iter()
-                .any(|c| c == &format!("write /sys/class/net/{BOND}/bonding/active_slave")),
+                .any(|c| c == &format!("set_active_port {BOND} {HOME}")),
             "a better-preferred, already-usable wire is moved to on the very first tick: {:?}",
             sys.calls
         );
@@ -1802,12 +1838,12 @@ mod tests {
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         // Home starts down; the bond sits on backup.
-        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut sys = bonding(BACKUP).port(HOME, no_carrier());
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         run_ticks(&mut p, &mut sys, &mut io, 3);
 
         // Home comes back: a real return, worded "again".
-        sys = sys.file(&format!("/sys/class/net/{HOME}/carrier"), "1\n");
+        sys.set_port(HOME, up());
         run_ticks(&mut p, &mut sys, &mut io, 1);
         let log = p.drain_log();
         assert!(
@@ -1852,7 +1888,7 @@ mod tests {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut sys = bonding(BACKUP).port(HOME, no_carrier());
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 2);
         let home = rows[0]
@@ -1883,8 +1919,7 @@ mod tests {
         // Every wire answers throughout, so every wire stays `reachable`: only the carrier goes.
         run_ticks(&mut p, &mut sys, &mut io, 2);
         assert!(p.drain_log().is_empty(), "nothing has happened yet");
-        sys.files
-            .insert(format!("/sys/class/net/{HOME}/carrier"), "0\n".to_string());
+        sys.set_port(HOME, no_carrier());
         run_ticks(&mut p, &mut sys, &mut io, 1);
         let log = p.drain_log();
         assert_eq!(
@@ -1902,13 +1937,87 @@ mod tests {
         );
     }
 
+    /// A port whose netdev has gone away (`ENODEV`) is a fact about the wire: it is out of the
+    /// running, and there is nothing to report beyond the row that already says so.
+    #[test]
+    fn a_port_whose_netdev_is_gone_is_out_of_the_running_and_is_not_a_fault() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP);
+        sys.remove_port(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 6);
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c == &format!("set_active_port {BOND} {HOME}")),
+            "a netdev that is not there is never made the active port: {:?}",
+            sys.calls
+        );
+        let log = p.drain_log();
+        assert!(
+            !log.iter().any(|l| l.contains("unreadable over netlink")),
+            "the netdev being gone is not us failing to read: {log:?}"
+        );
+    }
+
+    /// Fail loud: a port state that cannot be read at all is neither "no carrier" nor "the
+    /// netdev is gone". The port is out of the running (the kernel would refuse a move onto a
+    /// port we cannot see) AND the leg says so — once, not twice a second.
+    #[test]
+    fn a_port_state_that_cannot_be_read_is_said_once_and_never_a_move_target() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP).port_unreadable(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 8);
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c == &format!("set_active_port {BOND} {HOME}")),
+            "a port we cannot read is never made the active port: {:?}",
+            sys.calls
+        );
+        let log = p.drain_log();
+        let said: Vec<&String> = log
+            .iter()
+            .filter(|l| l.contains("bond state unreadable over netlink"))
+            .collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "said once for the leg, not once per tick per port: {log:?}"
+        );
+        assert!(
+            said[0].starts_with("cfab: mgmt ingress: bond state unreadable over netlink: "),
+            "and it names the zone, the family and the error: {said:?}"
+        );
+
+        // It reads again: the note re-arms, so a second outage is said a second time.
+        sys.unreadable_ports.clear();
+        run_ticks(&mut p, &mut sys, &mut io, 2);
+        p.drain_log();
+        sys = sys.port_unreadable(HOME);
+        run_ticks(&mut p, &mut sys, &mut io, 2);
+        assert_eq!(
+            p.drain_log()
+                .iter()
+                .filter(|l| l.contains("unreadable over netlink"))
+                .count(),
+            1,
+            "a second outage is a second line"
+        );
+    }
+
     /// The prober says the home wire is out of the running once, not twice a second forever.
     #[test]
     fn the_no_carrier_note_is_said_once_not_on_every_tick() {
         let f = fabric();
         let (mut p, names) = prober(&f);
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut sys = bonding(BACKUP).port(HOME, no_carrier());
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         io.dark(HOME);
         run_ticks(&mut p, &mut sys, &mut io, 8);
@@ -2009,12 +2118,7 @@ mod tests {
             .file(&format!("/sys/class/net/{FB}/bonding/active_slave"), active)
             .file(&format!("/sys/class/net/{FB}/bonding/primary"), active);
         for s in FB_PORTS {
-            sys = sys
-                .file(&format!("/sys/class/net/{s}/carrier"), "1\n")
-                .file(
-                    &format!("/sys/class/net/{s}/bonding_slave/mii_status"),
-                    "up\n",
-                );
+            sys = sys.port(s, up());
         }
         sys
     }
@@ -2423,8 +2527,8 @@ mod tests {
         let f = fabric();
         let mut p = fb_prober(&f, "pve1-tb");
         let mut sys = fb_bonding(FB_B)
-            .file(&format!("/sys/class/net/{FB_A}/carrier"), "0\n")
-            .file(&format!("/sys/class/net/{FB_C}/carrier"), "0\n");
+            .port(FB_A, no_carrier())
+            .port(FB_C, no_carrier());
         let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
         let t0 = Instant::now();
         for tick in 0..6u64 {
