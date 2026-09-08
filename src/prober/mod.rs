@@ -163,6 +163,24 @@ struct ProbePort {
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
     deaf: Option<String>,
+    /// This port's usability (F25: `reachable() && !hello_dead && carrier && link_up`, the same
+    /// test `decide::Candidate::usable` runs) as of the last tick it was checked, or `None`
+    /// before the first check. Not the log-worthy fact itself — `returned` is — just what the
+    /// transition is measured against.
+    usable_prev: Option<bool>,
+    /// F25: this port went unusable-then-usable since it was last the active port (or since the
+    /// leg started, if it has never been active) — a REAL return, distinct from a preference
+    /// move where the target was usable the whole time and only the bond's home ranking says it
+    /// belongs there. Set on the false→true transition of usability; cleared the moment this
+    /// port becomes the active target, which restarts the "since it was last active" window.
+    ///
+    /// The very first tick a port is ever checked sets `usable_prev` but does not itself set
+    /// `returned` (there is no prior tick to have transitioned from). So a port usable from the
+    /// first observation and chosen over a less-preferred active port is a preference move
+    /// (never sets `returned`); a port unusable on its first observation and usable on its
+    /// second IS a return — the wire came up — because that second tick is a genuine
+    /// false→true transition relative to the first.
+    returned: bool,
 }
 
 /// At most this many peers are asked when one wire is escalated. Four is the point past which
@@ -193,7 +211,25 @@ impl ProbePort {
             escalating: false,
             hello_dead: false,
             deaf: None,
+            usable_prev: None,
+            returned: false,
         }
+    }
+
+    /// The same test `decide::Candidate::usable` runs, from the fields the prober keeps rather
+    /// than the `Candidate` the decision borrows for a tick.
+    fn usable(&self) -> bool {
+        self.state.reachable() && !self.hello_dead && self.carrier && self.bond_link_up
+    }
+
+    /// Fold this tick's usability into `returned` (F25). Called once per port per tick, after
+    /// every field the usability test reads has this tick's value.
+    fn note_usability(&mut self) {
+        let cur = self.usable();
+        if self.usable_prev == Some(false) && cur {
+            self.returned = true;
+        }
+        self.usable_prev = Some(cur);
     }
 
     fn evidence(&self, active: Option<&str>) -> Evidence {
@@ -620,6 +656,11 @@ impl Leg {
                             newly_deaf.push((s.wire.clone(), why.clone()));
                             s.deaf = Some(why);
                         }
+                        // A deaf tap does not touch reachability or hello_dead this tick, but
+                        // carrier/link_up were already refreshed above, so usability can still
+                        // have changed (F25) and must still be folded in before skipping the
+                        // rest of this port's tick.
+                        s.note_usability();
                         continue;
                     }
                     Ok(()) => s.deaf = None,
@@ -695,6 +736,7 @@ impl Leg {
                     }
                 }
             }
+            s.note_usability();
         }
         let zone = self.zone.clone();
         let bond = self.bond.clone();
@@ -946,12 +988,24 @@ impl Leg {
         let from_carrier = from.map(|f| f.carrier);
         let from_reachable = from.map(|f| f.state.reachable());
         let from_hello_dead = from.is_some_and(|f| f.hello_dead);
+        // F25: read the target's `returned` fact — did it go unusable then usable since it was
+        // last active? — BEFORE clearing it below. It, not anything about `from`, is what tells
+        // a real return (the wire came back) from a preference move (the target was usable the
+        // whole time and only outranks the wire the bond happened to be on).
+        let target_returned = self
+            .ports
+            .iter()
+            .find(|s| s.ifname == target)
+            .is_some_and(|s| s.returned);
         // The port that has just been promoted gets its grace period here: it was chosen after
         // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
-        // interval. Without it a two-port ping-pong could move once per tick.
+        // interval. Without it a two-port ping-pong could move once per tick. Its `returned`
+        // flag is cleared here too: becoming the active port restarts the "since it was last
+        // active" window the next return is measured against.
         let grace = grace_of(&self.kind);
         if let Some(s) = self.ports.iter_mut().find(|s| s.ifname == target) {
             s.grace_until = Some(now + grace);
+            s.returned = false;
         }
         match (from_wire, from_carrier, from_reachable, from_hello_dead) {
             // Carrier is tested FIRST, and not only because it is the actionable end of a wire
@@ -973,8 +1027,15 @@ impl Leg {
                 "cfab: {} {family}: {noun} unreachable on {w}, moved {} to {to}",
                 self.zone, self.bond
             )),
-            (Some(w), _, _, _) => log.push(format!(
+            (Some(w), _, _, _) if target_returned => log.push(format!(
                 "cfab: {} {family}: {noun} reachable on {to} again, moved {} back from {w}",
+                self.zone, self.bond
+            )),
+            // F25: the target was usable the whole time (never went unusable-then-usable since
+            // it was last active) — the bond simply belongs on the better-preferred wire, not
+            // "back" on one that just came back.
+            (Some(w), _, _, _) => log.push(format!(
+                "cfab: {} {family}: {to} is preferred, moved {} from {w}",
                 self.zone, self.bond
             )),
             (None, _, _, _) => log.push(format!(
@@ -1563,11 +1624,58 @@ mod tests {
             HOME,
             "and it names the home wire"
         );
+        let log = p.drain_log();
         assert!(
-            p.drain_log()
+            log.iter()
+                .any(|l| l.contains("reachable on eth0 again") && l.contains("back from eth9")),
+            "F25: eth0 was unusable (going back) since the leg started and is usable now — a \
+             real return, worded as one: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("is preferred")),
+            "a real return is not worded as a preference move: {log:?}"
+        );
+    }
+
+    /// F25: the bond starts on the backup wire, but the home wire has been usable — reachable,
+    /// carrier, `mii_status up` — since the very first tick. Nothing ever came back: the bond
+    /// simply belongs on the better-preferred wire, so the log says "is preferred", never
+    /// "reachable … again … back from" (which would claim the home wire had been down).
+    #[test]
+    fn a_preference_move_is_not_worded_as_a_return() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // `bonding(BACKUP)` already gives every port (HOME included) carrier and mii_status up.
+        let mut sys = bonding(BACKUP);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 1);
+        let home = rows[0]
+            .ports
+            .iter()
+            .find(|s| s.wire == "eth0")
+            .expect("the home wire has a row");
+        assert!(
+            home.reachable,
+            "the home wire is usable from tick one: {rows:?}"
+        );
+        assert!(
+            sys.calls
                 .iter()
-                .any(|l| l.contains("moved") && l.contains("eth0")),
-            "up is up: the move is logged exactly as any other move home"
+                .any(|c| c == &format!("write /sys/class/net/{BOND}/bonding/active_slave")),
+            "a better-preferred, already-usable wire is moved to on the very first tick: {:?}",
+            sys.calls
+        );
+        let log = p.drain_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("eth0 is preferred") && l.contains("from eth9")),
+            "F25: home was usable the whole time — a preference move, not a return: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("again") || l.contains("back from")),
+            "the 'again … back from' sentence claims the wire came back; it never went away: {log:?}"
         );
     }
 
