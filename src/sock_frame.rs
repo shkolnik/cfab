@@ -122,7 +122,7 @@ mod tests {
         });
         let p = path.clone();
         let reply = tokio::task::spawn_blocking(move || {
-            crate::sys::RealSys
+            crate::sys::RealSys::default()
                 .unix_request(p.to_str().unwrap(), "probe\n")
                 .unwrap()
         })
@@ -170,7 +170,7 @@ mod tests {
             })
             .await;
         });
-        let reply = crate::sys::RealSys
+        let reply = crate::sys::RealSys::default()
             .unix_request(path.to_str().unwrap(), "components\n")
             .unwrap();
         assert_eq!(reply, "{\"echo\":\"components\"}\n");

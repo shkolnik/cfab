@@ -386,6 +386,12 @@ mod restore_and_merge_tests {
     fn a_restore_that_cannot_run_ethtool_warns_too() {
         struct NoEthtool(MockSys);
         impl Sys for NoEthtool {
+            fn bond_port_state(&mut self, p: &str) -> Result<crate::netlink::PortState> {
+                self.0.bond_port_state(p)
+            }
+            fn set_active_port(&mut self, b: &str, p: &str) -> Result<()> {
+                self.0.set_active_port(b, p)
+            }
             fn run(&mut self, argv: &[&str]) -> Result<crate::sys::Output> {
                 if argv[0] == "ethtool" {
                     return Err(Error::fatal("cannot exec ethtool"));

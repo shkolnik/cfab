@@ -296,7 +296,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     // refused, is exactly the operator who needs status to work. Every other command keeps
     // reading the file — they act on what is DECLARED, not on what is running.
     let applied = if let Command::Status { .. } = cli.command {
-        commands::status::applied_fabric(&RealSys, &path)
+        commands::status::applied_fabric(&RealSys::default(), &path)
     } else {
         None
     };
@@ -332,7 +332,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             // load_fabric + View::new above are the full validation gate: a conf that does
             // not validate for this member never reaches the cluster.
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             let conf_text = std::fs::read_to_string(&path)
                 .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
             print!(
@@ -392,12 +392,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::from(code))
         }
         Command::Down => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             print!("{}", commands::teardown::run_cli(&mut sys, &view)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { wait, permissive } => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             // The on-disk declaration is compared to the running one only when we are
             // describing the applied copy — otherwise the view IS the file and there is
             // nothing to compare it with.
@@ -407,7 +407,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::from(report.code))
         }
         Command::ShapeDaemon { debounce } => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             commands::shape_daemon::run(
                 &mut sys,
                 &view,
@@ -416,7 +416,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::FwdWatchdog => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             // Run by hand or by a timer, with no supervisor and so no ingress prober: nothing
             // holds a bond's `primary` away from the declared home.
             let report = commands::fwd_watchdog::run(
@@ -455,7 +455,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             }
         }
         Command::ConfSync => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             let exe = std::env::current_exe()
                 .map_err(|e| Error::fatal(format!("cannot resolve own path: {e}")))?
                 .to_string_lossy()
@@ -464,7 +464,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::MeasureCap { dev, peer, secs } => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             let summary = commands::measure_cap::run(
                 &mut sys,
                 &view,
@@ -482,7 +482,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::PolicyTeeth => {
-            let mut sys = RealSys;
+            let mut sys = RealSys::default();
             let conf_text = std::fs::read_to_string(&path)
                 .map_err(|e| Error::fatal(format!("cannot read {}: {e}", path.display())))?;
             let report = commands::policy_teeth::run(&mut sys, &view, &conf_text)?;
@@ -536,7 +536,7 @@ fn shape_for<'a>(
     fabric: &cfab::model::Fabric,
     dev: &str,
 ) -> Result<emit::shape::Derivation, Error> {
-    let mut sys = RealSys;
+    let mut sys = RealSys::default();
     let measured = cfab::caps::read_cap(
         &mut sys,
         &cfab::cluster::Pmxcfs::new(),
