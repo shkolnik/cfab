@@ -840,13 +840,21 @@ pub(crate) async fn serve(listener: TcpListener, latest: watch::Receiver<Arc<str
 /// `serve` with the in-flight bound handed in, so a test can watch the slots fill and drain
 /// rather than guess at the timing.
 async fn serve_on(listener: TcpListener, latest: watch::Receiver<Arc<str>>, slots: Arc<Semaphore>) {
+    let mut accept_failing = false;
     loop {
         let sock = match listener.accept().await {
-            Ok((sock, _)) => sock,
+            Ok((sock, _)) => {
+                accept_failing = false;
+                sock
+            }
             Err(e) => {
                 // Per-accept errors (EMFILE and friends) are transient; back off rather than
-                // spin, and never take the endpoint down for one of them.
-                tracing::warn!(%e, "metrics: accept failed");
+                // spin, and never take the endpoint down for one of them. Logged once per
+                // streak, not once per retry.
+                if !accept_failing {
+                    accept_failing = true;
+                    eprintln!("cfab: metrics: accept failed: {e}");
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }

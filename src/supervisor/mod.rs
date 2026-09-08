@@ -127,6 +127,9 @@ pub(crate) struct Shared {
     /// Metrics gathers that failed since start. The endpoint keeps serving the previous
     /// snapshot, so this counter is the only place a failing gather is visible over time.
     metrics_collect_failures: u64,
+    /// Set while a run of consecutive metrics-gather failures is ongoing, so the journal line
+    /// is printed once per streak rather than once per `metrics::REFRESH` tick.
+    metrics_gather_failing: bool,
 }
 
 impl Shared {
@@ -150,6 +153,7 @@ impl Shared {
             held: crate::prober::HeldPrimaries::default(),
             metrics_error: None,
             metrics_collect_failures: 0,
+            metrics_gather_failing: false,
         }
     }
 
@@ -643,7 +647,10 @@ pub(crate) async fn run_with(
             Err(e) => {
                 // Never fatal (spec §3.1): one warning, a standing `status` line for as long as
                 // it lasts, and a retry every `metrics_bind_retry`. The fabric is unaffected.
-                tracing::warn!(port = hooks.metrics_port, %e, "metrics endpoint not listening");
+                eprintln!(
+                    "cfab: metrics endpoint not listening on :{} ({e})",
+                    hooks.metrics_port
+                );
                 trace_mark(&trace, format!("metrics bind failed: {e}"));
                 shared.lock().unwrap().metrics_error = Some(e.to_string());
             }
@@ -829,7 +836,7 @@ pub(crate) async fn run_with(
                 if let Ok(l) = metrics::bind(hooks.metrics_port) {
                     tokio::spawn(metrics::serve(l, metrics_tx.subscribe()));
                     shared.lock().unwrap().metrics_error = None;
-                    tracing::info!(port = hooks.metrics_port, "metrics endpoint listening");
+                    eprintln!("cfab: metrics endpoint listening on :{}", hooks.metrics_port);
                 }
             }
             _ = feed => {
@@ -1357,10 +1364,19 @@ fn refresh_snapshot(
                 collect_failures: failures,
             };
             tx.send_replace(Arc::from(metrics::render(&Arc::new(snap))));
+            let mut st = shared.lock().unwrap();
+            if st.metrics_gather_failing {
+                st.metrics_gather_failing = false;
+                eprintln!("cfab: metrics: gather succeeded again");
+            }
         }
         Err(e) => {
-            shared.lock().unwrap().metrics_collect_failures += 1;
-            tracing::warn!(%e, "metrics: gather failed, serving the previous snapshot");
+            let mut st = shared.lock().unwrap();
+            st.metrics_collect_failures += 1;
+            if !st.metrics_gather_failing {
+                st.metrics_gather_failing = true;
+                eprintln!("cfab: metrics: gather failed, serving the previous snapshot: {e}");
+            }
         }
     }
 }
