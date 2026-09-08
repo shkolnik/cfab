@@ -2,7 +2,6 @@
 
 use crate::derive::View;
 use crate::error::Result;
-use crate::model::{Fabric, Zone};
 use crate::sys::{Sys, have_tool, run_ignore, run_ok, run_optional};
 
 /// One `ip rule` cfab owns: the pref it lives at, the substring that proves it is present, and
@@ -24,48 +23,31 @@ impl FabricRule {
             add: add.iter().map(|s| s.to_string()).collect(),
         }
     }
-
-    /// The `ip rule del` tail for a rule built with a FULL `ip rule add pref <pref> ...` argv in
-    /// `.add` (`workload_return_rules`, teardown's only consumer): strip the `ip rule add pref
-    /// <pref>` head, leaving the same selector tail `drop_rules` expects. Rules built with a
-    /// tail-only `.add` (`leak_guard_rules`, `return_path_rules` — the `ensure_fabric_rule`/
-    /// `ensure_rule` convention, which prepends that head itself) never call this.
-    pub(crate) fn del(&self) -> Vec<String> {
-        self.add[5..].to_vec()
-    }
-}
-
-/// The workload prefixes this zone may reach (declaration order): the one place that decides
-/// which (zone, workload) pairs get a pref-2000 sibling, so `workload_return_rules` and
-/// `return_path_rules` cannot drift on the answer.
-fn workload_prefixes_for(fabric: &Fabric, zone: &Zone) -> Vec<String> {
-    fabric
-        .workloads
-        .iter()
-        .filter(|w| w.allow.iter().any(|a| a == &zone.name))
-        .map(|w| w.prefix.to_string())
-        .collect()
 }
 
 /// Pref-2000 siblings (spec §5 item 4): fabric-sourced traffic to a workload prefix leaves via
 /// main on every member and leaf, before the 2001 per-zone table catches it. One per (allowed
 /// zone, workload), fabric-wide: leaves need it too, to answer `ip route get <vm> from
-/// <identity>`. `.add` carries the FULL `ip rule add ...` argv (unlike the tail-only convention
-/// elsewhere in this file) because teardown is this function's only consumer and drops the rule
-/// straight from it (`FabricRule::del`), never through `ensure_fabric_rule`.
+/// <identity>`. Tail-only `.add`, the same convention every other rule in this file uses:
+/// `return_path_rules` splices this function's own output (never re-formats the same needle
+/// itself), and teardown passes `.add` straight to `drop_rules`, which prepends `ip rule del
+/// pref <pref>` itself — one `FabricRule` shape, one place that decides which (zone, workload)
+/// pairs get a sibling.
 pub fn workload_return_rules(view: &View) -> Vec<FabricRule> {
     let mut out = Vec::new();
     for z in &view.fabric.zones {
         let blk = format!("{}.0.0/16", z.block());
-        for prefix in workload_prefixes_for(view.fabric, z) {
-            let needle = format!("from {blk} to {prefix} lookup main");
+        for w in view
+            .fabric
+            .workloads
+            .iter()
+            .filter(|w| w.allow.iter().any(|a| a == &z.name))
+        {
+            let prefix = w.prefix.to_string();
             out.push(FabricRule::new(
                 "2000",
-                needle,
-                &[
-                    "ip", "rule", "add", "pref", "2000", "from", &blk, "to", &prefix, "lookup",
-                    "main",
-                ],
+                format!("from {blk} to {prefix} lookup main"),
+                &["from", &blk, "to", &prefix, "lookup", "main"],
             ));
         }
     }
@@ -99,6 +81,10 @@ pub fn leak_guard_rules(view: &View) -> Vec<FabricRule> {
 /// outside reaches a leaf at the leaf's own addresses; only members use its identities.
 pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
     let mut out = Vec::new();
+    // Fabric-wide, computed once: `workload_return_rules` is the one place that decides which
+    // (zone, workload) pairs get a pref-2000 sibling, so this splices its own output rather
+    // than re-formatting the same needle a second time.
+    let siblings = workload_return_rules(view);
     for z in &view.fabric.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -118,13 +104,12 @@ pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
         ));
         // The sibling: fabric-sourced traffic bound for a workload this zone may reach leaves
         // via main too, before it can fall through to this zone's 2001/2002 pair below.
-        for prefix in workload_prefixes_for(view.fabric, z) {
-            out.push(FabricRule::new(
-                "2000",
-                format!("from {blk} to {prefix} lookup main"),
-                &["from", &blk, "to", &prefix, "lookup", "main"],
-            ));
-        }
+        out.extend(
+            siblings
+                .iter()
+                .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
+                .cloned(),
+        );
         // The substring "lookup <id>" is unique within this pref's rules.
         out.push(FabricRule::new(
             "2001",
@@ -524,10 +509,7 @@ mod tests {
             );
             assert_eq!(
                 r[0].add,
-                vec![
-                    "ip", "rule", "add", "pref", "2000", "from", "10.99.0.0/16", "to",
-                    "192.168.20.0/24", "lookup", "main"
-                ]
+                vec!["from", "10.99.0.0/16", "to", "192.168.20.0/24", "lookup", "main"]
             );
         }
     }

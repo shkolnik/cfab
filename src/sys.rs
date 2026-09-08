@@ -457,10 +457,22 @@ pub mod mock {
             }
             // Same reason, for `ip rule`: `drop_rules` loops on `ip rule show pref <pref>`
             // until the needle is gone, so a mock that keeps answering "still there" forever
-            // would hang any test of the present-then-deleted case rather than fail it.
-            if let ["ip", "rule", "del", "pref", pref, ..] = argv {
-                self.cmd_rules
-                    .retain(|(prefix, _)| prefix.as_slice() != ["ip", "rule", "show", "pref", pref]);
+            // would hang any test of the present-then-deleted case rather than fail it. Only
+            // the deleted rule's own line is dropped from the stub (never the whole `show`
+            // rule), so a pref stubbed with several rules on one line each survives a single
+            // delete with the others intact.
+            if let ["ip", "rule", "del", "pref", pref, tail @ ..] = argv {
+                let selector = tail.join(" ");
+                for (prefix, out) in &mut self.cmd_rules {
+                    if prefix.as_slice() == ["ip", "rule", "show", "pref", pref] {
+                        out.stdout = out
+                            .stdout
+                            .lines()
+                            .filter(|l| !l.contains(&selector))
+                            .map(|l| format!("{l}\n"))
+                            .collect();
+                    }
+                }
             }
             let hit = self
                 .cmd_rules
@@ -624,6 +636,44 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("mock: no socket /run/cfab/other.sock")
+        );
+    }
+
+    /// `ip rule del pref <pref> <selector>` drops only the stubbed line naming that selector —
+    /// a pref stubbed with several rules survives a single delete with the others intact,
+    /// which is what lets a `drop_rules` test converge instead of hanging (a static stub that
+    /// never changes loops forever) without losing the other rules at the same pref.
+    #[test]
+    fn deleting_one_rule_at_a_pref_leaves_the_others_stubbed() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "rule", "show", "pref", "2000"],
+            "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main\n\
+             2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+        );
+        sys.run(&[
+            "ip",
+            "rule",
+            "del",
+            "pref",
+            "2000",
+            "from",
+            "10.99.0.0/16",
+            "to",
+            "192.168.20.0/24",
+            "lookup",
+            "main",
+        ])
+        .unwrap();
+        let shown = sys.run(&["ip", "rule", "show", "pref", "2000"]).unwrap();
+        assert!(
+            !shown.stdout.contains("192.168.20.0/24"),
+            "{}",
+            shown.stdout
+        );
+        assert!(
+            shown.stdout.contains("to 10.99.0.0/16 lookup main"),
+            "the other rule at this pref must survive: {}",
+            shown.stdout
         );
     }
 

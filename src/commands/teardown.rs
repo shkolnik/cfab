@@ -152,7 +152,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     // default (deleted explicitly below). Anything else left in the table is not ours and is
     // left alone (the leftover-note loop says so).
     engine_ctl::stop_and_sweep(sys, f)?;
-    // return-path rules (both kinds)
+    // return-path rules (both kinds), plus the pref-2000 workload siblings (spec §5 item 4):
+    // computed once, fabric-wide, then filtered per zone below — one `FabricRule` shape (tail-
+    // only `.add`), so `drop_rules` (which prepends `ip rule del pref <pref>` itself) is the
+    // only way any of these rules is added to or removed from the kernel.
+    let workload_rules = crate::commands::common::workload_return_rules(view);
     for z in &f.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -171,15 +175,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
                 "0",
             ],
         )?;
-        // The pref-2000 workload siblings this zone may reach (spec §5 item 4): teardown is
-        // `workload_return_rules`'s only consumer, so its rules are dropped straight from it
-        // (`FabricRule::del`) rather than through `ensure_fabric_rule`'s tail-only convention.
-        for r in crate::commands::common::workload_return_rules(view)
-            .into_iter()
+        for r in workload_rules
+            .iter()
             .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
         {
-            let del_owned = r.del();
-            let del: Vec<&str> = del_owned.iter().map(String::as_str).collect();
+            let del: Vec<&str> = r.add.iter().map(String::as_str).collect();
             drop_rules(sys, &r.pref, &r.needle, &del)?;
         }
         drop_rules(
