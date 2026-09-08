@@ -1203,15 +1203,8 @@ impl Fabric {
     }
 
     /// The smallest set of prefixes covering every declared zone block, for DHCP option 121.
-    /// STUB for gate A: every zone block, sorted, with no merging of adjacent `/16`s — the
-    /// non-merging case this stub covers stays true once Task 4b (`emit::workload::aggregate`)
-    /// replaces this body with the real merge.
     pub fn aggregate(&self) -> Vec<String> {
-        let mut ids: Vec<u8> = self.zones.iter().map(|z| z.id).collect();
-        ids.sort_unstable();
-        ids.into_iter()
-            .map(|id| format!("10.{id}.0.0/16"))
-            .collect()
+        crate::emit::workload::aggregate(&self.zones.iter().map(|z| z.id).collect::<Vec<_>>())
     }
 }
 

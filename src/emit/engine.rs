@@ -64,9 +64,10 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
     let class_rows = view.class_rows();
     let fallback_rows = view.fallback_rows();
     let gw_rows = view.gw_rows();
+    let workload_rows = view.workload_rows();
 
     // Every interface any instance names, in class-row → fallback-bond → identity →
-    // ingress-leg order.
+    // ingress-leg → workload order.
     let mut if_names: Vec<String> = Vec::new();
     let mut add_if = |name: String| {
         if !if_names.contains(&name) {
@@ -86,6 +87,9 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
     }
     for r in &gw_rows {
         add_if(r.ifname.clone());
+    }
+    for r in &workload_rows {
+        add_if(r.wl.ifname.clone());
     }
     let interfaces: Vec<Value> = if_names
         .iter()
@@ -132,6 +136,13 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
         ospf_ifs.push(json!({ "name": View::identity_if(z), "passive": true }));
         for r in gw_rows.iter().filter(|r| r.zone == z.name) {
             ospf_ifs.push(json!({ "name": r.ifname, "passive": true }));
+        }
+        // A workload's interface is a passive stub link of every zone instance its row's
+        // `allow` names (spec §5.1 item 3): holo advertises every address on a passive
+        // interface as a stub link (R6), so the workload's /24 secondary reaches that zone's
+        // OSPF without the workload ever forming an adjacency.
+        for r in workload_rows.iter().filter(|r| r.wl.allow.contains(&z.name)) {
+            ospf_ifs.push(json!({ "name": r.wl.ifname, "passive": true }));
         }
         protocols.push(json!({
             "type": "ietf-ospf:ospfv2",
@@ -422,6 +433,13 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    /// The example fabric plus the shared `[[workload]]` fixture (`vms` on `primary.3`,
+    /// `allow = ["storage"]`, carried by pve1-tb and pve2-tb).
+    fn wl_fabric() -> Fabric {
+        let text = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
     /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
     /// deletes cfab's own default from under it) and must not collide with a well-known id.
     #[test]
@@ -548,6 +566,33 @@ mod tests {
             assert_eq!(e["type"], "iana-if-type:ethernetCsmacd");
             assert!(e["name"].as_str().unwrap().starts_with("cfab-"));
         }
+    }
+
+    /// Spec §5.1 item 3: a workload's interface is a passive OSPF stub link of every zone
+    /// instance the row's `allow` names, and of no other instance.
+    #[test]
+    fn a_workload_ifname_is_a_passive_interface_of_each_allowed_zone_instance_and_of_no_other() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let cfg = generate(&v).unwrap();
+        let storage = instance(&cfg, "storage");
+        let p = ospf_if(storage, "primary.3");
+        assert_eq!(p["passive"], true, "{p}");
+        assert!(p.get("cost").is_none(), "primary.3 carries a cost");
+        assert!(p.get("bfd").is_none(), "primary.3 carries bfd");
+        let cluster = instance(&cfg, "cluster");
+        assert!(
+            !ospf_ifs(cluster).iter().any(|i| i["name"] == "primary.3"),
+            "primary.3 in an instance not in allow: {cluster}"
+        );
+        assert!(if_names(&cfg).contains(&"primary.3".to_string()));
+        // A member that carries no row (the leaf pve3-tb) emits nothing for the ifname.
+        let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
+        assert!(!if_names(&leaf).contains(&"primary.3".to_string()), "{leaf}");
+        assert!(
+            !ospf_ifs(instance(&leaf, "storage")).iter().any(|i| i["name"] == "primary.3"),
+            "primary.3 passive on a non-carrier"
+        );
     }
 
     #[test]
