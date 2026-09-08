@@ -269,8 +269,8 @@ impl<'a> View<'a> {
             out.push((r.wl.ifname.clone(), transit));
         }
         for z in &f.zones {
-            let id = Self::identity_if(z);
-            out.push((format!("{id}-peer"), false));
+            let (id, peer) = crate::model::identity_ifnames(z.id);
+            out.push((peer, false));
             out.push((id, false));
         }
         out.sort();
@@ -299,7 +299,7 @@ impl<'a> View<'a> {
 
     /// The identity netdev for a zone: `cfab-id<id>`.
     pub fn identity_if(zone: &Zone) -> String {
-        format!("cfab-id{}", zone.id)
+        crate::model::identity_ifnames(zone.id).0
     }
 
     /// The identity address for this member in a zone: `10.<id>.0.<node>`.
@@ -954,7 +954,10 @@ mod tests {
         assert_eq!(get("pve3-tb", "primary.3"), None);
 
         // host_forward off: the workload row's transit bit follows the same gate as every
-        // other forwarding row, not the workload's own `allow` list.
+        // other forwarding row, not the workload's own `allow` list. `validate` now refuses any
+        // fabric with `[forward] enabled = false` and a `[[workload]]` row, so this half is a
+        // white-box check on a Fabric constructed past that gate — workload rows are always
+        // transit in a fabric `validate` actually accepts today.
         let mut f_off = f;
         f_off.host_forward = false;
         assert_eq!(

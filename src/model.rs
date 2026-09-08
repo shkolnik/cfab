@@ -262,6 +262,15 @@ impl Zone {
     }
 }
 
+/// The identity netdev name and its veth peer for a zone id: `cfab-id<id>` / `cfab-id<id>-peer`.
+/// The one producer of these two names, so `derive::View::identity_if` and `Fabric::validate`'s
+/// ifname-collision check cannot drift apart.
+pub fn identity_ifnames(zone_id: u8) -> (String, String) {
+    let id = format!("cfab-id{zone_id}");
+    let peer = format!("{id}-peer");
+    (id, peer)
+}
+
 /// One a zone's `segments` row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
 /// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -892,17 +901,32 @@ impl Fabric {
                     wl.name
                 )));
             }
+            // Every bond ifname that fans out into per-domain ports (a universal/fallback
+            // segment, or a migrating `gw` leg): `ports_of` names each port `<ifname>-<domain>`.
+            let bond_ifnames = self
+                .segments
+                .iter()
+                .filter(|s| s.scope.is_universal())
+                .map(|s| s.ifname.clone())
+                .chain(self.zones.iter().filter_map(|z| {
+                    let gw = z.gw.as_ref()?;
+                    gw.scope.is_universal().then(|| format!("cfab-gw{}", z.id))
+                }))
+                .collect::<Vec<_>>();
             // An ifname cfab already creates or owns by declaration: a declared wire, a
-            // declared segment/universal sub-if, or a zone's generated ingress/identity leg.
+            // declared segment/universal sub-if, a bond port, or a zone's generated
+            // ingress/identity leg.
             let collides = self
                 .members
                 .iter()
                 .any(|m| m.wires.iter().any(|w| w.name == wl.ifname))
                 || self.segments.iter().any(|s| s.ifname == wl.ifname)
+                || bond_ifnames
+                    .iter()
+                    .any(|b| self.domains.iter().any(|d| wl.ifname == format!("{b}-{d}")))
                 || self.zones.iter().any(|z| {
-                    wl.ifname == format!("cfab-gw{}", z.id)
-                        || wl.ifname == format!("cfab-id{}", z.id)
-                        || wl.ifname == format!("cfab-id{}-peer", z.id)
+                    let (id, peer) = identity_ifnames(z.id);
+                    wl.ifname == format!("cfab-gw{}", z.id) || wl.ifname == id || wl.ifname == peer
                 });
             if collides {
                 return Err(Error::config(format!(
@@ -942,8 +966,8 @@ impl Fabric {
             }
             if !self.host_forward {
                 return Err(Error::config(format!(
-                    "workload {}: allow is non-empty but [forward] enabled = false; enable \
-                     forwarding or remove allow",
+                    "workload {}: [forward] enabled = false; enable forwarding or delete the \
+                     [[workload]] row",
                     wl.name
                 )));
             }
@@ -1887,6 +1911,18 @@ mod tests {
             "fabric.toml: workload vms: ifname 'cfab-gw249' collides with an interface cfab \
              creates"
         );
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249-a\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'cfab-gw249-a' collides with an interface cfab \
+             creates"
+        );
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'cfab-id249' collides with an interface cfab \
+             creates"
+        );
     }
 
     #[test]
@@ -1903,8 +1939,8 @@ mod tests {
         let e = wl_err(|t| t.replace("enabled = true", "enabled = false"));
         assert_eq!(
             e,
-            "fabric.toml: workload vms: allow is non-empty but [forward] enabled = false; \
-             enable forwarding or remove allow"
+            "fabric.toml: workload vms: [forward] enabled = false; enable forwarding or delete \
+             the [[workload]] row"
         );
     }
 

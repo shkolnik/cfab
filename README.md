@@ -180,10 +180,15 @@ name = "pve1"
 workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on ifname
 ```
 
-`cfab check` refuses a `gw`, `router`, or member address outside `prefix`, a member address
-without the prefix's mask, an `allow` naming an unknown zone, a workload row no member carries, a
-member workload naming an unknown row, and a leaf carrying one (a leaf never transits). Names
-share the zone vocabulary, so `vms>storage` reads like `storage>storage`.
+`cfab check` refuses a `gw`, `router`, or member address outside `prefix`; any of them landing on
+`prefix`'s network or broadcast address; a member address without the prefix's mask or equal to
+`gw`; an empty `allow`; an `allow` naming an unknown zone; an `ifname` colliding with a declared
+wire, a declared segment, or a cfab-generated bond/identity interface; a workload row no member
+carries; a member declaring the same workload row twice; a member workload naming an unknown row;
+and a leaf carrying one (a leaf never transits). Names share the zone vocabulary, so `vms>storage`
+reads like `storage>storage`. A fabric with `[forward] enabled = false` cannot declare a
+`[[workload]]` row at all — a workload with nothing to reach is refused, and reaching a zone
+requires forwarding, so there is no valid `allow` once forwarding is off.
 
 - **`up` adds:** IPv4 forwarding on `ifname`; a passive OSPF entry for `ifname` in every allowed
   zone's instance, so every member and leaf learns the prefix; a pref-2000 sibling return-path

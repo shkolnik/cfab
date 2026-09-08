@@ -640,17 +640,33 @@ refuses a
 .BR gw ,
 .B router
 or member address outside
-.BR prefix ,
-a member address without the prefix's mask, an
+.BR prefix ;
+any of them on the prefix's network or broadcast address; a member address
+without the prefix's mask or equal to
+.BR gw ;
+an empty
+.BR allow ;
+an
 .B allow
-naming an unknown zone, a workload row no member carries, a member workload
-naming an unknown row, and a leaf carrying one (a leaf never transits); with
-rows declared it also prints the fabric aggregate (the smallest set of
-prefixes covering every declared zone block) and the DHCP option 121 snippet.
-Names share the zone vocabulary, so
+naming an unknown zone; an
+.B ifname
+colliding with a declared wire, a declared segment, or a cfab\-generated
+bond/identity interface; a workload row no member carries; a member
+declaring the same workload row twice; a member workload naming an unknown
+row; and a leaf carrying one (a leaf never transits); with rows declared it
+also prints the fabric aggregate (the smallest set of prefixes covering
+every declared zone block) and the DHCP option 121 snippet. Names share the
+zone vocabulary, so
 .B vms>storage
 reads like
 .BR storage>storage .
+A fabric with
+.B "[forward] enabled = false"
+cannot declare a
+.B [[workload]]
+row at all: reaching a zone requires forwarding, so no
+.B allow
+value is ever valid once it is off.
 .PP
 The VLAN interface itself is baseline\-owned (Proxmox, systemd\-networkd,
 whatever already brought it up); cfab only points at it, and never creates or
