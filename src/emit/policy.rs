@@ -68,6 +68,23 @@ pub fn generate(view: &View) -> Result<String> {
             "    iifname @{from} oifname @{to} counter accept comment \"allow-{from}-{to}\"\n"
         ));
     }
+    // Spec §5 item 6: a symmetric, stateless accept pair per (workload, allowed zone).
+    // Stateless is load-bearing (R4 measured `ct-invalid-seen` +3 when the storage→ifname
+    // accept was deleted): the reverse leg is a plain accept, never `ct state`.
+    for row in view.workload_rows() {
+        for z in &row.wl.allow {
+            out.push_str(&format!(
+                "    iifname \"{ifn}\" oifname @{z} counter accept comment \"allow-{wl}-{z}\"\n",
+                ifn = row.wl.ifname,
+                wl = row.wl.name
+            ));
+            out.push_str(&format!(
+                "    iifname @{z} oifname \"{ifn}\" counter accept comment \"allow-{z}-{wl}\"\n",
+                ifn = row.wl.ifname,
+                wl = row.wl.name
+            ));
+        }
+    }
     out.push_str("    counter comment \"default-deny\"\n  }\n}\n");
     Ok(out)
 }
@@ -83,6 +100,50 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Spec §5 item 6: a workload gets a symmetric, stateless accept pair per allowed zone —
+    /// stateless is load-bearing (R4 measured `ct-invalid-seen` +3 when the storage→ifname
+    /// accept was deleted) — and its ifname lands in the `cfab` owned set so an undeclared pair
+    /// hits default-deny rather than the blanket foreign-transit accept.
+    #[test]
+    fn a_workload_gets_symmetric_stateless_accepts_and_its_ifname_in_the_owned_set() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        assert!(
+            t.contains(
+                "iifname \"primary.3\" oifname @storage counter accept comment \"allow-vms-storage\""
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "iifname @storage oifname \"primary.3\" counter accept comment \"allow-storage-vms\""
+            ),
+            "{t}"
+        );
+        let cfab_set = t.split("set cfab {").nth(1).unwrap();
+        assert!(
+            cfab_set.contains("primary.3"),
+            "owned set must carry the workload ifname so undeclared pairs hit default-deny, \
+             not foreign-transit: {cfab_set}"
+        );
+        let pos = |s: &str| t.find(s).unwrap();
+        assert!(
+            pos("allow-vms-storage") > pos("return-of-allowed")
+                && pos("allow-vms-storage") < pos("default-deny")
+        );
     }
 
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
