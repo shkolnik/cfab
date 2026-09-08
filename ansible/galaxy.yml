@@ -1,6 +1,6 @@
 namespace: shkolnik
 name: cfab
-version: 0.4.9
+version: 0.4.10
 readme: README.md
 authors:
   - James Shkolnik
