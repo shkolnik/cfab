@@ -129,13 +129,12 @@ struct ProbePort {
     /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
     /// to believe it is three refused `active_slave` writes (F23).
     carrier: bool,
-    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`), read alongside
-    /// `carrier`. Carrier goes to 1 the instant a cable is plugged back in, but the driver holds
-    /// this file below `up` (`going_back`) for `updelay`, and the kernel's `active_slave` write
-    /// requires BOTH carrier and this file `up` (`bond_option_active_slave_set` ->
-    /// `bond_slave_is_up`, VERIFIED against the kernel source 2026-09-07, F24). Missing or
-    /// unreadable (port not in a bond) reads as NOT up: the kernel would refuse the write either
-    /// way, so treating it as eligible would just trade one refusal for another.
+    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
+    /// Carrier goes to 1 the instant a cable is plugged back in, but the driver holds this file
+    /// at `going back` for `updelay`, and the `active_slave` write refuses (EINVAL, "either the
+    /// port is down or the link is down") unless the port is running with carrier AND its bond
+    /// link is up. Missing or unreadable (port not in a bond) reads as NOT up: the kernel would
+    /// refuse the write either way.
     bond_link_up: bool,
     /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
     /// that has just come back is a port that has just been re-added, which is where the
@@ -486,7 +485,7 @@ fn has_carrier(sys: &dyn Sys, ifname: &str) -> Option<bool> {
 
 /// Does the bonding driver itself consider this port up? `bonding_slave/mii_status` (per PORT,
 /// not to be confused with the whole-bond `bonding/mii_status` `status` reads) is `up`,
-/// `going_back`, `going_down` or `down`; the kernel refuses `bonding/active_slave` unless this
+/// `going back`, `going down` or `down`; the kernel refuses `bonding/active_slave` unless this
 /// reads `up`, however healthy carrier already is (F24). A missing or unreadable file — the
 /// netdev is not a bond port, or carrier is already gone — is NOT up, deliberately: the kernel
 /// would refuse the write in that state too.
@@ -1503,9 +1502,8 @@ mod tests {
 
     /// F24, seen on the rack 2026-09-07 23:02 UTC: the home wire's cable is plugged back in
     /// (carrier 1, router answering) but the bonding driver holds the port below up for
-    /// `updelay` — `bonding_slave/mii_status` reads `going_back`, not `up` — and the kernel's
-    /// `active_slave` write wants BOTH carrier and this file `up` (`bond_option_active_slave_set`
-    /// → `bond_slave_is_up`, VERIFIED against the kernel source 2026-09-07). Writing anyway is
+    /// `updelay` — `bonding_slave/mii_status` reads `going back`, not `up` — and the kernel's
+    /// `active_slave` write wants BOTH carrier and this file `up`. Writing anyway is
     /// exactly the "cannot move … Invalid argument" line the fabric logged. The prober must
     /// leave the bond alone (and log nothing) until `mii_status` itself says `up`, then move on
     /// the very next tick.
@@ -1518,7 +1516,7 @@ mod tests {
             .file(&format!("/sys/class/net/{HOME}/carrier"), "1\n")
             .file(
                 &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
-                "going_back\n",
+                "going back\n",
             );
         let mut io = ScriptedIo::answering_on(ROUTER, &refs);
         let rows = run_ticks(&mut p, &mut sys, &mut io, 4);

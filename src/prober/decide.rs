@@ -88,17 +88,16 @@ pub struct Candidate {
     /// The router answers over this wire (the probe state machine above).
     pub reachable: bool,
     /// The port's netdev has carrier — a physical fact, and the ONLY one `skipped_for_carrier`
-    /// may speak of: "no carrier" said about a going_back port (carrier is 1) would be false.
+    /// may speak of: "no carrier" said about a `going back` port (carrier is 1) would be false.
     /// Carrier alone does not make the kernel accept `bonding/active_slave` on the port — see
     /// `link_up` — but it is what an operator means by "the cable is in", so it stays a fact of
     /// its own rather than folding `link_up` into it.
     pub carrier: bool,
     /// The bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
-    /// The driver holds a returning port's `mii_status` at `going_back` for `updelay` even after
+    /// The driver holds a returning port's `mii_status` at `going back` for `updelay` even after
     /// carrier comes back to 1, and the kernel's `bonding/active_slave` write requires BOTH
-    /// carrier and this reading `up` (`bond_option_active_slave_set` -> `bond_slave_is_up`,
-    /// VERIFIED against the kernel source 2026-09-07, F24 — F23 verified the carrier half on the
-    /// rack the same day). A port failing this is not a place ingress can be put, however
+    /// carrier and this reading `up` (its refusal says so: "either the port is down or the link
+    /// is down"; F23 measured the carrier half, F24 the link half). A port failing this is not a place ingress can be put, however
     /// recently the router answered over it or however solid its carrier — but it is not a
     /// fault either: `updelay` is expected and short, so it earns no log line the way losing
     /// carrier does. That is why it is a separate field from `carrier` rather than folded into
