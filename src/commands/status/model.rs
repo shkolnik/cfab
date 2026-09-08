@@ -133,3 +133,98 @@ impl Adjacency {
         }
     }
 }
+
+/// Which family of migrating leg a row describes. The two legs cfab builds — a zone's universal
+/// fallback segment and an ingress leg on gw scope `any` — are the same netdev shape built by
+/// the same builder, so they are one row type; only the words a renderer picks differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegKind {
+    Fallback,
+    Ingress,
+}
+
+/// What the supervisor's prober says about the far end's liveness under one leg. Carrier cannot
+/// answer this — an island whose uplink is dead keeps carrier and keeps switching locally
+/// (finding F21) — so where the bond SITS and whether anything can be reached over the wire it
+/// sits on are two different facts, and `status` needs both to name a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// No rows: no supervisor answering, a supervisor from before the prober, or a leg nothing
+    /// probes.
+    Unknown,
+    /// The far end is live over the home wire.
+    Home,
+    /// The home wire is silent and being asked, but nothing is confirmed yet.
+    HomeSuspect,
+    /// The home wire is confirmed dead, but another wire is live.
+    HomeDark,
+    /// No wire reaches the far end.
+    AllDark,
+    /// No wire of this leg has heard anything at all (spec §5 rule 2).
+    Quiet,
+}
+
+/// One declared port of a leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegPort {
+    pub ifname: String,
+    /// The physical wire the port is tagged on.
+    pub wire: String,
+    /// The wire is gone from the kernel, so this port cannot exist right now.
+    pub absent: bool,
+}
+
+/// `/sys/class/net/<home>/carrier`, read only when the leg is active off its home wire — the
+/// one branch in which the file decides anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeCarrier {
+    NotRead,
+    /// The file returns EINVAL on a down interface, so this is a field state, never healthy.
+    Unreadable,
+    Value(String),
+}
+
+/// What `bonding/` said about a leg that is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bonding {
+    /// `bonding/mii_status`, trimmed.
+    pub mii_status: String,
+    /// `bonding/active_slave`, trimmed; empty when the bond has no active port.
+    pub active_slave: String,
+    pub home_carrier: HomeCarrier,
+    /// `bonding/slaves`, split on whitespace; `Err` carries the read error.
+    pub slaves: std::result::Result<Vec<String>, String>,
+}
+
+/// One active-backup leg as it was read. Reads only — a leg that has migrated or lost a port is
+/// the watchdog's business to actuate on; here it is a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BondLeg {
+    pub kind: LegKind,
+    pub zone: String,
+    pub ifname: String,
+    /// The wire this leg belongs on: the zone's cheapest wire this member has.
+    pub home: String,
+    /// The gw router this leg reaches; `Some` only on an ingress leg.
+    pub router: Option<String>,
+    pub reach: Reach,
+    pub ports: Vec<LegPort>,
+    /// `None` when nothing under `bonding/` could be read — the netdev is not a bond.
+    pub bonding: Option<Bonding>,
+}
+
+impl BondLeg {
+    /// The wire the leg is carrying on, when a port of ours is active.
+    pub fn active_wire(&self) -> Option<&str> {
+        let b = self.bonding.as_ref()?;
+        self.ports
+            .iter()
+            .find(|p| p.ifname == b.active_slave)
+            .map(|p| p.wire.as_str())
+    }
+
+    /// Is the leg on the wire it belongs on?
+    pub fn on_home(&self) -> bool {
+        self.active_wire() == Some(self.home.as_str())
+    }
+}

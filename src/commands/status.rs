@@ -38,7 +38,10 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 
 pub mod model;
 
-pub use model::{Adjacency, Class, Condition, Headline, State};
+pub use model::{
+    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, LegKind, LegPort,
+    Reach, State,
+};
 
 pub struct StatusReport {
     pub state: State,
@@ -55,6 +58,10 @@ struct Ctx {
     /// Every expected adjacency, up or down. The `down <zone>:<seg>:.<node>` lines are rendered
     /// from these rows, never pushed as text.
     adjacencies: Vec<Adjacency>,
+    /// One row per zone carrying a fallback bond.
+    fallbacks: Vec<BondLeg>,
+    /// One row per gw zone whose ingress leg migrates.
+    ingress_legs: Vec<BondLeg>,
 }
 
 impl Ctx {
@@ -81,6 +88,9 @@ impl Ctx {
         for a in self.adjacencies.iter().filter(|a| !a.up) {
             // Settling: an adjacency that is still forming is the state `--wait` exists for.
             out.push((Class::Settling, format!("down {}", a.label())));
+        }
+        for leg in self.fallbacks.iter().chain(&self.ingress_legs) {
+            out.extend(leg_reasons(leg));
         }
         out
     }
@@ -943,48 +953,246 @@ fn posture(
     Ok(())
 }
 
-/// One active-backup leg to grade. The two migrating legs cfab builds — a zone's universal
-/// segment and an ingress leg on gw scope `any` — are the SAME netdev shape built by the same
-/// builder, so they are read by the same code and every condition has one spelling. Only three
-/// things differ per caller, and all of them are here rather than in a branch: the `subject`
-/// each line opens with (`<zone> fallback` / `<zone> ingress`), the `noun` for what is on the
-/// far end (`peers` / `router`), and the `dark` line, because a leg with no live port means
-/// "the safety net is gone" on a fallback and "the outside cannot reach this zone" on the
-/// ingress.
-struct BondCheck<'a> {
-    subject: String,
-    /// What this leg's liveness is about, in every line that names it. One spelling per
-    /// condition: the two families' reason lines differ by this word and nothing else.
-    noun: &'a str,
+/// Where one leg is and what to call it: everything `read_bond_leg` needs that the sysfs reads
+/// cannot supply.
+struct LegSpec<'a> {
+    kind: LegKind,
+    zone: &'a str,
     ifname: &'a str,
-    ports: &'a [Port],
     home: &'a str,
-    dark: String,
-    /// What the prober says about the far end under this leg.
+    /// The gw router this leg reaches; `Some` only on an ingress leg.
+    router: Option<String>,
+    ports: &'a [Port],
     reach: Reach,
 }
 
-/// What the supervisor's prober says about the far end's liveness under one leg. Carrier cannot
-/// answer this — an island whose uplink is dead keeps carrier and keeps switching locally
-/// (finding F21) — so where the bond SITS and whether anything can be reached over the wire it
-/// sits on are two different facts, and `status` needs both to name a cause.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// No rows: no supervisor answering, a supervisor from before the prober, or a leg nothing
-    /// probes. Every line reads exactly as it did before the prober existed.
-    Unknown,
-    /// The far end is live over the home wire.
-    Home,
-    /// The home wire is silent and being asked, but nothing is confirmed yet. A suspicion is not
-    /// a verdict, which is the whole difference between this and `HomeDark`.
-    HomeSuspect,
-    /// The home wire is confirmed dead, but another wire is live — the migration the prober makes.
-    HomeDark,
-    /// No wire reaches the far end.
-    AllDark,
-    /// No wire of this leg has heard anything at all (spec §5 rule 2). Nothing was moved,
-    /// because there is nowhere to move to; only a fallback leg can be in this state.
-    Quiet,
+/// What one leg's `bonding/` sysfs says, as a row. The two migrating legs cfab builds — a
+/// zone's universal segment and an ingress leg on gw scope `any` — are the SAME netdev shape
+/// built by the same builder, so they are read by the same code and every condition has one
+/// spelling. Reads only: a leg that has migrated or lost a port is the watchdog's business to
+/// actuate on; here it is named.
+fn read_bond_leg(sys: &mut dyn Sys, absent: &BTreeSet<String>, spec: LegSpec<'_>) -> BondLeg {
+    let LegSpec {
+        kind,
+        zone,
+        ifname,
+        home,
+        router,
+        ports,
+        reach,
+    } = spec;
+    let ports: Vec<LegPort> = ports
+        .iter()
+        .map(|p| LegPort {
+            ifname: p.ifname.clone(),
+            wire: p.wire.clone(),
+            absent: absent.contains(&p.ifname),
+        })
+        .collect();
+    let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
+    let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
+    let bonding = match (mii, active) {
+        // Nothing under `bonding/` can be read, the port list included: the port checks below
+        // would only repeat what that says.
+        (Err(_), _) | (_, Err(_)) => None,
+        (Ok(mii), Ok(active)) => {
+            let mii = mii.trim().to_string();
+            let active = active.trim().to_string();
+            // Off the home wire is only a fault while the home wire still has carrier, so this
+            // file is read in exactly the branch that turns on it — and nowhere else, because
+            // it returns EINVAL on a down interface.
+            let off_home = ports
+                .iter()
+                .find(|p| p.ifname == active)
+                .is_some_and(|p| p.wire != home);
+            let home_carrier = if mii == "up"
+                && !matches!(reach, Reach::AllDark | Reach::Quiet)
+                && off_home
+            {
+                match sys.read(&format!("/sys/class/net/{home}/carrier")) {
+                    Ok(v) => HomeCarrier::Value(v.trim().to_string()),
+                    Err(_) => HomeCarrier::Unreadable,
+                }
+            } else {
+                HomeCarrier::NotRead
+            };
+            let slaves = sys
+                .read(&format!("/sys/class/net/{ifname}/bonding/slaves"))
+                .map(|v| v.split_whitespace().map(str::to_string).collect())
+                .map_err(|e| e.to_string());
+            Some(Bonding {
+                mii_status: mii,
+                active_slave: active,
+                home_carrier,
+                slaves,
+            })
+        }
+    };
+    BondLeg {
+        kind,
+        zone: zone.to_string(),
+        ifname: ifname.to_string(),
+        home: home.to_string(),
+        router,
+        reach,
+        ports,
+        bonding,
+    }
+}
+
+/// What one leg row says, in words. Only three things differ between the two families, and all
+/// of them are here rather than in a branch: the `subject` each line opens with (`<zone>
+/// fallback` / `<zone> ingress`), the `noun` for what is on the far end (`peers` / `router`),
+/// and the `dark` line, because a leg with no live port means "the safety net is gone" on a
+/// fallback and "the outside cannot reach this zone" on the ingress.
+fn leg_reasons(leg: &BondLeg) -> Vec<(Class, String)> {
+    let mut out: Vec<(Class, String)> = Vec::new();
+    let ifname = &leg.ifname;
+    let home = &leg.home;
+    let zone = &leg.zone;
+    let subject = match leg.kind {
+        LegKind::Fallback => format!("{zone} fallback"),
+        LegKind::Ingress => format!("{zone} ingress"),
+    };
+    let noun = match leg.kind {
+        LegKind::Fallback => "peers",
+        LegKind::Ingress => "router",
+    };
+    // A leg with no live port IS the ingress being unreachable, and that already has a grade in
+    // `return_path_and_ingress`: keep its spelling, name the leg as the reason.
+    let dark = match leg.kind {
+        LegKind::Fallback => format!("{zone} fallback no carrier"),
+        LegKind::Ingress => format!(
+            "{zone} gw {} unreachable (ingress leg {ifname} has no live port)",
+            leg.router.as_deref().unwrap_or_default()
+        ),
+    };
+    let Some(b) = &leg.bonding else {
+        out.push((
+            Class::Settling,
+            format!(
+                "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
+                 — re-run cfab up"
+            ),
+        ));
+        return out;
+    };
+    let active = &b.active_slave;
+    if b.mii_status != "up" {
+        // A dark bond whose active port is a stranger is not the same fault as a dark bond, and
+        // "no carrier" would send an operator to the wrong end of the cable. The line says what
+        // was READ, not what the watchdog did with it: `status` cannot know whether an eviction
+        // was attempted (on a leaf the watchdog is not even scheduled), and a confident wrong
+        // diagnosis is worse than a plain one.
+        if !active.is_empty() && !leg.ports.iter().any(|s| s.ifname == *active) {
+            out.push((
+                Class::Settling,
+                format!("{subject} down with foreign port {active} active"),
+            ));
+        } else {
+            out.push((Class::Settling, dark));
+        }
+    } else if leg.reach == Reach::AllDark {
+        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
+        // the active port explains nothing an operator can act on, and the wire whose uplink to
+        // fix is every one of them.
+        out.push((
+            Class::Settling,
+            format!("{subject}: {noun} unreachable on every wire"),
+        ));
+    } else if leg.reach == Reach::Quiet {
+        // Nobody is heard anywhere, so no wire is to blame and the bond was left where it is.
+        // Settling: the fabric may simply be starting, and one line says it once.
+        out.push((
+            Class::Settling,
+            format!("{subject}: no {noun} heard on any wire"),
+        ));
+    } else {
+        match leg.active_wire() {
+            None => out.push((
+                Class::Settling,
+                format!(
+                    "{subject}: {ifname} is up with no port of ours active \
+                     (active_slave={active:?})"
+                ),
+            )),
+            Some(wire) if wire == home => {}
+            Some(wire) => match &b.home_carrier {
+                // Carrier and forwarding are not the same fact (finding F21). When the prober
+                // knows the home wire cannot reach the router, THAT is the cause and the
+                // carrier is a detail — the operator's next move is the uplink, not the bond.
+                // Standing, all four: the leg is up and carrying on a backup wire. That is the
+                // migration working, and it holds until the home wire's fault is fixed — a
+                // member that lives on one of these (a dead island uplink, a stuck reselect)
+                // would otherwise spend every deadline of every `status --wait` on it.
+                HomeCarrier::Value(s) if s == "1" && leg.reach == Reach::HomeDark => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home}: {noun} unreachable)"),
+                )),
+                // A suspicion, not a verdict: the home wire is silent and is being asked.
+                // Settling, because the next tick or two answers it either way.
+                HomeCarrier::Value(s) if s == "1" && leg.reach == Reach::HomeSuspect => out.push((
+                    Class::Settling,
+                    format!("{subject} via {wire} (home {home}: no {noun} heard)"),
+                )),
+                HomeCarrier::Value(s) if s == "1" => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home} has carrier)"),
+                )),
+                HomeCarrier::Value(_) => {
+                    out.push((Class::Standing, format!("{subject} via {wire}")))
+                }
+                // `NotRead` cannot reach this arm: the gather reads the file in exactly this
+                // branch. An unreadable carrier is never assumed healthy.
+                HomeCarrier::Unreadable | HomeCarrier::NotRead => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home} carrier unreadable)"),
+                )),
+            },
+        }
+    }
+    // Per port: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a port
+    // entirely, so the leg-level grade above cannot see it — and losing one is not theoretical
+    // (F5: a re-enumerated USB NIC comes back with a fresh ifindex and its leg is re-created
+    // unattached). A port whose wire has vanished is skipped: the wire's own line accounts for
+    // it, and its leg cannot exist at all.
+    let listed = match &b.slaves {
+        Ok(v) => v,
+        // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
+        // the port list is the only thing that can say a port went missing, so losing it is a
+        // named gap in the diagnosis, never silence.
+        Err(e) => {
+            out.push((
+                Class::Settling,
+                format!("{subject}: /sys/class/net/{ifname}/bonding/slaves unreadable ({e})"),
+            ));
+            return out;
+        }
+    };
+    for s in leg.ports.iter().filter(|s| !s.absent) {
+        if !listed.contains(&s.ifname) {
+            // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
+            // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
+            out.push((
+                Class::Settling,
+                format!(
+                    "{subject}: port {} on {} is not a port of {ifname} — re-run cfab up",
+                    s.ifname, s.wire
+                ),
+            ));
+        }
+    }
+    for name in listed
+        .iter()
+        .filter(|n| !leg.ports.iter().any(|s| s.ifname == **n))
+    {
+        // Standing: nothing of ours added it, so nothing of ours takes it back.
+        out.push((
+            Class::Standing,
+            format!("{subject}: {ifname} has a foreign port {name}"),
+        ));
+    }
+    out
 }
 
 /// The prober's verdict for one zone's leg, from the `components` document.
@@ -1006,137 +1214,6 @@ fn reach(rows: Option<&[ProbedLeg]>, zone: &str, home: &str) -> Reach {
         Some(s) if s.suspect => Reach::HomeSuspect,
         // A home wire the prober does not list at all cannot be called dark.
         Some(_) | None => Reach::Home,
-    }
-}
-
-/// What one leg's `bonding/` sysfs says, as reason lines. Reads only — a leg that has migrated
-/// or lost a port is the watchdog's business to actuate on; here it is named.
-fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, leg: &BondCheck) {
-    let BondCheck {
-        subject,
-        noun,
-        ifname,
-        ports,
-        home,
-        dark,
-        reach,
-    } = leg;
-    let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
-    let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
-    match (mii, active) {
-        (Err(_), _) | (_, Err(_)) => {
-            // Nothing under `bonding/` can be read, the port list included: one line, and the
-            // per-port check below would only repeat it.
-            c.settling(format!(
-                "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
-                 — re-run cfab up"
-            ));
-            return;
-        }
-        (Ok(mii), Ok(active)) if mii.trim() != "up" => {
-            // A dark bond whose active port is a stranger is not the same fault as a dark
-            // bond, and "no carrier" would send an operator to the wrong end of the cable.
-            // The line says what was READ, not what the watchdog did with it: `status`
-            // cannot know whether an eviction was attempted (on a leaf the watchdog is not
-            // even scheduled), and a confident wrong diagnosis is worse than a plain one.
-            let active = active.trim().to_string();
-            if !active.is_empty() && !ports.iter().any(|s| s.ifname == active) {
-                c.settling(format!("{subject} down with foreign port {active} active"));
-            } else {
-                c.settling(dark.clone());
-            }
-        }
-        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
-        // the active port explains nothing an operator can act on, and the wire whose uplink
-        // to fix is every one of them.
-        (Ok(_), Ok(_)) if *reach == Reach::AllDark => {
-            c.settling(format!("{subject}: {noun} unreachable on every wire"));
-        }
-        // Nobody is heard anywhere, so no wire is to blame and the bond was left where it is.
-        // Settling: the fabric may simply be starting, and one line says it once.
-        (Ok(_), Ok(_)) if *reach == Reach::Quiet => {
-            c.settling(format!("{subject}: no {noun} heard on any wire"));
-        }
-        (Ok(_), Ok(active)) => {
-            let active = active.trim();
-            match ports
-                .iter()
-                .find(|s| s.ifname == active)
-                .map(|s| s.wire.clone())
-            {
-                None => c.settling(format!(
-                    "{subject}: {ifname} is up with no port of ours active \
-                     (active_slave={active:?})"
-                )),
-                Some(wire) if wire == *home => {}
-                Some(wire) => {
-                    // Off the home wire is only a fault while the home wire still has
-                    // carrier: that is a stuck reselect. A dark home is the bond doing its
-                    // job. An unreadable carrier is neither and is never assumed healthy —
-                    // the file returns EINVAL on a down interface, so this is a field state.
-                    match sys.read(&format!("/sys/class/net/{home}/carrier")) {
-                        // Carrier and forwarding are not the same fact (finding F21). When the
-                        // prober knows the home wire cannot reach the router, THAT is the cause
-                        // and the carrier is a detail — the operator's next move is the uplink,
-                        // not the bond.
-                        // Standing, all four: the leg is up and carrying on a backup wire.
-                        // That is the migration working, and it holds until the home wire's
-                        // fault is fixed — a member that lives on one of these (a dead island
-                        // uplink, a stuck reselect) would otherwise spend every deadline of
-                        // every `status --wait` on it.
-                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeDark => c.standing(
-                            format!("{subject} via {wire} (home {home}: {noun} unreachable)"),
-                        ),
-                        // A suspicion, not a verdict: the home wire is silent and is being
-                        // asked. Settling, because the next tick or two answers it either way.
-                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeSuspect => c.settling(
-                            format!("{subject} via {wire} (home {home}: no {noun} heard)"),
-                        ),
-                        Ok(s) if s.trim() == "1" => {
-                            c.standing(format!("{subject} via {wire} (home {home} has carrier)"))
-                        }
-                        Ok(_) => c.standing(format!("{subject} via {wire}")),
-                        Err(_) => c.standing(format!(
-                            "{subject} via {wire} (home {home} carrier unreadable)"
-                        )),
-                    }
-                }
-            }
-        }
-    }
-    // Per port: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a port
-    // entirely, so the leg-level grade above cannot see it — and losing one is not theoretical
-    // (F5: a re-enumerated USB NIC comes back with a fresh ifindex and its leg is re-created
-    // unattached). A port whose wire has vanished is skipped: the wire's own line accounts
-    // for it, and its leg cannot exist at all.
-    let path = format!("/sys/class/net/{ifname}/bonding/slaves");
-    let listed = match sys.read(&path) {
-        Ok(v) => v,
-        // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
-        // the port list is the only thing that can say a port went missing, so losing it is
-        // a named gap in the diagnosis, never silence.
-        Err(e) => {
-            c.settling(format!("{subject}: {path} unreadable ({e})"));
-            return;
-        }
-    };
-    let listed: Vec<&str> = listed.split_whitespace().collect();
-    for s in ports.iter().filter(|s| !absent.contains(&s.ifname)) {
-        if !listed.contains(&s.ifname.as_str()) {
-            // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
-            // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
-            c.settling(format!(
-                "{subject}: port {} on {} is not a port of {ifname} — re-run cfab up",
-                s.ifname, s.wire
-            ));
-        }
-    }
-    for name in listed
-        .iter()
-        .filter(|n| !ports.iter().any(|s| s.ifname == **n))
-    {
-        // Standing: nothing of ours added it, so nothing of ours takes it back.
-        c.standing(format!("{subject}: {ifname} has a foreign port {name}"));
     }
 }
 
@@ -1167,20 +1244,19 @@ fn fallback(
         let zone = &r.zone;
 
         // ---- the leg: bonding/{mii_status,active_slave,slaves} -----------------------
-        bond_leg_health(
+        c.fallbacks.push(read_bond_leg(
             sys,
-            c,
             absent,
-            &BondCheck {
-                subject: format!("{zone} fallback"),
-                noun: "peers",
+            LegSpec {
+                kind: LegKind::Fallback,
+                zone,
                 ifname: &r.ifname,
-                ports: &r.ports,
                 home: &r.home,
-                dark: format!("{zone} fallback no carrier"),
+                router: None,
+                ports: &r.ports,
                 reach: reach(comps.map(|c| c.fallback.as_slice()), zone, &r.home),
             },
-        );
+        ));
 
         // ---- adjacency: every peer carrying this zone's fallback row, at least 2-Way ----
         let peer_members: Vec<&crate::model::Member> = f
@@ -1417,26 +1493,19 @@ fn return_path_and_ingress(
         // a port that never re-attached. A leg on a single domain is a plain sub-interface
         // and has none of this state.
         if leg.migrates() {
-            bond_leg_health(
+            c.ingress_legs.push(read_bond_leg(
                 sys,
-                c,
                 absent,
-                &BondCheck {
-                    subject: format!("{} ingress", z.name),
-                    noun: "router",
+                LegSpec {
+                    kind: LegKind::Ingress,
+                    zone: &z.name,
                     ifname: &leg.ifname,
-                    ports: &leg.ports,
                     home: &leg.home,
-                    // A leg with no live port IS the ingress being unreachable, and that
-                    // already has a grade in this function: keep its spelling, name the leg
-                    // as the reason.
-                    dark: format!(
-                        "{} gw {} unreachable (ingress leg {} has no live port)",
-                        z.name, gw.router, leg.ifname
-                    ),
+                    router: Some(gw.router.to_string()),
+                    ports: &leg.ports,
                     reach: reach(comps.map(|c| c.ingress.as_slice()), &z.name, &leg.home),
                 },
-            );
+            ));
         }
         let cidr = gw.leg_cidr(n);
         let addr = sys
