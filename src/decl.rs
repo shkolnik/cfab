@@ -716,8 +716,12 @@ mod tests {
 /// Declaration fixtures shared by the unit tests of every module: the shipped example, and
 /// the few edits tests make to it. Centralized so a change to the file's shape breaks one
 /// helper instead of thirty string literals.
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// Not `#[cfg(test)]`: the gate B golden (`tests/workload_golden.rs`) is an integration test and
+/// so links the crate as an external library, where a test-gated module does not exist. These are
+/// three string builders and a `read_to_string` of `examples/fabric.toml` resolved at call time,
+/// so the shipped binary gains nothing but the code.
+#[doc(hidden)]
+pub mod fixtures {
     /// The example declaration shipped with the crate.
     pub fn example() -> String {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
