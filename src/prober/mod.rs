@@ -144,9 +144,11 @@ struct ProbePort {
     /// The unknown link-state value the last "does not know" note named, so the same value is
     /// not logged twice a second for as long as it persists. `None` re-arms it.
     noted_bond_link: Option<u8>,
-    /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
-    /// that has just come back is a port that has just been re-added, which is where the
-    /// grace period comes from.
+    /// The netdev EXISTS: the kernel answered a GETLINK for it rather than `ENODEV`. An
+    /// administratively down port is present — it is there, it is simply not usable — and shows
+    /// up as `carrier` and `bond_link` saying so, which F24's eligibility rule already keeps out
+    /// of the running; only a netdev that is gone (a re-enumerating USB NIC, a port the kernel
+    /// removed) is absent, and only its return re-arms the grace period.
     present: bool,
     last_reply: Option<Instant>,
     /// Passive evidence, fallback legs only: the last peer packet and the last reflection of our
@@ -1984,6 +1986,51 @@ mod tests {
                 .iter()
                 .any(|c| c == &format!("set_active_port {BOND} {BACKUP}")),
             "and the bond actually moved: {:?}",
+            sys.calls
+        );
+    }
+
+    /// Presence is existence, not usability. An administratively down port is still there: it
+    /// is never a target (no carrier, and the driver's link is down), but it never counts as
+    /// gone either, so bringing it back up does not re-arm the F5 grace period the way a
+    /// re-enumerated netdev does — the test below covers that other half.
+    #[test]
+    fn an_admin_down_port_stays_present_and_its_return_does_not_re_arm_the_grace() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // The bond sits on the preferred wire eth0 and stays there; the spare eth9 is admin
+        // down (present, no carrier, the bonding driver's link down) throughout.
+        let mut sys = bonding(HOME).port(BACKUP, no_carrier());
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 4);
+        let spare = p.legs[0]
+            .ports
+            .iter()
+            .find(|s| s.ifname == BACKUP)
+            .expect("the spare is a port of the leg");
+        assert!(spare.present, "the netdev is there, it is just not usable");
+        // Whatever grace the leg's very first tick armed for every port: the point is that
+        // coming back up does not arm it AGAIN, the way a netdev reappearing does.
+        let grace_while_down = spare.grace_until;
+
+        // It comes back up. Nothing was ever absent, so nothing is re-armed — and the bond has
+        // no reason to move, so no promotion grace confuses the picture either.
+        sys.set_port(BACKUP, up());
+        p.tick(&mut sys, &mut io, Instant::now() + PROBE_INTERVAL * 10);
+        let spare = p.legs[0]
+            .ports
+            .iter()
+            .find(|s| s.ifname == BACKUP)
+            .expect("still a port of the leg");
+        assert!(spare.present, "it was present the whole time");
+        assert_eq!(
+            spare.grace_until, grace_while_down,
+            "an admin-down port that comes back was never re-added: the grace is not re-armed"
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("set_active_port")),
+            "and the bond had no reason to move at all: {:?}",
             sys.calls
         );
     }
