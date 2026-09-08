@@ -394,9 +394,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         }
         let state = out.stdout.split_whitespace().nth(1).unwrap_or("");
         if state != "UP" {
+            let remedy = if state == "LOWERLAYERDOWN" {
+                "fix the carrier of its lower device".to_string()
+            } else {
+                format!("ip link set {ifname} up, or fix its stanza")
+            };
+            // A blank field (unparsable `ip -br link show` output) must never surface as an
+            // empty word between "is" and the parenthesized remedy.
+            let label = if state.is_empty() { "unknown state" } else { state };
             return Err(Error::fatal(format!(
-                "workload {name}: interface {ifname} is {state} (ip link set {ifname} up, or \
-                 fix its stanza)"
+                "workload {name}: interface {ifname} is {label} ({remedy})"
             )));
         }
         let addr_out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
@@ -1436,6 +1443,30 @@ pub(crate) mod tests {
         assert_eq!(
             run(&mut noaddr, &view, &opts()).unwrap_err().to_string(),
             "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
+        );
+    }
+
+    #[test]
+    fn up_names_a_lower_layer_carrier_fault_with_its_own_remedy() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut lowerdown = sys.on_stdout(
+            &["ip", "-br", "link", "show", "dev", "primary.3"],
+            "primary.3@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
+        );
+        assert_eq!(
+            run(&mut lowerdown, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of its lower device)"
+        );
+    }
+
+    #[test]
+    fn up_names_an_unparseable_link_state_without_printing_an_empty_word() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        // no second whitespace-separated field at all
+        let mut blank = sys.on_stdout(&["ip", "-br", "link", "show", "dev", "primary.3"], "primary.3\n");
+        assert_eq!(
+            run(&mut blank, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 is unknown state (ip link set primary.3 up, or fix its stanza)"
         );
     }
 
