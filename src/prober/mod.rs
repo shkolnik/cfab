@@ -159,6 +159,12 @@ struct ProbePort {
     /// wins on preference, takes the bond back and dies again one dead interval later. Only a
     /// hello (a peer's, or our own reflection once this port is a backup) clears it.
     hello_dead: bool,
+    /// F28: when this port is confirmed dead (`state.reachable()` false) but still escalating,
+    /// the tick before which asking again is pointless — a live decision is asked every tick,
+    /// but a confirmed-dead wire is asked once per hello interval. `None` means the next ask is
+    /// due immediately, which is the state a wire enters the instant it is confirmed dead (the
+    /// first confirmed-dead round is not delayed) and whenever escalation starts or ends.
+    next_ask: Option<Instant>,
     /// The reason this port's tap could not be opened, as it was last reported. `None` once it
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
@@ -201,6 +207,7 @@ impl ProbePort {
             grace_until: None,
             escalating: false,
             hello_dead: false,
+            next_ask: None,
             deaf: None,
             usable_prev: None,
             returned: false,
@@ -724,6 +731,7 @@ impl Leg {
                     if heard_now || replied {
                         s.state.heard();
                         s.escalating = false;
+                        s.next_ask = None;
                     } else if s.escalating && s.probed {
                         s.state.observe(false);
                     }
@@ -817,6 +825,7 @@ impl Leg {
                 Verdict::Good => {
                     s.escalating = false;
                     s.probed = false;
+                    s.next_ask = None;
                     all_quiet = false;
                 }
                 Verdict::Suspect => {
@@ -826,9 +835,11 @@ impl Leg {
                     if s.hello_dead {
                         s.escalating = false;
                         s.probed = false;
+                        s.next_ask = None;
                     } else if !s.escalating {
                         s.escalating = true;
                         s.probed = false;
+                        s.next_ask = None;
                         s.state.precharge();
                     }
                 }
@@ -837,6 +848,7 @@ impl Leg {
                     // Nothing to move to and nothing to ask: whatever is wrong is not this wire.
                     s.escalating = false;
                     s.probed = false;
+                    s.next_ask = None;
                 }
             }
         }
@@ -883,6 +895,19 @@ impl Leg {
                     if !s.escalating {
                         continue;
                     }
+                    // F28: a live decision is asked every tick — that is what makes failover
+                    // fast — but a confirmed-dead wire (the ARP hysteresis has already said so)
+                    // is asked once per hello interval, the same cadence OSPF itself would use
+                    // to notice the wire come back. The first confirmed-dead round is not
+                    // delayed (`next_ask` starts `None`); any reply or hello clears `escalating`
+                    // (and `next_ask` with it) above, so recovery is never slowed by this.
+                    if !s.state.reachable() {
+                        if s.next_ask.is_some_and(|t| now < t) {
+                            s.probed = false;
+                            continue;
+                        }
+                        s.next_ask = Some(now + f.windows.hello);
+                    }
                     // The members demonstrably reachable over this wire until a moment ago, in
                     // preference to the whole segment: any one answer clears the wire, and the
                     // bound is what keeps a fabric-wide event a burst rather than a storm.
@@ -912,8 +937,10 @@ impl Leg {
                         // knowledge of it, so it is folded in as a miss and the escalation stops
                         // there — the decision below has already been told.
                         s.escalating = s.state.reachable();
+                        if !s.escalating {
+                            s.next_ask = None;
+                        }
                     }
-                    let _ = now;
                 }
             }
         }
@@ -2078,6 +2105,114 @@ mod tests {
                 .unwrap()
                 .reachable,
             "and the row blames that wire, not the bond"
+        );
+    }
+
+    /// F28: once a wire is confirmed dead by the ARP hysteresis (not merely still Suspect on the
+    /// passive channel), re-asking it backs off to one round per hello interval instead of one
+    /// every tick — the testbed's `[ospf]` is hello 1 s / dead 3 s, so one hello interval is two
+    /// 500 ms ticks. The deciding phase (before confirmed dead) is untouched: that is what makes
+    /// failover fast, and a real reply or hello always re-arms every-tick asking immediately.
+    #[test]
+    fn a_confirmed_dead_wire_backs_off_to_one_round_per_hello() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding(FB_A);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+
+        // Steady state: every wire hears the peers, and nothing at all is sent.
+        for tick in 0..4u64 {
+            for s in FB_PORTS {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+
+        // Island a's uplink dies: only the other two wires still hear the peers. This runs the
+        // wire through the deciding phase (one round, asked the very tick it goes Suspect) and
+        // into confirmed dead (one more round, sent immediately — no initial delay), exactly as
+        // `a_wire_that_goes_quiet_alone_is_asked_and_then_left` measures.
+        let mut per_tick = Vec::new();
+        for tick in 4..9u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            let before = io.sent_on(FB_A).len();
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+            per_tick.push(io.sent_on(FB_A).len() - before);
+        }
+        let rounds: Vec<usize> = per_tick.iter().copied().filter(|n| *n > 0).collect();
+        assert!(
+            rounds.len() == 2 && rounds[0] == rounds[1],
+            "the deciding phase is unchanged from today: one round on the tick the wire is \
+             suspected, one more sent immediately the tick it is confirmed dead: {per_tick:?}"
+        );
+        let per_round = rounds[0];
+        let deciding_sent = io.sent_on(FB_A).len();
+
+        // N more ticks with the wire still confirmed dead and still Suspect (nothing is ever
+        // heard again on it): the backoff caps this to one round per hello interval (two ticks),
+        // not one round per tick.
+        let n = 20u64;
+        for tick in 9..9 + n {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+        }
+        let extra = io.sent_on(FB_A).len() - deciding_sent;
+        assert_eq!(
+            extra % per_round,
+            0,
+            "only whole rounds are ever sent: {extra} frames, {per_round} per round"
+        );
+        let extra_rounds = extra / per_round;
+        let expected = (n / 2) as usize; // one hello interval = 2 ticks
+        assert!(
+            extra_rounds.abs_diff(expected) <= 1,
+            "a confirmed-dead wire is asked once per hello interval, not once per tick: \
+             {extra_rounds} rounds over {n} ticks (~{expected} expected), not ~{n}"
+        );
+
+        // Recovery: an answer clears confirmed-dead and hello-dead alike; the very next
+        // escalation (the wire goes dark again) is asked every tick immediately, with no
+        // leftover backoff from before the recovery.
+        io.lit(FB_A);
+        for tick in 0..7u64 {
+            hear(&mut io, FB_A, &[hello(2), hello(3)]);
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at((9 + n + tick) * 500));
+        }
+        io.dark(FB_A);
+        // FB_A is now a BACKUP port (the bond moved off it earlier), judged on the whole dead
+        // interval (6 ticks) rather than the active window — give it enough silent ticks to be
+        // suspected again.
+        let mut per_tick_after_redark = Vec::new();
+        for tick in 0..10u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            let before = io.sent_on(FB_A).len();
+            fb_tick(&mut p, &mut sys, &mut io, at((16 + n + tick) * 500));
+            per_tick_after_redark.push(io.sent_on(FB_A).len() - before);
+        }
+        assert!(
+            per_tick_after_redark.iter().any(|c| *c > 0),
+            "the wire is escalated again after going dark a second time: {per_tick_after_redark:?}"
+        );
+        // From the first tick it is asked at all, the deciding phase asks every tick — two
+        // consecutive non-empty ticks proves it is not backed off the way a confirmed-dead wire
+        // is (that phase would show empty ticks between rounds once the hello interval elapsed).
+        let first_asked = per_tick_after_redark.iter().position(|c| *c > 0).unwrap();
+        assert!(
+            first_asked + 1 < per_tick_after_redark.len()
+                && per_tick_after_redark[first_asked + 1] > 0,
+            "the deciding phase after a recovery asks every tick, not backed off: \
+             {per_tick_after_redark:?}"
         );
     }
 

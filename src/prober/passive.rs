@@ -27,6 +27,11 @@ pub struct Windows {
     /// Numerically the same as `backup`; kept as its own name because the two are answers to
     /// different questions and only one of them is about a backup port.
     pub dead: Duration,
+    /// The declared hello interval itself (F28): once a wire is confirmed dead (the ARP
+    /// escalation's own hysteresis has said so) but the passive channel still calls it Suspect,
+    /// re-asking it is backed off to one round per hello interval rather than one every tick —
+    /// the same cadence OSPF itself would use to notice the wire come back.
+    pub hello: Duration,
 }
 
 impl Windows {
@@ -38,6 +43,7 @@ impl Windows {
             backup: dead,
             grace: dead,
             dead,
+            hello,
         }
     }
 
