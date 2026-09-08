@@ -1,7 +1,7 @@
 //! Gateway announcer (spec §5.1 item 8, ruling 12): a gratuitous ARP request for `gw` every
 //! PERIOD on a fixed schedule, plus a burst of BURST_LEN at BURST_GAP when a MAC is learned on a
 //! VM port. The state machine is pure — the supervisor owns the clock, the socket and the
-//! neighbour watch — and the one line of I/O goes through `AnnounceIo`, so every schedule test
+//! neighbor watch — and the one line of I/O goes through `AnnounceIo`, so every schedule test
 //! runs without a kernel.
 //!
 //! R5 measured worst-case convergence 4.06 s at a 5 s period and 0.21 s at a 1 s period, with the
@@ -319,6 +319,56 @@ mod tests {
         assert_eq!(io.sent.len(), 4, "one beacon plus a burst of three");
         assert!(io.sent.iter().all(|(port, f)| port == "primary.3"
             && f[..] == gratuitous(mac, "192.168.20.254".parse().unwrap())[..]));
+    }
+
+    /// A caller that overslept several periods owes ONE frame, not a backlog, and the beacon
+    /// lands back on the original grid — the schedule is a grid the caller samples, not a debt.
+    #[test]
+    fn a_caller_late_by_several_periods_sends_once_and_lands_on_the_original_grid() {
+        let a0 = t0();
+        let mut io = mock::RecordingIo::default();
+        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mac = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01];
+        assert!(a.announce_due(&mut io, mac, a0).unwrap());
+        assert_eq!(a.next_due(), a0 + PERIOD);
+
+        // Missed the a0 + PERIOD and a0 + 2 * PERIOD deadlines outright.
+        let late = a0 + 2 * PERIOD + PERIOD / 2;
+        assert!(a.announce_due(&mut io, mac, late).unwrap());
+        assert_eq!(io.sent.len(), 2, "one frame owed, never a backlog of two");
+        assert_eq!(
+            a.next_due(),
+            a0 + 3 * PERIOD,
+            "back on the original grid, not `late + PERIOD`"
+        );
+        assert_eq!(a.counters(), (2, 0));
+    }
+
+    /// The one case the natural schedules do not produce on their own: a burst frame due at the
+    /// same instant as a beacon. The neighbor caches need one copy, so one frame goes out and one
+    /// is counted — and BOTH deadlines still advance.
+    #[test]
+    fn a_burst_frame_landing_on_a_beacon_deadline_sends_one_frame_and_counts_one() {
+        let a0 = t0();
+        let mut io = mock::RecordingIo::default();
+        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mac = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01];
+        a.announce_due(&mut io, mac, a0).unwrap(); // beacon grid: a0, a0 + 5 s, a0 + 10 s
+        a.on_event(a0 + 3 * S); // burst frames: a0 + 3 s, a0 + 4 s, a0 + 5 s
+        a.announce_due(&mut io, mac, a0 + 3 * S).unwrap();
+        a.announce_due(&mut io, mac, a0 + 4 * S).unwrap();
+        assert_eq!(io.sent.len(), 3);
+
+        let coincide = a0 + 5 * S;
+        assert_eq!(coincide, a0 + PERIOD, "the third burst frame IS a beacon deadline");
+        assert!(a.announce_due(&mut io, mac, coincide).unwrap());
+        assert_eq!(io.sent.len(), 4, "one frame, not two");
+        assert_eq!(a.counters(), (4, 1), "one announce counted, not two");
+        assert_eq!(
+            a.next_due(),
+            a0 + 2 * PERIOD,
+            "burst done and the beacon advanced: neither deadline is stuck"
+        );
     }
 
     #[test]
