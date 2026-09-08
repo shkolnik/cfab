@@ -78,6 +78,32 @@ impl Hysteresis {
     }
 }
 
+/// The bonding driver's own per-port link state, `/sys/class/net/<port>/bonding_slave/mii_status`.
+/// The four spellings are the driver's (read from the strings of bonding.ko, 7.0.14-14-pve;
+/// `up` and `going back` also seen live on the rack). This is the one place the kernel's strings
+/// are parsed or compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BondLink {
+    Up,
+    GoingBack,
+    GoingDown,
+    Down,
+}
+
+impl BondLink {
+    /// Parse one `mii_status` read (trimmed here). `None` for anything the driver is not known
+    /// to write; the caller decides what unknown means (the prober: not up, said once).
+    pub fn parse(s: &str) -> Option<BondLink> {
+        match s.trim() {
+            "up" => Some(BondLink::Up),
+            "going back" => Some(BondLink::GoingBack),
+            "going down" => Some(BondLink::GoingDown),
+            "down" => Some(BondLink::Down),
+            _ => None,
+        }
+    }
+}
+
 /// One port the bond could be active on, as the decision sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -189,6 +215,19 @@ pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four kernel spellings round-trip, and near-misses are rejected rather than guessed
+    /// at: an underscore is not a space, and empty is not `down`.
+    #[test]
+    fn bond_link_parses_the_kernel_spellings_and_rejects_near_misses() {
+        assert_eq!(BondLink::parse("up"), Some(BondLink::Up));
+        assert_eq!(BondLink::parse("going back"), Some(BondLink::GoingBack));
+        assert_eq!(BondLink::parse("going down"), Some(BondLink::GoingDown));
+        assert_eq!(BondLink::parse("down"), Some(BondLink::Down));
+        assert_eq!(BondLink::parse("going_back"), None);
+        assert_eq!(BondLink::parse(""), None);
+        assert_eq!(BondLink::parse("bogus"), None);
+    }
 
     /// Ports with carrier and the bonding driver's link up — the shape every case but the
     /// carrier/link_up ones is about.
