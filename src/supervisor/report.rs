@@ -45,6 +45,11 @@ pub struct ProbedLeg {
     /// `slaves` until 0.4.7: a status binary must still read a running older supervisor.
     #[serde(default, alias = "slaves")]
     pub ports: Vec<ProbedPort>,
+    /// Moves the prober has actuated on this leg since the supervisor started — the flapping
+    /// signal that today needs the journal. `#[serde(default)]` so an older supervisor's
+    /// document still parses.
+    #[serde(default)]
+    pub moves: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

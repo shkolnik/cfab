@@ -168,8 +168,37 @@ fn gather(
     // desired *right now* — which a restarting supervisor passes through, so this is
     // re-read on every poll like every other input to the verdict.
     let applied = sys.exists(&f.run_dir);
-    let mut c = base.clone();
     let components = applied.then(|| read_components(sys, f)).flatten();
+    gather_with(sys, view, expected, base, applied, components)
+}
+
+/// One gather without the `--wait` loop and without the `cfab.sock` round trip, for the
+/// supervisor: it already holds its own `components` document, and asking itself over its own
+/// socket from its own main thread is a deadlock waiting to be written.
+// The supervisor's metrics refresh is its only caller and it is not wired yet.
+#[allow(dead_code)]
+pub(crate) fn snapshot_model(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<Components>,
+) -> Result<StatusModel> {
+    let expected = expected_links(view)?;
+    let applied = sys.exists(&view.fabric.run_dir);
+    gather_with(sys, view, &expected, &Ctx::default(), applied, comps)
+}
+
+/// The gather itself, once the `components` document is in hand — from the socket for `status`,
+/// from memory for the supervisor. One body, so the two can never describe a member differently.
+fn gather_with(
+    sys: &mut dyn Sys,
+    view: &View,
+    expected: &[ExpectedLink],
+    base: &Ctx,
+    applied: bool,
+    components: Option<Components>,
+) -> Result<StatusModel> {
+    let f = view.fabric;
+    let mut c = base.clone();
     let headline = if applied {
         Some(read(sys, view, expected, &mut c, components.as_ref())?)
     } else {

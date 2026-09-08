@@ -1,0 +1,162 @@
+# HELP cfab_build_info The cfab version this member runs.
+# TYPE cfab_build_info gauge
+cfab_build_info{version="0.4.8"} 1
+# HELP cfab_member_info This member's row in the declaration.
+# TYPE cfab_member_info gauge
+cfab_member_info{member="pve1-tb",kind="host"} 1
+# HELP cfab_fabric_state The member's verdict; exactly one series is 1.
+# TYPE cfab_fabric_state gauge
+cfab_fabric_state{state="UP"} 1
+cfab_fabric_state{state="UP-DEGRADED"} 0
+cfab_fabric_state{state="FAILED"} 0
+cfab_fabric_state{state="DOWN"} 0
+# HELP cfab_peers_up Peers with at least one adjacency up.
+# TYPE cfab_peers_up gauge
+cfab_peers_up 2
+# HELP cfab_peers_expected Peers the declaration expects.
+# TYPE cfab_peers_expected gauge
+cfab_peers_expected 2
+# HELP cfab_links_up BFD sessions up on declared segments.
+# TYPE cfab_links_up gauge
+cfab_links_up 18
+# HELP cfab_links_expected BFD sessions the declaration expects, one per peer, zone and segment.
+# TYPE cfab_links_expected gauge
+cfab_links_expected 18
+# HELP cfab_fallbacks_up Fallback OSPF neighbors at least 2-Way.
+# TYPE cfab_fallbacks_up gauge
+cfab_fallbacks_up 6
+# HELP cfab_fallbacks_expected Fallback OSPF neighbors the declaration expects.
+# TYPE cfab_fallbacks_expected gauge
+cfab_fallbacks_expected 6
+# HELP cfab_bfd_session_up 1 when the BFD session on this declared segment leg is up.
+# TYPE cfab_bfd_session_up gauge
+cfab_bfd_session_up{zone="storage",segment="1",peer="pve2-tb"} 1
+cfab_bfd_session_up{zone="storage",segment="2",peer="pve3-tb"} 1
+cfab_bfd_session_up{zone="mgmt",segment="1",peer="pve2-tb"} 0
+# HELP cfab_fallback_neighbor_up 1 when this fallback OSPF neighbor is at least 2-Way.
+# TYPE cfab_fallback_neighbor_up gauge
+cfab_fallback_neighbor_up{zone="storage",peer="pve2-tb"} 1
+# HELP cfab_fallback_bond_active_home 1 when the leg's active port is on the wire it belongs on.
+# TYPE cfab_fallback_bond_active_home gauge
+cfab_fallback_bond_active_home{zone="storage",bond="cfab-st-fb"} 1
+# HELP cfab_bond_home_carrier The home wire's carrier, read only while the leg is off home.
+# TYPE cfab_bond_home_carrier gauge
+cfab_bond_home_carrier{zone="mgmt",bond="cfab-gw249"} 0
+# HELP cfab_wire_present 1 when this declared wire exists in the kernel.
+# TYPE cfab_wire_present gauge
+cfab_wire_present{wire="eth1"} 1
+cfab_wire_present{wire="eth9"} 1
+# HELP cfab_fallback_active 1 on the wire the zone's fallback leg is carrying on.
+# TYPE cfab_fallback_active gauge
+cfab_fallback_active{zone="storage",island="b",wire="eth9"} 1
+cfab_fallback_active{zone="storage",island="a",wire="eth1"} 0
+# HELP cfab_ingress_active 1 on the wire the zone's ingress leg is carrying on.
+# TYPE cfab_ingress_active gauge
+cfab_ingress_active{zone="mgmt",island="a",wire="eth1"} 0
+cfab_ingress_active{zone="mgmt",island="b",wire="eth9"} 1
+# HELP cfab_probe_port_usable 1 when the prober can reach the far end over this wire.
+# TYPE cfab_probe_port_usable gauge
+cfab_probe_port_usable{zone="storage",bond="cfab-st-fb",wire="eth9",island="b"} 1
+cfab_probe_port_usable{zone="storage",bond="cfab-st-fb",wire="eth1",island="a"} 0
+cfab_probe_port_usable{zone="mgmt",bond="cfab-gw249",wire="eth1",island="a"} 0
+cfab_probe_port_usable{zone="mgmt",bond="cfab-gw249",wire="eth9",island="b"} 1
+# HELP cfab_probe_port_suspect 1 when this wire is silent past its window and is being asked directly.
+# TYPE cfab_probe_port_suspect gauge
+cfab_probe_port_suspect{zone="storage",bond="cfab-st-fb",wire="eth9",island="b"} 0
+cfab_probe_port_suspect{zone="storage",bond="cfab-st-fb",wire="eth1",island="a"} 1
+cfab_probe_port_suspect{zone="mgmt",bond="cfab-gw249",wire="eth1",island="a"} 1
+cfab_probe_port_suspect{zone="mgmt",bond="cfab-gw249",wire="eth9",island="b"} 0
+# HELP cfab_probe_port_last_reply_seconds Seconds since this wire last showed life; absent when it never has.
+# TYPE cfab_probe_port_last_reply_seconds gauge
+cfab_probe_port_last_reply_seconds{zone="storage",bond="cfab-st-fb",wire="eth9",island="b"} 0.04
+cfab_probe_port_last_reply_seconds{zone="mgmt",bond="cfab-gw249",wire="eth9",island="b"} 0.12
+# HELP cfab_probe_moves Moves the prober has actuated on this leg since the supervisor started.
+# TYPE cfab_probe_moves counter
+cfab_probe_moves_total{zone="storage",bond="cfab-st-fb"} 0
+cfab_probe_moves_total{zone="mgmt",bond="cfab-gw249"} 2
+# HELP cfab_conditions Reason lines this member reports, counted by what they mean for a wait.
+# TYPE cfab_conditions gauge
+cfab_conditions{class="settling"} 1
+cfab_conditions{class="standing"} 1
+# HELP cfab_condition_info One series per reason line, worded exactly as status prints it.
+# TYPE cfab_condition_info gauge
+cfab_condition_info{class="settling",text="storage:1:.3 forming"} 1
+cfab_condition_info{class="standing",text="wire eth9 absent (no such netdev)"} 1
+# HELP cfab_ingress_reachable 1 when the prober reaches the gateway router over some wire of the ingress leg.
+# TYPE cfab_ingress_reachable gauge
+cfab_ingress_reachable{zone="mgmt"} 1
+# HELP cfab_bgp_neighbor_state The session state toward this zone's gateway router; exactly one series is 1.
+# TYPE cfab_bgp_neighbor_state gauge
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="Idle"} 0
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="Connect"} 0
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="Active"} 0
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="OpenSent"} 0
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="OpenConfirm"} 0
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="Established"} 1
+cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="absent"} 0
+# HELP cfab_bgp_neighbor_prefixes_sent Prefixes this member has sent the gateway router.
+# TYPE cfab_bgp_neighbor_prefixes_sent gauge
+cfab_bgp_neighbor_prefixes_sent{zone="mgmt",neighbor="192.168.249.254"} 3
+# HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.
+# TYPE cfab_component_state gauge
+cfab_component_state{component="engine",state="starting"} 0
+cfab_component_state{component="engine",state="running"} 1
+cfab_component_state{component="engine",state="restarting"} 0
+cfab_component_state{component="engine",state="stopped"} 0
+cfab_component_state{component="shape-daemon",state="starting"} 0
+cfab_component_state{component="shape-daemon",state="running"} 1
+cfab_component_state{component="shape-daemon",state="restarting"} 0
+cfab_component_state{component="shape-daemon",state="stopped"} 0
+cfab_component_state{component="conf-sync",state="starting"} 0
+cfab_component_state{component="conf-sync",state="running"} 0
+cfab_component_state{component="conf-sync",state="restarting"} 0
+cfab_component_state{component="conf-sync",state="stopped"} 1
+# HELP cfab_component_expected 0 when this member is not meant to run the child, which is why it is stopped.
+# TYPE cfab_component_expected gauge
+cfab_component_expected{component="engine"} 1
+cfab_component_expected{component="shape-daemon"} 1
+cfab_component_expected{component="conf-sync"} 0
+# HELP cfab_component_restarts Restarts of this child since the supervisor started.
+# TYPE cfab_component_restarts counter
+cfab_component_restarts_total{component="engine"} 0
+cfab_component_restarts_total{component="shape-daemon"} 0
+cfab_component_restarts_total{component="conf-sync"} 0
+# HELP cfab_component_uptime_seconds Seconds this child has been running; absent when it is not.
+# TYPE cfab_component_uptime_seconds gauge
+cfab_component_uptime_seconds{component="engine"} 60
+cfab_component_uptime_seconds{component="shape-daemon"} 60
+# HELP cfab_component_last_exit_age_seconds Seconds since this child last exited, by the cause it exited with.
+# TYPE cfab_component_last_exit_age_seconds gauge
+cfab_component_last_exit_age_seconds{component="shape-daemon",cause="signal SIGTERM"} 300
+# HELP cfab_watchdog_last_tick_age_seconds Seconds since the forwarding watchdog last ticked.
+# TYPE cfab_watchdog_last_tick_age_seconds gauge
+cfab_watchdog_last_tick_age_seconds 1
+# HELP cfab_watchdog_result What the forwarding watchdog's last tick did; exactly one series is 1.
+# TYPE cfab_watchdog_result gauge
+cfab_watchdog_result{result="ok"} 1
+cfab_watchdog_result{result="actuated"} 0
+cfab_watchdog_result{result="failed-closed"} 0
+cfab_watchdog_result{result="blocked"} 0
+cfab_watchdog_result{result="error"} 0
+# HELP cfab_supervisor_uptime_seconds Seconds this supervisor has been running.
+# TYPE cfab_supervisor_uptime_seconds gauge
+cfab_supervisor_uptime_seconds 3600
+# HELP cfab_supervisor_applies Fabric applies this supervisor has completed.
+# TYPE cfab_supervisor_applies counter
+cfab_supervisor_applies_total 1
+# HELP cfab_supervisor_applying 1 while an apply is in progress.
+# TYPE cfab_supervisor_applying gauge
+cfab_supervisor_applying 0
+# HELP cfab_supervisor_last_apply_failed 1 when the last apply left an error; the message stays in status and the journal.
+# TYPE cfab_supervisor_last_apply_failed gauge
+cfab_supervisor_last_apply_failed 0
+# HELP cfab_telemetry_last_refresh_seconds Unix time at which this snapshot was gathered.
+# TYPE cfab_telemetry_last_refresh_seconds gauge
+cfab_telemetry_last_refresh_seconds 1700000000.0
+# HELP cfab_telemetry_collect_seconds Wall time of the last gather and render.
+# TYPE cfab_telemetry_collect_seconds gauge
+cfab_telemetry_collect_seconds 0.048
+# HELP cfab_telemetry_collect_failures Gathers that failed since the supervisor started.
+# TYPE cfab_telemetry_collect_failures counter
+cfab_telemetry_collect_failures_total 0
+# EOF

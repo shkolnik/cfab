@@ -498,6 +498,8 @@ impl Prober {
                 bond: l.bond.clone(),
                 active: l.active_now.clone(),
                 quiet: l.quiet(),
+                // Filled by the prober's actuation path; 0 until then.
+                moves: 0,
                 ports: l
                     .ports
                     .iter()

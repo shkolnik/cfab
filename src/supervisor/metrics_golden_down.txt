@@ -1,0 +1,79 @@
+# HELP cfab_build_info The cfab version this member runs.
+# TYPE cfab_build_info gauge
+cfab_build_info{version="0.4.8"} 1
+# HELP cfab_member_info This member's row in the declaration.
+# TYPE cfab_member_info gauge
+cfab_member_info{member="pve1-tb",kind="host"} 1
+# HELP cfab_fabric_state The member's verdict; exactly one series is 1.
+# TYPE cfab_fabric_state gauge
+cfab_fabric_state{state="UP"} 0
+cfab_fabric_state{state="UP-DEGRADED"} 0
+cfab_fabric_state{state="FAILED"} 0
+cfab_fabric_state{state="DOWN"} 1
+# HELP cfab_conditions Reason lines this member reports, counted by what they mean for a wait.
+# TYPE cfab_conditions gauge
+cfab_conditions{class="settling"} 0
+cfab_conditions{class="standing"} 0
+# HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.
+# TYPE cfab_component_state gauge
+cfab_component_state{component="engine",state="starting"} 0
+cfab_component_state{component="engine",state="running"} 1
+cfab_component_state{component="engine",state="restarting"} 0
+cfab_component_state{component="engine",state="stopped"} 0
+cfab_component_state{component="shape-daemon",state="starting"} 0
+cfab_component_state{component="shape-daemon",state="running"} 1
+cfab_component_state{component="shape-daemon",state="restarting"} 0
+cfab_component_state{component="shape-daemon",state="stopped"} 0
+cfab_component_state{component="conf-sync",state="starting"} 0
+cfab_component_state{component="conf-sync",state="running"} 0
+cfab_component_state{component="conf-sync",state="restarting"} 0
+cfab_component_state{component="conf-sync",state="stopped"} 1
+# HELP cfab_component_expected 0 when this member is not meant to run the child, which is why it is stopped.
+# TYPE cfab_component_expected gauge
+cfab_component_expected{component="engine"} 1
+cfab_component_expected{component="shape-daemon"} 1
+cfab_component_expected{component="conf-sync"} 0
+# HELP cfab_component_restarts Restarts of this child since the supervisor started.
+# TYPE cfab_component_restarts counter
+cfab_component_restarts_total{component="engine"} 0
+cfab_component_restarts_total{component="shape-daemon"} 0
+cfab_component_restarts_total{component="conf-sync"} 0
+# HELP cfab_component_uptime_seconds Seconds this child has been running; absent when it is not.
+# TYPE cfab_component_uptime_seconds gauge
+cfab_component_uptime_seconds{component="engine"} 60
+cfab_component_uptime_seconds{component="shape-daemon"} 60
+# HELP cfab_component_last_exit_age_seconds Seconds since this child last exited, by the cause it exited with.
+# TYPE cfab_component_last_exit_age_seconds gauge
+cfab_component_last_exit_age_seconds{component="shape-daemon",cause="signal SIGTERM"} 300
+# HELP cfab_watchdog_last_tick_age_seconds Seconds since the forwarding watchdog last ticked.
+# TYPE cfab_watchdog_last_tick_age_seconds gauge
+cfab_watchdog_last_tick_age_seconds 1
+# HELP cfab_watchdog_result What the forwarding watchdog's last tick did; exactly one series is 1.
+# TYPE cfab_watchdog_result gauge
+cfab_watchdog_result{result="ok"} 1
+cfab_watchdog_result{result="actuated"} 0
+cfab_watchdog_result{result="failed-closed"} 0
+cfab_watchdog_result{result="blocked"} 0
+cfab_watchdog_result{result="error"} 0
+# HELP cfab_supervisor_uptime_seconds Seconds this supervisor has been running.
+# TYPE cfab_supervisor_uptime_seconds gauge
+cfab_supervisor_uptime_seconds 3600
+# HELP cfab_supervisor_applies Fabric applies this supervisor has completed.
+# TYPE cfab_supervisor_applies counter
+cfab_supervisor_applies_total 1
+# HELP cfab_supervisor_applying 1 while an apply is in progress.
+# TYPE cfab_supervisor_applying gauge
+cfab_supervisor_applying 0
+# HELP cfab_supervisor_last_apply_failed 1 when the last apply left an error; the message stays in status and the journal.
+# TYPE cfab_supervisor_last_apply_failed gauge
+cfab_supervisor_last_apply_failed 0
+# HELP cfab_telemetry_last_refresh_seconds Unix time at which this snapshot was gathered.
+# TYPE cfab_telemetry_last_refresh_seconds gauge
+cfab_telemetry_last_refresh_seconds 1700000000.0
+# HELP cfab_telemetry_collect_seconds Wall time of the last gather and render.
+# TYPE cfab_telemetry_collect_seconds gauge
+cfab_telemetry_collect_seconds 0.048
+# HELP cfab_telemetry_collect_failures Gathers that failed since the supervisor started.
+# TYPE cfab_telemetry_collect_failures counter
+cfab_telemetry_collect_failures_total 0
+# EOF
