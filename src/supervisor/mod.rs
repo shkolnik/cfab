@@ -329,7 +329,7 @@ pub fn run(
     let code = rt.block_on(async {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
         spawn_signal_forwarders(cmd_tx.clone());
-        let mut sys = RealSys;
+        let mut sys = RealSys::default();
         let mut spawner = RealSpawner;
         run_with(
             &mut sys,
@@ -1489,6 +1489,12 @@ mod tests {
     }
 
     impl Sys for TestSys {
+        fn bond_port_state(&mut self, p: &str) -> crate::error::Result<crate::netlink::PortState> {
+            self.inner.bond_port_state(p)
+        }
+        fn set_active_port(&mut self, b: &str, p: &str) -> crate::error::Result<()> {
+            self.inner.set_active_port(b, p)
+        }
         fn run(&mut self, argv: &[&str]) -> crate::error::Result<crate::sys::Output> {
             self.calls.lock().unwrap().push(argv.join(" "));
             self.inner.run(argv)

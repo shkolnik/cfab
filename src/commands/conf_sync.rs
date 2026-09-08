@@ -46,7 +46,7 @@ impl Applier for SocketApplier {
     fn reapply(&mut self) -> Result<()> {
         // A missing or unanswering socket means no supervisor is there to apply anything:
         // that is a refusal, never a silent success.
-        let reply = crate::sys::RealSys.unix_request(&self.sock, "reapply\n")?;
+        let reply = crate::sys::RealSys::default().unix_request(&self.sock, "reapply\n")?;
         let doc: serde_json::Value = serde_json::from_str(&reply).map_err(|e| {
             Error::fatal(format!(
                 "{}: unreadable reply to reapply ({e}): {}",

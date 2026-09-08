@@ -173,7 +173,7 @@ mod tests {
         let line = format!("{line}\n");
         let text = tokio::task::spawn_blocking(move || {
             for _ in 0..100 {
-                if let Ok(r) = crate::sys::RealSys.unix_request(&path, &line) {
+                if let Ok(r) = crate::sys::RealSys::default().unix_request(&path, &line) {
                     return r;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));

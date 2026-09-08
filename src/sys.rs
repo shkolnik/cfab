@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::netlink::{BondNetlink, PortState};
 
 #[derive(Debug, Clone, Default)]
 pub struct Output {
@@ -68,6 +69,16 @@ pub trait Sys {
             Err(e) => UnixProbe::Unreachable(e.to_string()),
         }
     }
+
+    /// Everything the prober needs to know about one bond port, in one kernel round trip:
+    /// carrier, the bonding driver's own link state, and which bond owns it. `Err` carrying
+    /// `ENODEV` (`netlink::is_no_device`) means the netdev is gone, which is a fact about the
+    /// wire; any other error is a fault to report, never a silent "no carrier".
+    fn bond_port_state(&mut self, port: &str) -> Result<PortState>;
+
+    /// Make `port` the bond's active port. The kernel's refusal (`EINVAL` when the port is
+    /// down or its link is not up) comes back as the errno it is.
+    fn set_active_port(&mut self, bond: &str, port: &str) -> Result<()>;
 }
 
 /// Run and require exit 0.
@@ -103,9 +114,23 @@ pub fn have_tool(sys: &mut dyn Sys, tool: &str) -> Result<bool> {
         .ok())
 }
 
-pub struct RealSys;
+/// The real system. It owns the prober's netlink socket, which is opened on first use and kept
+/// for the life of the value — the loop that reads it every 500 ms pays for one socket, not one
+/// per tick.
+#[derive(Default)]
+pub struct RealSys {
+    nl: BondNetlink,
+}
 
 impl Sys for RealSys {
+    fn bond_port_state(&mut self, port: &str) -> Result<PortState> {
+        self.nl.port_state(port)
+    }
+
+    fn set_active_port(&mut self, bond: &str, port: &str) -> Result<()> {
+        self.nl.set_active_port(bond, port)
+    }
+
     fn run(&mut self, argv: &[&str]) -> Result<Output> {
         let out = std::process::Command::new(argv[0])
             .args(&argv[1..])
@@ -223,6 +248,7 @@ pub mod mock {
 
     use super::{Output, Sys, UnixProbe};
     use crate::error::{Error, Result};
+    use crate::netlink::PortState;
 
     #[derive(Default)]
     pub struct MockSys {
@@ -260,6 +286,13 @@ pub mod mock {
         /// write to — and a poll loop that waits for something to appear (a run dir written by
         /// a restarting supervisor) has no other way to be tested.
         pub appear_after: Vec<(usize, String, String)>,
+        /// port netdev -> what `bond_port_state` answers for it. A port that is not in the map
+        /// does not exist: the read fails with `ENODEV`, which is how a real kernel reports a
+        /// netdev that has gone away.
+        pub port_states: BTreeMap<String, PortState>,
+        /// Ports whose state cannot be read at all (`EIO`) — the socket is there but the answer
+        /// is not, which is neither "no carrier" nor "the netdev is gone".
+        pub unreadable_ports: Vec<String>,
     }
 
     impl MockSys {
@@ -348,6 +381,29 @@ pub mod mock {
             self
         }
 
+        /// One bond port and everything the kernel would say about it.
+        pub fn port(mut self, name: &str, state: PortState) -> Self {
+            self.port_states.insert(name.to_string(), state);
+            self
+        }
+
+        /// Change (or add) a port's state mid-test — a cable pulled between two ticks.
+        pub fn set_port(&mut self, name: &str, state: PortState) {
+            self.port_states.insert(name.to_string(), state);
+        }
+
+        /// A port whose state the kernel does not answer for: the failure the prober must
+        /// report rather than read as an absent cable.
+        pub fn port_unreadable(mut self, name: &str) -> Self {
+            self.unreadable_ports.push(name.to_string());
+            self
+        }
+
+        /// Take a port's netdev away entirely, as a re-enumerating USB NIC does.
+        pub fn remove_port(&mut self, name: &str) {
+            self.port_states.remove(name);
+        }
+
         pub fn ran(&self, needle: &str) -> bool {
             self.calls.iter().any(|c| c.contains(needle))
         }
@@ -358,6 +414,33 @@ pub mod mock {
     }
 
     impl Sys for MockSys {
+        fn bond_port_state(&mut self, port: &str) -> Result<PortState> {
+            if self.unreadable_ports.iter().any(|p| p == port) {
+                return Err(Error::Io(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EIO as i32,
+                )));
+            }
+            self.port_states.get(port).copied().ok_or_else(|| {
+                Error::Io(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::ENODEV as i32,
+                ))
+            })
+        }
+
+        /// Records the call and models what the kernel would then report: `status` still reads
+        /// the bond's active port out of sysfs, so the modelled write lands there.
+        fn set_active_port(&mut self, bond: &str, port: &str) -> Result<()> {
+            self.calls.push(format!("set_active_port {bond} {port}"));
+            let path = format!("/sys/class/net/{bond}/bonding/active_slave");
+            if self.write_fails.iter().any(|p| p.as_str() == path) {
+                return Err(Error::Io(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EINVAL as i32,
+                )));
+            }
+            self.files.insert(path, port.to_string());
+            Ok(())
+        }
+
         fn run(&mut self, argv: &[&str]) -> Result<Output> {
             self.calls.push(argv.join(" "));
             // A deleted netdev stops existing. Without this the mock answers `ip link show
@@ -552,7 +635,7 @@ mod tests {
             stream.write_all(format!("got {line}").as_bytes()).unwrap();
             // Return drops the stream: EOF is the reply terminator.
         });
-        let reply = RealSys
+        let reply = RealSys::default()
             .unix_request(path.to_str().unwrap(), "state\n")
             .unwrap();
         server.join().unwrap();
@@ -562,7 +645,7 @@ mod tests {
 
     #[test]
     fn real_unix_request_missing_socket_names_path() {
-        let err = RealSys
+        let err = RealSys::default()
             .unix_request("/nonexistent/cfab/engine.sock", "state\n")
             .unwrap_err();
         assert!(

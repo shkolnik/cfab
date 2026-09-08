@@ -107,6 +107,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,6 +216,9 @@ dependencies = [
  "holo-utils",
  "holo-yang",
  "ipnetwork",
+ "netlink-packet-core",
+ "netlink-packet-route",
+ "netlink-sys",
  "nix 0.31.3",
  "schemars 1.2.2",
  "sd-notify",
@@ -217,12 +226,12 @@ dependencies = [
  "serde_json",
  "socket2",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
- "yang5",
+ "yang5 0.3.0",
 ]
 
 [[package]]
@@ -354,9 +363,9 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "convert_case"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -482,7 +491,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -768,7 +777,7 @@ dependencies = [
  "itertools",
  "libc",
  "nix 0.31.3",
- "num-derive",
+ "num-derive 0.5.1",
  "num-traits",
  "phf 0.14.0",
  "rand 0.10.2",
@@ -777,7 +786,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -799,7 +808,7 @@ dependencies = [
  "ipnetwork",
  "itertools",
  "libc",
- "num-derive",
+ "num-derive 0.5.1",
  "num-traits",
  "phf 0.14.0",
  "prefix-trie",
@@ -809,7 +818,7 @@ dependencies = [
  "serde_with",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -836,14 +845,14 @@ dependencies = [
  "rtnetlink",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
 name = "holo-northbound"
 version = "0.9.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bitflags 2.13.1",
  "check_keyword",
  "convert_case",
@@ -856,7 +865,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -882,7 +891,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix 0.31.3",
- "num-derive",
+ "num-derive 0.5.1",
  "num-traits",
  "phf 0.14.0",
  "rand 0.10.2",
@@ -894,7 +903,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -911,7 +920,7 @@ dependencies = [
  "phf 0.14.0",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -928,7 +937,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -960,7 +969,7 @@ dependencies = [
  "sysctl",
  "tokio",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -980,7 +989,7 @@ dependencies = [
  "itertools",
  "libc",
  "nix 0.31.3",
- "num-derive",
+ "num-derive 0.5.1",
  "num-traits",
  "pickledb",
  "prefix-trie",
@@ -992,20 +1001,20 @@ dependencies = [
  "tokio",
  "tracing",
  "vectorize",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
 name = "holo-yang"
 version = "0.5.6"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "chrono",
  "ipnetwork",
  "maplit",
  "serde",
  "tracing",
- "yang5",
+ "yang5 0.4.0",
 ]
 
 [[package]]
@@ -1193,6 +1202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyang5-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a730d258bf66b488cd72a221fe888098491b84c6c09d65187ec5a3cee6cb6523"
+dependencies = [
+ "cmake",
+ "pkg-config",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,30 +1285,28 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-core"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b897d7bd4f0af82e68d40d0344cf37e97f9c97ddf74a098de3e4da05e96ca395"
-dependencies = [
- "paste",
-]
+checksum = "2d6e2daf9a8c2e21302714706860a0e6be02e03d17294ecc66b354ea7d4059dd"
 
 [[package]]
 name = "netlink-packet-route"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
+checksum = "59d48ffc8b73a506e1ff0878528c72668f2bfbc3d875b6be890a96be5d0d5576"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
  "log",
  "netlink-packet-core",
+ "zerocopy",
 ]
 
 [[package]]
 name = "netlink-proto"
-version = "0.12.2"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93af8261786086024cd5e96e0a991dd65ced07bbf7c233a487bbc96b971d5539"
+checksum = "97e03ae6247c6cdb499e8f14e98c72b83954d85822b687056e3a21150b438f2b"
 dependencies = [
  "bytes",
  "futures-channel",
@@ -1297,14 +1314,14 @@ dependencies = [
  "log",
  "netlink-packet-core",
  "netlink-sys",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
 name = "netlink-sys"
-version = "0.8.8"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+checksum = "c99d38e00b420df49e940fe0826e667c3dad82ac68eb4c2bbf754c1c14a83a10"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1365,6 +1382,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-derive"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4e98dc3b890f6c23a0f9d3d491a2823d0dea0fa656302a13dd225fa924112a8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1405,12 +1433,6 @@ name = "password-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "phf"
@@ -1542,9 +1564,9 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "prefix-trie"
-version = "0.9.4"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be1ea03ff63e842fa707c9cffedc9ff9fa4a0ab540af1a7693d2ff15fa03c65"
+checksum = "6369af434551b9bf8be05ab871ac1263687d6f0c9485e6d781f904f3e06d7d03"
 dependencies = [
  "array-const-fn-init",
  "either",
@@ -1684,9 +1706,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rtnetlink"
-version = "0.21.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc19f84f710fa2f337617f9bc0400260a94224bde7bae28fd8879f3771ca5784"
+checksum = "90f60a3ee149005c5819e03e3d73ba4a470bc18b52b0c8422cfe1bea2cae63c6"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -1696,7 +1718,7 @@ dependencies = [
  "netlink-proto",
  "netlink-sys",
  "nix 0.30.1",
- "thiserror 1.0.69",
+ "thiserror",
  "tokio",
 ]
 
@@ -1844,7 +1866,7 @@ version = "3.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee78f1fbe43ac4a0e47aadb3dbd357b69eb0d3793e948624cd03dd2750ab1c0a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "hex",
@@ -2010,7 +2032,7 @@ dependencies = [
  "byteorder",
  "enum-as-inner 0.6.1",
  "libc",
- "thiserror 2.0.20",
+ "thiserror",
  "walkdir",
 ]
 
@@ -2029,31 +2051,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.20",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -2458,10 +2460,44 @@ checksum = "4a4d3b8d5cfe5695c70e683afefe43edef0ee3fb1abf3358d14a92f96988cb30"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
- "libyang5-sys",
+ "libyang5-sys 0.1.0",
  "log",
- "num-derive",
+ "num-derive 0.4.2",
  "num-traits",
+]
+
+[[package]]
+name = "yang5"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ccc69999c31a45560b6d43e5c764a0db687e98795503aba4d12d9917ee7fbe"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+ "libyang5-sys 0.2.0",
+ "log",
+ "num-derive 0.4.2",
+ "num-traits",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.8.56"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.56"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
