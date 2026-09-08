@@ -1,23 +1,24 @@
-# Ansible role `cfab_fabric`
+# Ansible collection `shkolnik.cfab`
 
-Installs the `cfab` package from its apt repository on a host and drives a gated rollout, one
-operation per run, selected by tag. It carries nothing about any particular site: the declaration
-(`fabric.toml`) is the operator's and comes in through `cfab_declaration`.
+One role, `shkolnik.cfab.fabric`: installs the `cfab` package from its apt repository on a host and
+drives a gated rollout, one operation per run, selected by tag. It carries nothing about any
+particular site: the declaration (`fabric.toml`) is the operator's and comes in through
+`cfab_declaration`. Collection version = cfab package version, for now.
 
 ## Use from your own repository
 
-`roles/requirements.yml`:
+`requirements.yml` (installs straight from git, no Galaxy needed):
 
 ```yaml
-- src: https://github.com/shkolnik/cfab.git
-  scm: git
-  version: v0.4.9            # role tag = package version, for now
-  name: cfab_fabric
-  # the role lives under ansible/roles/cfab_fabric in the repo
+collections:
+  - name: https://github.com/shkolnik/cfab.git#/ansible/
+    type: git
+    version: v0.4.9
 ```
 
-Galaxy cannot fetch a role from a subdirectory, so either vendor it
-(`git subtree`/`git archive`) or check the repo out and point `roles_path` at `ansible/roles`.
+```
+ansible-galaxy collection install -r requirements.yml
+```
 
 Playbook:
 
@@ -27,7 +28,7 @@ Playbook:
   vars:
     cfab_declaration: "{{ playbook_dir }}/files/cfab/fabric.toml"
   roles:
-    - cfab_fabric
+    - shkolnik.cfab.fabric
 ```
 
 Run, always `-l` one host at a time:

@@ -1,5 +1,5 @@
 galaxy_info:
-  role_name: cfab_fabric
+  role_name: fabric
   author: shkolnik
   description: Install cfab from its apt repository and drive a gated rollout (probe / install / apply with timed revert / disarm / rollback)
   license: MIT OR Apache-2.0

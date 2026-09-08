@@ -1,4 +1,4 @@
-# cfab_fabric — defaults. The binary comes from the apt repository. The declaration is the
+# shkolnik.cfab.fabric — defaults. The binary comes from the apt repository. The declaration is the
 # operator's: `cfab_declaration` (REQUIRED, no default) is the path, on the control node, of the
 # fabric.toml this host gets. Nothing about any particular site lives in this role.
 cfab_declaration: ""

@@ -1,0 +1,15 @@
+namespace: shkolnik
+name: cfab
+version: 0.4.9
+readme: README.md
+authors:
+  - James Shkolnik
+description: Install cfab (cluster network fabric) from its apt repository and drive a gated rollout
+license:
+  - MIT
+  - Apache-2.0
+tags: [networking, infrastructure, debian, proxmox]
+repository: https://github.com/shkolnik/cfab
+issues: https://github.com/shkolnik/cfab/issues
+build_ignore:
+  - "*.tar.gz"
