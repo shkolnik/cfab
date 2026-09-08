@@ -87,25 +87,32 @@ pub struct Candidate {
     pub wire: String,
     /// The router answers over this wire (the probe state machine above).
     pub reachable: bool,
-    /// The kernel would accept `bonding/active_slave` naming this port: its netdev has carrier
-    /// AND the bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
-    /// Carrier alone is not enough — the driver holds a returning port's `mii_status` at
-    /// `going_back` for `updelay` after carrier comes back, and the kernel refuses the write
-    /// during that window just as it does with no carrier at all (`EINVAL`, "either the port is
-    /// down or the link is down"; both halves VERIFIED on the rack 2026-09-07, findings F23 and
-    /// F24). Named `carrier` for history, not because carrier alone decides it: a port failing
-    /// either half is not a place ingress can be put, however recently the router answered over
-    /// it, and not a wire the router can be reached over at all — which is why it is excluded
-    /// here rather than waited out through the hysteresis: three ticks of "reachable" on it
-    /// would be three refused writes.
+    /// The port's netdev has carrier — a physical fact, and the ONLY one `skipped_for_carrier`
+    /// may speak of: "no carrier" said about a going_back port (carrier is 1) would be false.
+    /// Carrier alone does not make the kernel accept `bonding/active_slave` on the port — see
+    /// `link_up` — but it is what an operator means by "the cable is in", so it stays a fact of
+    /// its own rather than folding `link_up` into it.
     pub carrier: bool,
+    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
+    /// The driver holds a returning port's `mii_status` at `going_back` for `updelay` even after
+    /// carrier comes back to 1, and the kernel's `bonding/active_slave` write requires BOTH
+    /// carrier and this reading `up` (`bond_option_active_slave_set` -> `bond_slave_is_up`,
+    /// VERIFIED against the kernel source 2026-09-07, F24 — F23 verified the carrier half on the
+    /// rack the same day). A port failing this is not a place ingress can be put, however
+    /// recently the router answered over it or however solid its carrier — but it is not a
+    /// fault either: `updelay` is expected and short, so it earns no log line the way losing
+    /// carrier does. That is why it is a separate field from `carrier` rather than folded into
+    /// it: `skipped_for_carrier` must still be able to tell "no cable" from "cable is in, kernel
+    /// just isn't ready yet" and stay silent on the second one.
+    pub link_up: bool,
 }
 
 impl Candidate {
-    /// Can ingress sit here? Both halves are necessary: the router must answer, and the kernel
-    /// must accept the port.
+    /// Can ingress sit here? All three are necessary: the router must answer, the port must
+    /// have carrier, and the bonding driver must have finished bringing it up — the kernel
+    /// refuses the write if either physical half is missing.
     fn usable(&self) -> bool {
-        self.reachable && self.carrier
+        self.reachable && self.carrier && self.link_up
     }
 }
 
@@ -119,7 +126,14 @@ fn rank(prefs: &[String], wire: &str) -> usize {
 
 /// The best-preferred port that only its missing carrier keeps out of the running, when it is
 /// preferred over the port the bond is `on`. This is the fact worth one log line: the wire the
-/// operator would expect ingress to be on is not one the kernel would take.
+/// operator would expect ingress to be on is not one the kernel would take, and the cable is
+/// the thing to go check.
+///
+/// Keys on `carrier` alone, deliberately: a port with carrier but `link_up` still false is
+/// `updelay` running its course, expected and ~500 ms long, not a fault an operator can act on
+/// — naming it here would print "has no carrier" about a port whose carrier is 1, which is
+/// simply false. `decide`'s `usable()` already keeps such a port out of the running; this
+/// function only decides what is worth a sentence.
 ///
 /// `None` once the bond is already on that wire or a better one — a worse-preferred wire with no
 /// carrier is not news, it is the normal state of every spare.
@@ -150,8 +164,9 @@ pub fn skipped_for_carrier<'a>(
 /// - anything else ⇒ the best usable port: the active one is dead, or a better-preferred
 ///   wire came back and ingress belongs on it.
 ///
-/// "Usable" is reachable AND with carrier: a wire the kernel would refuse is not a target, so
-/// the prober never asks for a move it knows will fail.
+/// "Usable" is reachable AND with carrier AND with the bonding driver's own link state up: a
+/// wire the kernel would refuse is not a target, so the prober never asks for a move it knows
+/// will fail.
 pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Option<String> {
     let rank_of = |wire: &str| rank(prefs, wire);
     // Ties (two wires outside the preference order) keep join order, which is `[[member]]`
@@ -176,7 +191,8 @@ pub fn decide(active: Option<&str>, cands: &[Candidate], prefs: &[String]) -> Op
 mod tests {
     use super::*;
 
-    /// Ports with carrier — the shape every case but the carrier ones is about.
+    /// Ports with carrier and the bonding driver's link up — the shape every case but the
+    /// carrier/link_up ones is about.
     fn cands(spec: &[(&str, &str, bool)]) -> Vec<Candidate> {
         spec.iter()
             .map(|(ifname, wire, reachable)| Candidate {
@@ -184,6 +200,7 @@ mod tests {
                 wire: wire.to_string(),
                 reachable: *reachable,
                 carrier: true,
+                link_up: true,
             })
             .collect()
     }
@@ -193,6 +210,17 @@ mod tests {
         for x in &mut c {
             if dark.contains(&x.ifname.as_str()) {
                 x.carrier = false;
+            }
+        }
+        c
+    }
+
+    /// The same, with the named ports' carrier left alone but the bonding driver's own link
+    /// state not yet up — a port mid-`updelay`.
+    fn without_link_up(mut c: Vec<Candidate>, going_back: &[&str]) -> Vec<Candidate> {
+        for x in &mut c {
+            if going_back.contains(&x.ifname.as_str()) {
+                x.link_up = false;
             }
         }
         c
@@ -424,6 +452,33 @@ mod tests {
             "the best-preferred wire cannot take the bond, and where we are can"
         );
         assert_eq!(decide(None, &c, &p), Some("cfab-gw249-a".to_string()));
+    }
+
+    /// F24: a port mid-`updelay` has carrier but the bonding driver has not brought it up yet.
+    /// It must be exactly as untargetable as a carrier-less one — but, unlike carrier loss,
+    /// `skipped_for_carrier` must stay silent about it: carrier is 1, so "has no carrier" would
+    /// be a false sentence, and `updelay` is an expected ~500 ms window, not a fault.
+    #[test]
+    fn a_port_mid_updelay_is_never_a_target_and_never_the_skipped_one() {
+        let c = without_link_up(
+            cands(&[
+                ("cfab-gw249-a", "eth9", true),
+                ("cfab-gw249-b", "eth1", true),
+                ("cfab-gw249-c", "eth0", true),
+            ]),
+            &["cfab-gw249-c"],
+        );
+        let p = prefs(&["eth0", "eth9", "eth1"]);
+        assert_eq!(
+            decide(Some("cfab-gw249-a"), &c, &p),
+            None,
+            "eth0 has carrier but is not yet up: it cannot take the bond"
+        );
+        assert_eq!(
+            skipped_for_carrier(Some("cfab-gw249-a"), &c, &p),
+            None,
+            "carrier is 1 on eth0 — never named by the carrier note"
+        );
     }
 
     /// The other half: a port that loses carrier UNDER the bond is not somewhere ingress can

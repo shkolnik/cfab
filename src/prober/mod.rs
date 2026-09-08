@@ -892,9 +892,8 @@ impl Leg {
                 ifname: s.ifname.clone(),
                 wire: s.wire.clone(),
                 reachable: s.state.reachable() && !s.hello_dead,
-                // The kernel's actual acceptance rule for `active_slave` is carrier AND the
-                // bonding driver's own per-port link state (F24) — not carrier alone.
-                carrier: s.carrier && s.bond_link_up,
+                carrier: s.carrier,
+                link_up: s.bond_link_up,
             })
             .collect();
         let Some(target) = decide(active, &cands, &self.prefs) else {
@@ -1537,6 +1536,15 @@ mod tests {
             home.reachable,
             "the router answers over it, mii_status is a move-eligibility fact, not a reachability one: {rows:?}"
         );
+        let log = p.drain_log();
+        assert!(
+            !log.iter().any(|l| l.contains("no carrier")),
+            "carrier is 1: 'no carrier' about eth0 would be a false sentence: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("cannot move")),
+            "updelay is expected and short: it earns no warn line: {log:?}"
+        );
 
         // Now the bonding driver finishes updelay.
         sys = sys.file(
@@ -1556,6 +1564,12 @@ mod tests {
                 .unwrap(),
             HOME,
             "and it names the home wire"
+        );
+        assert!(
+            p.drain_log()
+                .iter()
+                .any(|l| l.contains("moved") && l.contains("eth0")),
+            "up is up: the move is logged exactly as any other move home"
         );
     }
 
