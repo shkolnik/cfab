@@ -1,0 +1,125 @@
+# Apply = arm the timed revert, then bringup (start, or re-apply in place if already active), then
+# verify and print. The host disarms itself only via `--tags disarm`; otherwise cfab-revert fires.
+- name: The unit must be installed first
+  stat:
+    path: /etc/systemd/system/cfab.service
+  register: cfab_unit
+  failed_when: not cfab_unit.stat.exists
+
+- name: Drop a previous revert timer (re-apply inside the window restarts the clock)
+  command: systemctl stop cfab-revert.timer cfab-revert.service
+  changed_when: false
+  failed_when: false
+
+- name: Arm the timed revert ({{ cfab_revert_minutes }} min)
+  command: >-
+    systemd-run --quiet --unit=cfab-revert --on-active={{ cfab_revert_minutes }}m
+    --description="cfab timed revert (disarm: systemctl stop cfab-revert.timer)"
+    {{ cfab_revert_script }} timed
+  changed_when: true
+
+- name: Enable cfab (persists across reboot)
+  systemd:
+    name: cfab.service
+    enabled: true
+
+- name: Bringup (start; or reload = SIGHUP re-apply in place when already active)
+  command: systemctl reload-or-restart cfab.service
+  register: cfab_start
+  changed_when: true
+  failed_when: false
+
+- name: Bringup log
+  command: journalctl -u cfab.service --no-pager -n 40 -o cat
+  register: cfab_journal
+  changed_when: false
+  when: cfab_start.rc != 0
+
+- name: Bringup failed
+  fail:
+    msg: |
+      bringup FAILED on {{ cfab_host }} (rc={{ cfab_start.rc }}); revert fires in {{ cfab_revert_minutes }} min,
+      or now: --tags rollback. Last journal lines:
+      {{ cfab_journal.stdout }}
+  when: cfab_start.rc != 0
+
+- name: Status (wait up to {{ cfab_status_wait }} s for UP)
+  command: /usr/bin/cfab -c {{ cfab_conf_path }} status --wait {{ cfab_status_wait }}
+  environment:
+    CFAB_HOST: "{{ cfab_host }}"
+  register: cfab_status
+  changed_when: false
+  failed_when: false
+
+- name: Status output
+  debug:
+    msg: "{{ (cfab_status.stdout ~ '\n' ~ cfab_status.stderr).split('\n') }}"
+
+- name: Revert timer
+  command: systemctl list-timers cfab-revert.timer --no-pager
+  register: cfab_timer
+  changed_when: false
+
+# A member with no peer yet is not a broken member: `status` grades reachability, so the first host
+# of a from-scratch rollout honestly reads FAILED (0/P | 0/L | 0/F) with nothing wrong locally, and
+# every host before the last one reads UP-DEGRADED. The three facts below read that shape out of the
+# status output itself, so the play needs no "this is the first member" knob.
+- name: Status output as lines (headline first, then the reason block)
+  set_fact:
+    cfab_status_lines: >-
+      {{ ((cfab_status.stdout | default('')).splitlines() + (cfab_status.stderr | default('')).splitlines())
+         | map('trim') | select() | list }}
+
+# `down <zone>:<segment>:.<node>` (BFD) and `down <zone>:fallback:.<node>` (OSPF adjacency) are the
+# only two shapes that mean "a peer is not there". Every other reason line names something local —
+# an absent wire, a carrierless fallback bond, drift, a held BFD port, a dead engine, an unreachable
+# gw, a stale declaration. `mark: <backend>`, `prefs …` and `components: …` are printed on every
+# status, so only the healthy spelling of each is structural; `mark: iptables-legacy` and a
+# components line carrying a restart, an exit or a refused apply are local problems like any other.
+- name: Sort the reason lines into peer-absence and local problems
+  set_fact:
+    cfab_peer_field: "{{ cfab_status_lines | first | default('') | regex_search('[0-9]+/[0-9]+') | default('-1/-1', true) }}"
+    cfab_down_nodes: >-
+      {{ cfab_status_lines[1:] | select('match', '^down [^:]+:[^:]+:\.[0-9]+$')
+         | map('regex_replace', '^down .*\.', '') | unique | list }}
+    cfab_local_reasons: >-
+      {{ (cfab_status_lines[1:] | reject('match', '^down [^:]+:[^:]+:\.[0-9]+$')
+          | reject('match', '^prefs ') | reject('match', '^components: ')
+          | reject('match', '^mark: nft$') | list)
+         + (cfab_status_lines[1:] | select('match', '^components: ')
+            | select('search', 'restarting|last exit|last apply:|no supervisor answering') | list) }}
+
+# Accept only the peers-absent shape: at least one peer down, no local reason line, and every node
+# named down is down on ALL its links. That last clause is the teeth — `peers_up` counts a peer with
+# any link up, so a node that appears in a `down` line while others to it are up makes the sum
+# exceed `peers`, and a dead local wire toward a live peer stays a hard failure.
+- name: A non-UP status whose only reason is that peers are absent
+  set_fact:
+    cfab_peers_absent_only: >-
+      {{ cfab_status.rc | int in [1, 2]
+         and cfab_down_nodes | length > 0
+         and cfab_local_reasons | length == 0
+         and (cfab_down_nodes | length) + (cfab_peer_field.split('/')[0] | int)
+             == (cfab_peer_field.split('/')[1] | int) }}
+
+- name: Apply report
+  debug:
+    msg: >-
+      {{ cfab_host }}: {{ {0: 'UP', 1: 'UP-DEGRADED', 2: 'FAILED', 3: 'DOWN'}.get(cfab_status.rc, 'UNKNOWN')
+         ~ ' (rc=' ~ cfab_status.rc ~ ')' }}{{
+         ' (peers absent only: acceptable for the first member of a rollout; re-run status once a second member is up — down: ' ~ (cfab_down_nodes | join(' ')) ~ ')'
+         if cfab_peers_absent_only | bool else '' }}.
+      {{ cfab_timer.stdout_lines[1] | default('NO REVERT TIMER?') }}.
+      Keep it: --tags disarm.  Undo now: --tags rollback.
+
+# Strict on purpose (no --permissive): a rollout that leaves a member UP-DEGRADED is a rollout
+# with a dead link, and the operator should see it before the revert timer is disarmed. The one
+# exception is the peers-absent shape above, which a rollout produces by construction.
+- name: Status is not UP for a local reason (fabric left up for inspection; the revert timer is still armed)
+  fail:
+    msg: >-
+      cfab status rc={{ cfab_status.rc }} (1 = UP-DEGRADED, 2 = FAILED, 3 = DOWN) on {{ cfab_host }} —
+      see 'Status output' above.
+      {{ 'local reasons: ' ~ (cfab_local_reasons | join(' / ')) if cfab_local_reasons | length > 0
+         else 'not the peers-absent shape: a node is down on some links while others to it are up, or nothing is down at all' }}
+  when: cfab_status.rc != 0 and not cfab_peers_absent_only | bool

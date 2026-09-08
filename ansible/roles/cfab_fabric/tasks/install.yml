@@ -1,0 +1,130 @@
+# Install = the apt repository, then the cfab package plus its declaration and the
+# interim boot unit. Nothing is enabled or started: the network is untouched until `--tags apply`.
+# Idempotent; re-run to ship a declaration change (it takes effect on the next apply/boot, never
+# by itself — see the report at the end).
+#
+# FRR is deliberately NOT installed any more: the routing engine is embedded in the cfab binary,
+# and a running frr steals the BFD control port (3784) from it.
+
+- name: The declaration is the operator's (set cfab_declaration to its path)
+  ansible.builtin.assert:
+    that: cfab_declaration | length > 0
+    fail_msg: "cfab_declaration is unset: point it at the fabric.toml this host runs"
+
+- name: Apt repository
+  block:
+    # gpg dearmors the signing key; deb822_repository imports python3-debian and fails without it.
+    - name: Repository prerequisites (gpg, python3-debian)
+      ansible.builtin.apt:
+        name: [gpg, python3-debian]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # The key is pinned in this repo, not curled at play time: trusting a signing key is a
+    # decision that belongs in git history where it can be reviewed and diffed.
+    - name: Signing key, armored (pinned in the role)
+      ansible.builtin.copy:
+        src: jshkol-archive-keyring.asc
+        dest: "{{ cfab_keyring_asc_path }}"
+        mode: "0644"
+      register: cfab_key_asc
+
+    - name: Is the dearmored keyring already there?
+      ansible.builtin.stat:
+        path: "{{ cfab_keyring_path }}"
+      register: cfab_keyring
+
+    - name: Signing key, dearmored ({{ cfab_keyring_path }})
+      ansible.builtin.command:
+        cmd: >-
+          gpg --batch --yes --dearmor
+          -o {{ cfab_keyring_path }}
+          {{ cfab_keyring_asc_path }}
+      when: cfab_key_asc is changed or not cfab_keyring.stat.exists
+      changed_when: true
+
+    # deb822_repository needs ansible-core >= 2.15 (Debian 13 ships 2.19). It writes
+    # /etc/apt/sources.list.d/jshkol.sources — the same sources line documented at pkg.jshkol.com.
+    - name: Repository entry (pkg.jshkol.com {{ cfab_apt_suite }}/{{ cfab_apt_component }})
+      ansible.builtin.deb822_repository:
+        name: jshkol
+        types: [deb]
+        uris: "{{ cfab_apt_uri }}"
+        suites: "{{ cfab_apt_suite }}"
+        components: "{{ cfab_apt_component }}"
+        signed_by: "{{ cfab_keyring_path }}"
+        enabled: true
+        state: present
+      register: cfab_repo
+
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: true
+      when: cfab_repo is changed
+
+- name: Install and configure cfab
+  block:
+    # Unpinned = the newest the repository serves (`state: present` would leave an older installed
+    # cfab in place: R13 2026-09-07 kept pve1 on 0.4.1 after 0.4.2 was published). Pinned = exactly
+    # that version. Either way apt will not replace a package with the SAME version string, e.g.
+    # a locally built 0.1.0-1: bump the version (or `dpkg -i`) to move a host onto another build.
+    - name: cfab package
+      ansible.builtin.apt:
+        name: "cfab{{ ('=' + cfab_version) if cfab_version | length > 0 else '' }}"
+        state: "{{ 'present' if cfab_version | length > 0 else 'latest' }}"
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: /etc/cfab
+      ansible.builtin.file:
+        path: "{{ cfab_conf_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Declaration ({{ cfab_declaration }})
+      ansible.builtin.copy:
+        src: "{{ cfab_declaration }}"
+        dest: "{{ cfab_conf_path }}"
+        mode: "0644"
+      register: cfab_conf
+
+    - name: cfab-revert (what the timed revert and --tags rollback run)
+      ansible.builtin.template:
+        src: revert.sh.j2
+        dest: "{{ cfab_revert_script }}"
+        mode: "0755"
+
+    # The deb (0.3.0+) ships its own cfab.service (packaging/deb/cfab.service, disabled/unstarted).
+    # This role's copy pins the same unit at /etc/systemd/system/cfab.service so cfab_host and
+    # cfab_conf_path are baked in without editing /etc/default/cfab separately.
+    - name: cfab.service (installed disabled)
+      ansible.builtin.template:
+        src: cfab.service.j2
+        dest: /etc/systemd/system/cfab.service
+        mode: "0644"
+      notify: systemd daemon-reload
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Installed version
+      ansible.builtin.command: dpkg-query -W -f='${Version}' cfab
+      register: cfab_dpkg
+      changed_when: false
+
+    - name: Is the fabric active on this host?
+      ansible.builtin.command: systemctl is-active cfab.service
+      register: cfab_active
+      changed_when: false
+      failed_when: false
+
+    - name: Install report
+      ansible.builtin.debug:
+        msg: >-
+          {{ cfab_host }}: cfab {{ cfab_dpkg.stdout }} from {{ cfab_apt_uri }},
+          declaration {{ cfab_conf_path }}; unit cfab is
+          {{ 'ACTIVE' if cfab_active.stdout == 'active' else 'not running' }}
+          {{ '— declaration changed: run --tags apply to re-run bringup in place'
+             if (cfab_conf.changed and cfab_active.stdout == 'active') else '' }}
+          {{ '— next: --tags probe (read-only), then --tags apply' if cfab_active.stdout != 'active' else '' }}

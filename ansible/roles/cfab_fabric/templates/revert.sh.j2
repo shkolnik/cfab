@@ -1,0 +1,10 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# cfab-revert — take the fabric off this host: disable + stop the supervisor (SIGTERM makes
+# `cfab run` tear itself down and exit 0), then `cfab down` once more for the case the supervisor
+# was SIGKILLed or never came up (down is idempotent and refuses only while a supervisor still
+# answers `cfab.sock`). $1 = why (timed|manual), for the journal.
+export CFAB_HOST={{ cfab_host }}
+logger -t cfab-revert "revert ($1): disabling cfab and tearing down"
+systemctl disable --now cfab.service
+/usr/bin/cfab -c {{ cfab_conf_path }} down

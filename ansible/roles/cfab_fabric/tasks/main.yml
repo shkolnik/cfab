@@ -1,0 +1,12 @@
+# One operation per run, selected by tag. Plain `ansible-playbook` = install (no network change);
+# everything that touches the network is behind a `never` tag and must be asked for by name.
+- import_tasks: probe.yml
+  tags: [probe, never]
+- import_tasks: install.yml
+  tags: [install]
+- import_tasks: apply.yml
+  tags: [apply, never]
+- import_tasks: disarm.yml
+  tags: [disarm, never]
+- import_tasks: rollback.yml
+  tags: [rollback, never]

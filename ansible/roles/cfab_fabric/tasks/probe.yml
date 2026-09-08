@@ -1,0 +1,17 @@
+# Read-only inventory of the host before the fabric touches it; paste the output back.
+# (shell + file lookup rather than `script`: no pty, so no \r and no color escapes in the paste.)
+- name: Probe the host (read-only)
+  shell: "{{ lookup('file', 'probe-pve.sh') }}"
+  args:
+    executable: /bin/bash
+  environment:
+    CFAB_CONF: "{{ cfab_conf_path }}"
+    CFAB_NICS: "{{ cfab_nics }}"
+    CFAB_KEYRING: "{{ cfab_keyring_path }}"
+  register: cfab_probe
+  changed_when: false
+  failed_when: false
+
+- name: Probe output
+  debug:
+    msg: "{{ (cfab_probe.stdout ~ '\n' ~ cfab_probe.stderr).split('\n') }}"
