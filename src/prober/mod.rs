@@ -30,7 +30,7 @@ use crate::derive::View;
 use crate::supervisor::report::{ProbedLeg, ProbedPort};
 use crate::sys::Sys;
 
-use decide::{Candidate, Hysteresis, decide};
+use decide::{BondLink, Candidate, Hysteresis, decide};
 use io::ProbeIo;
 use passive::{Evidence, Verdict, Windows};
 
@@ -129,13 +129,17 @@ struct ProbePort {
     /// is a fact the kernel hands over instantly and acts on instantly, so waiting three ticks
     /// to believe it is three refused `active_slave` writes (F23).
     carrier: bool,
-    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`) reads `up`.
-    /// Carrier goes to 1 the instant a cable is plugged back in, but the driver holds this file
-    /// at `going back` for `updelay`, and the `active_slave` write refuses (EINVAL, "either the
-    /// port is down or the link is down") unless the port is running with carrier AND its bond
-    /// link is up. Missing or unreadable (port not in a bond) reads as NOT up: the kernel would
-    /// refuse the write either way.
-    bond_link_up: bool,
+    /// The bonding driver's own per-port link state (`bonding_slave/mii_status`), parsed by the
+    /// one place that knows the kernel's spellings (`decide::BondLink`). Carrier goes to 1 the
+    /// instant a cable is plugged back in, but the driver holds this file at `going back` for
+    /// `updelay`, and the `active_slave` write refuses (EINVAL, "either the port is down or the
+    /// link is down") unless the port is running with carrier AND its bond link is up. `None`
+    /// covers both "missing or unreadable" (port not in a bond) and "read something the driver
+    /// is not documented to write" — the kernel would refuse the write in either state.
+    bond_link: Option<BondLink>,
+    /// The raw `mii_status` value the last "does not know" note named, so the same unknown
+    /// value is not logged twice a second for as long as it persists. `None` re-arms it.
+    noted_bond_link: Option<String>,
     /// The netdev exists at all (its `carrier` file could be opened, whatever it said). A netdev
     /// that has just come back is a port that has just been re-added, which is where the
     /// grace period comes from.
@@ -195,7 +199,8 @@ impl ProbePort {
             state: Hysteresis::default(),
             probed: false,
             carrier: false,
-            bond_link_up: false,
+            bond_link: None,
+            noted_bond_link: None,
             // Not present until a tick has read the netdev, so every port starts its life in
             // the grace period a re-added one gets: at leg start no hello has arrived on any
             // wire yet, and the first one to arrive must not condemn the others.
@@ -223,7 +228,7 @@ impl ProbePort {
             wire: self.wire.clone(),
             reachable: self.state.reachable() && !self.hello_dead,
             carrier: self.carrier,
-            link_up: self.bond_link_up,
+            link_up: self.bond_link == Some(BondLink::Up),
         }
     }
 
@@ -524,16 +529,15 @@ fn has_carrier(sys: &dyn Sys, ifname: &str) -> Option<bool> {
         .map(|s| s.trim() == "1")
 }
 
-/// Does the bonding driver itself consider this port up? `bonding_slave/mii_status` (per PORT,
-/// not to be confused with the whole-bond `bonding/mii_status` `status` reads) is `up`,
-/// `going back`, `going down` or `down`; the kernel refuses `bonding/active_slave` unless this
-/// reads `up`, however healthy carrier already is (F24). A missing or unreadable file — the
-/// netdev is not a bond port, or carrier is already gone — is NOT up, deliberately: the kernel
-/// would refuse the write in that state too.
-fn bond_link_up(sys: &dyn Sys, ifname: &str) -> bool {
+/// The bonding driver's own per-port link state (per PORT, not to be confused with the
+/// whole-bond `bonding/mii_status` `status` reads), raw and trimmed. `None` when the file is
+/// missing or unreadable — the netdev is not a bond port, or carrier is already gone — which is
+/// the normal not-in-a-bond state and stays silent. `Some` of anything the caller's `BondLink`
+/// does not recognize is a kernel value we have not seen before, which is loud, not silent.
+fn read_bond_link(sys: &dyn Sys, ifname: &str) -> Option<String> {
     sys.read(&format!("/sys/class/net/{ifname}/bonding_slave/mii_status"))
-        .map(|s| s.trim() == "up")
-        .unwrap_or(false)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// One `Sys` error as a line a task that carries on may print. `Sys::write` reports every
@@ -644,7 +648,30 @@ impl Leg {
             // carrier would send an operator to the wrong end of it.
             let present = has_carrier(&*sys, &s.ifname);
             s.carrier = present.unwrap_or(false);
-            s.bond_link_up = bond_link_up(&*sys, &s.ifname);
+            match read_bond_link(&*sys, &s.ifname) {
+                None => {
+                    s.bond_link = None;
+                    s.noted_bond_link = None;
+                }
+                Some(raw) => match BondLink::parse(&raw) {
+                    Some(bl) => {
+                        s.bond_link = Some(bl);
+                        s.noted_bond_link = None;
+                    }
+                    None => {
+                        s.bond_link = None;
+                        if s.noted_bond_link.as_deref() != Some(raw.as_str()) {
+                            log.push(format!(
+                                "cfab: {} {}: {} reports bonding link state \"{raw}\" the prober does not know — treated as not up",
+                                self.zone,
+                                self.kind.family(),
+                                s.wire
+                            ));
+                            s.noted_bond_link = Some(raw);
+                        }
+                    }
+                },
+            }
             // A netdev that has just come back is a port the kernel has just re-added (F5).
             // Judging it before a hello can arrive on it would confirm it dead for being new.
             if present.is_some() && !s.present {
@@ -1664,6 +1691,44 @@ mod tests {
         assert!(
             !log.iter().any(|l| l.contains("is preferred")),
             "a real return is not worded as a preference move: {log:?}"
+        );
+    }
+
+    /// An `mii_status` value the driver is not documented to write (a future kernel spelling, a
+    /// corrupted read) must not be silently treated as reachable, and must not be silent about
+    /// it either: one note per port per distinct value, not one per tick.
+    #[test]
+    fn an_unknown_bond_link_value_is_never_a_move_target_and_is_said_once() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(BACKUP)
+            .file(&format!("/sys/class/net/{HOME}/carrier"), "1\n")
+            .file(
+                &format!("/sys/class/net/{HOME}/bonding_slave/mii_status"),
+                "bogus\n",
+            );
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        let rows = run_ticks(&mut p, &mut sys, &mut io, 6);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("write /sys")),
+            "an unknown bonding link state is never a move target: {:?}",
+            sys.calls
+        );
+        assert!(
+            rows[0].ports.iter().any(|s| s.wire == "eth0"),
+            "the home wire still has a row: {rows:?}"
+        );
+        let log = p.drain_log();
+        let notes: Vec<&String> = log.iter().filter(|l| l.contains("does not know")).collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "said once across several ticks, not once per tick: {log:?}"
+        );
+        assert!(
+            notes[0].contains("eth0") && notes[0].contains("\"bogus\""),
+            "names the wire and the raw value: {log:?}"
         );
     }
 
