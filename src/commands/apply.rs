@@ -18,6 +18,7 @@ use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
+use crate::workload::uplink;
 
 pub struct ApplyOpts {
     /// pmxcfs mount root probed to decide whether to start conf-sync (/etc/pve in
@@ -367,6 +368,66 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         }
     }
 
+    // ---- workload preconditions and gw address (spec §5.1): the VM VLAN sub-interface must
+    // already exist, be up and carry this member's address (declared in /etc/network/interfaces
+    // — cfab never creates it), and its uplink must be identified and STP-forwarding before
+    // anything else touches it. `workload_uplinks` (gw, identified uplink) feeds the bridge
+    // guard table below, once every row has passed.
+    let mut workload_uplinks: Vec<(std::net::Ipv4Addr, uplink::Uplink)> = Vec::new();
+    let mut workload_descs: Vec<String> = Vec::new();
+    for row in view.workload_rows() {
+        let ifname = row.wl.ifname.as_str();
+        let name = &row.wl.name;
+        let out = sys.run(&["ip", "-br", "link", "show", "dev", ifname])?;
+        if !out.ok() {
+            return Err(Error::fatal(format!(
+                "workload {name}: interface {ifname} does not exist (declare it in \
+                 /etc/network/interfaces with address {} on the VLAN)",
+                row.address
+            )));
+        }
+        let state = out.stdout.split_whitespace().nth(1).unwrap_or("");
+        if state != "UP" {
+            return Err(Error::fatal(format!(
+                "workload {name}: interface {ifname} is {state} (ip link set {ifname} up, or \
+                 fix its stanza)"
+            )));
+        }
+        let addr_out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
+        if !addr_out.stdout.contains(&row.address) {
+            return Err(Error::fatal(format!(
+                "workload {name}: interface {ifname} lacks {} (the member address from the \
+                 declaration)",
+                row.address
+            )));
+        }
+        let up = uplink::identify(sys, ifname)
+            .map_err(|e| Error::fatal(format!("workload {name}: {e}")))?;
+        for port in &up.ports {
+            match uplink::stp_forwarding(sys, &up.bridge, port) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let raw = sys
+                        .read(&format!("/sys/class/net/{}/brif/{port}/state", up.bridge))
+                        .unwrap_or_default();
+                    return Err(Error::fatal(format!(
+                        "workload {name}: uplink {port} of bridge {} is not forwarding (STP \
+                         state {}); wait for forward_delay or set bridge-stp off / bridge-fd 0",
+                        up.bridge,
+                        raw.trim()
+                    )));
+                }
+                Err(e) => return Err(Error::fatal(format!("workload {name}: {e}"))),
+            }
+        }
+        run_ok(sys, &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", ifname])?;
+        workload_descs.push(format!("{name} on {ifname} (uplink {})", up.ports.join(", ")));
+        workload_uplinks.push((row.wl.gw, up));
+    }
+    if !workload_uplinks.is_empty() {
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1")?;
+    }
+
     // ---- per-class netdevs -----------------------------------------------------
     for z in &f.zones {
         mk_identity(
@@ -473,6 +534,21 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         sys.remove(&format!("{}/policy.applied", f.run_dir))?;
     }
 
+    // ---- workload bridge ARP guard (after forwarding is up, before the mark table: the
+    // announcer only starts once `apply` returns, so ordering here is about the guard being in
+    // place before anything else touches the mark table, not a race with the announcer) --------
+    if !workload_uplinks.is_empty() {
+        let bridge_nft = emit::workload::bridge_table(&workload_uplinks);
+        let bridge_path = format!("{}/workload-bridge.nft", f.run_dir);
+        sys.write(&bridge_path, &bridge_nft)?;
+        run_ok(sys, &["nft", "-f", &bridge_path])?; // one transaction: atomic replace
+        let applied = run_ok(sys, &["nft", "-s", "list", "table", "bridge", "cfab"])?;
+        sys.write(
+            &format!("{}/workload-bridge.applied", f.run_dir),
+            &applied.stdout,
+        )?;
+    }
+
     // ---- marking + the fallback ceiling (EVERY kind) ----------------------------------------
     // `table inet cfab` is derived from the class table alone — `oifname` groups over this
     // member's own `cfab-*` segments, bonds and ingress legs, which a leaf creates exactly as a
@@ -534,6 +610,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             "apply OK on {host} (node {n}, leaf); no transit (cost +{}, forwarding=0, leak guard)",
             f.leaf_cost_offset
         ));
+    }
+    if !workload_descs.is_empty()
+        && let Some(last) = warnings.last_mut()
+    {
+        last.push_str(&format!("; workloads: {}", workload_descs.join(", ")));
     }
     Ok(warnings)
 }
@@ -1040,6 +1121,10 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Re
     for admin in view.admin_ifs() {
         proc_sysctl(sys, admin, "forwarding", "0")?; // belt (the policy's admin rules = braces)
     }
+    // A workload VLAN's whole point is routing VM traffic to its allowed zones.
+    for r in view.workload_rows() {
+        proc_sysctl(sys, &r.wl.ifname, "forwarding", "1")?;
+    }
     // A foreign stack's forward-hook policy drop kills transit that cfab accepts, and cfab
     // cannot out-accept it. Where the stack offers a user hook (Docker's DOCKER-USER), ask it
     // to pass cfab transit; `down` removes exactly this rule again.
@@ -1234,6 +1319,156 @@ mod tests {
     fn opts() -> ApplyOpts {
         ApplyOpts {
             pmxcfs_root: "/nonexistent/pve".to_string(),
+        }
+    }
+
+    /// pve1-tb with the workload row: `up_sys` plus the pve1 sysfs tree of Task 5 and the two
+    /// interface facts the precondition reads.
+    fn wl_sys(view: &View) -> MockSys {
+        up_sys(view)
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file("/sys/class/net/eth0/ifindex", "2\n")
+            .file("/sys/class/net/tap100i0/ifindex", "10\n")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .on_stdout(
+                &["ip", "-br", "link", "show", "dev", "primary.3"],
+                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                "primary.3 UP 192.168.20.2/24\n",
+            )
+    }
+
+    pub(crate) fn wl_sys_and_view(member: &str) -> (MockSys, View<'static>) {
+        let f: &'static Fabric = Box::leak(Box::new(wl_fabric()));
+        let view = View::new(f, member).unwrap();
+        let sys = wl_sys(&view);
+        (sys, view)
+    }
+
+    #[test]
+    fn up_with_a_workload_adds_gw_forwarding_arp_ignore_and_the_bridge_guard_before_the_mark_table()
+     {
+        let (mut sys, view) = wl_sys_and_view("pve1-tb");
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
+        );
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            Some(&"1")
+        );
+        assert!(sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert!(sys.ran("nft -s list table bridge cfab"));
+        let pos = |needle: &str| {
+            sys.calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not run: {:#?}", sys.calls))
+        };
+        assert!(
+            pos("nft -f /run/cfab/policy.nft")
+                < sys
+                    .calls
+                    .iter()
+                    .rposition(|c| c == "write /proc/sys/net/ipv4/conf/primary.3/forwarding")
+                    .unwrap(),
+            "forwarding=1 follows the policy load (enable_forwarding)"
+        );
+        assert!(
+            pos("nft -f /run/cfab/workload-bridge.nft") < pos("nft -f /run/cfab/mark.nft"),
+            "guard before the mark table; the announcer starts after apply returns"
+        );
+        assert!(!sys.ran("ip link del primary.3"));
+    }
+
+    #[test]
+    fn up_refuses_when_the_workload_interface_is_missing_down_or_lacks_the_member_address() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut missing = sys.on_fail(
+            &["ip", "-br", "link", "show", "dev", "primary.3"],
+            1,
+            "Device \"primary.3\" does not exist.",
+        );
+        assert_eq!(
+            run(&mut missing, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 does not exist (declare it in /etc/network/interfaces with address 192.168.20.2/24 on the VLAN)"
+        );
+        let mut down = wl_sys(&view).on_stdout(
+            &["ip", "-br", "link", "show", "dev", "primary.3"],
+            "primary.3@primary DOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
+        );
+        assert_eq!(
+            run(&mut down, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 is DOWN (ip link set primary.3 up, or fix its stanza)"
+        );
+        let mut noaddr = wl_sys(&view).on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP\n",
+        );
+        assert_eq!(
+            run(&mut noaddr, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
+        );
+    }
+
+    #[test]
+    fn up_refuses_when_the_uplink_is_not_forwarding_or_cannot_be_identified() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut listening = sys.file("/sys/class/net/primary/brif/eth0/state", "1\n");
+        assert_eq!(
+            run(&mut listening, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: uplink eth0 of bridge primary is not forwarding (STP state 1); wait for forward_delay or set bridge-stp off / bridge-fd 0"
+        );
+        let mut no_uplink = wl_sys(&view);
+        no_uplink.links.remove("/sys/class/net/eth0/device");
+        assert!(
+            run(&mut no_uplink, &view, &opts())
+                .unwrap_err()
+                .to_string()
+                .starts_with("FATAL: workload vms: bridge primary has no uplink port")
+        );
+    }
+
+    #[test]
+    fn up_with_a_workload_elsewhere_does_not_touch_arp_ignore_on_a_member_without_one() {
+        let (mut sys, view) = wl_sys_and_view("pve3-tb"); // wl_sys adds facts pve3 never reads; harmless
+        let mut sys = absent_fallback_netdevs(std::mem::take(&mut sys), &view);
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty()
+        );
+        assert!(
+            sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
+            "the leaf gets the sibling"
+        );
+    }
+
+    #[test]
+    fn the_workload_apply_sequence_is_pinned() {
+        let (mut sys, view) = wl_sys_and_view("pve1-tb");
+        run(&mut sys, &view, &opts()).unwrap();
+        let got = format!("{}\n", sys.calls.join("\n"));
+        let path = format!(
+            "{}/tests/fixtures/apply-argv-workload-pve1-tb.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let want = std::fs::read_to_string(&path).unwrap_or_default();
+        if got != want {
+            std::fs::write(format!("{path}.actual"), &got).unwrap();
+            panic!("the workload apply sequence changed; see {path}.actual");
         }
     }
 
