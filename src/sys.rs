@@ -455,6 +455,13 @@ pub mod mock {
                 self.files
                     .retain(|p, _| !p.starts_with(&format!("/sys/class/net/{dev}/")));
             }
+            // Same reason, for `ip rule`: `drop_rules` loops on `ip rule show pref <pref>`
+            // until the needle is gone, so a mock that keeps answering "still there" forever
+            // would hang any test of the present-then-deleted case rather than fail it.
+            if let ["ip", "rule", "del", "pref", pref, ..] = argv {
+                self.cmd_rules
+                    .retain(|(prefix, _)| prefix.as_slice() != ["ip", "rule", "show", "pref", pref]);
+            }
             let hit = self
                 .cmd_rules
                 .iter()

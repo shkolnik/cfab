@@ -171,6 +171,17 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
                 "0",
             ],
         )?;
+        // The pref-2000 workload siblings this zone may reach (spec §5 item 4): teardown is
+        // `workload_return_rules`'s only consumer, so its rules are dropped straight from it
+        // (`FabricRule::del`) rather than through `ensure_fabric_rule`'s tail-only convention.
+        for r in crate::commands::common::workload_return_rules(view)
+            .into_iter()
+            .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
+        {
+            let del_owned = r.del();
+            let del: Vec<&str> = del_owned.iter().map(String::as_str).collect();
+            drop_rules(sys, &r.pref, &r.needle, &del)?;
+        }
         drop_rules(
             sys,
             "2001",
@@ -359,6 +370,16 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
@@ -799,6 +820,34 @@ mod tests {
                 .iter()
                 .filter(|c| c.contains("route del default"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The pref-2000 workload sibling (spec §5 item 4) comes off when it is there, and `down`
+    /// issues no delete for it when it is not — the same idempotent shape as every other
+    /// `drop_rules` caller here.
+    #[test]
+    fn teardown_drops_the_workload_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+
+        let mut present = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no").on_stdout(
+            &["ip", "rule", "show", "pref", "2000"],
+            "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+        );
+        run(&mut present, &view).unwrap();
+        assert!(
+            present.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
+            "{:?}",
+            present.calls
+        );
+
+        let mut absent = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut absent, &view).unwrap();
+        assert!(
+            !absent.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24"),
+            "{:?}",
+            absent.calls
         );
     }
 

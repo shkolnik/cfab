@@ -1074,6 +1074,16 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     /// Task 5: the engine start, the shape daemon, the watchdog and conf-sync all moved to
     /// the (not-yet-built) supervisor. `apply` itself must launch no daemon at all — no
     /// `systemd-run`, no `systemctl`, no `spawn_detached` — and must name no unit.
@@ -1965,6 +1975,24 @@ mod tests {
                 "storage/cfab-st".to_string(),
                 "storage/cfab-st-fb (no wire with carrier under it)".to_string(),
             ]
+        );
+    }
+
+    /// The pref-2000 workload sibling (spec §5 item 4) is installed on a leaf too — it is
+    /// fabric-wide, not host-only, because a leaf must be able to answer `ip route get <vm>
+    /// from <identity>`. The host case (a member that itself carries the workload row) is
+    /// deferred to Task 7a: forwarding for a workload needs the uplink refusal that task adds,
+    /// and this apply fixture does not build it.
+    #[test]
+    fn apply_adds_the_workload_sibling_rule_on_a_leaf() {
+        let f: &'static Fabric = Box::leak(Box::new(wl_fabric()));
+        let view = View::new(f, "pve3-tb").unwrap();
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view);
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(
+            sys.ran("rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
+            "{:?}",
+            sys.calls
         );
     }
 
