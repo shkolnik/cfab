@@ -104,3 +104,32 @@ pub struct Condition {
     /// their own (adjacencies, legs) are structured so far.
     pub text: String,
 }
+
+/// One expected adjacency to a peer: a BFD session on a declared segment, or an OSPF neighbor
+/// on the zone's fallback bond. The declaration is the denominator, so a row exists whether or
+/// not the adjacency is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adjacency {
+    pub zone: String,
+    /// The segment number, or `None` for the zone's fallback bond.
+    pub seg: Option<u8>,
+    /// The peer's node number, its last address octet in every zone.
+    pub peer_node: u8,
+    pub peer_name: String,
+    /// The peer's segment address this BFD session is keyed by; `None` on a fallback bond,
+    /// where the adjacency is keyed by the peer's router id instead.
+    pub peer_addr: Option<String>,
+    /// BFD `up`, or an OSPF neighbor at least 2-Way on the fallback bond.
+    pub up: bool,
+}
+
+impl Adjacency {
+    /// `<zone>:<segment>:.<node>` — how status names one adjacency, `fallback` in the segment
+    /// position for the bond.
+    pub fn label(&self) -> String {
+        match self.seg {
+            Some(s) => format!("{}:{s}:.{}", self.zone, self.peer_node),
+            None => format!("{}:fallback:.{}", self.zone, self.peer_node),
+        }
+    }
+}

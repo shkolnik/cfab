@@ -38,7 +38,7 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 
 pub mod model;
 
-pub use model::{Class, Condition, Headline, State};
+pub use model::{Adjacency, Class, Condition, Headline, State};
 
 pub struct StatusReport {
     pub state: State,
@@ -52,6 +52,9 @@ pub struct StatusReport {
 #[derive(Default, Clone)]
 struct Ctx {
     reasons: Vec<(Class, String)>,
+    /// Every expected adjacency, up or down. The `down <zone>:<seg>:.<node>` lines are rendered
+    /// from these rows, never pushed as text.
+    adjacencies: Vec<Adjacency>,
 }
 
 impl Ctx {
@@ -68,7 +71,18 @@ impl Ctx {
     /// Is this fabric still settling? One settling line is enough: `--wait` exists for exactly
     /// the window in which they are still there.
     fn settling_now(&self) -> bool {
-        self.reasons.iter().any(|(k, _)| *k == Class::Settling)
+        self.all_reasons().iter().any(|(k, _)| *k == Class::Settling)
+    }
+
+    /// Every reason line this gather carries: the ones stated in words, plus the ones a row
+    /// renders. One list, so the class of a rendered line is decided in exactly one place.
+    fn all_reasons(&self) -> Vec<(Class, String)> {
+        let mut out = self.reasons.clone();
+        for a in self.adjacencies.iter().filter(|a| !a.up) {
+            // Settling: an adjacency that is still forming is the state `--wait` exists for.
+            out.push((Class::Settling, format!("down {}", a.label())));
+        }
+        out
     }
 }
 
@@ -258,7 +272,7 @@ fn finish(
         state.word(),
         view.member.name
     );
-    for r in once_each(&c.reasons) {
+    for r in once_each(&c.all_reasons()) {
         // A TOML parse error arrives as several lines (message, then the caret snippet); its
         // continuation lines are indented one step further so the block still reads as one
         // reason under the headline.
@@ -299,13 +313,22 @@ fn finish(
     }
 }
 
+/// One expected BFD session, as the declaration alone describes it.
+struct ExpectedLink {
+    node: u8,
+    name: String,
+    zone: String,
+    seg: u8,
+    addr: String,
+}
+
 /// One BFD session per (zone, segment) shared with each peer, keyed by the peer's segment
 /// address — exact for a heterogeneous membership and per session, so a dark segment is named,
 /// not just counted. The declaration is the denominator, and it is meant to ignore a cable pull.
-fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
+fn expected_links(view: &View) -> Result<Vec<ExpectedLink>> {
     let f = view.fabric;
     let host = &view.member.name;
-    let mut expected: Vec<(u8, String, u8, String)> = Vec::new();
+    let mut expected: Vec<ExpectedLink> = Vec::new();
     let ours = segments_of(f, view.member);
     for m in &f.members {
         if m.name == *host {
@@ -316,12 +339,13 @@ fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
             let (z, seg) = shared.split_once(':').expect("zone:seg");
             let zone = f.zone(z)?;
             let seg: u8 = seg.parse().expect("seg number");
-            expected.push((
-                m.node,
-                z.to_string(),
+            expected.push(ExpectedLink {
+                node: m.node,
+                name: m.name.clone(),
+                zone: z.to_string(),
                 seg,
-                format!("{}.{seg}.{}", zone.block(), m.node),
-            ));
+                addr: format!("{}.{seg}.{}", zone.block(), m.node),
+            });
         }
     }
     Ok(expected)
@@ -331,7 +355,7 @@ fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
 fn read(
     sys: &mut dyn Sys,
     view: &View,
-    expected: &[(u8, String, u8, String)],
+    expected: &[ExpectedLink],
     c: &mut Ctx,
     comps: Option<&Components>,
 ) -> Result<Headline> {
@@ -374,16 +398,23 @@ fn read(
     // The BFD-up legs are the runtime half of the expectation rule below: which segment can
     // actually carry this peer's traffic right now, as opposed to which one we declared.
     let mut up_legs: BTreeSet<(u8, String, u8)> = BTreeSet::new();
-    for (p, z, seg, addr) in expected {
-        peers.insert(*p);
+    for e in expected {
+        peers.insert(e.node);
         counts.links += 1;
-        if up_addrs.contains(addr) {
+        let up = up_addrs.contains(&e.addr);
+        if up {
             counts.links_up += 1;
-            peers_up.insert(*p);
-            up_legs.insert((*p, z.clone(), *seg));
-        } else {
-            c.settling(format!("down {z}:{seg}:.{p}"));
+            peers_up.insert(e.node);
+            up_legs.insert((e.node, e.zone.clone(), e.seg));
         }
+        c.adjacencies.push(Adjacency {
+            zone: e.zone.clone(),
+            seg: Some(e.seg),
+            peer_node: e.node,
+            peer_name: e.name.clone(),
+            peer_addr: Some(e.addr.clone()),
+            up,
+        });
     }
 
     // ---- fallbacks: one expected OSPF neighbor per peer carrying the zone's row ----
@@ -1179,23 +1210,35 @@ fn fallback(
                 ));
             }
             for m in &peer_members {
-                c.settling(format!("down {zone}:fallback:.{}", m.node));
+                c.adjacencies.push(fallback_adjacency(m, zone, false));
             }
             continue;
         };
         for m in &peer_members {
             let rid = format!("{}.0.{}", z.block(), m.node);
             let state = crate::engine::state::neighbor_state(nbrs, &rid);
-            if crate::engine::state::at_least_two_way(state) {
+            let up = crate::engine::state::at_least_two_way(state);
+            if up {
                 counts.fallbacks_up += 1;
                 peers_up.insert(m.node);
                 two_way.insert((m.node, zone.clone()));
-            } else {
-                c.settling(format!("down {zone}:fallback:.{}", m.node));
             }
+            c.adjacencies.push(fallback_adjacency(m, zone, up));
         }
     }
     Ok(two_way)
+}
+
+/// One peer's row on a zone's fallback bond.
+fn fallback_adjacency(m: &crate::model::Member, zone: &str, up: bool) -> Adjacency {
+    Adjacency {
+        zone: zone.to_string(),
+        seg: None,
+        peer_node: m.node,
+        peer_name: m.name.clone(),
+        peer_addr: None,
+        up,
+    }
 }
 
 /// Each peer's identity, in each zone, must be reached over the interface we expect and with a
@@ -4976,7 +5019,7 @@ mod tests {
         expected_links(view)
             .unwrap()
             .into_iter()
-            .map(|(p, z, seg, _)| (p, z, seg))
+            .map(|e| (e.node, e.zone, e.seg))
             .collect()
     }
 
@@ -5113,7 +5156,7 @@ mod tests {
             expected_links(&view)
                 .unwrap()
                 .iter()
-                .filter(|(p, z, _, _)| *p == 1 && z == "storage")
+                .filter(|e| e.node == 1 && e.zone == "storage")
                 .count(),
             2
         );
