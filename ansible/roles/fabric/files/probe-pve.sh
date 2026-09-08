@@ -90,3 +90,40 @@ for f in /etc/apt/sources.list.d/jshkol.sources "$KEYRING"; do
 done
 [ -d /run/cfab ] && echo "  /run/cfab present (fabric applied since boot)" || echo "  /run/cfab absent"
 ip -c=never -br link | awk '$1 ~ /^cfab-/ {print "  netdev " $1}'
+
+s workload "(declaration: $CONF)"
+WLIFS=$([ -f "$CONF" ] && awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && $1=="ifname"{gsub(/"/,"",$3); print $3}' "$CONF")
+if [ -z "$WLIFS" ]; then
+  echo "  no [[workload]] rows in $CONF"
+fi
+for ifn in $WLIFS; do
+  echo "  -- $ifn"
+  if ! ip link show "$ifn" >/dev/null 2>&1; then
+    echo "    MISSING (precondition unmet: the interface must exist before apply)"
+    continue
+  fi
+  ip -d -br link show dev "$ifn" 2>&1 | sed 's/^/    /'
+  ip -4 -br addr show dev "$ifn" 2>&1 | sed 's/^/    /'
+  if [ -f /proc/net/vlan/"$ifn" ]; then
+    awk '/^Device:|VID:/{print "    " $0}' /proc/net/vlan/"$ifn"
+  else
+    echo "    /proc/net/vlan/$ifn absent (not an 802.1q sub-interface, or 8021q not loaded)"
+  fi
+  low=$(ls -d /sys/class/net/"$ifn"/lower_* 2>/dev/null | sed 's|.*/lower_||')
+  echo "    lower: ${low:-none}"
+  if [ -n "$low" ] && [ -d /sys/class/net/"$low"/bridge ]; then
+    echo "    bridge $low: stp=$(cat /sys/class/net/"$low"/bridge/stp_state 2>/dev/null) forward_delay=$(cat /sys/class/net/"$low"/bridge/forward_delay 2>/dev/null)"
+    for p in /sys/class/net/"$low"/brif/*; do
+      [ -e "$p" ] || continue
+      p=${p##*/}
+      dev=no; [ -e /sys/class/net/"$p"/device ] && dev=yes
+      plow=$(ls -d /sys/class/net/"$p"/lower_* 2>/dev/null | sed 's|.*/lower_||' | tr '\n' ' ')
+      # state 3 = forwarding (the port passes traffic); anything else blocks it.
+      echo "    port $p state=$(cat /sys/class/net/"$low"/brif/"$p"/state 2>/dev/null) device=$dev lowers=${plow:-none}"
+    done
+    have bridge && bridge -c=never vlan show dev "$low" 2>&1 | sed 's/^/    /'
+  fi
+done
+echo "  net.ipv4.conf.all.arp_ignore = $(sysctl -n net.ipv4.conf.all.arp_ignore 2>/dev/null || echo absent)"
+BRTABLES=$(have nft && nft list tables 2>/dev/null | grep -E '^table bridge')
+if [ -n "$BRTABLES" ]; then echo "$BRTABLES" | sed 's/^/  /'; else echo "  no bridge nft tables"; fi
