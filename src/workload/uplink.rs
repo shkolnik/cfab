@@ -61,27 +61,33 @@ fn parse_vid(text: &str) -> Option<u16> {
 /// port, or a workload interface that is not itself an 802.1Q sub-interface.
 pub fn identify(sys: &dyn Sys, ifname: &str) -> Result<Uplink, String> {
     let lowers = lower_of(sys, ifname);
-    let [bridge] = lowers.as_slice() else {
-        return Err(format!(
-            "workload interface {ifname} is not a VLAN sub-interface of a bridge (no lower link in /sys/class/net/{ifname})"
-        ));
+    let bridge = match lowers.as_slice() {
+        [] => {
+            return Err(format!(
+                "workload interface {ifname} is not a VLAN sub-interface of a bridge (no lower link in /sys/class/net/{ifname})"
+            ));
+        }
+        [bridge] => bridge.clone(),
+        many => {
+            return Err(format!(
+                "{} lower links in /sys/class/net/{ifname}; expected exactly one",
+                many.len()
+            ));
+        }
     };
-    let bridge = bridge.clone();
 
-    let is_bridge = !sys
+    let brif = sys
         .list_dir(&format!("/sys/class/net/{bridge}/brif/"))
-        .unwrap_or_default()
-        .is_empty()
-        || sys.exists(&format!("/sys/class/net/{bridge}/bridge/stp_state"));
+        .unwrap_or_default();
+    let is_bridge =
+        !brif.is_empty() || sys.exists(&format!("/sys/class/net/{bridge}/bridge/stp_state"));
     if !is_bridge {
         return Err(format!(
             "workload interface {ifname} sits on {bridge}, which is not a bridge (phase 1 needs a bridge port for the VMs)"
         ));
     }
 
-    let ports = sys
-        .list_dir(&format!("/sys/class/net/{bridge}/brif/"))
-        .unwrap_or_default();
+    let ports = brif;
     let uplink_ports: Vec<String> = ports
         .iter()
         .filter(|p| is_uplink_port(sys, p, 0))
@@ -121,20 +127,31 @@ pub fn stp_forwarding(sys: &dyn Sys, bridge: &str, port: &str) -> Result<bool, S
 
 /// The ifindexes of every port on `up`'s bridge that is NOT one of its uplink ports (the VM taps
 /// and any other non-uplink ports) — the set the announcer scans, excluding the uplink itself. A
-/// port whose ifindex cannot be read is skipped rather than failing the whole set: an
-/// unreadable ifindex on one port is that port's problem, not a reason to blind the announcer to
-/// every other tap.
-pub fn non_uplink_ifindexes(sys: &dyn Sys, up: &Uplink) -> BTreeSet<u32> {
-    sys.list_dir(&format!("/sys/class/net/{}/brif/", up.bridge))
+/// port that no longer has an `ifindex` file at all has vanished mid-scan (the tap was torn
+/// down) and is skipped, not an error; a port whose `ifindex` file exists but cannot be read or
+/// does not parse is a fault worth naming (something is wrong with that specific netdev, not
+/// "it went away"), so it fails the whole scan rather than silently under-reporting the set.
+pub fn non_uplink_ifindexes(sys: &dyn Sys, up: &Uplink) -> Result<BTreeSet<u32>, String> {
+    let mut out = BTreeSet::new();
+    for port in sys
+        .list_dir(&format!("/sys/class/net/{}/brif/", up.bridge))
         .unwrap_or_default()
-        .into_iter()
-        .filter(|p| !up.ports.contains(p))
-        .filter_map(|p| {
-            sys.read(&format!("/sys/class/net/{p}/ifindex"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-        })
-        .collect()
+    {
+        if up.ports.contains(&port) {
+            continue;
+        }
+        let path = format!("/sys/class/net/{port}/ifindex");
+        if !sys.exists(&path) {
+            continue;
+        }
+        let ifindex = sys
+            .read(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("port {port}: cannot read ifindex from {path}"))?;
+        out.insert(ifindex);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -175,8 +192,40 @@ mod tests {
             }
         );
         assert_eq!(
-            non_uplink_ifindexes(&pve1(), &up),
+            non_uplink_ifindexes(&pve1(), &up).unwrap(),
             [10, 11, 12].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn a_port_that_vanished_mid_scan_is_skipped() {
+        let sys = MockSys::default()
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .file("/sys/class/net/primary/brif/goner/state", "3\n");
+        // "goner" is a bridge port with no /sys/class/net/goner/ifindex at all: it was torn
+        // down between the brif/ listing and the ifindex read.
+        let up = Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        assert_eq!(non_uplink_ifindexes(&sys, &up).unwrap(), BTreeSet::new());
+    }
+
+    #[test]
+    fn unparseable_ifindex_content_is_a_named_error() {
+        let sys = MockSys::default()
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .file("/sys/class/net/tap100i0/ifindex", "not-a-number\n");
+        let up = Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        assert_eq!(
+            non_uplink_ifindexes(&sys, &up).unwrap_err(),
+            "port tap100i0: cannot read ifindex from /sys/class/net/tap100i0/ifindex"
         );
     }
 
@@ -243,6 +292,17 @@ mod tests {
         assert_eq!(
             identify(&no_vid, "primary.3").unwrap_err(),
             "workload interface primary.3 is not an 802.1Q sub-interface (no /proc/net/vlan/primary.3)"
+        );
+    }
+
+    #[test]
+    fn two_lower_links_is_its_own_refusal_naming_the_count() {
+        let two_lowers = MockSys::default()
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .link("/sys/class/net/primary.3/lower_other", "../../other");
+        assert_eq!(
+            identify(&two_lowers, "primary.3").unwrap_err(),
+            "2 lower links in /sys/class/net/primary.3; expected exactly one"
         );
     }
 

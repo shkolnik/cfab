@@ -17,7 +17,7 @@ use crate::workload::uplink::Uplink;
 /// idempotent apply idiom used by every other emitted table (see `mark.rs::generate`): the first
 /// `table` statement makes `delete` a no-op on first apply instead of an error, and `delete`
 /// clears whatever a previous generation left before this one is defined.
-pub fn bridge_table(guards: &[(String, Uplink)]) -> String {
+pub fn bridge_table(guards: &[(std::net::Ipv4Addr, Uplink)]) -> String {
     let mut out = String::new();
     out.push_str("table bridge cfab\n");
     out.push_str("delete table bridge cfab\n");
@@ -46,14 +46,14 @@ mod bridge_guard_tests {
     use super::*;
 
     #[test]
-    fn the_bridge_table_drops_arp_for_gw_from_and_to_the_uplink_at_filter_priority() {
+    fn the_bridge_table_drops_arp_for_gw_arriving_on_the_uplink_at_filter_priority() {
         let up = Uplink {
             bridge: "primary".into(),
             vid: 3,
             ports: vec!["eth0".into()],
         };
         assert_eq!(
-            bridge_table(&[("192.168.20.254".into(), up)]),
+            bridge_table(&[("192.168.20.254".parse().unwrap(), up)]),
             "\
 table bridge cfab
 delete table bridge cfab
@@ -75,7 +75,7 @@ table bridge cfab {
             vid: 3,
             ports: vec!["eth0".into(), "eth1".into()],
         };
-        let out = bridge_table(&[("192.168.20.254".into(), up)]);
+        let out = bridge_table(&[("192.168.20.254".parse().unwrap(), up)]);
         assert_eq!(out.matches("counter drop").count(), 4);
         assert_eq!(out.matches("iifname \"eth0\"").count(), 2);
         assert_eq!(out.matches("iifname \"eth1\"").count(), 2);
