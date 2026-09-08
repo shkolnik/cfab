@@ -22,6 +22,10 @@ pub struct Components {
     /// construction: one leg reader, one set of conditions, one spelling each.
     #[serde(default)]
     pub fallback: Vec<ProbedLeg>,
+    /// Why the metrics endpoint is not listening, if it is not. `None` is the normal case —
+    /// bound, or never asked for. `#[serde(default)]` so an older supervisor's document parses.
+    #[serde(default)]
+    pub metrics_error: Option<String>,
 }
 
 /// What the prober knows about one zone's leg: where the bond sits, and whether the far end —

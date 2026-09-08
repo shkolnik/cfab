@@ -121,6 +121,9 @@ pub(crate) struct Shared {
     /// The port the prober holds each bond's `primary` on. Read by the forwarding watchdog,
     /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
+    /// Why the metrics endpoint is not listening, if it is not: the bind errno, for as long as
+    /// the bind keeps failing. `cfab status` prints it as a standing line.
+    metrics_error: Option<String>,
     /// Metrics gathers that failed since start. The endpoint keeps serving the previous
     /// snapshot, so this counter is the only place a failing gather is visible over time.
     metrics_collect_failures: u64,
@@ -145,6 +148,7 @@ impl Shared {
             wd_last_tick: None,
             probed: crate::prober::ProbeRows::default(),
             held: crate::prober::HeldPrimaries::default(),
+            metrics_error: None,
             metrics_collect_failures: 0,
         }
     }
@@ -204,6 +208,7 @@ impl Shared {
             },
             ingress: self.probed.ingress.clone(),
             fallback: self.probed.fallback.clone(),
+            metrics_error: self.metrics_error.clone(),
         }
     }
 
@@ -266,6 +271,9 @@ pub(crate) struct Hooks {
     /// The channel the refreshed snapshot is published on. Production makes its own; a test
     /// passes one in so it can read what the endpoint would serve without scraping it.
     pub metrics_watch: Option<tokio::sync::watch::Sender<Arc<str>>>,
+    /// How often a failed metrics bind is retried. Production is `metrics::BIND_RETRY`; a test
+    /// shrinks it so the retry is exercised without a real minute.
+    pub metrics_bind_retry: Duration,
     pub shared: Option<Arc<Mutex<Shared>>>,
     /// A test recorder the stop sequence appends its signal/wait/kill markers to, in order, so
     /// a test can assert the stop ordering (spec §13) against a single merged trace shared with
@@ -290,6 +298,7 @@ impl Hooks {
             serve_metrics: true,
             metrics_port: metrics::PORT,
             metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: None,
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
@@ -632,7 +641,11 @@ pub(crate) async fn run_with(
                 tokio::spawn(metrics::serve(l, metrics_rx));
             }
             Err(e) => {
+                // Never fatal (spec §3.1): one warning, a standing `status` line for as long as
+                // it lasts, and a retry every `metrics_bind_retry`. The fabric is unaffected.
                 tracing::warn!(port = hooks.metrics_port, %e, "metrics endpoint not listening");
+                trace_mark(&trace, format!("metrics bind failed: {e}"));
+                shared.lock().unwrap().metrics_error = Some(e.to_string());
             }
         }
     }
@@ -677,6 +690,12 @@ pub(crate) async fn run_with(
         tokio::time::interval_at(tokio::time::Instant::now() + PROBE_INTERVAL, PROBE_INTERVAL);
     // The metrics snapshot. Same cadence and same thread as the watchdog tick: one gather, on
     // the main thread, whether or not anybody is scraping.
+    // The bind retry. It only does anything while the bind is failing, so a bound endpoint pays
+    // one lock check a minute.
+    let mut metrics_retry = tokio::time::interval_at(
+        tokio::time::Instant::now() + hooks.metrics_bind_retry,
+        hooks.metrics_bind_retry,
+    );
     let mut metrics_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + metrics::REFRESH,
         metrics::REFRESH,
@@ -805,6 +824,13 @@ pub(crate) async fn run_with(
             // gather is read-only and bounded, and it must not pin the runtime thread.
             _ = metrics_tick.tick() => {
                 refresh_snapshot(sys, view, &shared, &metrics_tx);
+            }
+            _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
+                if let Ok(l) = metrics::bind(hooks.metrics_port) {
+                    tokio::spawn(metrics::serve(l, metrics_tx.subscribe()));
+                    shared.lock().unwrap().metrics_error = None;
+                    tracing::info!(port = hooks.metrics_port, "metrics endpoint listening");
+                }
             }
             _ = feed => {
                 let (apply, engine_state) = {
@@ -1655,6 +1681,7 @@ mod tests {
             serve_metrics: false,
             metrics_port: metrics::PORT,
             metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared),
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
@@ -1692,6 +1719,7 @@ mod tests {
                 serve_metrics: false,
                 metrics_port: metrics::PORT,
                 metrics_watch: None,
+                metrics_bind_retry: metrics::BIND_RETRY,
                 shared: None,
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
@@ -1760,6 +1788,82 @@ mod tests {
         assert_eq!(comp("shape-daemon").state, child::State::Stopped);
         assert_eq!(comp("conf-sync").state, child::State::Stopped);
         assert_eq!(comp("conf-sync").why.as_deref(), Some("not clustered"));
+    }
+
+    /// Spec §3.1: a metrics port somebody else holds is a warning, a standing `status` line and
+    /// a retry — never fatal. The fabric comes up regardless, and the endpoint takes the port
+    /// over as soon as it is free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_metrics_port_warns_and_is_retried_until_it_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        // Hold the exact address the supervisor will ask for — wildcard against wildcard, so the
+        // conflict is a real EADDRINUSE and not a SO_REUSEADDR nicety.
+        let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let held = sh.lock().unwrap().metrics_error.clone();
+            let engine = sh.lock().unwrap().child("engine").state;
+            drop(holder);
+            // The retry is 100 ms in this run; give it twenty tries before failing.
+            let mut freed = None;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                freed = sh.lock().unwrap().metrics_error.clone();
+                if freed.is_none() {
+                    break;
+                }
+            }
+            driver_tx.send(Cmd::Terminate).ok();
+            (held, engine, freed)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.serve_metrics = true;
+        hooks.metrics_port = port;
+        hooks.metrics_bind_retry = Duration::from_millis(100);
+        hooks.trace = Some(trace.clone());
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        let (held, engine, freed) = driver.await.unwrap();
+        assert_eq!(code, 0, "a metrics bind failure is never fatal");
+        assert_eq!(
+            engine,
+            child::State::Running,
+            "the fabric comes up whatever the endpoint does"
+        );
+        let held = held.expect("a held port must be recorded as the reason status prints");
+        assert!(held.contains("in use"), "{held}");
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("metrics bind failed:")),
+            "the failure must be said once, loudly: {:?}",
+            trace.lock().unwrap()
+        );
+        assert_eq!(freed, None, "the retry must take the freed port over");
     }
 
     /// Spec §3.2: the endpoint never serves an empty body. One gather runs as soon as the
@@ -1847,6 +1951,7 @@ mod tests {
                 serve_metrics: false,
                 metrics_port: metrics::PORT,
                 metrics_watch: None,
+                metrics_bind_retry: metrics::BIND_RETRY,
                 shared: None,
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
@@ -2840,6 +2945,7 @@ mod tests {
             serve_metrics: false,
             metrics_port: metrics::PORT,
             metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared),
             trace: Some(calls.clone()),
             stop_grace: grace,
@@ -2973,6 +3079,7 @@ mod tests {
             serve_metrics: false,
             metrics_port: metrics::PORT,
             metrics_watch: None,
+            metrics_bind_retry: metrics::BIND_RETRY,
             shared: Some(shared.clone()),
             trace: None,
             stop_grace: CHILD_STOP_GRACE,

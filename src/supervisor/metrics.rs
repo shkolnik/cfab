@@ -816,6 +816,10 @@ const MAX_INFLIGHT: usize = 16;
 /// own default scrape interval, so a scrape is never more than one gather stale.
 pub(crate) const REFRESH: Duration = Duration::from_secs(15);
 
+/// How often a failed bind is retried. Rule (spec §3.1): a bind failure is never fatal, and a
+/// minute is soon enough to take the port over once whatever held it goes away.
+pub(crate) const BIND_RETRY: Duration = Duration::from_secs(60);
+
 /// The listening socket, on every address. Bound blocking and handed to tokio, so a failure is
 /// an `io::Error` the caller can report rather than a panic inside a task.
 pub(crate) fn bind(port: u16) -> std::io::Result<TcpListener> {
@@ -959,6 +963,7 @@ mod tests {
             },
             ingress: Vec::new(),
             fallback: Vec::new(),
+            metrics_error: None,
         }
     }
 

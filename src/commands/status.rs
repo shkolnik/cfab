@@ -202,6 +202,15 @@ fn gather_with(
     } else {
         None
     };
+    // The supervisor cannot print its own warning where an operator will see it, so the one
+    // place a failed metrics bind is visible without the journal is here. Standing: no amount of
+    // waiting clears a port somebody else is holding.
+    if let Some(e) = components.as_ref().and_then(|k| k.metrics_error.as_ref()) {
+        c.standing(format!(
+            "metrics endpoint not listening on :{} ({e})",
+            crate::supervisor::metrics::PORT
+        ));
+    }
     let conditions = c.conditions();
     Ok(StatusModel {
         member: MemberInfo {
@@ -5612,6 +5621,49 @@ mod tests {
     }
 
     // ---- Task 11: the components block and the reworded rows (spec §9) ------------------
+
+    /// The supervisor's metrics endpoint failing to bind is a standing reason line — no amount
+    /// of waiting frees a port somebody else holds — and it is the only place an operator sees
+    /// it without the journal. One spelling, from `metrics::PORT`.
+    #[test]
+    fn a_failed_metrics_bind_is_a_standing_reason_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&healthy_components(&view)).unwrap();
+        doc["metrics_error"] = serde_json::json!("Address already in use (os error 98)");
+        let mut sys = healthy_host(&f, &view).socket("/run/cfab/cfab.sock", &doc.to_string());
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let line = format!(
+            "metrics endpoint not listening on :{} (Address already in use (os error 98))",
+            crate::supervisor::metrics::PORT
+        );
+        let found = m
+            .conditions
+            .iter()
+            .find(|c| c.text == line)
+            .unwrap_or_else(|| panic!("no metrics line in {:?}", m.conditions));
+        assert_eq!(
+            found.class,
+            Class::Standing,
+            "a held port is not something waiting clears"
+        );
+        assert!(
+            render_text(&m, false, true)
+                .output
+                .contains(&format!("  {line}\n")),
+            "{}",
+            render_text(&m, false, true).output
+        );
+        // The healthy fixture carries no error: the line is not printed unconditionally.
+        let mut clean = healthy_host(&f, &view);
+        let m2 = gather(&mut clean, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            m2.conditions
+                .iter()
+                .all(|c| !c.text.starts_with("metrics "))
+        );
+    }
 
     /// A `components:` line is always printed, and last — after every reason line.
     #[test]
