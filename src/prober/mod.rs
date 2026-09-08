@@ -163,23 +163,14 @@ struct ProbePort {
     /// opens again, so a tap that fails, recovers and fails again is said twice — and one that
     /// has been failing the same way for an hour is said once.
     deaf: Option<String>,
-    /// This port's usability (F25: `reachable() && !hello_dead && carrier && link_up`, the same
-    /// test `decide::Candidate::usable` runs) as of the last tick it was checked, or `None`
-    /// before the first check. Not the log-worthy fact itself — `returned` is — just what the
+    /// This port's `Candidate::usable()` as of the last tick it was checked, or `None` before
+    /// the first check. Not the log-worthy fact itself — `returned` is — just what the
     /// transition is measured against.
     usable_prev: Option<bool>,
     /// F25: this port went unusable-then-usable since it was last the active port (or since the
     /// leg started, if it has never been active) — a REAL return, distinct from a preference
-    /// move where the target was usable the whole time and only the bond's home ranking says it
-    /// belongs there. Set on the false→true transition of usability; cleared the moment this
-    /// port becomes the active target, which restarts the "since it was last active" window.
-    ///
-    /// The very first tick a port is ever checked sets `usable_prev` but does not itself set
-    /// `returned` (there is no prior tick to have transitioned from). So a port usable from the
-    /// first observation and chosen over a less-preferred active port is a preference move
-    /// (never sets `returned`); a port unusable on its first observation and usable on its
-    /// second IS a return — the wire came up — because that second tick is a genuine
-    /// false→true transition relative to the first.
+    /// move where the target was usable the whole time. Set on the false→true transition of
+    /// usability; cleared whenever this port is the active port, which restarts the window.
     returned: bool,
 }
 
@@ -216,16 +207,23 @@ impl ProbePort {
         }
     }
 
-    /// The same test `decide::Candidate::usable` runs, from the fields the prober keeps rather
-    /// than the `Candidate` the decision borrows for a tick.
-    fn usable(&self) -> bool {
-        self.state.reachable() && !self.hello_dead && self.carrier && self.bond_link_up
+    /// The `Candidate` `decide` would see for this port right now, built from the fields the
+    /// prober keeps. The one place that spells out of these fields what a `Candidate` is, so
+    /// `actuate`'s `cands` and `note_usability`'s usability test cannot drift apart.
+    fn candidate(&self) -> Candidate {
+        Candidate {
+            ifname: self.ifname.clone(),
+            wire: self.wire.clone(),
+            reachable: self.state.reachable() && !self.hello_dead,
+            carrier: self.carrier,
+            link_up: self.bond_link_up,
+        }
     }
 
     /// Fold this tick's usability into `returned` (F25). Called once per port per tick, after
     /// every field the usability test reads has this tick's value.
     fn note_usability(&mut self) {
-        let cur = self.usable();
+        let cur = self.candidate().usable();
         if self.usable_prev == Some(false) && cur {
             self.returned = true;
         }
@@ -656,11 +654,6 @@ impl Leg {
                             newly_deaf.push((s.wire.clone(), why.clone()));
                             s.deaf = Some(why);
                         }
-                        // A deaf tap does not touch reachability or hello_dead this tick, but
-                        // carrier/link_up were already refreshed above, so usability can still
-                        // have changed (F25) and must still be folded in before skipping the
-                        // rest of this port's tick.
-                        s.note_usability();
                         continue;
                     }
                     Ok(()) => s.deaf = None,
@@ -736,12 +729,16 @@ impl Leg {
                     }
                 }
             }
-            s.note_usability();
         }
         let zone = self.zone.clone();
         let bond = self.bond.clone();
         let total = deaf > 0 && deaf == self.ports.len();
         let Kind::Fallback(f) = &mut self.kind else {
+            // Ingress ports never set `hello_dead`, so usability is already final for every
+            // port the moment the loop above ends — fold it in here (F25) before returning.
+            for s in &mut self.ports {
+                s.note_usability();
+            }
             return;
         };
         for (wire, why) in newly_deaf {
@@ -758,6 +755,11 @@ impl Leg {
         }
         f.noted_deaf = total;
         if total {
+            // No listen succeeded, so the condemn block below never runs and `hello_dead` is
+            // final for this tick already — fold usability in here (F25) before returning.
+            for s in &mut self.ports {
+                s.note_usability();
+            }
             return;
         }
         let evidence: Vec<Evidence> = self.ports.iter().map(|s| s.evidence(active)).collect();
@@ -848,6 +850,12 @@ impl Leg {
         } else if !all_quiet {
             f.noted_quiet = false;
         }
+        // F25: fold usability in last, after the condemn block above has set this tick's final
+        // `hello_dead` — a wire condemned and revived by a hello in the same tick must see a
+        // real false→true transition, not a stale `true` recorded before condemnation ran.
+        for s in &mut self.ports {
+            s.note_usability();
+        }
     }
 
     /// Ask, where asking is warranted: every port of an ingress leg, and only an escalating
@@ -926,17 +934,15 @@ impl Leg {
         let noun = self.kind.noun();
         let base = format!("/sys/class/net/{}/bonding", self.bond);
         let active = active.filter(|a| !a.is_empty());
-        let cands: Vec<Candidate> = self
-            .ports
-            .iter()
-            .map(|s| Candidate {
-                ifname: s.ifname.clone(),
-                wire: s.wire.clone(),
-                reachable: s.state.reachable() && !s.hello_dead,
-                carrier: s.carrier,
-                link_up: s.bond_link_up,
-            })
-            .collect();
+        // F25: whichever port the kernel currently holds active has its return window restarted
+        // on every tick it holds it — being active is what resets `returned`, not merely the
+        // tick a move onto it is chosen.
+        if let Some(a) = active
+            && let Some(s) = self.ports.iter_mut().find(|s| s.ifname == a)
+        {
+            s.returned = false;
+        }
+        let cands: Vec<Candidate> = self.ports.iter().map(ProbePort::candidate).collect();
         let Some(target) = decide(active, &cands, &self.prefs) else {
             // Staying put. Say so once if the wire an operator would expect the leg on is out
             // of the running for a reason the bond cannot fix.
@@ -988,25 +994,22 @@ impl Leg {
         let from_carrier = from.map(|f| f.carrier);
         let from_reachable = from.map(|f| f.state.reachable());
         let from_hello_dead = from.is_some_and(|f| f.hello_dead);
-        // F25: read the target's `returned` fact — did it go unusable then usable since it was
-        // last active? — BEFORE clearing it below. It, not anything about `from`, is what tells
-        // a real return (the wire came back) from a preference move (the target was usable the
-        // whole time and only outranks the wire the bond happened to be on).
-        let target_returned = self
-            .ports
-            .iter()
-            .find(|s| s.ifname == target)
-            .is_some_and(|s| s.returned);
         // The port that has just been promoted gets its grace period here: it was chosen after
         // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
-        // interval. Without it a two-port ping-pong could move once per tick. Its `returned`
-        // flag is cleared here too: becoming the active port restarts the "since it was last
-        // active" window the next return is measured against.
+        // interval. Without it a two-port ping-pong could move once per tick. Reads `returned`
+        // in the same lookup, BEFORE the write below: it, not anything about `from`, is what
+        // tells a real return (the wire came back) from a preference move (the target was
+        // usable the whole time and only outranks the wire the bond happened to be on).
         let grace = grace_of(&self.kind);
-        if let Some(s) = self.ports.iter_mut().find(|s| s.ifname == target) {
-            s.grace_until = Some(now + grace);
-            s.returned = false;
-        }
+        let target_returned = self
+            .ports
+            .iter_mut()
+            .find(|s| s.ifname == target)
+            .map(|s| {
+                s.grace_until = Some(now + grace);
+                s.returned
+            })
+            .unwrap_or(false);
         match (from_wire, from_carrier, from_reachable, from_hello_dead) {
             // Carrier is tested FIRST, and not only because it is the actionable end of a wire
             // that has both faults: the carrier fast path moves the bond while the hysteresis
@@ -1676,6 +1679,57 @@ mod tests {
             !log.iter()
                 .any(|l| l.contains("again") || l.contains("back from")),
             "the 'again … back from' sentence claims the wire came back; it never went away: {log:?}"
+        );
+    }
+
+    /// F25: `returned` must not survive past the tick the port it belongs to stops being the
+    /// active one and never comes back false on its own. A real return sets it once (moving
+    /// home is worded "again"); if nothing ever clears it, a LATER move onto the same wire —
+    /// one where it was usable the whole intervening time — is still worded as if it had just
+    /// come back, which is false.
+    #[test]
+    fn a_later_move_onto_a_wire_that_never_left_is_a_preference_move_not_a_stale_return() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Home starts down; the bond sits on backup.
+        let mut sys = bonding(BACKUP).file(&format!("/sys/class/net/{HOME}/carrier"), "0\n");
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        run_ticks(&mut p, &mut sys, &mut io, 3);
+
+        // Home comes back: a real return, worded "again".
+        sys = sys.file(&format!("/sys/class/net/{HOME}/carrier"), "1\n");
+        run_ticks(&mut p, &mut sys, &mut io, 1);
+        let log = p.drain_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("reachable on eth0 again") && l.contains("back from eth9")),
+            "the setup return: {log:?}"
+        );
+
+        // Home stays usable and active for a while — nothing else changes.
+        run_ticks(&mut p, &mut sys, &mut io, 5);
+        p.drain_log();
+
+        // Something else moves the bond off home without home ever going unusable (an operator,
+        // or the kernel's own reselect on an event the prober does not itself observe as a
+        // fault) — simulated here as the fixture simply reporting a different active port.
+        sys.files.insert(
+            format!("/sys/class/net/{BOND}/bonding/active_slave"),
+            BACKUP.to_string(),
+        );
+        run_ticks(&mut p, &mut sys, &mut io, 1);
+        let log = p.drain_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("eth0 is preferred") && l.contains("from eth9")),
+            "F25: home was usable the whole time since its earlier return — this move is a \
+             preference move, not the same return said twice: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("again") || l.contains("back from")),
+            "a stale `returned` would word this move as the return that already happened: {log:?}"
         );
     }
 
@@ -2395,6 +2449,69 @@ mod tests {
                 == "cfab: storage fallback: peers silent on eth9 (adjacency down, arp still \
                     answers), moved cfab-st-fb to eth1"),
             "and it says why this move is not the ARP one: {log:?}"
+        );
+    }
+
+    /// F25 ordering: `hello_dead` is set by the condemn block, which runs AFTER the per-port
+    /// observe loop `note_usability` used to run inside. On the tick the home wire is condemned,
+    /// usability must already reflect that condemnation — not a stale reading from before it —
+    /// or a hello arriving the very next tick sees no false→true transition and the move home
+    /// is wrongly worded as a preference move instead of the real return it is.
+    #[test]
+    fn a_wire_revived_by_a_hello_the_tick_after_condemnation_is_worded_as_a_return() {
+        let f = fabric();
+        let mut p = fb_prober(&f, "pve1-tb");
+        let mut sys = fb_bonding_with_engine(FB_A, &[(2, "down"), (3, "down")]);
+        let mut io = ScriptedIo::answering_on("10.99.9.2", &[FB_A]);
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        fb_steady(&mut p, &mut sys, &mut io, t0);
+        p.drain_log();
+
+        // OSPF is dropped on eth9 (home) only; the siblings keep hearing the peers, and the
+        // engine confirms the adjacency is down — the same condemnation as the sibling test.
+        // Ticked one at a time so the revival below can land on the tick RIGHT AFTER `hello_dead`
+        // is first set, which is where a stale `usable_prev` (recorded before the condemn block
+        // ran) would hide the ordering bug: every later tick's `usable_prev` is already correct,
+        // because `hello_dead` persists true across ticks once set.
+        let mut condemned_at = None;
+        for tick in 4..14u64 {
+            for s in [FB_B, FB_C] {
+                hear(&mut io, s, &[hello(2), hello(3)]);
+            }
+            fb_tick(&mut p, &mut sys, &mut io, at(tick * 500));
+            if condemned_at.is_none()
+                && sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")) == Some(FB_B)
+            {
+                condemned_at = Some(tick);
+                break;
+            }
+        }
+        let condemned_at = condemned_at.expect("the leg condemns the home wire within 10 ticks");
+        p.drain_log();
+
+        // The very next tick, a peer's hello arrives on the home wire again — the real event
+        // that un-condemns it (F27's own rule: only a hello clears `hello_dead`).
+        hear(&mut io, FB_A, &[hello(2)]);
+        for s in [FB_B, FB_C] {
+            hear(&mut io, s, &[hello(2), hello(3)]);
+        }
+        fb_tick(&mut p, &mut sys, &mut io, at((condemned_at + 1) * 500));
+        assert_eq!(
+            sys.writes_to(&format!("/sys/class/net/{FB}/bonding/active_slave")),
+            Some(FB_A),
+            "home is preferred and usable again, so the bond moves back to it"
+        );
+        let log = p.drain_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("peers reachable on eth9 again") && l.contains("back from")),
+            "F25: eth9 was condemned (unusable) last tick and is usable this tick — a real \
+             return, not a preference move: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("is preferred")),
+            "the ordering bug words this a preference move instead: {log:?}"
         );
     }
 

@@ -110,7 +110,7 @@ impl Candidate {
     /// Can ingress sit here? All three are necessary: the router must answer, the port must
     /// have carrier, and the bonding driver must have finished bringing it up — the kernel
     /// refuses the write if either physical half is missing.
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.reachable && self.carrier && self.link_up
     }
 }
