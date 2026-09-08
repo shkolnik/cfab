@@ -36,36 +36,12 @@ const POLL_SECS: u64 = 2;
 /// never. Chosen, not derived — the tick cadence is a supervisor constant, not a declaration.
 const WATCHDOG_STALE_SECS: u64 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Up,
-    /// Up, but some expected adjacency is down. One hyphenated token so it has one spelling and
-    /// the word UP stays visible on a degraded member.
-    UpDegraded,
-    Failed,
-    Down,
-}
+pub mod model;
 
-impl State {
-    pub fn word(self) -> &'static str {
-        match self {
-            State::Up => "UP",
-            State::UpDegraded => "UP-DEGRADED",
-            State::Failed => "FAILED",
-            State::Down => "DOWN",
-        }
-    }
-
-    /// Nagios-style: 0 ok, 1 warning, 2 critical, 3 unknown/not-desired.
-    pub fn code(self) -> u8 {
-        match self {
-            State::Up => 0,
-            State::UpDegraded => 1,
-            State::Failed => 2,
-            State::Down => 3,
-        }
-    }
-}
+pub use model::{
+    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
+    LegPort, MemberInfo, Reach, State, StatusModel,
+};
 
 pub struct StatusReport {
     pub state: State,
@@ -74,63 +50,18 @@ pub struct StatusReport {
     pub output: String,
 }
 
-/// The three fields of the headline, each `n/N`. All three are on the links axis; they are
-/// separate because a lost BFD session shows sub-second and a lost fallback neighbor only after
-/// the OSPF dead interval.
-#[derive(Default, Debug, PartialEq, Eq)]
-struct Counts {
-    peers_up: usize,
-    peers: usize,
-    links_up: usize,
-    links: usize,
-    fallbacks_up: usize,
-    fallbacks: usize,
-}
-
-impl Counts {
-    fn state(&self) -> State {
-        if self.links_up == 0 && self.fallbacks_up == 0 {
-            State::Failed
-        } else if self.links_up == self.links && self.fallbacks_up == self.fallbacks {
-            State::Up
-        } else {
-            State::UpDegraded
-        }
-    }
-
-    fn fields(&self) -> String {
-        format!(
-            "{}/{} | {}/{} | {}/{}",
-            self.peers_up, self.peers, self.links_up, self.links, self.fallbacks_up, self.fallbacks
-        )
-    }
-}
-
-/// What one reason line means for `--wait`, and the only thing the classification decides
-/// (F22, VERIFIED on the rack 2026-09-07: the headline goes UP seconds before the engine has
-/// installed the routes, and a wait that ends on the headline alone lets a deployment gate pass
-/// over a fabric that cannot carry anything yet).
-///
-/// Every emitter states its class at the call site — there is no default and no matching on the
-/// text of a line, so a new reason line cannot join either set by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
-    /// The fabric itself clears this one: an adjacency that is still forming, a route or an
-    /// address the engine has not installed yet, a child the supervisor is restarting, a
-    /// sysctl/rule/leg `up` and the watchdog own. Its presence means "not settled", so it holds
-    /// `--wait` open until the deadline.
-    Settling,
-    /// Waiting changes nothing: the line is a design-health note a settled fabric prints, a
-    /// counter, a drift against generated state, a foreign daemon, or a hardware fact. Holding
-    /// the wait on one would cost every `status --wait` its whole deadline, every time.
-    Standing,
-}
-
 /// Reason lines. Not verdicts: a posture condition either actuates (the links go down and the
 /// state follows) or lands here, where it never moves the state.
 #[derive(Default, Clone)]
 struct Ctx {
     reasons: Vec<(Class, String)>,
+    /// Every expected adjacency, up or down. The `down <zone>:<seg>:.<node>` lines are rendered
+    /// from these rows, never pushed as text.
+    adjacencies: Vec<Adjacency>,
+    /// One row per zone carrying a fallback bond.
+    fallbacks: Vec<BondLeg>,
+    /// One row per gw zone on a host.
+    ingress: Vec<Ingress>,
 }
 
 impl Ctx {
@@ -144,10 +75,45 @@ impl Ctx {
         self.reasons.push((Class::Standing, msg.into()));
     }
 
-    /// Is this fabric still settling? One settling line is enough: `--wait` exists for exactly
-    /// the window in which they are still there.
-    fn settling_now(&self) -> bool {
-        self.reasons.iter().any(|(k, _)| *k == Class::Settling)
+    /// One expected adjacency, with the line a down one earns pushed where the gather found
+    /// it. Rendered from the row, so the `down …` spelling has one source.
+    fn adjacency(&mut self, a: Adjacency) {
+        if !a.up {
+            // Settling: an adjacency that is still forming is the state `--wait` exists for.
+            self.settling(format!("down {}", a.label()));
+        }
+        self.adjacencies.push(a);
+    }
+
+    /// One zone's fallback leg, with the lines it earns.
+    fn fallback_leg(&mut self, leg: BondLeg) {
+        self.reasons.extend(leg_reasons(&leg));
+        self.fallbacks.push(leg);
+    }
+
+    /// The reasons so far, as the model carries them.
+    fn conditions(&self) -> Vec<Condition> {
+        self.reasons
+            .iter()
+            .map(|(class, text)| Condition {
+                class: *class,
+                text: text.clone(),
+            })
+            .collect()
+    }
+
+    /// One gw zone's ingress, with the lines it earns.
+    fn ingress(&mut self, row: Ingress) {
+        self.reasons.extend(ingress_reasons(&row));
+        self.ingress.push(row);
+    }
+}
+
+impl StatusModel {
+    /// Is this fabric still settling? One settling condition is enough: `--wait` exists for
+    /// exactly the window in which they are still there.
+    pub fn settling(&self) -> bool {
+        self.conditions.iter().any(|c| c.class == Class::Settling)
     }
 }
 
@@ -161,7 +127,6 @@ pub fn run(
     permissive: bool,
     declared: Option<&std::path::Path>,
 ) -> Result<StatusReport> {
-    let f = view.fabric;
     // Read once, before the `--wait` loop: the file on disk is not what the loop is waiting for.
     let mut base = Ctx::default();
     if let Some(cfg) = declared
@@ -173,53 +138,60 @@ pub fn run(
     let expected = expected_links(view)?;
     let mut t = 0u64;
     loop {
-        // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
-        // desired *right now* — which a restarting supervisor passes through, so this is
-        // re-read on every poll like every other input to the verdict.
-        let applied = sys.exists(&f.run_dir);
-        let mut c = base.clone();
-        let comps = applied.then(|| read_components(sys, f)).flatten();
-        let counts = if applied {
-            Some(read(sys, view, &expected, &mut c, comps.as_ref())?)
-        } else {
-            None
-        };
+        let m = gather(sys, view, &expected, &base)?;
         // The wait exists for the post-`up` settle, not as a verdict: only a settled UP ends it
         // early. Every other state — degraded, failed, not applied — and every UP that still
         // carries a settling reason line waits the full deadline and then reports what it
         // reached. The headline alone is not enough: it counts sessions, and a member's routes,
         // addresses and source pins arrive after the sessions do (F22).
-        let done = counts
-            .as_ref()
-            .is_some_and(|n| n.state() == State::Up && !c.settling_now())
-            || t >= wait_s;
-        if done {
-            return Ok(match counts {
-                Some(n) => finish(
-                    view,
-                    n.state(),
-                    n.fields(),
-                    &c,
-                    permissive,
-                    comps.as_ref(),
-                    true,
-                ),
-                // No fabric applied: there is nothing to describe and no supervisor to ask, so
-                // the always-printed components line is suppressed here alone.
-                None => finish(
-                    view,
-                    State::Down,
-                    "fabric not applied".to_string(),
-                    &c,
-                    permissive,
-                    None,
-                    false,
-                ),
-            });
+        if (m.state == State::Up && !m.settling()) || t >= wait_s {
+            // No fabric applied: there is nothing to describe and no supervisor to ask, so
+            // the always-printed components line is suppressed then alone.
+            let with_components = m.headline.is_some();
+            return Ok(render_text(&m, permissive, with_components));
         }
         t += POLL_SECS;
         sys.sleep(Duration::from_secs(POLL_SECS));
     }
+}
+
+/// One instant read of this member's fabric into the model both renderers consume. `base`
+/// carries the reasons that were read once, before the `--wait` loop.
+fn gather(
+    sys: &mut dyn Sys,
+    view: &View,
+    expected: &[ExpectedLink],
+    base: &Ctx,
+) -> Result<StatusModel> {
+    let f = view.fabric;
+    // Intent: `up` creates the run dir, `down` removes it whole. No run dir = up is not
+    // desired *right now* — which a restarting supervisor passes through, so this is
+    // re-read on every poll like every other input to the verdict.
+    let applied = sys.exists(&f.run_dir);
+    let mut c = base.clone();
+    let components = applied.then(|| read_components(sys, f)).flatten();
+    let headline = if applied {
+        Some(read(sys, view, expected, &mut c, components.as_ref())?)
+    } else {
+        None
+    };
+    let conditions = c.conditions();
+    Ok(StatusModel {
+        member: MemberInfo {
+            name: view.member.name.clone(),
+            kind: view.kind(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        state: headline.as_ref().map_or(State::Down, Headline::state),
+        headline,
+        adjacencies: c.adjacencies,
+        fallbacks: c.fallbacks,
+        ingress: c.ingress,
+        conditions,
+        components,
+        prefs: view.prefs(),
+        run_dir: f.run_dir.clone(),
+    })
 }
 
 /// The fabric the supervisor applied, if it is still on disk: `<run_dir>/fabric.toml.applied`,
@@ -318,26 +290,19 @@ fn engine_down_reason(f: &Fabric, comps: Option<&Components>) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish(
-    view: &View,
-    state: State,
-    fields: String,
-    c: &Ctx,
-    permissive: bool,
-    comps: Option<&Components>,
-    with_components: bool,
-) -> StatusReport {
-    let kind_s = match view.kind() {
-        MemberKind::Host => "host",
-        MemberKind::Leaf => "leaf",
+/// The prose renderer: the model in the words `cfab status` has always used.
+pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> StatusReport {
+    let fields = match &m.headline {
+        Some(h) => h.fields(),
+        None => "fabric not applied".to_string(),
     };
     let mut out = format!(
-        "{} ({fields}) on {} ({kind_s})\n",
-        state.word(),
-        view.member.name
+        "{} ({fields}) on {} ({})\n",
+        m.state.word(),
+        m.member.name,
+        m.member.kind_word()
     );
-    for r in once_each(&c.reasons) {
+    for r in once_each(&m.conditions) {
         // A TOML parse error arrives as several lines (message, then the caret snippet); its
         // continuation lines are indented one step further so the block still reads as one
         // reason under the headline.
@@ -348,12 +313,12 @@ fn finish(
     // This member's wire order per zone, with the derived/override marker: the one thing an
     // operator cannot infer from the interface names, and what every OSPF cost below comes
     // from. Same spelling as `cfab gen prefs`, minus the member column.
-    for p in view.prefs() {
+    for p in &m.prefs {
         let _ = writeln!(out, "  prefs {}", p.render());
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
-        match comps {
+        match &m.components {
             Some(cc) => {
                 let _ = writeln!(out, "  {}", render_line(cc));
             }
@@ -361,30 +326,39 @@ fn finish(
                 let _ = writeln!(
                     out,
                     "  components: no supervisor answering on {}/cfab.sock",
-                    view.fabric.run_dir
+                    m.run_dir
                 );
             }
         }
     }
-    let code = if permissive && matches!(state, State::Up | State::UpDegraded) {
+    let code = if permissive && matches!(m.state, State::Up | State::UpDegraded) {
         0
     } else {
-        state.code()
+        m.state.code()
     };
     StatusReport {
-        state,
+        state: m.state,
         code,
         output: out,
     }
 }
 
+/// One expected BFD session, as the declaration alone describes it.
+struct ExpectedLink {
+    node: u8,
+    name: String,
+    zone: String,
+    seg: u8,
+    addr: String,
+}
+
 /// One BFD session per (zone, segment) shared with each peer, keyed by the peer's segment
 /// address — exact for a heterogeneous membership and per session, so a dark segment is named,
 /// not just counted. The declaration is the denominator, and it is meant to ignore a cable pull.
-fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
+fn expected_links(view: &View) -> Result<Vec<ExpectedLink>> {
     let f = view.fabric;
     let host = &view.member.name;
-    let mut expected: Vec<(u8, String, u8, String)> = Vec::new();
+    let mut expected: Vec<ExpectedLink> = Vec::new();
     let ours = segments_of(f, view.member);
     for m in &f.members {
         if m.name == *host {
@@ -395,12 +369,13 @@ fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
             let (z, seg) = shared.split_once(':').expect("zone:seg");
             let zone = f.zone(z)?;
             let seg: u8 = seg.parse().expect("seg number");
-            expected.push((
-                m.node,
-                z.to_string(),
+            expected.push(ExpectedLink {
+                node: m.node,
+                name: m.name.clone(),
+                zone: z.to_string(),
                 seg,
-                format!("{}.{seg}.{}", zone.block(), m.node),
-            ));
+                addr: format!("{}.{seg}.{}", zone.block(), m.node),
+            });
         }
     }
     Ok(expected)
@@ -410,10 +385,10 @@ fn expected_links(view: &View) -> Result<Vec<(u8, String, u8, String)>> {
 fn read(
     sys: &mut dyn Sys,
     view: &View,
-    expected: &[(u8, String, u8, String)],
+    expected: &[ExpectedLink],
     c: &mut Ctx,
     comps: Option<&Components>,
-) -> Result<Counts> {
+) -> Result<Headline> {
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
     // below needs the engine. Diagnose that before reporting its symptoms.
@@ -433,7 +408,7 @@ fn read(
     shape_posture(sys, view, comps, c)?;
     link_speeds(sys, view, c, &absent)?;
 
-    let mut counts = Counts::default();
+    let mut counts = Headline::default();
     let mut peers: BTreeSet<u8> = BTreeSet::new();
     let mut peers_up: BTreeSet<u8> = BTreeSet::new();
 
@@ -453,16 +428,23 @@ fn read(
     // The BFD-up legs are the runtime half of the expectation rule below: which segment can
     // actually carry this peer's traffic right now, as opposed to which one we declared.
     let mut up_legs: BTreeSet<(u8, String, u8)> = BTreeSet::new();
-    for (p, z, seg, addr) in expected {
-        peers.insert(*p);
+    for e in expected {
+        peers.insert(e.node);
         counts.links += 1;
-        if up_addrs.contains(addr) {
+        let up = up_addrs.contains(&e.addr);
+        if up {
             counts.links_up += 1;
-            peers_up.insert(*p);
-            up_legs.insert((*p, z.clone(), *seg));
-        } else {
-            c.settling(format!("down {z}:{seg}:.{p}"));
+            peers_up.insert(e.node);
+            up_legs.insert((e.node, e.zone.clone(), e.seg));
         }
+        c.adjacency(Adjacency {
+            zone: e.zone.clone(),
+            seg: Some(e.seg),
+            peer_node: e.node,
+            peer_name: e.name.clone(),
+            peer_addr: Some(e.addr.clone()),
+            up,
+        });
     }
 
     // ---- fallbacks: one expected OSPF neighbor per peer carrying the zone's row ----
@@ -991,48 +973,244 @@ fn posture(
     Ok(())
 }
 
-/// One active-backup leg to grade. The two migrating legs cfab builds — a zone's universal
-/// segment and an ingress leg on gw scope `any` — are the SAME netdev shape built by the same
-/// builder, so they are read by the same code and every condition has one spelling. Only three
-/// things differ per caller, and all of them are here rather than in a branch: the `subject`
-/// each line opens with (`<zone> fallback` / `<zone> ingress`), the `noun` for what is on the
-/// far end (`peers` / `router`), and the `dark` line, because a leg with no live port means
-/// "the safety net is gone" on a fallback and "the outside cannot reach this zone" on the
-/// ingress.
-struct BondCheck<'a> {
-    subject: String,
-    /// What this leg's liveness is about, in every line that names it. One spelling per
-    /// condition: the two families' reason lines differ by this word and nothing else.
-    noun: &'a str,
+/// Where one leg is and what to call it: everything `read_bond_leg` needs that the sysfs reads
+/// cannot supply.
+struct LegSpec<'a> {
+    kind: LegKind,
+    zone: &'a str,
     ifname: &'a str,
-    ports: &'a [Port],
     home: &'a str,
-    dark: String,
-    /// What the prober says about the far end under this leg.
+    /// The gw router this leg reaches; `Some` only on an ingress leg.
+    router: Option<String>,
+    ports: &'a [Port],
     reach: Reach,
 }
 
-/// What the supervisor's prober says about the far end's liveness under one leg. Carrier cannot
-/// answer this — an island whose uplink is dead keeps carrier and keeps switching locally
-/// (finding F21) — so where the bond SITS and whether anything can be reached over the wire it
-/// sits on are two different facts, and `status` needs both to name a cause.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// No rows: no supervisor answering, a supervisor from before the prober, or a leg nothing
-    /// probes. Every line reads exactly as it did before the prober existed.
-    Unknown,
-    /// The far end is live over the home wire.
-    Home,
-    /// The home wire is silent and being asked, but nothing is confirmed yet. A suspicion is not
-    /// a verdict, which is the whole difference between this and `HomeDark`.
-    HomeSuspect,
-    /// The home wire is confirmed dead, but another wire is live — the migration the prober makes.
-    HomeDark,
-    /// No wire reaches the far end.
-    AllDark,
-    /// No wire of this leg has heard anything at all (spec §5 rule 2). Nothing was moved,
-    /// because there is nowhere to move to; only a fallback leg can be in this state.
-    Quiet,
+/// What one leg's `bonding/` sysfs says, as a row. The two migrating legs cfab builds — a
+/// zone's universal segment and an ingress leg on gw scope `any` — are the SAME netdev shape
+/// built by the same builder, so they are read by the same code and every condition has one
+/// spelling. Reads only: a leg that has migrated or lost a port is the watchdog's business to
+/// actuate on; here it is named.
+fn read_bond_leg(sys: &mut dyn Sys, absent: &BTreeSet<String>, spec: LegSpec<'_>) -> BondLeg {
+    let LegSpec {
+        kind,
+        zone,
+        ifname,
+        home,
+        router,
+        ports,
+        reach,
+    } = spec;
+    let ports: Vec<LegPort> = ports
+        .iter()
+        .map(|p| LegPort {
+            ifname: p.ifname.clone(),
+            wire: p.wire.clone(),
+            absent: absent.contains(&p.ifname),
+        })
+        .collect();
+    let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
+    let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
+    let bonding = match (mii, active) {
+        // Nothing under `bonding/` can be read, the port list included: the port checks below
+        // would only repeat what that says.
+        (Err(_), _) | (_, Err(_)) => None,
+        (Ok(mii), Ok(active)) => {
+            let mii = mii.trim().to_string();
+            let active = active.trim().to_string();
+            // Off the home wire is only a fault while the home wire still has carrier, so this
+            // file is read in exactly the branch that turns on it — and nowhere else, because
+            // it returns EINVAL on a down interface.
+            let off_home = ports
+                .iter()
+                .find(|p| p.ifname == active)
+                .is_some_and(|p| p.wire != home);
+            let home_carrier =
+                if mii == "up" && !matches!(reach, Reach::AllDark | Reach::Quiet) && off_home {
+                    match sys.read(&format!("/sys/class/net/{home}/carrier")) {
+                        Ok(v) => HomeCarrier::Value(v.trim().to_string()),
+                        Err(_) => HomeCarrier::Unreadable,
+                    }
+                } else {
+                    HomeCarrier::NotRead
+                };
+            let slaves = sys
+                .read(&format!("/sys/class/net/{ifname}/bonding/slaves"))
+                .map(|v| v.split_whitespace().map(str::to_string).collect())
+                .map_err(|e| e.to_string());
+            Some(Bonding {
+                mii_status: mii,
+                active_slave: active,
+                home_carrier,
+                slaves,
+            })
+        }
+    };
+    BondLeg {
+        kind,
+        zone: zone.to_string(),
+        ifname: ifname.to_string(),
+        home: home.to_string(),
+        router,
+        reach,
+        ports,
+        bonding,
+    }
+}
+
+/// What one leg row says, in words. Only three things differ between the two families, and all
+/// of them are here rather than in a branch: the `subject` each line opens with (`<zone>
+/// fallback` / `<zone> ingress`), the `noun` for what is on the far end (`peers` / `router`),
+/// and the `dark` line, because a leg with no live port means "the safety net is gone" on a
+/// fallback and "the outside cannot reach this zone" on the ingress.
+fn leg_reasons(leg: &BondLeg) -> Vec<(Class, String)> {
+    let mut out: Vec<(Class, String)> = Vec::new();
+    let ifname = &leg.ifname;
+    let home = &leg.home;
+    let zone = &leg.zone;
+    let subject = match leg.kind {
+        LegKind::Fallback => format!("{zone} fallback"),
+        LegKind::Ingress => format!("{zone} ingress"),
+    };
+    let noun = match leg.kind {
+        LegKind::Fallback => "peers",
+        LegKind::Ingress => "router",
+    };
+    // A leg with no live port IS the ingress being unreachable, and that already has a grade in
+    // `return_path_and_ingress`: keep its spelling, name the leg as the reason.
+    let dark = match leg.kind {
+        LegKind::Fallback => format!("{zone} fallback no carrier"),
+        LegKind::Ingress => format!(
+            "{zone} gw {} unreachable (ingress leg {ifname} has no live port)",
+            leg.router.as_deref().unwrap_or_default()
+        ),
+    };
+    let Some(b) = &leg.bonding else {
+        out.push((
+            Class::Settling,
+            format!(
+                "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
+                 — re-run cfab up"
+            ),
+        ));
+        return out;
+    };
+    let active = &b.active_slave;
+    if b.mii_status != "up" {
+        // A dark bond whose active port is a stranger is not the same fault as a dark bond, and
+        // "no carrier" would send an operator to the wrong end of the cable. The line says what
+        // was READ, not what the watchdog did with it: `status` cannot know whether an eviction
+        // was attempted (on a leaf the watchdog is not even scheduled), and a confident wrong
+        // diagnosis is worse than a plain one.
+        if !active.is_empty() && !leg.ports.iter().any(|s| s.ifname == *active) {
+            out.push((
+                Class::Settling,
+                format!("{subject} down with foreign port {active} active"),
+            ));
+        } else {
+            out.push((Class::Settling, dark));
+        }
+    } else if leg.reach == Reach::AllDark {
+        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
+        // the active port explains nothing an operator can act on, and the wire whose uplink to
+        // fix is every one of them.
+        out.push((
+            Class::Settling,
+            format!("{subject}: {noun} unreachable on every wire"),
+        ));
+    } else if leg.reach == Reach::Quiet {
+        // Nobody is heard anywhere, so no wire is to blame and the bond was left where it is.
+        // Settling: the fabric may simply be starting, and one line says it once.
+        out.push((
+            Class::Settling,
+            format!("{subject}: no {noun} heard on any wire"),
+        ));
+    } else {
+        match leg.active_wire() {
+            None => out.push((
+                Class::Settling,
+                format!(
+                    "{subject}: {ifname} is up with no port of ours active \
+                     (active_slave={active:?})"
+                ),
+            )),
+            Some(wire) if wire == home => {}
+            Some(wire) => match &b.home_carrier {
+                // Carrier and forwarding are not the same fact (finding F21). When the prober
+                // knows the home wire cannot reach the router, THAT is the cause and the
+                // carrier is a detail — the operator's next move is the uplink, not the bond.
+                // Standing, all four: the leg is up and carrying on a backup wire. That is the
+                // migration working, and it holds until the home wire's fault is fixed — a
+                // member that lives on one of these (a dead island uplink, a stuck reselect)
+                // would otherwise spend every deadline of every `status --wait` on it.
+                HomeCarrier::Value(s) if s == "1" && leg.reach == Reach::HomeDark => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home}: {noun} unreachable)"),
+                )),
+                // A suspicion, not a verdict: the home wire is silent and is being asked.
+                // Settling, because the next tick or two answers it either way.
+                HomeCarrier::Value(s) if s == "1" && leg.reach == Reach::HomeSuspect => out.push((
+                    Class::Settling,
+                    format!("{subject} via {wire} (home {home}: no {noun} heard)"),
+                )),
+                HomeCarrier::Value(s) if s == "1" => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home} has carrier)"),
+                )),
+                HomeCarrier::Value(_) => {
+                    out.push((Class::Standing, format!("{subject} via {wire}")))
+                }
+                // `NotRead` cannot reach this arm: the gather reads the file in exactly this
+                // branch. An unreadable carrier is never assumed healthy.
+                HomeCarrier::Unreadable | HomeCarrier::NotRead => out.push((
+                    Class::Standing,
+                    format!("{subject} via {wire} (home {home} carrier unreadable)"),
+                )),
+            },
+        }
+    }
+    // Per port: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a port
+    // entirely, so the leg-level grade above cannot see it — and losing one is not theoretical
+    // (F5: a re-enumerated USB NIC comes back with a fresh ifindex and its leg is re-created
+    // unattached). A port whose wire has vanished is skipped: the wire's own line accounts for
+    // it, and its leg cannot exist at all.
+    let listed = match &b.slaves {
+        Ok(v) => v,
+        // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
+        // the port list is the only thing that can say a port went missing, so losing it is a
+        // named gap in the diagnosis, never silence.
+        Err(e) => {
+            out.push((
+                Class::Settling,
+                format!("{subject}: /sys/class/net/{ifname}/bonding/slaves unreadable ({e})"),
+            ));
+            return out;
+        }
+    };
+    for s in leg.ports.iter().filter(|s| !s.absent) {
+        if !listed.contains(&s.ifname) {
+            // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
+            // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
+            out.push((
+                Class::Settling,
+                format!(
+                    "{subject}: port {} on {} is not a port of {ifname} — re-run cfab up",
+                    s.ifname, s.wire
+                ),
+            ));
+        }
+    }
+    for name in listed
+        .iter()
+        .filter(|n| !leg.ports.iter().any(|s| s.ifname == **n))
+    {
+        // Standing: nothing of ours added it, so nothing of ours takes it back.
+        out.push((
+            Class::Standing,
+            format!("{subject}: {ifname} has a foreign port {name}"),
+        ));
+    }
+    out
 }
 
 /// The prober's verdict for one zone's leg, from the `components` document.
@@ -1057,137 +1235,6 @@ fn reach(rows: Option<&[ProbedLeg]>, zone: &str, home: &str) -> Reach {
     }
 }
 
-/// What one leg's `bonding/` sysfs says, as reason lines. Reads only — a leg that has migrated
-/// or lost a port is the watchdog's business to actuate on; here it is named.
-fn bond_leg_health(sys: &mut dyn Sys, c: &mut Ctx, absent: &BTreeSet<String>, leg: &BondCheck) {
-    let BondCheck {
-        subject,
-        noun,
-        ifname,
-        ports,
-        home,
-        dark,
-        reach,
-    } = leg;
-    let mii = sys.read(&format!("/sys/class/net/{ifname}/bonding/mii_status"));
-    let active = sys.read(&format!("/sys/class/net/{ifname}/bonding/active_slave"));
-    match (mii, active) {
-        (Err(_), _) | (_, Err(_)) => {
-            // Nothing under `bonding/` can be read, the port list included: one line, and the
-            // per-port check below would only repeat it.
-            c.settling(format!(
-                "{subject}: {ifname} is not a bond (/sys/class/net/{ifname}/bonding unreadable) \
-                 — re-run cfab up"
-            ));
-            return;
-        }
-        (Ok(mii), Ok(active)) if mii.trim() != "up" => {
-            // A dark bond whose active port is a stranger is not the same fault as a dark
-            // bond, and "no carrier" would send an operator to the wrong end of the cable.
-            // The line says what was READ, not what the watchdog did with it: `status`
-            // cannot know whether an eviction was attempted (on a leaf the watchdog is not
-            // even scheduled), and a confident wrong diagnosis is worse than a plain one.
-            let active = active.trim().to_string();
-            if !active.is_empty() && !ports.iter().any(|s| s.ifname == active) {
-                c.settling(format!("{subject} down with foreign port {active} active"));
-            } else {
-                c.settling(dark.clone());
-            }
-        }
-        // The prober's verdict outranks where the bond sits: with no wire reaching the router,
-        // the active port explains nothing an operator can act on, and the wire whose uplink
-        // to fix is every one of them.
-        (Ok(_), Ok(_)) if *reach == Reach::AllDark => {
-            c.settling(format!("{subject}: {noun} unreachable on every wire"));
-        }
-        // Nobody is heard anywhere, so no wire is to blame and the bond was left where it is.
-        // Settling: the fabric may simply be starting, and one line says it once.
-        (Ok(_), Ok(_)) if *reach == Reach::Quiet => {
-            c.settling(format!("{subject}: no {noun} heard on any wire"));
-        }
-        (Ok(_), Ok(active)) => {
-            let active = active.trim();
-            match ports
-                .iter()
-                .find(|s| s.ifname == active)
-                .map(|s| s.wire.clone())
-            {
-                None => c.settling(format!(
-                    "{subject}: {ifname} is up with no port of ours active \
-                     (active_slave={active:?})"
-                )),
-                Some(wire) if wire == *home => {}
-                Some(wire) => {
-                    // Off the home wire is only a fault while the home wire still has
-                    // carrier: that is a stuck reselect. A dark home is the bond doing its
-                    // job. An unreadable carrier is neither and is never assumed healthy —
-                    // the file returns EINVAL on a down interface, so this is a field state.
-                    match sys.read(&format!("/sys/class/net/{home}/carrier")) {
-                        // Carrier and forwarding are not the same fact (finding F21). When the
-                        // prober knows the home wire cannot reach the router, THAT is the cause
-                        // and the carrier is a detail — the operator's next move is the uplink,
-                        // not the bond.
-                        // Standing, all four: the leg is up and carrying on a backup wire.
-                        // That is the migration working, and it holds until the home wire's
-                        // fault is fixed — a member that lives on one of these (a dead island
-                        // uplink, a stuck reselect) would otherwise spend every deadline of
-                        // every `status --wait` on it.
-                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeDark => c.standing(
-                            format!("{subject} via {wire} (home {home}: {noun} unreachable)"),
-                        ),
-                        // A suspicion, not a verdict: the home wire is silent and is being
-                        // asked. Settling, because the next tick or two answers it either way.
-                        Ok(s) if s.trim() == "1" && *reach == Reach::HomeSuspect => c.settling(
-                            format!("{subject} via {wire} (home {home}: no {noun} heard)"),
-                        ),
-                        Ok(s) if s.trim() == "1" => {
-                            c.standing(format!("{subject} via {wire} (home {home} has carrier)"))
-                        }
-                        Ok(_) => c.standing(format!("{subject} via {wire}")),
-                        Err(_) => c.standing(format!(
-                            "{subject} via {wire} (home {home} carrier unreadable)"
-                        )),
-                    }
-                }
-            }
-        }
-    }
-    // Per port: is it still ATTACHED? `mii_status` reads `up` on a bond that has lost a port
-    // entirely, so the leg-level grade above cannot see it — and losing one is not theoretical
-    // (F5: a re-enumerated USB NIC comes back with a fresh ifindex and its leg is re-created
-    // unattached). A port whose wire has vanished is skipped: the wire's own line accounts
-    // for it, and its leg cannot exist at all.
-    let path = format!("/sys/class/net/{ifname}/bonding/slaves");
-    let listed = match sys.read(&path) {
-        Ok(v) => v,
-        // `if_file`'s spelling for an unreadable per-interface file, with this leg's subject:
-        // the port list is the only thing that can say a port went missing, so losing it is
-        // a named gap in the diagnosis, never silence.
-        Err(e) => {
-            c.settling(format!("{subject}: {path} unreadable ({e})"));
-            return;
-        }
-    };
-    let listed: Vec<&str> = listed.split_whitespace().collect();
-    for s in ports.iter().filter(|s| !absent.contains(&s.ifname)) {
-        if !listed.contains(&s.ifname.as_str()) {
-            // Settling despite the remedy it names: the watchdog re-attaches a leg the kernel
-            // re-created under a fresh ifindex within a tick (F5, measured 3 s on pve3-tb).
-            c.settling(format!(
-                "{subject}: port {} on {} is not a port of {ifname} — re-run cfab up",
-                s.ifname, s.wire
-            ));
-        }
-    }
-    for name in listed
-        .iter()
-        .filter(|n| !ports.iter().any(|s| s.ifname == **n))
-    {
-        // Standing: nothing of ours added it, so nothing of ours takes it back.
-        c.standing(format!("{subject}: {ifname} has a foreign port {name}"));
-    }
-}
-
 /// The fallback segment: which wire each zone's bond is actually on, and whether every peer that
 /// carries the row is adjacent on it. Fallback legs carry no BFD, so an OSPF neighbor at ≥ 2-Way
 /// is the availability signal — and it counts toward the state, in its own field.
@@ -1200,7 +1247,7 @@ fn fallback(
     comps: Option<&Components>,
     c: &mut Ctx,
     absent: &BTreeSet<String>,
-    counts: &mut Counts,
+    counts: &mut Headline,
     peers: &mut BTreeSet<u8>,
     peers_up: &mut BTreeSet<u8>,
 ) -> Result<BTreeSet<(u8, String)>> {
@@ -1215,20 +1262,20 @@ fn fallback(
         let zone = &r.zone;
 
         // ---- the leg: bonding/{mii_status,active_slave,slaves} -----------------------
-        bond_leg_health(
+        let leg = read_bond_leg(
             sys,
-            c,
             absent,
-            &BondCheck {
-                subject: format!("{zone} fallback"),
-                noun: "peers",
+            LegSpec {
+                kind: LegKind::Fallback,
+                zone,
                 ifname: &r.ifname,
-                ports: &r.ports,
                 home: &r.home,
-                dark: format!("{zone} fallback no carrier"),
+                router: None,
+                ports: &r.ports,
                 reach: reach(comps.map(|c| c.fallback.as_slice()), zone, &r.home),
             },
         );
+        c.fallback_leg(leg);
 
         // ---- adjacency: every peer carrying this zone's fallback row, at least 2-Way ----
         let peer_members: Vec<&crate::model::Member> = f
@@ -1258,23 +1305,35 @@ fn fallback(
                 ));
             }
             for m in &peer_members {
-                c.settling(format!("down {zone}:fallback:.{}", m.node));
+                c.adjacency(fallback_adjacency(m, zone, false));
             }
             continue;
         };
         for m in &peer_members {
             let rid = format!("{}.0.{}", z.block(), m.node);
             let state = crate::engine::state::neighbor_state(nbrs, &rid);
-            if crate::engine::state::at_least_two_way(state) {
+            let up = crate::engine::state::at_least_two_way(state);
+            if up {
                 counts.fallbacks_up += 1;
                 peers_up.insert(m.node);
                 two_way.insert((m.node, zone.clone()));
-            } else {
-                c.settling(format!("down {zone}:fallback:.{}", m.node));
             }
+            c.adjacency(fallback_adjacency(m, zone, up));
         }
     }
     Ok(two_way)
+}
+
+/// One peer's row on a zone's fallback bond.
+fn fallback_adjacency(m: &crate::model::Member, zone: &str, up: bool) -> Adjacency {
+    Adjacency {
+        zone: zone.to_string(),
+        seg: None,
+        peer_node: m.node,
+        peer_name: m.name.clone(),
+        peer_addr: None,
+        up,
+    }
 }
 
 /// Each peer's identity, in each zone, must be reached over the interface we expect and with a
@@ -1420,99 +1479,135 @@ fn return_path_and_ingress(
             .lines()
             .filter(|l| l.starts_with("default "))
             .collect();
-        if default_lines.is_empty() {
-            // Settling: the default in this table is LEARNED from the router, so a table with
-            // none is the ordinary state of the first seconds after the engine starts.
-            c.settling(format!(
-                "{} gw {} unreachable (table {id} has no default)",
-                z.name, gw.router
-            ));
-        } else if leg.as_ref().is_none_or(|l| !l.migrates())
-            && default_lines
-                .iter()
-                // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
-                // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
-                // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
-                // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
-                // degraded the zone; cfab must not read healthier than the FRR build did. If E3
-                // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
-                .any(|l| l.contains("linkdown") || l.contains("dead"))
-        {
-            c.settling(format!(
-                "{} gw {} unreachable (table {id} default is linkdown - the ingress leg has no \
-                 carrier)",
-                z.name, gw.router
-            ));
-        }
+        let mut row = Ingress {
+            zone: z.name.clone(),
+            router: gw.router.to_string(),
+            table: id.clone(),
+            default_present: !default_lines.is_empty(),
+            default_linkdown: leg.as_ref().is_none_or(|l| !l.migrates())
+                && default_lines
+                    .iter()
+                    // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
+                    // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
+                    // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
+                    // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
+                    // degraded the zone; cfab must not read healthier than the FRR build did. If E3
+                    // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
+                    .any(|l| l.contains("linkdown") || l.contains("dead")),
+            ifname: None,
+            cidr: gw.leg_cidr(n),
+            cidr_present: None,
+            bond: None,
+            bgp_state: None,
+            bgp_pfx_snt: None,
+        };
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
-        let Some(leg) = leg else { continue };
+        let Some(leg) = leg else {
+            c.ingress(row);
+            continue;
+        };
+        row.ifname = Some(leg.ifname.clone());
         // A leg on gw scope `any` is an active-backup bond: the same reader the universal
         // segments get, so the ONE leg the outside depends on is graded like every other
         // migrating leg — a dark bond, a stranger active on it, a migration to a backup wire,
         // a port that never re-attached. A leg on a single domain is a plain sub-interface
         // and has none of this state.
         if leg.migrates() {
-            bond_leg_health(
+            row.bond = Some(read_bond_leg(
                 sys,
-                c,
                 absent,
-                &BondCheck {
-                    subject: format!("{} ingress", z.name),
-                    noun: "router",
+                LegSpec {
+                    kind: LegKind::Ingress,
+                    zone: &z.name,
                     ifname: &leg.ifname,
-                    ports: &leg.ports,
                     home: &leg.home,
-                    // A leg with no live port IS the ingress being unreachable, and that
-                    // already has a grade in this function: keep its spelling, name the leg
-                    // as the reason.
-                    dark: format!(
-                        "{} gw {} unreachable (ingress leg {} has no live port)",
-                        z.name, gw.router, leg.ifname
-                    ),
+                    router: Some(gw.router.to_string()),
+                    ports: &leg.ports,
                     reach: reach(comps.map(|c| c.ingress.as_slice()), &z.name, &leg.home),
                 },
-            );
+            ));
         }
-        let cidr = gw.leg_cidr(n);
         let addr = sys
             .run(&["ip", "-4", "-br", "addr", "show", "dev", &leg.ifname])?
             .stdout;
-        if !addr.contains(&format!(" {cidr}")) {
-            c.settling(format!(
-                "{} ingress leg {} missing or not {cidr}",
-                z.name, leg.ifname
-            ));
-        }
-        let Some(doc) = doc else { continue };
+        row.cidr_present = Some(addr.contains(&format!(" {}", row.cidr)));
+        let Some(doc) = doc else {
+            c.ingress(row);
+            continue;
+        };
         let entry = doc["bgp"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|n| n["peer"] == gw.router.as_str());
-        let state = entry
-            .and_then(|n| n["state"].as_str())
-            .unwrap_or("absent")
-            .to_string();
-        if state != "Established" {
-            // Settling, and so is the `pfx_snt == 0` line below it: a BGP session takes seconds
-            // to establish and another moment to send the zone's prefixes.
-            c.settling(format!(
-                "{} ingress: bgp {} {state} (not Established - the router is not \
-                 learning this zone's identities)",
-                z.name, gw.router
-            ));
-        } else if entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0) == 0 {
-            // Established but advertising nothing is the exact signature of a missing neighbor
-            // afi-safi export policy: the session is healthy, the zone's identities never leave.
-            c.settling(format!(
-                "{} ingress: bgp {} Established but advertising nothing (0 sent prefixes \
-                 - the neighbor afi-safi export policy is not attached)",
-                z.name, gw.router
-            ));
-        }
+        row.bgp_state = Some(
+            entry
+                .and_then(|n| n["state"].as_str())
+                .unwrap_or("absent")
+                .to_string(),
+        );
+        row.bgp_pfx_snt = Some(entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0));
+        c.ingress(row);
     }
     Ok(())
+}
+
+/// What one gw zone's ingress row says, in words.
+fn ingress_reasons(i: &Ingress) -> Vec<(Class, String)> {
+    let mut out: Vec<(Class, String)> = Vec::new();
+    let (zone, router, table) = (&i.zone, &i.router, &i.table);
+    if !i.default_present {
+        // Settling: the default in this table is LEARNED from the router, so a table with none
+        // is the ordinary state of the first seconds after the engine starts.
+        out.push((
+            Class::Settling,
+            format!("{zone} gw {router} unreachable (table {table} has no default)"),
+        ));
+    } else if i.default_linkdown {
+        out.push((
+            Class::Settling,
+            format!(
+                "{zone} gw {router} unreachable (table {table} default is linkdown - the \
+                 ingress leg has no carrier)"
+            ),
+        ));
+    }
+    if let Some(b) = &i.bond {
+        out.extend(leg_reasons(b));
+    }
+    if let (Some(ifname), Some(false)) = (&i.ifname, i.cidr_present) {
+        out.push((
+            Class::Settling,
+            format!("{zone} ingress leg {ifname} missing or not {}", i.cidr),
+        ));
+    }
+    match (&i.bgp_state, i.bgp_pfx_snt) {
+        (Some(state), _) if state != "Established" => {
+            // Settling, and so is the `pfx_snt == 0` line below it: a BGP session takes seconds
+            // to establish and another moment to send the zone's prefixes.
+            out.push((
+                Class::Settling,
+                format!(
+                    "{zone} ingress: bgp {router} {state} (not Established - the router is not \
+                     learning this zone's identities)"
+                ),
+            ));
+        }
+        (Some(_), Some(0)) => {
+            // Established but advertising nothing is the exact signature of a missing neighbor
+            // afi-safi export policy: the session is healthy, the zone's identities never leave.
+            out.push((
+                Class::Settling,
+                format!(
+                    "{zone} ingress: bgp {router} Established but advertising nothing (0 sent \
+                     prefixes - the neighbor afi-safi export policy is not attached)"
+                ),
+            ));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The backend `up` recorded, or nft when there is no record: nft is what every member ran
@@ -1759,8 +1854,8 @@ fn route_dev(sys: &mut dyn Sys, target: &str) -> Result<(Option<String>, String)
 
 /// Each condition is named once and the lines are sorted: a zone with two down peers pushes its
 /// line per peer, and this output is read by humans, scripts and agents alike.
-fn once_each(reasons: &[(Class, String)]) -> Vec<String> {
-    let mut sorted: Vec<String> = reasons.iter().map(|(_, m)| m.clone()).collect();
+fn once_each(conditions: &[Condition]) -> Vec<String> {
+    let mut sorted: Vec<String> = conditions.iter().map(|c| c.text.clone()).collect();
     sorted.sort();
     sorted.dedup();
     sorted
@@ -2535,13 +2630,15 @@ mod tests {
 
     #[test]
     fn reasons_are_sorted_and_named_once() {
-        let r = vec![
-            (Class::Settling, "b".to_string()),
-            (Class::Standing, "a".to_string()),
-            (Class::Settling, "b".to_string()),
-            (Class::Standing, "a".to_string()),
-        ];
-        assert_eq!(once_each(&r), vec!["a".to_string(), "b".to_string()]);
+        let mut c = Ctx::default();
+        c.settling("b");
+        c.standing("a");
+        c.settling("b");
+        c.standing("a");
+        assert_eq!(
+            once_each(&c.conditions()),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     /// A forwarding host with every leg up, every route on its primary and every BFD session
@@ -2577,6 +2674,165 @@ mod tests {
         }
         sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
             .socket("/run/cfab/cfab.sock", &healthy_components(view))
+    }
+
+    /// The prose is rendered from the model and from nothing else, byte for byte. The literal
+    /// is the whole report a healthy forwarding host prints, so any renderer change — a word,
+    /// an indent, a line's position — fails here rather than in the field.
+    #[test]
+    fn the_prose_is_rendered_from_the_model_byte_for_byte() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+
+        // The rows the headline counts, each one a fact and not a line.
+        assert_eq!(m.member.name, "pve1-tb");
+        assert_eq!(m.member.kind_word(), "host");
+        assert_eq!(m.member.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(m.state, State::Up);
+        let h = m.headline.clone().unwrap();
+        assert_eq!((h.links_up, h.links), (18, 18));
+        assert_eq!((h.fallbacks_up, h.fallbacks), (6, 6));
+        assert_eq!(m.adjacencies.iter().filter(|a| a.seg.is_some()).count(), 18);
+        assert_eq!(m.adjacencies.iter().filter(|a| a.seg.is_none()).count(), 6);
+        assert!(m.adjacencies.iter().all(|a| a.up));
+        assert_eq!(m.fallbacks.len(), f.zones.len());
+        assert!(m.fallbacks.iter().all(|l| l.on_home()), "{:?}", m.fallbacks);
+        let ing = m.ingress.iter().find(|i| i.zone == "mgmt").unwrap();
+        assert_eq!(ing.router, "192.168.249.254");
+        assert_eq!(ing.bgp_state.as_deref(), Some("Established"));
+        assert_eq!(ing.bgp_pfx_snt, Some(0));
+        assert_eq!(m.prefs.len(), f.zones.len());
+        assert!(m.components.is_some());
+
+        let report = render_text(&m, false, true);
+        assert_eq!(report.code, 0);
+        assert_eq!(
+            report.output,
+            "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)\n  \
+             mark: nft\n  \
+             mgmt ingress leg cfab-gw249 missing or not 192.168.249.1/24\n  \
+             mgmt ingress: bgp 192.168.249.254 Established but advertising nothing (0 sent \
+             prefixes - the neighbor afi-safi export policy is not attached)\n  \
+             prefs storage: eth9 eth1 eth0 (derived)\n  \
+             prefs cluster: eth1 eth9 eth0 (derived)\n  \
+             prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
+        );
+
+        // `run` is the two halves called in order and adds nothing of its own.
+        let mut sys = healthy_host(&f, &view);
+        assert_eq!(
+            run(&mut sys, &view, 0, false, None).unwrap().output,
+            report.output
+        );
+    }
+
+    /// One member with every kind of adjacency trouble at once, so the report carries an
+    /// ingress reason, a down BFD link, a migrated fallback leg and a dark one with a peer down
+    /// on it in the same print: a down BFD session in storage, the storage fallback bond off
+    /// its home wire, the cluster fallback bond dark and missing pve2-tb's neighbor, and a gw
+    /// router that is not peering.
+    fn tangled_host(f: &Fabric, view: &View) -> MockSys {
+        let mut sys = healthy_host(f, view);
+        let mut bfd = Vec::new();
+        for p in [2u8, 3u8] {
+            for z in &f.zones {
+                for seg in [1u8, 2, 3] {
+                    let state = if z.name == "storage" && seg == 1 && p == 2 {
+                        "down"
+                    } else {
+                        "up"
+                    };
+                    bfd.push((format!("{}.{seg}.{p}", z.block()), state));
+                }
+            }
+        }
+        let mut doc = engine_value(view, &bfd);
+        for r in view.fallback_rows() {
+            let z = f.zone(&r.zone).unwrap();
+            if r.zone == "cluster" {
+                doc["ospf"][&r.zone]["interfaces"][&r.ifname]["neighbors"] = serde_json::json!([{
+                    "router_id": format!("{}.0.3", z.block()),
+                    "addr": format!("{}.{}.3", z.block(), r.seg),
+                    "state": "full",
+                }]);
+            }
+        }
+        for n in doc["bgp"].as_array_mut().into_iter().flatten() {
+            n["state"] = serde_json::json!("Idle");
+        }
+        for r in view.fallback_rows() {
+            if r.zone == "storage" {
+                let off = r.ports.iter().find(|s| s.wire != r.home).unwrap();
+                sys = sys.file(
+                    &format!("/sys/class/net/{}/bonding/active_slave", r.ifname),
+                    &format!("{}\n", off.ifname),
+                );
+            }
+            if r.zone == "cluster" {
+                sys = sys.file(
+                    &format!("/sys/class/net/{}/bonding/mii_status", r.ifname),
+                    "down\n",
+                );
+            }
+        }
+        sys.socket("/run/cfab/engine.sock", &doc.to_string())
+    }
+
+    /// The report a member carrying every kind of adjacency trouble at once prints, byte for
+    /// byte. The expected text was captured from the pre-model `run` at e3b8623, not from this
+    /// code: it has an ingress reason, a down BFD link, a migrated fallback leg and a dark one
+    /// with a peer down on it, so a renderer that lost a line, reordered the block or dropped a
+    /// row's derivation fails here.
+    #[test]
+    fn a_report_with_ingress_link_and_both_fallback_troubles_matches_the_pre_model_render() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tangled_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert_eq!(report.code, 1);
+        assert_eq!(
+            report.output,
+            "UP-DEGRADED (2/2 | 17/18 | 5/6) on pve1-tb (host)\n  \
+             cluster fallback no carrier\n  \
+             down cluster:fallback:.2\n  \
+             down storage:1:.2\n  \
+             mark: nft\n  \
+             mgmt ingress leg cfab-gw249 missing or not 192.168.249.1/24\n  \
+             mgmt ingress: bgp 192.168.249.254 Idle (not Established - the router is not \
+             learning this zone's identities)\n  \
+             storage fallback via eth1 (home eth9 has carrier)\n  \
+             storage to pve2-tb via cfab-st, expected cfab-st-bk\n  \
+             prefs storage: eth9 eth1 eth0 (derived)\n  \
+             prefs cluster: eth1 eth9 eth0 (derived)\n  \
+             prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
+        );
+
+        // The rows carry the same four facts, structured, for the renderers that want numbers.
+        let mut sys = tangled_host(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(render_text(&m, false, true).output, report.output);
+        let down: Vec<String> = m
+            .adjacencies
+            .iter()
+            .filter(|a| !a.up)
+            .map(Adjacency::label)
+            .collect();
+        assert_eq!(down, vec!["storage:1:.2", "cluster:fallback:.2"]);
+        let st = m.fallbacks.iter().find(|l| l.zone == "storage").unwrap();
+        assert!(!st.on_home());
+        assert_eq!(st.active_wire(), Some("eth1"));
+        let cl = m.fallbacks.iter().find(|l| l.zone == "cluster").unwrap();
+        assert_eq!(cl.bonding.as_ref().unwrap().mii_status, "down");
+        let ing = m.ingress.iter().find(|i| i.zone == "mgmt").unwrap();
+        assert_eq!(ing.bgp_state.as_deref(), Some("Idle"));
     }
 
     #[test]
@@ -5055,7 +5311,7 @@ mod tests {
         expected_links(view)
             .unwrap()
             .into_iter()
-            .map(|(p, z, seg, _)| (p, z, seg))
+            .map(|e| (e.node, e.zone, e.seg))
             .collect()
     }
 
@@ -5123,7 +5379,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            once_each(&c.reasons),
+            once_each(&c.conditions()),
             vec![
                 "cluster to pve2-tb via fallback".to_string(),
                 "mgmt to pve2-tb via fallback".to_string(),
@@ -5155,7 +5411,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            once_each(&c.reasons)
+            once_each(&c.conditions())
                 .contains(&"storage to pve2-tb via cfab-st, expected cfab-st-fb".to_string()),
             "{:?}",
             c.reasons
@@ -5192,7 +5448,7 @@ mod tests {
             expected_links(&view)
                 .unwrap()
                 .iter()
-                .filter(|(p, z, _, _)| *p == 1 && z == "storage")
+                .filter(|e| e.node == 1 && e.zone == "storage")
                 .count(),
             2
         );
