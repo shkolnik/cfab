@@ -1912,6 +1912,36 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
     words.get(i + 2)?.parse().ok()
 }
 
+/// Every argv `status` is allowed to run, and the one socket request. This list is the
+/// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
+/// `calls` too, so anything that is not on it fails the test by name. Shared with the
+/// supervisor's metrics-refresh guard, which gathers the same model.
+#[cfg(test)]
+pub(crate) fn is_read_only(call: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "ip route get ",
+        "ip route show table ",
+        "ip rule show pref ",
+        "ip -4 -br addr show dev ",
+        "nft list ",
+        "nft -s list ",
+        "nft -j list ",
+        "systemctl is-active ",
+        "systemctl is-enabled ",
+        "tc class show dev ",
+        "ethtool -i ",
+    ];
+    if let Some(rest) = call.strip_prefix("unix_request ") {
+        // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
+        // `components` / `log` (spec §9). Every other request would be a write.
+        return matches!(
+            rest.split_whitespace().nth(1),
+            Some("state" | "components" | "log")
+        );
+    }
+    ALLOWED.iter().any(|p| call.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2434,34 +2464,6 @@ mod tests {
 
     fn headline(report: &StatusReport) -> &str {
         report.output.lines().next().unwrap_or("")
-    }
-
-    /// Every argv `status` is allowed to run, and the one socket request. This list is the
-    /// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
-    /// `calls` too, so anything that is not on it fails the test by name.
-    fn is_read_only(call: &str) -> bool {
-        const ALLOWED: &[&str] = &[
-            "ip route get ",
-            "ip route show table ",
-            "ip rule show pref ",
-            "ip -4 -br addr show dev ",
-            "nft list ",
-            "nft -s list ",
-            "nft -j list ",
-            "systemctl is-active ",
-            "systemctl is-enabled ",
-            "tc class show dev ",
-            "ethtool -i ",
-        ];
-        if let Some(rest) = call.strip_prefix("unix_request ") {
-            // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
-            // `components` / `log` (spec §9). Every other request would be a write.
-            return matches!(
-                rest.split_whitespace().nth(1),
-                Some("state" | "components" | "log")
-            );
-        }
-        ALLOWED.iter().any(|p| call.starts_with(p))
     }
 
     /// One `status` run over one fixture: nothing in `MockSys.files` may change, and every

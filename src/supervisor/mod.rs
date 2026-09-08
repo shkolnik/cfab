@@ -2322,6 +2322,62 @@ mod tests {
     /// sequence tears down under the declaration the supervisor was STARTED on (finding F2's
     /// fix), so the bond AND its ports go, and the restart builds the plain leg from scratch.
     /// Torn down under the new file instead, the bond's ports would be nameless and stranded.
+    /// **The exporter reads; it never actuates.** The metrics refresh gathers the same status
+    /// model `cfab status` does, so it inherits that command's read-only allowlist
+    /// (`status::is_read_only`) verbatim: one refresh over the healthy fixture may change no
+    /// file and may make no call outside the allowlist. `metrics::render` is proven to make no
+    /// host call twice over — the call log does not grow across it, and its signature takes no
+    /// `Sys` at all, so it has nothing to call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_metrics_refresh_reads_and_never_actuates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = fresh_sys(&view, tmp.path());
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (tx, _rx) = tokio::sync::watch::channel(Arc::<str>::from(""));
+
+        let files_before = sys.files.clone();
+        refresh_snapshot(&mut sys, &view, &shared, &tx);
+
+        let changed: Vec<&String> = files_before
+            .keys()
+            .chain(sys.files.keys())
+            .filter(|k| files_before.get(*k) != sys.files.get(*k))
+            .collect();
+        assert!(changed.is_empty(), "the refresh changed {changed:?}");
+        for call in &sys.calls {
+            assert!(
+                crate::commands::status::is_read_only(call),
+                "the metrics refresh is not read-only: `{call}`"
+            );
+        }
+        assert!(
+            !tx.borrow().is_empty(),
+            "the refresh published no snapshot, so the allowlist proved nothing"
+        );
+
+        // And the render itself: build a snapshot, then watch the call log across `render`.
+        let comps = shared.lock().unwrap().components(Instant::now());
+        let model = crate::commands::status::snapshot_model(&mut sys, &view, Some(comps)).unwrap();
+        let snap = Arc::new(metrics::Snapshot {
+            model,
+            probed: crate::prober::ProbeRows::default(),
+            collected_at_unix: 1_700_000_000.0,
+            collect_seconds: 0.048,
+            collect_failures: 0,
+        });
+        let before = sys.calls.len();
+        let text = metrics::render(&snap);
+        assert_eq!(
+            sys.calls.len(),
+            before,
+            "render made a host call: {:?}",
+            &sys.calls[before..]
+        );
+        assert!(text.contains("cfab_fabric_state"), "{text}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sighup_that_flips_the_gw_scope_tears_down_the_leg_the_old_declaration_built() {
         let o = reload_with(|m, dir| {
