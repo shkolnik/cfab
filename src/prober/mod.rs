@@ -1079,6 +1079,8 @@ impl Leg {
         let from_carrier = from.map(|f| f.carrier);
         let from_reachable = from.map(|f| f.state.reachable());
         let from_hello_dead = from.is_some_and(|f| f.hello_dead);
+        // F30: the bonding driver's own link state on the port the bond is leaving.
+        let from_link_up = from.is_none_or(|f| f.bond_link == Some(BondLink::Up));
         // The port that has just been promoted gets its grace period here: it was chosen after
         // a bidirectional check, and if it is nonetheless dead the adjacency says so at the dead
         // interval. Without it a two-port ping-pong could move once per tick. Reads `returned`
@@ -1117,6 +1119,15 @@ impl Leg {
             )),
             (Some(w), _, _, _) if target_returned => log.push(format!(
                 "cfab: {} {family}: {noun} reachable on {to} again, moved {} back from {w}",
+                self.zone, self.bond
+            )),
+            // F30: the wire answers and its cable is in, but the bonding driver does not have
+            // the port up — `updelay` running, or a port the driver has taken out of service.
+            // The bond is leaving because the kernel would not keep ingress there, which is a
+            // different fact from the target simply outranking it, and the operator who reads
+            // "is preferred" would go looking for a preference change that never happened.
+            (Some(w), _, _, _) if !from_link_up => log.push(format!(
+                "cfab: {} {family}: {w} link not up (bonding), moved {} to {to}",
                 self.zone, self.bond
             )),
             // F25: the target was usable the whole time (never went unusable-then-usable since
@@ -1934,6 +1945,46 @@ mod tests {
         assert_eq!(
             sys.writes_to(&format!("/sys/class/net/{BOND}/bonding/active_slave")),
             Some(BACKUP)
+        );
+    }
+
+    /// F30: the bond leaves a wire the bonding driver has taken down under it. The wire
+    /// answers, its cable is in, so the only reason the bond cannot stay is the driver's own
+    /// link state — and that is what the line must say. "is preferred" would send an operator
+    /// looking for a preference change nobody made.
+    #[test]
+    fn a_move_off_a_port_the_bonding_driver_has_not_up_says_the_link_is_not_up() {
+        let f = fabric();
+        let (mut p, names) = prober(&f);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut sys = bonding(HOME);
+        let mut io = ScriptedIo::answering_on(ROUTER, &refs);
+        // Every wire answers throughout and every cable stays in: only the driver's per-port
+        // link state on the wire the bond sits on goes.
+        run_ticks(&mut p, &mut sys, &mut io, 2);
+        assert!(p.drain_log().is_empty(), "nothing has happened yet");
+        sys.set_port(HOME, link(BondLink::GoingDown));
+        run_ticks(&mut p, &mut sys, &mut io, 1);
+        let log = p.drain_log();
+        assert_eq!(
+            log.first().map(String::as_str),
+            Some("cfab: mgmt ingress: eth0 link not up (bonding), moved cfab-gw249 to eth9"),
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("is preferred")),
+            "eth9 did not become preferred — the bond was pushed off eth0: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("carrier")),
+            "the cable is in: saying otherwise sends the operator to the wrong end of it: {log:?}"
+        );
+        assert!(
+            sys.calls
+                .iter()
+                .any(|c| c == &format!("set_active_port {BOND} {BACKUP}")),
+            "and the bond actually moved: {:?}",
+            sys.calls
         );
     }
 
