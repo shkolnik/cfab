@@ -74,14 +74,15 @@ impl Ctx {
     fn standing(&mut self, msg: impl Into<String>) {
         self.reasons.push((Class::Standing, msg.into()));
     }
-
 }
 
 impl StatusModel {
     /// Is this fabric still settling? One settling reason is enough: `--wait` exists for exactly
     /// the window in which they are still there.
     pub fn settling(&self) -> bool {
-        self.all_reasons().iter().any(|(k, _)| *k == Class::Settling)
+        self.all_reasons()
+            .iter()
+            .any(|(k, _)| *k == Class::Settling)
     }
 
     /// Every reason line this gather carries: the ones stated in words, plus the ones a row
@@ -1017,17 +1018,15 @@ fn read_bond_leg(sys: &mut dyn Sys, absent: &BTreeSet<String>, spec: LegSpec<'_>
                 .iter()
                 .find(|p| p.ifname == active)
                 .is_some_and(|p| p.wire != home);
-            let home_carrier = if mii == "up"
-                && !matches!(reach, Reach::AllDark | Reach::Quiet)
-                && off_home
-            {
-                match sys.read(&format!("/sys/class/net/{home}/carrier")) {
-                    Ok(v) => HomeCarrier::Value(v.trim().to_string()),
-                    Err(_) => HomeCarrier::Unreadable,
-                }
-            } else {
-                HomeCarrier::NotRead
-            };
+            let home_carrier =
+                if mii == "up" && !matches!(reach, Reach::AllDark | Reach::Quiet) && off_home {
+                    match sys.read(&format!("/sys/class/net/{home}/carrier")) {
+                        Ok(v) => HomeCarrier::Value(v.trim().to_string()),
+                        Err(_) => HomeCarrier::Unreadable,
+                    }
+                } else {
+                    HomeCarrier::NotRead
+                };
             let slaves = sys
                 .read(&format!("/sys/class/net/{ifname}/bonding/slaves"))
                 .map(|v| v.split_whitespace().map(str::to_string).collect())
@@ -2665,6 +2664,61 @@ mod tests {
         }
         sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
             .socket("/run/cfab/cfab.sock", &healthy_components(view))
+    }
+
+    /// The prose is rendered from the model and from nothing else, byte for byte. The literal
+    /// is the whole report a healthy forwarding host prints, so any renderer change — a word,
+    /// an indent, a line's position — fails here rather than in the field.
+    #[test]
+    fn the_prose_is_rendered_from_the_model_byte_for_byte() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+
+        // The rows the headline counts, each one a fact and not a line.
+        assert_eq!(m.member.name, "pve1-tb");
+        assert_eq!(m.member.kind_word(), "host");
+        assert_eq!(m.member.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(m.state, State::Up);
+        let h = m.headline.clone().unwrap();
+        assert_eq!((h.links_up, h.links), (18, 18));
+        assert_eq!((h.fallbacks_up, h.fallbacks), (6, 6));
+        assert_eq!(m.adjacencies.iter().filter(|a| a.seg.is_some()).count(), 18);
+        assert_eq!(m.adjacencies.iter().filter(|a| a.seg.is_none()).count(), 6);
+        assert!(m.adjacencies.iter().all(|a| a.up));
+        assert_eq!(m.fallbacks.len(), f.zones.len());
+        assert!(m.fallbacks.iter().all(|l| l.on_home()), "{:?}", m.fallbacks);
+        let ing = m.ingress.iter().find(|i| i.zone == "mgmt").unwrap();
+        assert_eq!(ing.router, "192.168.249.254");
+        assert_eq!(ing.bgp_state.as_deref(), Some("Established"));
+        assert_eq!(ing.bgp_pfx_snt, Some(0));
+        assert_eq!(m.prefs.len(), f.zones.len());
+        assert!(m.components.is_some());
+
+        let report = render_text(&m, false, true);
+        assert_eq!(report.code, 0);
+        assert_eq!(
+            report.output,
+            "UP (2/2 | 18/18 | 6/6) on pve1-tb (host)\n  \
+             mark: nft\n  \
+             mgmt ingress leg cfab-gw249 missing or not 192.168.249.1/24\n  \
+             mgmt ingress: bgp 192.168.249.254 Established but advertising nothing (0 sent \
+             prefixes - the neighbor afi-safi export policy is not attached)\n  \
+             prefs storage: eth9 eth1 eth0 (derived)\n  \
+             prefs cluster: eth1 eth9 eth0 (derived)\n  \
+             prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
+             (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
+        );
+
+        // `run` is the two halves called in order and adds nothing of its own.
+        let mut sys = healthy_host(&f, &view);
+        assert_eq!(
+            run(&mut sys, &view, 0, false, None).unwrap().output,
+            report.output
+        );
     }
 
     #[test]
