@@ -2,6 +2,7 @@
 //! branches are testable against `MockSys`.
 
 pub mod apply;
+pub mod check;
 pub mod cluster;
 pub mod common;
 pub mod conf_sync;

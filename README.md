@@ -159,6 +159,55 @@ the point of use, with identical single-host behavior when absent:
 - `measure-cap` serializes floods behind a cluster lease and publishes measured capacities so
   they survive reboots.
 
+## VM workloads
+
+A `[[workload]]` row declares a VM VLAN cfab reaches into the fabric — an anycast gateway every
+member answers, a passive OSPF advertisement into the zones it may reach, and a symmetric
+forward policy. The VLAN interface itself is baseline-owned (Proxmox/systemd-networkd/whatever
+already brought it up); cfab only points at it.
+
+```toml
+[[workload]]
+name   = "vms"
+ifname = "primary.3"          # host-side interface on the workload VLAN; preconfigured, required
+prefix = "192.168.20.0/24"
+gw     = "192.168.20.254"     # the anycast gateway every host answers
+router = "192.168.20.1"       # the VLAN's existing default router, printed inside DHCP option 121
+allow  = ["storage"]          # zones this workload may reach; default deny, counted
+
+[[member]]
+name = "pve1"
+workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on ifname
+```
+
+`cfab check` refuses a `gw`, `router`, or member address outside `prefix`, a member address
+without the prefix's mask, an `allow` naming an unknown zone, a workload row no member carries, a
+member workload naming an unknown row, and a leaf carrying one (a leaf never transits). Names
+share the zone vocabulary, so `vms>storage` reads like `storage>storage`.
+
+- **`up` adds:** IPv4 forwarding on `ifname`; a passive OSPF entry for `ifname` in every allowed
+  zone's instance, so every member and leaf learns the prefix; a pref-2000 sibling return-path
+  rule per (zone, workload prefix) on every member and leaf, ahead of the general egress rule, so
+  a reply that ECMPs to a host that never saw the flow still finds its way back; a symmetric
+  stateless accept pair in the forward policy (`vms>storage` emits both directions, because the
+  reply may arrive on a different host than the request left from); a forward-hook DSCP
+  overwrite (a workload's own marking is never trusted); the anycast `gw` as a second address on
+  `ifname`, answered with the host's own MAC, with `net.ipv4.conf.all.arp_ignore=1` so a host
+  answers `gw` only on the interface that holds it; an nft bridge rule that drops ARP for `gw`
+  arriving on the bridge's uplink port, so hosts never contend over who answers it; and a
+  gratuitous-ARP announcer, a beacon every few seconds plus a burst when the bridge learns a new
+  MAC, so a migrated VM's fabric-side neighbor entries converge onto its new host.
+- **`down` removes** everything `up` added on this member: the OSPF entry, the return-path
+  rules, the forward accepts, the DSCP hook, the second address, the bridge guard, and stops the
+  announcer. It never touches `ifname` itself.
+- **The watchdog restores** anything of the above it finds missing or wrong, the same way it
+  restores every other cfab-owned interface, rule, or sysctl.
+- A VM's DHCP lease should carry option 121 (RFC 3442) with the fabric aggregate routed via `gw`,
+  plus the default route via the declared `router` inside the *same* option: a client that
+  receives option 121 ignores option 3 (VERIFIED: isc-dhclient and systemd-networkd both do,
+  so a 121 lease with no default route inside it leaves the VM with none at all). A VM without
+  option 121 still reaches fabric identities via the declared `router`, degraded, not broken.
+
 ## Design
 
 - **Pure core, thin exec.** Parse → typed model + validation → derivation → pure generators

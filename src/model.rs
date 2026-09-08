@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::Ipv4Addr;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,9 @@ pub struct Member {
     /// so every wire gets the nft admin treatment and its own `[admin] floor_mbps` band. A leaf owns no
     /// L3 of ours on any wire.
     pub wires: Vec<Wire>,
+    /// This member's addresses on `[[workload]]` interfaces it carries. A leaf carries none
+    /// (`validate` refuses one that does).
+    pub workloads: Vec<MemberWorkload>,
 }
 
 impl Member {
@@ -278,6 +282,103 @@ pub struct WirePref {
     pub order: Vec<String>,
 }
 
+/// Whether a workload's VLAN stays switch-local (phase 1) or becomes a routed per-host prefix
+/// (phase 2, not built yet). `span = "host"` is accepted by the schema and refused at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Span {
+    Switch,
+    Host,
+}
+
+/// An IPv4 network: address + prefix length, with the host bits cleared. `parse` refuses a
+/// string whose address is not already aligned to its own mask (e.g. `192.168.20.5/24`) with
+/// the same message a missing `/len` gets — both are "not a valid prefix", not two things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Ipv4Prefix {
+    pub net: Ipv4Addr,
+    pub len: u8,
+}
+
+impl Ipv4Prefix {
+    fn mask(len: u8) -> u32 {
+        if len == 0 { 0 } else { u32::MAX << (32 - len) }
+    }
+
+    pub fn parse(s: &str) -> std::result::Result<Ipv4Prefix, String> {
+        let bad = || {
+            format!("prefix '{s}' is not an IPv4 prefix with a length (example: 192.168.20.0/24)")
+        };
+        let (addr, len) = s.split_once('/').ok_or_else(bad)?;
+        let addr: Ipv4Addr = addr.parse().map_err(|_| bad())?;
+        let len: u8 = len.parse().map_err(|_| bad())?;
+        if len > 32 {
+            return Err(bad());
+        }
+        let raw = u32::from(addr);
+        let net = raw & Self::mask(len);
+        if net != raw {
+            return Err(bad());
+        }
+        Ok(Ipv4Prefix {
+            net: Ipv4Addr::from(net),
+            len,
+        })
+    }
+
+    pub fn contains(&self, a: Ipv4Addr) -> bool {
+        (u32::from(a) & Self::mask(self.len)) == u32::from(self.net)
+    }
+
+    /// The network address plus one — the lowest usable host in the prefix.
+    pub fn first_host(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.net) + 1)
+    }
+}
+
+impl fmt::Display for Ipv4Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.net, self.len)
+    }
+}
+
+/// One `[[workload]]` row, typed (spec §4): a VM workload VLAN, its anycast gateway, and the
+/// zones it may reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Workload {
+    pub name: String,
+    pub ifname: String,
+    pub prefix: Ipv4Prefix,
+    /// The anycast gateway every host answers (bare address; the prefix's mask applies).
+    pub gw: Ipv4Addr,
+    /// The VLAN's existing default router, inside DHCP option 121 (RULED, spec §10 call 14).
+    pub router: Ipv4Addr,
+    /// Zones this workload may reach; validated against the declared zones.
+    pub allow: Vec<String>,
+    /// Phase 1: always `Switch` (`span = "host"` is refused at load).
+    pub span: Span,
+}
+
+impl Workload {
+    /// `gw` with the prefix's mask, e.g. `192.168.20.254/24`.
+    pub fn gw_cidr(&self) -> String {
+        format!("{}/{}", self.gw, self.prefix.len)
+    }
+}
+
+/// One member's address on a `[[workload]]` interface it carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberWorkload {
+    pub name: String,
+    pub address: Ipv4Addr,
+    pub len: u8,
+}
+
+impl MemberWorkload {
+    pub fn address_cidr(&self) -> String {
+        format!("{}/{}", self.address, self.len)
+    }
+}
+
 /// The whole declaration, typed. Everything the deployed runtime needs and nothing it computes.
 ///
 /// `PartialEq` is the derived, ORDER-SENSITIVE comparison: `[[member]]` / `[[zone]]` / segment
@@ -315,6 +416,8 @@ pub struct Fabric {
     /// Runtime state dir written by `up`, read by `status` and the daemons (`[runtime] run_dir`).
     pub run_dir: String,
     pub dns_domain: String,
+    /// `[[workload]]` rows, in declaration order.
+    pub workloads: Vec<Workload>,
 }
 
 /// RFC 5881's single-hop port, as `[bfd] port` defaults to it.
@@ -347,6 +450,64 @@ fn resolve_gw(zone: &str, g: &crate::decl::GwDecl) -> Result<ZoneGw> {
             .map_err(|e| Error::context(format!("zone {zone}: gw "), e))?,
         vid: g.vid,
         router: router.to_string(),
+    })
+}
+
+/// A member's own address on a `[[workload]]` interface: `a.b.c.d/len`, a HOST address (not
+/// masked to its network — unlike `Ipv4Prefix`, whose whole point is that it IS the network).
+fn parse_ipv4_with_len(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, len) = s.split_once('/')?;
+    let addr: Ipv4Addr = addr.parse().ok()?;
+    let len: u8 = len.parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    Some((addr, len))
+}
+
+/// One `[[workload]]` row, typed. `prefix`/`gw`/`router` malformed-value messages are named
+/// here so `from_decl` reads as one gate per row; cross-row and cross-table meaning (zone
+/// collisions, which member carries it) is `Fabric::validate`'s job.
+fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
+    let prefix = Ipv4Prefix::parse(&w.prefix)
+        .map_err(|e| Error::config(format!("workload {}: {e}", w.name)))?;
+    let gw: Ipv4Addr = w.gw.parse().map_err(|_| {
+        Error::config(format!(
+            "workload {}: gw '{}' must be a bare IPv4 address (the prefix's mask is applied)",
+            w.name, w.gw
+        ))
+    })?;
+    let router: Ipv4Addr = w.router.parse().map_err(|_| {
+        Error::config(format!(
+            "workload {}: router '{}' must be a bare IPv4 address (the VLAN's existing default \
+             router)",
+            w.name, w.router
+        ))
+    })?;
+    let span = match w.span.as_deref() {
+        None | Some("switch") => Span::Switch,
+        Some("host") => {
+            return Err(Error::config(format!(
+                "workload {}: span = \"host\" is phase 2 and not built yet (omit it, or span = \
+                 \"switch\")",
+                w.name
+            )));
+        }
+        Some(s) => {
+            return Err(Error::config(format!(
+                "workload {}: span '{s}' is not one of switch, host",
+                w.name
+            )));
+        }
+    };
+    Ok(Workload {
+        name: w.name.clone(),
+        ifname: w.ifname.clone(),
+        prefix,
+        gw,
+        router,
+        allow: w.allow.clone(),
+        span,
     })
 }
 
@@ -395,11 +556,26 @@ impl Fabric {
                     order: order.clone(),
                 });
             }
+            let mut workloads = Vec::new();
+            for mw in &m.workloads {
+                let (address, len) = parse_ipv4_with_len(&mw.address).ok_or_else(|| {
+                    Error::config(format!(
+                        "member {}: workload {}: address '{}' is not an IPv4 address with a length",
+                        m.name, mw.name, mw.address
+                    ))
+                })?;
+                workloads.push(MemberWorkload {
+                    name: mw.name.clone(),
+                    address,
+                    len,
+                });
+            }
             members.push(Member {
                 name: m.name.clone(),
                 node: m.node,
                 kind: m.kind,
                 wires,
+                workloads,
             });
         }
         let mut zones = Vec::new();
@@ -445,6 +621,11 @@ impl Fabric {
                 gw,
             });
         }
+        let workloads = d
+            .workload
+            .iter()
+            .map(resolve_workload)
+            .collect::<Result<Vec<_>>>()?;
         let forward_allow = d
             .forward
             .allow
@@ -505,6 +686,7 @@ impl Fabric {
             bgp_connect_s: bgp.connect_s,
             run_dir: runtime.run_dir,
             dns_domain: d.dns_domain.clone(),
+            workloads,
         };
         fabric.validate()?;
         Ok(fabric)
@@ -689,6 +871,100 @@ impl Fabric {
                 }
             }
         }
+        // ---- workloads ----
+        let mut seen = BTreeSet::new();
+        for wl in &self.workloads {
+            if self.zone(&wl.name).is_ok() {
+                return Err(Error::config(format!(
+                    "workload {}: name is also a zone (workload and zone names share one \
+                     vocabulary)",
+                    wl.name
+                )));
+            }
+            if !seen.insert(wl.name.clone()) {
+                return Err(Error::config(format!(
+                    "workload {}: declared twice",
+                    wl.name
+                )));
+            }
+            if !wl.prefix.contains(wl.gw) {
+                return Err(Error::config(format!(
+                    "workload {}: gw {} is outside prefix {}",
+                    wl.name, wl.gw, wl.prefix
+                )));
+            }
+            if !wl.prefix.contains(wl.router) {
+                return Err(Error::config(format!(
+                    "workload {}: router {} is outside prefix {}",
+                    wl.name, wl.router, wl.prefix
+                )));
+            }
+            for z in &wl.allow {
+                if self.zone(z).is_err() {
+                    let zones = self
+                        .zones
+                        .iter()
+                        .map(|z| z.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::config(format!(
+                        "workload {}: allow '{}': unknown zone (zones: {})",
+                        wl.name, z, zones
+                    )));
+                }
+            }
+            if !self
+                .members
+                .iter()
+                .any(|m| m.workloads.iter().any(|w| w.name == wl.name))
+            {
+                return Err(Error::config(format!(
+                    "workload {}: no member carries it (add workloads = [{{ name = \"{}\", \
+                     address = \"<host address>/{}\" }}] to a member)",
+                    wl.name, wl.name, wl.prefix.len
+                )));
+            }
+        }
+        for m in &self.members {
+            for mw in &m.workloads {
+                let Some(wl) = self.workload(&mw.name) else {
+                    let names = self
+                        .workloads
+                        .iter()
+                        .map(|w| w.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::config(format!(
+                        "member {}: workload '{}' is not a declared [[workload]] (workloads: {})",
+                        m.name, mw.name, names
+                    )));
+                };
+                if m.kind == MemberKind::Leaf {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: a leaf carries no workload (kind = leaf)",
+                        m.name, wl.name
+                    )));
+                }
+                if !wl.prefix.contains(mw.address) {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: address {} is outside prefix {}",
+                        m.name,
+                        wl.name,
+                        mw.address_cidr(),
+                        wl.prefix
+                    )));
+                }
+                if mw.len != wl.prefix.len {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: address {} must carry the prefix's mask /{}",
+                        m.name,
+                        wl.name,
+                        mw.address_cidr(),
+                        wl.prefix.len
+                    )));
+                }
+            }
+        }
         for z in &self.zones {
             let Some(gw) = &z.gw else { continue };
             // scope `any` = a migrating ingress leg: a bond over one tagged sub-interface
@@ -821,6 +1097,23 @@ impl Fabric {
         self.wire_prefs
             .iter()
             .find(|p| p.member == member && p.zone == zone)
+    }
+
+    /// The declared `[[workload]]` row of this name, if any.
+    pub fn workload(&self, name: &str) -> Option<&Workload> {
+        self.workloads.iter().find(|w| w.name == name)
+    }
+
+    /// The smallest set of prefixes covering every declared zone block, for DHCP option 121.
+    /// STUB for gate A: every zone block, sorted, with no merging of adjacent `/16`s — the
+    /// non-merging case this stub covers stays true once Task 4b (`emit::workload::aggregate`)
+    /// replaces this body with the real merge.
+    pub fn aggregate(&self) -> Vec<String> {
+        let mut ids: Vec<u8> = self.zones.iter().map(|z| z.id).collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| format!("10.{id}.0.0/16"))
+            .collect()
     }
 }
 
@@ -1415,5 +1708,200 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("a wire is listed twice"), "{err}");
+    }
+
+    // ---- workloads ---------------------------------------------------------------------------
+
+    /// The workload fixture with one text edit, through the whole gate (parse + validate).
+    fn wl_fabric_edit(edit: impl FnOnce(String) -> String) -> Result<Fabric> {
+        let text = edit(crate::decl::fixtures::with_workload(
+            &crate::decl::fixtures::example(),
+        ));
+        Fabric::from_decl(&Declaration::parse(&text)?)
+    }
+    fn wl_err(edit: impl FnOnce(String) -> String) -> String {
+        wl_fabric_edit(edit).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_workload_row_becomes_a_model_workload_with_the_prefix_mask_on_gw() {
+        let f = wl_fabric_edit(|t| t).unwrap();
+        let wl = f.workload("vms").unwrap();
+        assert_eq!(wl.prefix.to_string(), "192.168.20.0/24");
+        assert_eq!(wl.gw_cidr(), "192.168.20.254/24");
+        assert_eq!(wl.router.to_string(), "192.168.20.1");
+        assert_eq!(wl.span, Span::Switch);
+        assert_eq!(
+            f.member("pve1-tb").unwrap().workloads[0].address_cidr(),
+            "192.168.20.2/24"
+        );
+        assert!(f.member("pve3-tb").unwrap().workloads.is_empty());
+    }
+
+    #[test]
+    fn check_refuses_a_gw_outside_the_prefix() {
+        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.30.254\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: gw 192.168.30.254 is outside prefix 192.168.20.0/24"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_router_outside_the_prefix_or_malformed() {
+        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.30.1\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: router 192.168.30.1 is outside prefix 192.168.20.0/24"
+        );
+        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.1/24\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: router '192.168.20.1/24' must be a bare IPv4 address \
+             (the VLAN's existing default router)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_address_outside_the_prefix() {
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.30.2/24\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.30.2/24 is outside \
+             prefix 192.168.20.0/24"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_address_without_the_prefix_mask() {
+        let e = wl_err(|t| {
+            t.replace(
+                "address = \"192.168.20.2/24\"",
+                "address = \"192.168.20.2/32\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.2/32 must carry the \
+             prefix's mask /24"
+        );
+    }
+
+    #[test]
+    fn check_refuses_an_allow_naming_an_unknown_zone() {
+        let e = wl_err(|t| t.replace("allow = [\"storage\"]", "allow = [\"storage\", \"backup\"]"));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: allow 'backup': unknown zone (zones: storage, cluster, \
+             mgmt)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_workload_no_member_carries() {
+        let e = wl_err(|t| {
+            t.lines()
+                .filter(|l| !l.starts_with("workloads = ["))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: no member carries it (add workloads = [{ name = \
+             \"vms\", address = \"<host address>/24\" }] to a member)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_member_workload_naming_an_unknown_row() {
+        let e = wl_err(|t| {
+            t.replace(
+                "{ name = \"vms\", address = \"192.168.20.2/24\" }",
+                "{ name = \"nope\", address = \"192.168.20.2/24\" }",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload 'nope' is not a declared [[workload]] \
+             (workloads: vms)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_leaf_carrying_a_workload() {
+        let e = wl_err(|t| {
+            crate::decl::fixtures::with_prefs(
+                &t,
+                "pve3-tb",
+                "workloads = [{ name = \"vms\", address = \"192.168.20.4/24\" }]",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: member pve3-tb: workload vms: a leaf carries no workload (kind = leaf)"
+        );
+    }
+
+    #[test]
+    fn check_refuses_span_host_in_phase_1() {
+        let e = wl_err(|t| {
+            t.replace(
+                "gw = \"192.168.20.254\"",
+                "gw = \"192.168.20.254\"\nspan = \"host\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: span = \"host\" is phase 2 and not built yet (omit it, \
+             or span = \"switch\")"
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_workload_named_like_a_zone_or_declared_twice() {
+        let e = wl_err(|t| {
+            t.replace(
+                "[[workload]]\nname = \"vms\"",
+                "[[workload]]\nname = \"storage\"",
+            )
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: workload storage: name is also a zone (workload and zone names share \
+             one vocabulary)"
+        );
+        let e = wl_err(|t| format!("{t}{}", crate::decl::fixtures::WORKLOAD_BLOCK));
+        assert_eq!(e, "fabric.toml: workload vms: declared twice");
+    }
+
+    #[test]
+    fn check_refuses_malformed_prefix_and_gw() {
+        let e = wl_err(|t| t.replace("prefix = \"192.168.20.0/24\"", "prefix = \"192.168.20.0\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: prefix '192.168.20.0' is not an IPv4 prefix with a \
+             length (example: 192.168.20.0/24)"
+        );
+        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.20.254/24\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: gw '192.168.20.254/24' must be a bare IPv4 address (the \
+             prefix's mask is applied)"
+        );
+    }
+
+    #[test]
+    fn the_aggregate_covers_every_declared_zone_block() {
+        let f = wl_fabric_edit(|t| t).unwrap();
+        assert_eq!(
+            f.aggregate(),
+            vec!["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]
+        );
     }
 }

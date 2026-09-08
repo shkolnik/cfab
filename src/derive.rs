@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
-use crate::model::{Fabric, Member, MemberKind, SegScope, Zone};
+use crate::model::{Fabric, Member, MemberKind, SegScope, Workload, Zone};
 
 /// A a zone's `segments` row resolved for one member: domain → that member's wire. A member with no
 /// wire on a row's domain simply has no such row (heterogeneity is generated, not branched).
@@ -61,6 +61,15 @@ pub struct FallbackRow {
     pub ospf_cost: u32,
     pub home: String,
     pub ports: Vec<Port>,
+}
+
+/// A `[[workload]]` row this member carries: the declared row, joined to this member's own
+/// address on it.
+#[derive(Debug, Clone)]
+pub struct WorkloadRow<'a> {
+    pub wl: &'a Workload,
+    /// This member's address on `wl.ifname`, e.g. `192.168.20.2/24`.
+    pub address: String,
 }
 
 /// Where a (member, zone) wire order came from: the default producer, or a a member's `prefs` row.
@@ -157,6 +166,26 @@ impl<'a> View<'a> {
         prefs_of(self.fabric, self.member)
     }
 
+    /// This member's `[[workload]]` rows, in declaration order (the fabric's row order, not
+    /// the member's `workloads = [...]` order): every declared row this member carries, joined
+    /// to its own address on it.
+    pub fn workload_rows(&self) -> Vec<WorkloadRow<'a>> {
+        self.fabric
+            .workloads
+            .iter()
+            .filter_map(|wl| {
+                self.member
+                    .workloads
+                    .iter()
+                    .find(|mw| mw.name == wl.name)
+                    .map(|mw| WorkloadRow {
+                        wl,
+                        address: mw.address_cidr(),
+                    })
+            })
+            .collect()
+    }
+
     /// This member's interfaces in a zone: segments (table order), then the universal bond, then
     /// the ingress leg — adjacency interfaces before the router-facing one.
     pub fn zone_ifs(&self, zone: &str) -> Vec<String> {
@@ -235,6 +264,13 @@ impl<'a> View<'a> {
             for s in r.ports {
                 out.push((s.ifname, false));
             }
+        }
+        // A workload interface always forwards (spec §5.1.2): it is baseline-owned, not one of
+        // cfab's own legs, so it carries no untagged admin plane to protect, and its reach into
+        // an allowed zone does not depend on `[forward] enabled` (that flag gates transit
+        // BETWEEN zones, not a workload's own declared reach).
+        for r in self.workload_rows() {
+            out.push((r.wl.ifname.clone(), true));
         }
         for z in &f.zones {
             let id = Self::identity_if(z);
@@ -904,6 +940,21 @@ mod tests {
                 assert!(s.ifname.len() <= 15, "{}", s.ifname);
             }
         }
+    }
+
+    #[test]
+    fn owned_forwarding_includes_the_workload_ifname() {
+        let text = fixtures::with_workload(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
+        let get = |member: &str, ifname: &str| {
+            View::new(&f, member)
+                .unwrap()
+                .owned_forwarding()
+                .iter()
+                .any(|(n, _)| n == ifname)
+        };
+        assert!(get("pve1-tb", "primary.3"));
+        assert!(!get("pve3-tb", "primary.3"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub mod prober;
 pub mod sock_frame;
 pub mod supervisor;
 pub mod sys;
+pub mod workload;
 
 use std::path::Path;
 
