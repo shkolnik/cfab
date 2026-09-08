@@ -228,3 +228,51 @@ impl BondLeg {
         self.active_wire() == Some(self.home.as_str())
     }
 }
+
+/// One gw zone's ingress, as it was read: the table the return path uses, the leg the outside
+/// arrives on, and the BGP session that teaches the router this zone's identities. A row exists
+/// for every gw zone on a host, whether or not this member carries the leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ingress {
+    pub zone: String,
+    /// The gw router's address.
+    pub router: String,
+    /// The routing table the zone's return path uses (the zone id).
+    pub table: String,
+    /// The table holds at least one `default` line.
+    pub default_present: bool,
+    /// A `default` line in the table is inactive (`linkdown`/`dead`). Read only on a leg that
+    /// does not migrate: a migrating leg owns its own carrier diagnosis.
+    pub default_linkdown: bool,
+    /// The leg's netdev; `None` when this member carries no ingress leg for the zone.
+    pub ifname: Option<String>,
+    /// The address the leg must carry.
+    pub cidr: String,
+    /// The leg carries `cidr`; `None` when there is no leg to read.
+    pub cidr_present: Option<bool>,
+    /// The leg as a bond; `Some` only on gw scope `any`, where the leg migrates between wires.
+    pub bond: Option<BondLeg>,
+    /// The BGP session's state, `absent` when the router is not in the engine's list; `None`
+    /// when the engine's socket is silent or there is no leg.
+    pub bgp_state: Option<String>,
+    /// Prefixes this member has sent the router; `None` alongside `bgp_state`.
+    pub bgp_pfx_snt: Option<u64>,
+}
+
+impl Ingress {
+    /// What the prober says about reaching the router under this leg; `None` on a leg that does
+    /// not migrate, which nothing probes.
+    pub fn reach(&self) -> Option<Reach> {
+        self.bond.as_ref().map(|b| b.reach)
+    }
+
+    /// The wire the leg is carrying on, when it migrates and a port of ours is active.
+    pub fn active_wire(&self) -> Option<&str> {
+        self.bond.as_ref().and_then(|b| b.active_wire())
+    }
+
+    /// The wire the leg belongs on, when it migrates.
+    pub fn home_wire(&self) -> Option<&str> {
+        self.bond.as_ref().map(|b| b.home.as_str())
+    }
+}

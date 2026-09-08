@@ -39,8 +39,8 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 pub mod model;
 
 pub use model::{
-    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, LegKind, LegPort,
-    Reach, State,
+    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
+    LegPort, Reach, State,
 };
 
 pub struct StatusReport {
@@ -60,8 +60,8 @@ struct Ctx {
     adjacencies: Vec<Adjacency>,
     /// One row per zone carrying a fallback bond.
     fallbacks: Vec<BondLeg>,
-    /// One row per gw zone whose ingress leg migrates.
-    ingress_legs: Vec<BondLeg>,
+    /// One row per gw zone on a host.
+    ingress: Vec<Ingress>,
 }
 
 impl Ctx {
@@ -89,8 +89,11 @@ impl Ctx {
             // Settling: an adjacency that is still forming is the state `--wait` exists for.
             out.push((Class::Settling, format!("down {}", a.label())));
         }
-        for leg in self.fallbacks.iter().chain(&self.ingress_legs) {
+        for leg in &self.fallbacks {
             out.extend(leg_reasons(leg));
+        }
+        for i in &self.ingress {
+            out.extend(ingress_reasons(i));
         }
         out
     }
@@ -1460,40 +1463,42 @@ fn return_path_and_ingress(
             .lines()
             .filter(|l| l.starts_with("default "))
             .collect();
-        if default_lines.is_empty() {
-            // Settling: the default in this table is LEARNED from the router, so a table with
-            // none is the ordinary state of the first seconds after the engine starts.
-            c.settling(format!(
-                "{} gw {} unreachable (table {id} has no default)",
-                z.name, gw.router
-            ));
-        } else if leg.as_ref().is_none_or(|l| !l.migrates())
-            && default_lines
-                .iter()
-                // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
-                // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
-                // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
-                // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
-                // degraded the zone; cfab must not read healthier than the FRR build did. If E3
-                // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
-                .any(|l| l.contains("linkdown") || l.contains("dead"))
-        {
-            c.settling(format!(
-                "{} gw {} unreachable (table {id} default is linkdown - the ingress leg has no \
-                 carrier)",
-                z.name, gw.router
-            ));
-        }
+        let mut row = Ingress {
+            zone: z.name.clone(),
+            router: gw.router.to_string(),
+            table: id.clone(),
+            default_present: !default_lines.is_empty(),
+            default_linkdown: leg.as_ref().is_none_or(|l| !l.migrates())
+                && default_lines
+                    .iter()
+                    // INFERRED, not measured (task E2.2 — no CAP_NET_ADMIN on the build host; task E3
+                    // settles it live): `up` sets ignore_routes_with_linkdown=1, which the reading says
+                    // KEEPS a carrier-less leg's default line but flags it `linkdown` (or `dead`) and
+                    // makes it inactive for lookups. Under FRR, zebra withdrew the route and `verify`
+                    // degraded the zone; cfab must not read healthier than the FRR build did. If E3
+                    // finds the kernel withdraws the line instead of flagging it, this branch is dropped.
+                    .any(|l| l.contains("linkdown") || l.contains("dead")),
+            ifname: None,
+            cidr: gw.leg_cidr(n),
+            cidr_present: None,
+            bond: None,
+            bgp_state: None,
+            bgp_pfx_snt: None,
+        };
         // ingress leg + session (members carrying the leg): the router must be peering, else
         // the outside cannot reach this zone's identities
-        let Some(leg) = leg else { continue };
+        let Some(leg) = leg else {
+            c.ingress.push(row);
+            continue;
+        };
+        row.ifname = Some(leg.ifname.clone());
         // A leg on gw scope `any` is an active-backup bond: the same reader the universal
         // segments get, so the ONE leg the outside depends on is graded like every other
         // migrating leg — a dark bond, a stranger active on it, a migration to a backup wire,
         // a port that never re-attached. A leg on a single domain is a plain sub-interface
         // and has none of this state.
         if leg.migrates() {
-            c.ingress_legs.push(read_bond_leg(
+            row.bond = Some(read_bond_leg(
                 sys,
                 absent,
                 LegSpec {
@@ -1507,45 +1512,86 @@ fn return_path_and_ingress(
                 },
             ));
         }
-        let cidr = gw.leg_cidr(n);
         let addr = sys
             .run(&["ip", "-4", "-br", "addr", "show", "dev", &leg.ifname])?
             .stdout;
-        if !addr.contains(&format!(" {cidr}")) {
-            c.settling(format!(
-                "{} ingress leg {} missing or not {cidr}",
-                z.name, leg.ifname
-            ));
-        }
-        let Some(doc) = doc else { continue };
+        row.cidr_present = Some(addr.contains(&format!(" {}", row.cidr)));
+        let Some(doc) = doc else {
+            c.ingress.push(row);
+            continue;
+        };
         let entry = doc["bgp"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|n| n["peer"] == gw.router.as_str());
-        let state = entry
-            .and_then(|n| n["state"].as_str())
-            .unwrap_or("absent")
-            .to_string();
-        if state != "Established" {
-            // Settling, and so is the `pfx_snt == 0` line below it: a BGP session takes seconds
-            // to establish and another moment to send the zone's prefixes.
-            c.settling(format!(
-                "{} ingress: bgp {} {state} (not Established - the router is not \
-                 learning this zone's identities)",
-                z.name, gw.router
-            ));
-        } else if entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0) == 0 {
-            // Established but advertising nothing is the exact signature of a missing neighbor
-            // afi-safi export policy: the session is healthy, the zone's identities never leave.
-            c.settling(format!(
-                "{} ingress: bgp {} Established but advertising nothing (0 sent prefixes \
-                 - the neighbor afi-safi export policy is not attached)",
-                z.name, gw.router
-            ));
-        }
+        row.bgp_state = Some(
+            entry
+                .and_then(|n| n["state"].as_str())
+                .unwrap_or("absent")
+                .to_string(),
+        );
+        row.bgp_pfx_snt = Some(entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0));
+        c.ingress.push(row);
     }
     Ok(())
+}
+
+/// What one gw zone's ingress row says, in words.
+fn ingress_reasons(i: &Ingress) -> Vec<(Class, String)> {
+    let mut out: Vec<(Class, String)> = Vec::new();
+    let (zone, router, table) = (&i.zone, &i.router, &i.table);
+    if !i.default_present {
+        // Settling: the default in this table is LEARNED from the router, so a table with none
+        // is the ordinary state of the first seconds after the engine starts.
+        out.push((
+            Class::Settling,
+            format!("{zone} gw {router} unreachable (table {table} has no default)"),
+        ));
+    } else if i.default_linkdown {
+        out.push((
+            Class::Settling,
+            format!(
+                "{zone} gw {router} unreachable (table {table} default is linkdown - the \
+                 ingress leg has no carrier)"
+            ),
+        ));
+    }
+    if let Some(b) = &i.bond {
+        out.extend(leg_reasons(b));
+    }
+    if let (Some(ifname), Some(false)) = (&i.ifname, i.cidr_present) {
+        out.push((
+            Class::Settling,
+            format!("{zone} ingress leg {ifname} missing or not {}", i.cidr),
+        ));
+    }
+    match (&i.bgp_state, i.bgp_pfx_snt) {
+        (Some(state), _) if state != "Established" => {
+            // Settling, and so is the `pfx_snt == 0` line below it: a BGP session takes seconds
+            // to establish and another moment to send the zone's prefixes.
+            out.push((
+                Class::Settling,
+                format!(
+                    "{zone} ingress: bgp {router} {state} (not Established - the router is not \
+                     learning this zone's identities)"
+                ),
+            ));
+        }
+        (Some(_), Some(0)) => {
+            // Established but advertising nothing is the exact signature of a missing neighbor
+            // afi-safi export policy: the session is healthy, the zone's identities never leave.
+            out.push((
+                Class::Settling,
+                format!(
+                    "{zone} ingress: bgp {router} Established but advertising nothing (0 sent \
+                     prefixes - the neighbor afi-safi export policy is not attached)"
+                ),
+            ));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The backend `up` recorded, or nft when there is no record: nft is what every member ran
