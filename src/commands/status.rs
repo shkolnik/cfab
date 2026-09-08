@@ -36,94 +36,15 @@ const POLL_SECS: u64 = 2;
 /// never. Chosen, not derived — the tick cadence is a supervisor constant, not a declaration.
 const WATCHDOG_STALE_SECS: u64 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Up,
-    /// Up, but some expected adjacency is down. One hyphenated token so it has one spelling and
-    /// the word UP stays visible on a degraded member.
-    UpDegraded,
-    Failed,
-    Down,
-}
+pub mod model;
 
-impl State {
-    pub fn word(self) -> &'static str {
-        match self {
-            State::Up => "UP",
-            State::UpDegraded => "UP-DEGRADED",
-            State::Failed => "FAILED",
-            State::Down => "DOWN",
-        }
-    }
-
-    /// Nagios-style: 0 ok, 1 warning, 2 critical, 3 unknown/not-desired.
-    pub fn code(self) -> u8 {
-        match self {
-            State::Up => 0,
-            State::UpDegraded => 1,
-            State::Failed => 2,
-            State::Down => 3,
-        }
-    }
-}
+pub use model::{Class, Condition, Headline, State};
 
 pub struct StatusReport {
     pub state: State,
     /// The process exit code — `state.code()`, or 0 for UP/UP-DEGRADED under `--permissive`.
     pub code: u8,
     pub output: String,
-}
-
-/// The three fields of the headline, each `n/N`. All three are on the links axis; they are
-/// separate because a lost BFD session shows sub-second and a lost fallback neighbor only after
-/// the OSPF dead interval.
-#[derive(Default, Debug, PartialEq, Eq)]
-struct Counts {
-    peers_up: usize,
-    peers: usize,
-    links_up: usize,
-    links: usize,
-    fallbacks_up: usize,
-    fallbacks: usize,
-}
-
-impl Counts {
-    fn state(&self) -> State {
-        if self.links_up == 0 && self.fallbacks_up == 0 {
-            State::Failed
-        } else if self.links_up == self.links && self.fallbacks_up == self.fallbacks {
-            State::Up
-        } else {
-            State::UpDegraded
-        }
-    }
-
-    fn fields(&self) -> String {
-        format!(
-            "{}/{} | {}/{} | {}/{}",
-            self.peers_up, self.peers, self.links_up, self.links, self.fallbacks_up, self.fallbacks
-        )
-    }
-}
-
-/// What one reason line means for `--wait`, and the only thing the classification decides
-/// (F22, VERIFIED on the rack 2026-09-07: the headline goes UP seconds before the engine has
-/// installed the routes, and a wait that ends on the headline alone lets a deployment gate pass
-/// over a fabric that cannot carry anything yet).
-///
-/// Every emitter states its class at the call site — there is no default and no matching on the
-/// text of a line, so a new reason line cannot join either set by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
-    /// The fabric itself clears this one: an adjacency that is still forming, a route or an
-    /// address the engine has not installed yet, a child the supervisor is restarting, a
-    /// sysctl/rule/leg `up` and the watchdog own. Its presence means "not settled", so it holds
-    /// `--wait` open until the deadline.
-    Settling,
-    /// Waiting changes nothing: the line is a design-health note a settled fabric prints, a
-    /// counter, a drift against generated state, a foreign daemon, or a hardware fact. Holding
-    /// the wait on one would cost every `status --wait` its whole deadline, every time.
-    Standing,
 }
 
 /// Reason lines. Not verdicts: a posture condition either actuates (the links go down and the
@@ -413,7 +334,7 @@ fn read(
     expected: &[(u8, String, u8, String)],
     c: &mut Ctx,
     comps: Option<&Components>,
-) -> Result<Counts> {
+) -> Result<Headline> {
     let f = view.fabric;
     // First: the engine may be gone because another BFD daemon took our port, and every count
     // below needs the engine. Diagnose that before reporting its symptoms.
@@ -433,7 +354,7 @@ fn read(
     shape_posture(sys, view, comps, c)?;
     link_speeds(sys, view, c, &absent)?;
 
-    let mut counts = Counts::default();
+    let mut counts = Headline::default();
     let mut peers: BTreeSet<u8> = BTreeSet::new();
     let mut peers_up: BTreeSet<u8> = BTreeSet::new();
 
@@ -1200,7 +1121,7 @@ fn fallback(
     comps: Option<&Components>,
     c: &mut Ctx,
     absent: &BTreeSet<String>,
-    counts: &mut Counts,
+    counts: &mut Headline,
     peers: &mut BTreeSet<u8>,
     peers_up: &mut BTreeSet<u8>,
 ) -> Result<BTreeSet<(u8, String)>> {
