@@ -1735,7 +1735,7 @@ fn workload_posture(
                 ifname: wl.ifname.clone(),
                 address: row.address.clone(),
                 gw: gw_cidr,
-                up: false,
+                up: WorkloadState::Deferred.is_up(),
                 state: WorkloadState::Deferred,
                 zones: wl.allow.clone(),
                 uplinks: Vec::new(),
@@ -1825,13 +1825,17 @@ fn workload_posture(
         } else {
             WorkloadState::Up
         };
-        let up = state == WorkloadState::Up;
+        let up = state.is_up();
 
         // Observability, never a health condition (availability first): a failed read is a
         // `None`, never a fault line and never a change to `up`. The neighbor read is taken
         // only once the row's `up` is final, and only for an up row — a row that is not up
         // skips it rather than taking it and discarding it.
-        let guard_drops = if bridge_ok {
+        // `None` when the table is absent OR this row's uplink ports are unknown (review M1): an
+        // identify failure leaves `uplinks` empty, and summing over zero ports would otherwise
+        // report a fabricated `Some { claim: 0, request: 0 }` indistinguishable from "the guard
+        // ran and dropped nothing".
+        let guard_drops = if bridge_ok && !uplinks.is_empty() {
             let mut claim = 0u64;
             let mut request = 0u64;
             for port in &uplinks {
@@ -3408,30 +3412,47 @@ mod tests {
         assert_eq!(deferred[0].class, Class::Settling);
     }
 
-    /// `up == (state == Up)` over a real `gather()`, across all four states: a healthy row, a
-    /// deferred one, a broken one (bridge guard missing) and an announcer-not-started one. The
-    /// sibling tests above pin each state's own scenario in detail; this one is the general
-    /// property, checked on the same code path.
+    /// Each of the four `WorkloadState` variants actually gets produced by its named scenario
+    /// (not just "some non-`Up` state or other" — review M2, this used to assert only
+    /// `up == (state == Up)`, a near-tautology of `status.rs`'s own `let up = state.is_up();`
+    /// that would still pass if the deferred scenario silently classified as `Broken`), and
+    /// `up == (state == Up)` holds at every one of them, over a real `gather()`. The sibling
+    /// tests pin each scenario's full detail (reason lines, class); this one is the general
+    /// property, checked on the same code path, for all four at once.
     #[test]
     fn up_is_exactly_state_equals_up() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let expected = expected_links(&view).unwrap();
         let no_announcer = components_doc(true, serde_json::json!([]));
-        let scenarios: Vec<MockSys> = vec![
-            wl_status_sys(&f, &view),
-            wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n"),
-            wl_status_sys(&f, &view).on_fail(
-                &["nft", "list", "table", "bridge", "cfab"],
-                1,
-                "Error: No such file or directory",
+        let scenarios: Vec<(&str, MockSys, WorkloadState)> = vec![
+            ("healthy", wl_status_sys(&f, &view), WorkloadState::Up),
+            (
+                "deferred",
+                wl_status_sys(&f, &view)
+                    .file(&format!("{}/workload-deferred", f.run_dir), "vms\n"),
+                WorkloadState::Deferred,
             ),
-            wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer),
+            (
+                "broken (bridge guard missing)",
+                wl_status_sys(&f, &view).on_fail(
+                    &["nft", "list", "table", "bridge", "cfab"],
+                    1,
+                    "Error: No such file or directory",
+                ),
+                WorkloadState::Broken,
+            ),
+            (
+                "announcer not started",
+                wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer),
+                WorkloadState::AnnouncerNotStarted,
+            ),
         ];
-        for mut sys in scenarios {
+        for (label, mut sys, want_state) in scenarios {
             let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
             let row = &m.workloads[0];
-            assert_eq!(row.up, row.state == WorkloadState::Up, "{row:?}");
+            assert_eq!(row.state, want_state, "{label}: {row:?}");
+            assert_eq!(row.up, row.state == WorkloadState::Up, "{label}: {row:?}");
         }
     }
 
@@ -3514,6 +3535,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
         assert_eq!(hit.class, Class::Standing);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
+        // review M1: an identify failure leaves `uplinks` empty, so `guard_drops` must be `None`
+        // — never a fabricated `Some { claim: 0, request: 0 }` — even though the bridge table
+        // itself (unrelated to this row's own ports) is present in this fixture.
+        assert_eq!(m.workloads[0].guard_drops, None);
     }
 
     /// `sibling_return_reason` never panics, and its three arms are distinct: never emitted by

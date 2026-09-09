@@ -294,6 +294,16 @@ pub enum WorkloadState {
     Broken,
 }
 
+impl WorkloadState {
+    /// `WorkloadStatus.up` is always exactly this — the one place that maps a state to the
+    /// boolean, so every production site that constructs a row sets `up: state.is_up()` instead
+    /// of hand-writing the pair (review M3: a hand-written pair is only conventionally, not
+    /// structurally, tied to `state`).
+    pub fn is_up(self) -> bool {
+        self == WorkloadState::Up
+    }
+}
+
 /// The bridge guard's two counters (spec addendum, `counter_packets_for`), summed over the row's
 /// uplink ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +342,8 @@ pub struct WorkloadStatus {
     /// or the `ip -j neigh show dev` read failed — observability, never a health condition.
     pub vms_seen: Option<u32>,
     /// The bridge guard's claim/request drop counters, summed over the row's uplink ports;
-    /// `None` when the guard table is absent.
+    /// `None` when the guard table is absent, or the row's uplink ports are unknown (an
+    /// `uplink::identify` failure leaves nothing to sum over).
     pub guard_drops: Option<GuardDrops>,
     /// `(rx_bytes, tx_bytes)` from `/sys/class/net/<ifname>/statistics/`; `None` on a read
     /// failure.
