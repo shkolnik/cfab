@@ -939,7 +939,7 @@ mod tests {
     }
 
     use crate::commands::status::model::{
-        Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach, WorkloadStatus,
+        Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach, WorkloadState, WorkloadStatus,
     };
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
@@ -1153,9 +1153,15 @@ mod tests {
                     address: "192.168.20.2/24".to_string(),
                     gw: "192.168.20.254/24".to_string(),
                     up: true,
+                    // Task 2 wires vms_seen/guard_drops/bytes into the collector; the fixture
+                    // here only needs to keep compiling with the new required fields.
+                    state: WorkloadState::Up,
                     zones: vec!["storage".to_string()],
                     uplinks: vec!["eth0".to_string()],
                     trigger: Some("neigh events".to_string()),
+                    vms_seen: None,
+                    guard_drops: None,
+                    bytes: None,
                 }]
             } else {
                 Vec::new()

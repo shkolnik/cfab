@@ -42,8 +42,8 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 pub mod model;
 
 pub use model::{
-    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
-    LegPort, MemberInfo, Reach, State, StatusModel, WorkloadStatus,
+    Adjacency, BondLeg, Bonding, Class, Condition, GuardDrops, Headline, HomeCarrier, Ingress,
+    LegKind, LegPort, MemberInfo, Reach, State, StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -1735,14 +1735,23 @@ fn workload_posture(
                 address: row.address.clone(),
                 gw: gw_cidr,
                 up: false,
+                state: WorkloadState::Deferred,
                 zones: wl.allow.clone(),
                 uplinks: Vec::new(),
                 trigger: None,
+                vms_seen: None,
+                guard_drops: None,
+                bytes: None,
             });
             continue;
         }
 
-        let mut up = true;
+        // `broken` is every `up = false` reason below the deferral check (the seven sites the
+        // plan enumerates, including `c.broken_workloads`, which pushes no condition of its own
+        // but still makes the row `Broken`, never `Up`); `announcer_not_started` is tracked
+        // apart so precedence (`Broken` over `AnnouncerNotStarted`) is a fact of the code, not
+        // an accident of evaluation order.
+        let mut broken = false;
         let link = sys.run(&["ip", "-br", "link", "show", "dev", &wl.ifname])?;
         let mut uplinks = Vec::new();
         if !link.ok() {
@@ -1752,7 +1761,7 @@ fn workload_posture(
                 "workload {name}: interface {} does not exist",
                 wl.ifname
             ));
-            up = false;
+            broken = true;
         } else {
             let addr = sys
                 .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
@@ -1762,20 +1771,20 @@ fn workload_posture(
                     "workload {name}: address {} missing on {}",
                     row.address, wl.ifname
                 ));
-                up = false;
+                broken = true;
             }
             if !addr.contains(&format!(" {gw_cidr}")) {
                 c.settling(format!(
                     "workload {name}: gw {gw_cidr} missing on {}",
                     wl.ifname
                 ));
-                up = false;
+                broken = true;
             }
             match crate::workload::uplink::identify(&*sys, &wl.ifname) {
                 Ok(u) => uplinks = u.ports,
                 Err(e) => {
                     c.standing(format!("workload {name}: {e}"));
-                    up = false;
+                    broken = true;
                 }
             }
         }
@@ -1784,16 +1793,16 @@ fn workload_posture(
             c.settling(format!(
                 "workload {name}: net.ipv4.conf.all.arp_ignore is {arp} (want 1)"
             ));
-            up = false;
+            broken = true;
         }
         if !bridge_ok {
             c.settling(format!(
                 "workload {name}: bridge table cfab missing (uplink ARP guard down)"
             ));
-            up = false;
+            broken = true;
         }
         if c.broken_workloads.contains(name) {
-            up = false;
+            broken = true;
         }
 
         // A row `apply` did not defer, but whose announcer the supervisor never started (Task
@@ -1802,24 +1811,45 @@ fn workload_posture(
         // With no supervisor answering the announcer's state is unknown, and that fault already
         // has its own line: only an answering supervisor with no entry means "not started".
         let announce = comps.and_then(|k| k.workloads.iter().find(|w| w.name == name));
-        if comps.is_some() && announce.is_none() {
+        let announcer_not_started = comps.is_some() && announce.is_none();
+        if announcer_not_started {
             c.settling(format!("workload {name}: announcer not started"));
-            up = false;
         }
         let trigger = announce.map(|w| w.trigger.clone());
+
+        let state = if broken {
+            WorkloadState::Broken
+        } else if announcer_not_started {
+            WorkloadState::AnnouncerNotStarted
+        } else {
+            WorkloadState::Up
+        };
+        let up = state == WorkloadState::Up;
+        // Task 1 item 3 fills these in from live reads, gated the same way (`vms_seen` only
+        // once `up` above is final, and only for an up row); item 2 only adds the fields and
+        // the classification they will be gated on.
+        let guard_drops = None;
+        let bytes = None;
+        let vms_seen = None;
+
         c.workload(WorkloadStatus {
             name: name.to_string(),
             ifname: wl.ifname.clone(),
             address: row.address.clone(),
             gw: gw_cidr,
             up,
+            state,
             zones: wl.allow.clone(),
             uplinks,
             trigger,
+            vms_seen,
+            guard_drops,
+            bytes,
         });
     }
     Ok(())
 }
+
 
 /// What one gw zone's ingress row says, in words.
 fn ingress_reasons(i: &Ingress) -> Vec<(Class, String)> {
@@ -3031,6 +3061,7 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert_eq!(m.workloads.len(), 1);
         assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Up);
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
@@ -3140,6 +3171,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
             assert_eq!(hit.class, class, "{want}");
             assert!(!m.workloads[0].up, "{want}");
+            assert_eq!(m.workloads[0].state, WorkloadState::Broken, "{want}");
             // Exactly one condition about THIS workload — an extra reason line for the one
             // thing perturbed would pass the `find` above and still be a regression. Scoped to
             // "vms" / its prefix, never the fixture's other zones' own (always-missing in this
@@ -3170,6 +3202,7 @@ mod tests {
                 .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
         );
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
     }
 
     /// A row `apply` did not defer, but whose announcer the supervisor never started — Task 8b's
@@ -3191,11 +3224,14 @@ mod tests {
             .unwrap_or_else(|| panic!("{:#?}", m.conditions));
         assert_eq!(hit.class, Class::Settling);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::AnnouncerNotStarted);
         assert_eq!(m.workloads[0].trigger, None);
     }
 
     /// No supervisor answering is one fault with its own line; the announcer's state is then
     /// unknown, not "not started", so the row does not earn a second reason for the same cause.
+    /// With no supervisor answering the row is classified from the live checks alone (all
+    /// healthy here), so it is still `Up`.
     #[test]
     fn no_supervisor_does_not_also_read_as_announcer_not_started() {
         let f = wl_fabric();
@@ -3209,6 +3245,29 @@ mod tests {
             m.conditions
         );
         assert_eq!(m.workloads[0].trigger, None);
+        assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Up);
+    }
+
+    /// Precedence: a row that is both `Broken` (bridge guard table missing) and has no announcer
+    /// entry is `Broken`, never `AnnouncerNotStarted` — the more severe fault wins even though
+    /// the announcer check runs last and would otherwise "see" the row's `up` already false.
+    #[test]
+    fn a_broken_row_with_no_announcer_is_broken_not_announcer_not_started() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let no_announcer = components_doc(true, serde_json::json!([]));
+        let mut sys = wl_status_sys(&f, &view)
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .socket("/run/cfab/cfab.sock", &no_announcer);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
     }
 
     /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy
@@ -3223,6 +3282,7 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert_eq!(m.workloads.len(), 1);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Deferred);
         let deferred: Vec<&Condition> = m
             .conditions
             .iter()
@@ -3235,6 +3295,33 @@ mod tests {
              it is)"
         );
         assert_eq!(deferred[0].class, Class::Settling);
+    }
+
+    /// `up == (state == Up)` over a real `gather()`, across all four states: a healthy row, a
+    /// deferred one, a broken one (bridge guard missing) and an announcer-not-started one. The
+    /// sibling tests above pin each state's own scenario in detail; this one is the general
+    /// property, checked on the same code path.
+    #[test]
+    fn up_is_exactly_state_equals_up() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let expected = expected_links(&view).unwrap();
+        let no_announcer = components_doc(true, serde_json::json!([]));
+        let scenarios: Vec<MockSys> = vec![
+            wl_status_sys(&f, &view),
+            wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n"),
+            wl_status_sys(&f, &view).on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            ),
+            wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer),
+        ];
+        for mut sys in scenarios {
+            let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+            let row = &m.workloads[0];
+            assert_eq!(row.up, row.state == WorkloadState::Up, "{row:?}");
+        }
     }
 
     /// A leaf carries no `[[workload]]` row of its own, but the sibling rule and the route-get

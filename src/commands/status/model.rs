@@ -281,6 +281,27 @@ impl Ingress {
     }
 }
 
+/// A row's classification (metrics addendum 2026-09-09). Precedence when several conditions
+/// apply at once: `Deferred` > `Broken` > `AnnouncerNotStarted` > `Up` — a deferred row is
+/// classified before any of the checks below run (`apply` never gave it a gw address), and a
+/// return-path-broken row (`c.broken_workloads`, which pushes no condition of its own) is
+/// `Broken`, never `Up`, even though it adds nothing to `up`'s reasons by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadState {
+    Up,
+    Deferred,
+    AnnouncerNotStarted,
+    Broken,
+}
+
+/// The bridge guard's two counters (spec addendum, `counter_packets_for`), summed over the row's
+/// uplink ports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardDrops {
+    pub claim: u64,
+    pub request: u64,
+}
+
 /// One `[[workload]]` row on this member, as `status` read it (spec §5.1 item 10). A row exists
 /// only on a member that carries the interface (`view.workload_rows()`) — a member the workload
 /// merely reaches (an allowed zone with no address on `ifname`) has none, and is checked by the
@@ -294,7 +315,10 @@ pub struct WorkloadStatus {
     /// The anycast gateway with the prefix's mask, e.g. `192.168.20.254/24`.
     pub gw: String,
     /// The interface, its addresses, the ARP guard and the return path are all in place.
+    /// Always `state == WorkloadState::Up`.
     pub up: bool,
+    /// This row's classification; `up == (state == Up)`.
+    pub state: WorkloadState,
     /// Zones this workload is advertised into (the declared `allow` list).
     pub zones: Vec<String>,
     /// The bridge's uplink port(s), from `uplink::identify`; empty when unidentified.
@@ -303,6 +327,16 @@ pub struct WorkloadStatus {
     /// `components` document; `None` when no supervisor is answering or the announcer has not
     /// started.
     pub trigger: Option<String>,
+    /// Count of neighbor entries in `prefix` recently resolved to something other than a
+    /// declared member, `gw` or `router` (a VM, presumptively). `None` when the row is not up,
+    /// or the `ip -j neigh show dev` read failed — observability, never a health condition.
+    pub vms_seen: Option<u32>,
+    /// The bridge guard's claim/request drop counters, summed over the row's uplink ports;
+    /// `None` when the guard table is absent.
+    pub guard_drops: Option<GuardDrops>,
+    /// `(rx_bytes, tx_bytes)` from `/sys/class/net/<ifname>/statistics/`; `None` on a read
+    /// failure.
+    pub bytes: Option<(u64, u64)>,
 }
 
 /// Which member this gather describes.
