@@ -3094,6 +3094,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
             assert_eq!(hit.class, class, "{want}");
             assert!(!m.workloads[0].up, "{want}");
+            // Exactly one condition about THIS workload — an extra reason line for the one
+            // thing perturbed would pass the `find` above and still be a regression. Scoped to
+            // "vms" / its prefix, never the fixture's other zones' own (always-missing in this
+            // mock) pref-2000 defaults, which are noise unrelated to any of these cases.
+            let related: Vec<&Condition> = m
+                .conditions
+                .iter()
+                .filter(|c| c.text.starts_with("workload vms:") || c.text.contains("192.168.20.0/24"))
+                .collect();
+            assert_eq!(related.len(), 1, "{want}: {related:#?}");
         }
     }
 
