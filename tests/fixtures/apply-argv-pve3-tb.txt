@@ -239,6 +239,7 @@ ip rule show pref 1000
 ip rule add pref 1000 to 10.249.0.0/16 iif lo lookup main
 ip rule show pref 1001
 ip rule add pref 1001 to 10.249.0.0/16 unreachable
+rm /run/cfab/workload-deferred
 write /run/cfab/mark.backend
 /usr/bin/env sh -c command -v iptables-legacy
 /usr/bin/env sh -c command -v iptables-legacy-save

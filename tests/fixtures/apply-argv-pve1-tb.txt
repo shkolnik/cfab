@@ -286,6 +286,7 @@ write /proc/sys/net/ipv4/conf/eth9/forwarding
 write /proc/sys/net/ipv4/conf/eth1/forwarding
 write /proc/sys/net/ipv4/conf/eth0/forwarding
 iptables -S DOCKER-USER
+rm /run/cfab/workload-deferred
 write /run/cfab/mark.backend
 /usr/bin/env sh -c command -v iptables-legacy
 /usr/bin/env sh -c command -v iptables-legacy-save

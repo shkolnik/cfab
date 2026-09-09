@@ -600,7 +600,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // ---- workload gw address + arp_ignore (spec §5.1 pass 3, review item 1: the guard above is
     // in place BEFORE any gw address goes live — closes the window where the address was
     // reachable with no ARP-guard protection) + deferred-row bookkeeping for the watchdog -------
-    if !view.workload_rows().is_empty() {
+    if view.workload_rows().is_empty() {
+        // A declaration that dropped its last `[[workload]]` row (or never had one) must not
+        // leave a prior apply's stale deferred name behind — `remove` is already absent-safe.
+        sys.remove(&format!("{}/workload-deferred", f.run_dir))?;
+    } else {
         sys.write(
             &format!("{}/workload-deferred", f.run_dir),
             &deferred_names.join("\n"),
@@ -1648,6 +1652,16 @@ pub(crate) mod tests {
             sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
             "the leaf gets the sibling"
         );
+    }
+
+    #[test]
+    fn up_with_zero_workload_rows_removes_a_stale_deferred_file() {
+        // MINOR 2 (re-review): a declaration that dropped its last `[[workload]]` row (or never
+        // had one) must not leave a prior `apply`'s workload-deferred file behind for a stale
+        // name the watchdog would otherwise keep trying to install forever.
+        let (mut sys, view) = up_sys_and_view();
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran(&format!("rm {}/workload-deferred", view.fabric.run_dir)));
     }
 
     #[test]
