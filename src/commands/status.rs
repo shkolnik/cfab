@@ -1782,9 +1782,15 @@ fn workload_posture(
             up = false;
         }
 
-        let trigger = comps
-            .and_then(|k| k.workloads.iter().find(|w| w.name == name))
-            .map(|w| w.trigger.clone());
+        // A row `apply` did not defer, but whose announcer the supervisor never started (Task
+        // 8b's own journal says why) has no entry here — that is its own fault, not "healthy
+        // with nothing to show for the trigger": one settling line, and the row counts down.
+        let announce = comps.and_then(|k| k.workloads.iter().find(|w| w.name == name));
+        if announce.is_none() {
+            c.settling(format!("workload {name}: announcer not started"));
+            up = false;
+        }
+        let trigger = announce.map(|w| w.trigger.clone());
         c.workload(WorkloadStatus {
             name: name.to_string(),
             ifname: wl.ifname.clone(),
@@ -3108,6 +3114,42 @@ mod tests {
                 .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
         );
         assert!(!m.workloads[0].up);
+    }
+
+    /// A row `apply` did not defer, but whose announcer the supervisor never started — Task 8b's
+    /// `Components.workloads` carries no entry for it — is its own fault: `announce trigger -`
+    /// on a `down` row would otherwise look indistinguishable from a healthy row whose trigger
+    /// just was not fetched yet.
+    #[test]
+    fn a_row_with_no_announcer_entry_is_its_own_reason_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let no_announcer = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "shape-daemon", "state": "running", "pid": 1250, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
+            "workloads": []
+        })
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let hit = m
+            .conditions
+            .iter()
+            .find(|c| c.text == "workload vms: announcer not started")
+            .unwrap_or_else(|| panic!("{:#?}", m.conditions));
+        assert_eq!(hit.class, Class::Settling);
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].trigger, None);
     }
 
     /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy
