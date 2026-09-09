@@ -1897,9 +1897,11 @@ fn sysfs_bytes(sys: &dyn Sys, ifname: &str) -> Option<(u64, u64)> {
 }
 
 /// One neighbor read on `ifname` (`ip -j neigh show dev`, JSON), counting IPv4 entries inside
-/// `prefix` whose state is REACHABLE/STALE/DELAY/PROBE and whose address is not in `exclude`
-/// (every declared member's address on this workload, `gw`, `router`). Out-of-prefix entries are
-/// excluded by the `prefix.contains` check, not a separate list. `None` on a read or parse
+/// `prefix` whose state is REACHABLE/STALE/DELAY/PROBE/PERMANENT (RULED, gate M1 review I1,
+/// research commit 0e9bced: a static neighbor is a resolved host too) and whose address is not
+/// in `exclude` (every declared member's address on this workload, `gw`, `router`). NOARP,
+/// FAILED and INCOMPLETE never carry a resolved lladdr and do not count. Out-of-prefix entries
+/// are excluded by the `prefix.contains` check, not a separate list. `None` on a read or parse
 /// failure — this is observability, never a health condition.
 fn neighbors_seen(
     sys: &mut dyn Sys,
@@ -1929,7 +1931,7 @@ fn neighbors_seen(
             .into_iter()
             .flatten()
             .filter_map(|s| s.as_str())
-            .any(|s| matches!(s, "REACHABLE" | "STALE" | "DELAY" | "PROBE"));
+            .any(|s| matches!(s, "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT"));
         if resolved {
             count += 1;
         }
@@ -4108,6 +4110,9 @@ table bridge cfab {
         let neigh_json = serde_json::json!([
             {"dst": "192.168.20.50", "dev": "primary.3", "state": ["FAILED"]},
             {"dst": "192.168.20.51", "dev": "primary.3", "state": ["INCOMPLETE"]},
+            // NOARP never carries a resolved lladdr either (RULED, gate M1 review I1): a
+            // no-ARP interface entry, not a host that answered.
+            {"dst": "192.168.20.52", "dev": "primary.3", "state": ["NOARP"]},
         ])
         .to_string();
         let mut sys = MockSys::default()
@@ -4115,6 +4120,24 @@ table bridge cfab {
         assert_eq!(
             neighbors_seen(&mut sys, "primary.3", &prefix, &[]),
             Some(0)
+        );
+    }
+
+    /// A `PERMANENT` (statically pinned) neighbor counts (RULED, gate M1 review I1, research
+    /// commit 0e9bced): a static neighbor is a resolved host, and a statically-pinned VM must
+    /// not read as absent.
+    #[test]
+    fn neighbors_seen_counts_a_permanent_entry() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["PERMANENT"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default()
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], &neigh_json);
+        assert_eq!(
+            neighbors_seen(&mut sys, "primary.3", &prefix, &[]),
+            Some(1)
         );
     }
 
