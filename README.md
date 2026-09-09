@@ -72,6 +72,21 @@ driver record is empty, and `status` says `driver ?` and names the gap once, rat
 refusing anything. The retired `driver_features` and `usb` wire keys are refused at load,
 naming this.
 
+An example udev rule for an adapter that needs an offload turned off (matched here by USB
+vendor/product ID, not by netdev name, since a re-enumerated NIC can pick up a new one):
+
+```
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8157", ATTR{bConfigurationValue}="1"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="8157", RUN+="/usr/local/sbin/nic-offload"
+```
+
+with `/usr/local/sbin/nic-offload` doing the actual work on the interface udev hands it in
+`$INTERFACE`:
+
+```
+ethtool -K "$INTERFACE" tx off rx off sg off tso off gso off
+```
+
 ## Running it as a service
 
 The Debian package ships `cfab.service`, **installed disabled and not started** —
