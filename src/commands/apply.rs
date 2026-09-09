@@ -375,13 +375,26 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         }
     }
 
-    // ---- workload preconditions and gw address (spec §5.1): the VM VLAN sub-interface must
-    // already exist, be up and carry this member's address (declared in /etc/network/interfaces
-    // — cfab never creates it), and its uplink must be identified and STP-forwarding before
-    // anything else touches it. `workload_uplinks` (gw, identified uplink) feeds the bridge
-    // guard table below, once every row has passed.
+    // ---- workload preconditions (spec §5.1 pass 1 — pure reads, no state change): the VM VLAN
+    // sub-interface must already exist, be admin-up and carry this member's address (declared in
+    // /etc/network/interfaces — cfab never creates it). Those are facts about the declaration and
+    // still refuse the whole apply on failure.
+    //
+    // An uplink that cannot yet be identified, or is not STP-forwarding, is NOT a declaration
+    // fault (James's ruling 2026-09-09, "bias towards availability"): it DEFERS that one row to
+    // the watchdog instead of refusing every other row's apply. This deviates from spec §5.1
+    // item 1 by that ruling. `ready` collects what pass 3 (below the bridge table load) applies;
+    // `workload_uplinks` also gets an entry for a row whose uplink WAS identified but is not yet
+    // forwarding — the guard rule is harmless to install before the address exists — but not for
+    // one whose uplink could not be identified at all (there is no bridge/port to guard).
+    struct ReadyWorkload {
+        ifname: String,
+        gw_cidr: String,
+    }
     let mut workload_uplinks: Vec<(std::net::Ipv4Addr, uplink::Uplink)> = Vec::new();
     let mut workload_descs: Vec<String> = Vec::new();
+    let mut ready: Vec<ReadyWorkload> = Vec::new();
+    let mut deferred_names: Vec<String> = Vec::new();
     for row in view.workload_rows() {
         let ifname = row.wl.ifname.as_str();
         let name = &row.wl.name;
@@ -415,31 +428,52 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 row.address
             )));
         }
-        let up = uplink::identify(sys, ifname)
-            .map_err(|e| Error::fatal(format!("workload {name}: {e}")))?;
+        let up = match uplink::identify(sys, ifname) {
+            Ok(up) => up,
+            Err(e) => {
+                warnings.push(format!(
+                    "workload {name}: uplink not identified: {e}; row deferred to the watchdog"
+                ));
+                deferred_names.push(name.clone());
+                continue;
+            }
+        };
+        let mut not_forwarding: Option<String> = None;
         for port in &up.ports {
             match uplink::stp_forwarding(sys, &up.bridge, port) {
                 Ok((true, _)) => {}
                 Ok((false, state)) => {
-                    return Err(Error::fatal(format!(
-                        "workload {name}: uplink {port} of bridge {} is not forwarding (STP \
-                         state {state}); wait for forward_delay or set bridge-stp off / bridge-fd 0",
-                        up.bridge
-                    )));
+                    not_forwarding = Some(format!(
+                        "workload {name}: uplink {port} not forwarding (STP state {state}); \
+                         row deferred to the watchdog"
+                    ));
+                    break;
                 }
-                Err(e) => return Err(Error::fatal(format!("workload {name}: {e}"))),
+                Err(e) => {
+                    not_forwarding = Some(format!(
+                        "workload {name}: uplink {port} not forwarding ({e}); row deferred to \
+                         the watchdog"
+                    ));
+                    break;
+                }
             }
         }
-        run_ok(sys, &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", ifname])?;
+        if let Some(warning) = not_forwarding {
+            warnings.push(warning);
+            deferred_names.push(name.clone());
+            workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the address exists
+            continue;
+        }
         workload_descs.push(format!(
             "{name} on {ifname} ({} {})",
             uplink_word(&up.ports),
             up.ports.join(", ")
         ));
+        ready.push(ReadyWorkload {
+            ifname: ifname.to_string(),
+            gw_cidr: row.wl.gw_cidr(),
+        });
         workload_uplinks.push((row.wl.gw, up));
-    }
-    if !workload_uplinks.is_empty() {
-        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1")?;
     }
 
     // ---- per-class netdevs -----------------------------------------------------
@@ -561,6 +595,22 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             &format!("{}/workload-bridge.applied", f.run_dir),
             &applied.stdout,
         )?;
+    }
+
+    // ---- workload gw address + arp_ignore (spec §5.1 pass 3, review item 1: the guard above is
+    // in place BEFORE any gw address goes live — closes the window where the address was
+    // reachable with no ARP-guard protection) + deferred-row bookkeeping for the watchdog -------
+    if !view.workload_rows().is_empty() {
+        sys.write(
+            &format!("{}/workload-deferred", f.run_dir),
+            &deferred_names.join("\n"),
+        )?;
+    }
+    for plan in &ready {
+        run_ok(sys, &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.ifname])?;
+    }
+    if !ready.is_empty() {
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1")?;
     }
 
     // ---- marking + the fallback ceiling (EVERY kind) ----------------------------------------
@@ -1193,6 +1243,23 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// pve1-tb with TWO workload rows on the same "primary" bridge/eth0 uplink: "vms" on
+    /// primary.3 (row 1, healthy per `wl_sys`) and "vms2" on primary.4 (row 2, its interface is
+    /// refused as missing) — for proving pass 1 is pure reads: a hard refusal partway through
+    /// must leave no write from an earlier row applied.
+    fn two_row_wl_fabric() -> Fabric {
+        let t = crate::decl::fixtures::with_prefs(
+            &crate::decl::fixtures::example(),
+            "pve1-tb",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
+        );
+        let blocks = format!(
+            "{}\n[[workload]]\nname = \"vms2\"\nifname = \"primary.4\"\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            crate::decl::fixtures::WORKLOAD_BLOCK
+        );
+        Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
+    }
+
     /// Task 5: the engine start, the shape daemon, the watchdog and conf-sync all moved to
     /// the (not-yet-built) supervisor. `apply` itself must launch no daemon at all — no
     /// `systemd-run`, no `systemctl`, no `spawn_detached` — and must name no unit.
@@ -1414,7 +1481,39 @@ pub(crate) mod tests {
             pos("nft -f /run/cfab/workload-bridge.nft") < pos("nft -f /run/cfab/mark.nft"),
             "guard before the mark table; the announcer starts after apply returns"
         );
+        assert!(
+            pos("nft -f /run/cfab/workload-bridge.nft")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+            "review item 1: the ARP guard is loaded before the gw address goes live, never after"
+        );
         assert!(!sys.ran("ip link del primary.3"));
+    }
+
+    #[test]
+    fn a_refusal_on_the_second_workload_row_leaves_no_address_from_the_first_applied() {
+        let f: &'static Fabric = Box::leak(Box::new(two_row_wl_fabric()));
+        let view = View::new(f, "pve1-tb").unwrap();
+        let mut sys = wl_sys(&view).on_fail(
+            &["ip", "-br", "link", "show", "dev", "primary.4"],
+            1,
+            "Device \"primary.4\" does not exist.",
+        );
+        let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "FATAL: workload vms2: interface primary.4 does not exist (declare it in \
+             /etc/network/interfaces with address 192.168.30.2/24 on the VLAN)"
+        );
+        // Pass 1 is pure reads: row 1 ("vms") was fully valid, but nothing workload-shaped was
+        // written for it — the hard refusal on row 2 happens before pass 2 (bridge table) or
+        // pass 3 (the gw address + arp_ignore writes) ever starts.
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert!(sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore").is_empty());
+        assert!(
+            sys.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1486,22 +1585,49 @@ pub(crate) mod tests {
         );
     }
 
+    // James's ruling 2026-09-09 ("bias towards availability"): an uplink that is not yet
+    // STP-forwarding, or that cannot be identified at all, no longer refuses the whole apply
+    // (spec §5.1 item 1) — it defers that one row to the watchdog and applies everything else.
     #[test]
-    fn up_refuses_when_the_uplink_is_not_forwarding_or_cannot_be_identified() {
+    fn up_defers_a_not_yet_forwarding_uplink_instead_of_refusing_the_whole_apply() {
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut listening = sys.file("/sys/class/net/primary/brif/eth0/state", "1\n");
-        assert_eq!(
-            run(&mut listening, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: uplink eth0 of bridge primary is not forwarding (STP state 1); wait for forward_delay or set bridge-stp off / bridge-fd 0"
-        );
-        let mut no_uplink = wl_sys(&view);
-        no_uplink.links.remove("/sys/class/net/eth0/device");
+        let warnings = run(&mut listening, &view, &opts()).unwrap();
         assert!(
-            run(&mut no_uplink, &view, &opts())
-                .unwrap_err()
-                .to_string()
-                .starts_with("FATAL: workload vms: bridge primary has no uplink port")
+            warnings.iter().any(|w| w
+                == "workload vms: uplink eth0 not forwarding (STP state 1); row deferred to \
+                    the watchdog"),
+            "{warnings:#?}"
         );
+        assert!(!listening.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(
+            listening
+                .writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty(),
+            "no ready row on this member; arp_ignore is not this row's to set"
+        );
+        assert_eq!(
+            listening.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // Everything else still applies: the policy loaded, forwarding still went on.
+        assert!(listening.ran("nft -f /run/cfab/policy.nft"));
+    }
+
+    #[test]
+    fn up_defers_an_unidentifiable_uplink_instead_of_refusing_the_whole_apply() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut no_uplink = sys;
+        no_uplink.links.remove("/sys/class/net/eth0/device");
+        let warnings = run(&mut no_uplink, &view, &opts()).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.starts_with("workload vms: uplink not identified: "))
+            .unwrap_or_else(|| panic!("{warnings:#?}"));
+        assert!(warning.contains("bridge primary has no uplink port"), "{warning}");
+        assert!(warning.ends_with("; row deferred to the watchdog"), "{warning}");
+        assert!(!no_uplink.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!no_uplink.ran("nft -f /run/cfab/workload-bridge.nft"), "no uplink to guard");
     }
 
     #[test]
