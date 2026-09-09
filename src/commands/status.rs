@@ -386,8 +386,7 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             Some(t) if !t.is_empty() => t,
             _ => "-",
         };
-        let _ = writeln!(
-            out,
+        let mut line = format!(
             "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
              trigger {trigger}",
             w.name,
@@ -396,6 +395,13 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             w.gw,
             w.zones.join(", ")
         );
+        // One spelling for every N, including 0 and 1 (metrics addendum 2026-09-09): scripts
+        // grep it, so "vms seen" never turns into "vm seen" for the singular. Nothing appended
+        // when the row is not up or the neighbor read failed (`None`).
+        if let Some(n) = w.vms_seen {
+            let _ = write!(line, ", {n} vms seen");
+        }
+        let _ = writeln!(out, "{line}");
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
@@ -3214,6 +3220,56 @@ mod tests {
             1,
             "the line, and no reason lines: {text}"
         );
+        assert_eq!(m.workloads[0].vms_seen, None, "wl_status_sys mocks no neigh read");
+        assert!(
+            !text.contains("vms seen"),
+            "a None vms_seen must append nothing: {text}"
+        );
+    }
+
+    /// The status-line addendum (2026-09-09): a row that read `vms_seen` appends `, N vms seen`
+    /// after the trigger, one spelling for every N including 0 (never "0 vms seen" vs "1 vm
+    /// seen" — scripts grep the noun).
+    #[test]
+    fn a_row_with_vms_seen_appends_n_vms_seen_to_the_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].vms_seen, Some(1));
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
+                 to storage, uplink eth0, announce trigger neigh events, 1 vms seen\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `0 vms seen` is not a fault and is not omitted: one spelling for every N (spec addendum).
+    #[test]
+    fn zero_vms_seen_still_appends_the_same_spelling() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([]).to_string();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].vms_seen, Some(0));
+        let text = render_text(&m, false, true).output;
+        assert!(text.contains("announce trigger neigh events, 0 vms seen\n"), "{text}");
     }
 
     // M1 (whole-branch review): the address/gw reads used `.contains(" <cidr>")`, a substring
