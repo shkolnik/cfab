@@ -2430,28 +2430,19 @@ mod tests {
         sys
     }
 
-    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
-    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
-    /// (this testbed is not clustered), and the forwarding watchdog ticking. Uptimes are 3600 s
-    /// so the line renders `1h00m`.
-    fn healthy_components(view: &View) -> String {
-        let shape = if view.kind() == MemberKind::Host {
+    /// The `components` document a healthy supervisor publishes, with the given `workloads`
+    /// array spliced in verbatim: the one place the supervisor/components/watchdog shape is
+    /// spelled out, so `healthy_components` and any fixture that only needs a different
+    /// `workloads` entry (a blank trigger, a missing announcer) never re-type the rest of the
+    /// document a second time. Uptimes are 3600 s so the line renders `1h00m`.
+    fn components_doc(shape_running: bool, workloads: serde_json::Value) -> String {
+        let shape = if shape_running {
             serde_json::json!({"name": "shape-daemon", "state": "running", "pid": 1250,
                 "uptime_s": 3600, "restarts": 0, "last_exit": null})
         } else {
             serde_json::json!({"name": "shape-daemon", "state": "stopped", "pid": null,
                 "uptime_s": null, "restarts": 0, "last_exit": null, "why": "host only"})
         };
-        // One running announcer per `[[workload]]` row THIS member carries (Task 8b): none on a
-        // view whose fabric declares no workload, and none on a leaf, which carries no row.
-        let workloads: Vec<serde_json::Value> = view
-            .workload_rows()
-            .into_iter()
-            .map(|r| {
-                serde_json::json!({"name": r.wl.name, "ifname": r.wl.ifname,
-                    "trigger": "neigh events", "announces": 12, "bursts": 1})
-            })
-            .collect();
         serde_json::json!({
             "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
                 "last_apply_error": null},
@@ -2466,6 +2457,23 @@ mod tests {
             "workloads": workloads
         })
         .to_string()
+    }
+
+    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
+    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
+    /// (this testbed is not clustered), and the forwarding watchdog ticking.
+    fn healthy_components(view: &View) -> String {
+        // One running announcer per `[[workload]]` row THIS member carries (Task 8b): none on a
+        // view whose fabric declares no workload, and none on a leaf, which carries no row.
+        let workloads: Vec<serde_json::Value> = view
+            .workload_rows()
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({"name": r.wl.name, "ifname": r.wl.ifname,
+                    "trigger": "neigh events", "announces": 12, "bursts": 1})
+            })
+            .collect();
+        components_doc(view.kind() == MemberKind::Host, workloads.into())
     }
 
     /// The `components` document of a supervisor whose engine is down: it keeps failing to
@@ -3045,23 +3053,12 @@ mod tests {
     fn an_empty_trigger_renders_the_same_dash_as_no_entry() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let blank_trigger = serde_json::json!({
-            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
-                "last_apply_error": null},
-            "components": [
-                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
-                 "restarts": 0, "last_exit": null},
-                {"name": "shape-daemon", "state": "running", "pid": 1250, "uptime_s": 3600,
-                 "restarts": 0, "last_exit": null},
-                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
-                 "restarts": 0, "last_exit": null, "why": "not clustered"}
-            ],
-            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
-            "workloads": [
+        let blank_trigger = components_doc(
+            true,
+            serde_json::json!([
                 {"name": "vms", "ifname": "primary.3", "trigger": "", "announces": 0, "bursts": 0}
-            ]
-        })
-        .to_string();
+            ]),
+        );
         let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &blank_trigger);
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
@@ -3183,21 +3180,7 @@ mod tests {
     fn a_row_with_no_announcer_entry_is_its_own_reason_line() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let no_announcer = serde_json::json!({
-            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
-                "last_apply_error": null},
-            "components": [
-                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
-                 "restarts": 0, "last_exit": null},
-                {"name": "shape-daemon", "state": "running", "pid": 1250, "uptime_s": 3600,
-                 "restarts": 0, "last_exit": null},
-                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
-                 "restarts": 0, "last_exit": null, "why": "not clustered"}
-            ],
-            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
-            "workloads": []
-        })
-        .to_string();
+        let no_announcer = components_doc(true, serde_json::json!([]));
         let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer);
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
