@@ -141,10 +141,18 @@ a standing `cfab status` line `metrics endpoint not listening on :23232 (...)` f
 the bind keeps failing, and retries every 60 s. The fabric is unaffected: a bind failure is
 never fatal and never delays the apply.
 
-A member carrying at least one `[[workload]]` row also serves `cfab_workload_up{name}` (1 when
-the row's table is present, its addresses and sibling return-path rule are installed, the
-route-get proof succeeds, and its announcer is running); a member with no row carries no series
-at all.
+A member carrying at least one `[[workload]]` row also serves, all labeled `{name}` and all
+absent for a row whose source field is `None` (deferred, or the read failed) rather than a
+fabricated zero; a member with no row carries none of them:
+
+| series | type | meaning |
+|---|---|---|
+| `cfab_workload_up` | gauge | 1 when the row's table is present, its addresses and sibling return-path rule are installed, the route-get proof succeeds, and its announcer is running |
+| `cfab_workload_state{state}` | gauge | the row's classification, one of `up`/`deferred`/`announcer_not_started`/`broken`; exactly one series is 1 |
+| `cfab_workload_vms_seen` | gauge | neighbor entries on the row's `ifname` resolved to something other than a declared member, `gw` or `router` (a VM, presumptively); 0 with the row up means "gateway up, nobody home" |
+| `cfab_workload_guard_drops_total{kind}` | counter | the bridge guard's `claim`/`request` drop counters, summed over the row's uplink ports; resets to 0 when `apply` re-renders the table or the watchdog restores it |
+| `cfab_workload_rx_bytes_total`, `cfab_workload_tx_bytes_total` | counter | the gateway's own forwarding on the row's `ifname`; not cross-host VM-to-VM traffic, which stays on the physical switch |
+| `cfab_workload_announces_total`, `cfab_workload_bursts_total` | counter | gratuitous ARPs and re-announce bursts the row's announcer has sent; a rising burst rate is flapping (MAC churn, watch deaths) |
 
 ```
 curl -s http://10.249.0.1:23232/metrics | grep -E 'cfab_fabric_state|cfab_links_up'

@@ -615,11 +615,43 @@ line
 .BR "metrics endpoint not listening on :23232 (...)" ,
 and retries every 60\ s \(em the fabric is unaffected. A member carrying at least one
 .B [[workload]]
-row also serves
-.BR "cfab_workload_up{name}" ,
+row also serves, all labeled
+.BR {name} ,
+and each absent (never a fabricated zero) for a row whose source field is
+.B None
+(deferred, or the read failed); a member with no row carries none of them:
+.BR "cfab_workload_up" ,
 1 when that row's table is present, its addresses and sibling return-path rule are installed,
-the route-get proof succeeds, and its announcer is running; a member with no row carries no
-series at all.
+the route-get proof succeeds, and its announcer is running;
+.BR "cfab_workload_state{state}" ,
+the row's classification, one of
+.BR up / deferred / announcer_not_started / broken
+with exactly one series 1;
+.BR "cfab_workload_vms_seen" ,
+neighbor entries on the row's
+.I ifname
+resolved to something other than a declared member,
+.BR gw
+or
+.BR router
+(a VM, presumptively) \(em 0 with the row up means "gateway up, nobody home";
+.BR "cfab_workload_guard_drops_total{kind}" ,
+the bridge guard's
+.B claim
+/
+.B request
+drop counters summed over the row's uplink ports, reset to 0 when
+.B apply
+re\-renders the table or the watchdog restores it;
+.BR "cfab_workload_rx_bytes_total" ,
+.BR "cfab_workload_tx_bytes_total" ,
+the gateway's own forwarding on the row's
+.I ifname
+(not cross\-host VM\-to\-VM traffic, which stays on the physical switch); and
+.BR "cfab_workload_announces_total" ,
+.BR "cfab_workload_bursts_total" ,
+gratuitous ARPs and re\-announce bursts the row's announcer has sent (a rising burst rate is
+flapping \(em MAC churn, watch deaths).
 .SH WORKLOADS
 A
 .B [[workload]]
