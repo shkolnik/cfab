@@ -3220,7 +3220,10 @@ mod tests {
             1,
             "the line, and no reason lines: {text}"
         );
-        assert_eq!(m.workloads[0].vms_seen, None, "wl_status_sys mocks no neigh read");
+        assert_eq!(
+            m.workloads[0].vms_seen, None,
+            "wl_status_sys mocks no neigh read"
+        );
         assert!(
             !text.contains("vms seen"),
             "a None vms_seen must append nothing: {text}"
@@ -3269,7 +3272,10 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert_eq!(m.workloads[0].vms_seen, Some(0));
         let text = render_text(&m, false, true).output;
-        assert!(text.contains("announce trigger neigh events, 0 vms seen\n"), "{text}");
+        assert!(
+            text.contains("announce trigger neigh events, 0 vms seen\n"),
+            "{text}"
+        );
     }
 
     // M1 (whole-branch review): the address/gw reads used `.contains(" <cidr>")`, a substring

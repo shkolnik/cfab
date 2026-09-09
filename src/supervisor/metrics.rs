@@ -580,7 +580,10 @@ impl FabricCollector {
             .flat_map(|w| {
                 WORKLOAD_STATES.iter().map(move |s| {
                     (
-                        lbl(&[("name", w.name.as_str()), ("state", workload_state_word(*s))]),
+                        lbl(&[
+                            ("name", w.name.as_str()),
+                            ("state", workload_state_word(*s)),
+                        ]),
                         i64::from(*s == w.state),
                     )
                 })
@@ -613,7 +616,10 @@ impl FabricCollector {
         let mut guard_drops: Vec<(Labels, u64)> = Vec::new();
         for w in ws {
             if let Some(gd) = &w.guard_drops {
-                guard_drops.push((lbl(&[("name", w.name.as_str()), ("kind", "claim")]), gd.claim));
+                guard_drops.push((
+                    lbl(&[("name", w.name.as_str()), ("kind", "claim")]),
+                    gd.claim,
+                ));
                 guard_drops.push((
                     lbl(&[("name", w.name.as_str()), ("kind", "request")]),
                     gd.request,
@@ -1451,7 +1457,10 @@ mod tests {
         let text = render(&s);
         assert!(!text.contains("cfab_workload_announces"), "{text}");
         assert!(!text.contains("cfab_workload_bursts"), "{text}");
-        assert!(text.contains("cfab_workload_vms_seen{name=\"vms\"} 3"), "{text}");
+        assert!(
+            text.contains("cfab_workload_vms_seen{name=\"vms\"} 3"),
+            "{text}"
+        );
         assert!(
             text.contains("cfab_workload_state{name=\"vms\",state=\"up\"} 1"),
             "{text}"
