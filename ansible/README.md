@@ -16,7 +16,7 @@ collection is published to Ansible Galaxy from CI). The role works with cfab pac
 collections:
   - name: https://github.com/shkolnik/cfab.git#/ansible/
     type: git
-    version: ansible/v0.6.0
+    version: ansible/v0.10.0
 ```
 
 ```
@@ -73,7 +73,7 @@ is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansi
 | `CFAB_HOST=<cfab_host>` (the packaged unit's `EnvironmentFile`) | `/etc/default/cfab` |
 
 The unit is the package's own, `/lib/systemd/system/cfab.service`, installed disabled; the role ships
-no unit of its own. Collection versions before 0.6.0 templated a copy of the unit to
+no unit of its own. Collection versions before 0.10.0 templated a copy of the unit to
 `/etc/systemd/system/cfab.service`; install removes that copy (and only that copy) so the packaged
 unit takes over, and apply refuses to run while anything else overrides it there.
 
