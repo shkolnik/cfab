@@ -1502,22 +1502,22 @@ fn reachability(
 }
 
 /// The workload's own pref-2000 sibling, sourced from `siblings` (`common::workload_return_rules`'s
-/// own output, filtered the same `starts_with` way `return_path_rules` splices it — never a
-/// second reformat of the needle) rather than an `.expect()`: `status` only ever reads, so a
-/// sibling that should always exist by construction (both call sites filter the same (zone,
-/// workload) pairs from the same `view.fabric`) and somehow does not — a future refactor that
-/// ever lets the two filters drift — is reported as the same "return path missing" fact an
-/// installed-but-dropped sibling gets, never a panic.
+/// own output — never a second reformat of the needle) rather than an `.expect()`: `status` only
+/// ever reads, so three cases, never a panic. (1) the builder emitted this row's rule and it is
+/// installed: healthy. (2) the builder emitted it but `ip rule show pref 2000` does not have it:
+/// dropped, report the builder's own needle (`r.needle`, not a needle formatted here a second
+/// time). (3) the builder emitted no rule for this row at all — it should always exist by
+/// construction (both call sites filter the same (zone, workload) pairs from the same
+/// `view.fabric`), so this is the two filters having drifted — report the needle this call site
+/// derives AND say plainly that the builder never emitted it, so the two facts are not confused.
 fn sibling_return_reason(siblings: &[FabricRule], blk: &str, prefix: &str, r2000: &str) -> Option<String> {
     let needle = format!("from {blk} to {prefix} lookup main");
-    let installed = siblings
-        .iter()
-        .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
-        .any(|r| r.needle == needle && r2000.contains(&r.needle));
-    if installed {
-        None
-    } else {
-        Some(format!("return path missing: pref 2000 {needle}"))
+    match siblings.iter().find(|r| r.needle == needle) {
+        Some(r) if r2000.contains(&r.needle) => None,
+        Some(r) => Some(format!("return path missing: pref 2000 {}", r.needle)),
+        None => Some(format!(
+            "return path missing: pref 2000 {needle} (workload_return_rules never emitted this rule)"
+        )),
     }
 }
 
@@ -3335,27 +3335,40 @@ mod tests {
         assert!(!m.workloads[0].up);
     }
 
-    /// `sibling_return_reason` never panics: an empty (or non-matching) `siblings` list is
-    /// reported as the same "return path missing" fact an installed-but-dropped sibling gets,
-    /// from the needle the function derives itself when there is nothing to source it from.
+    /// `sibling_return_reason` never panics, and its three arms are distinct: never emitted by
+    /// the builder, emitted but not installed, and installed.
     #[test]
-    fn a_missing_sibling_reports_the_reason_never_panics() {
-        let want = "return path missing: pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main";
+    fn sibling_return_reason_has_three_arms() {
+        // Arm 3: the builder emitted no rule for this (zone, workload) pair at all — report the
+        // needle this call site derives AND say plainly it was never emitted, from an empty
+        // `siblings` (nothing to source a rule from).
         assert_eq!(
             sibling_return_reason(&[], "10.99.0.0/16", "192.168.20.0/24", ""),
-            Some(want.to_string())
+            Some(
+                "return path missing: pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup \
+                 main (workload_return_rules never emitted this rule)"
+                    .to_string()
+            )
         );
-        // A sibling list that has rules, just not this one (a different zone's block).
+        // Still arm 3: a `siblings` list that has rules, just not this one (a different zone's
+        // block).
         let other = workload_return_rules(&View::new(&wl_fabric(), "pve1-tb").unwrap());
         assert_eq!(other.len(), 1, "{other:#?}");
         assert_eq!(
             sibling_return_reason(&other, "10.100.0.0/16", "192.168.20.0/24", ""),
             Some(
-                "return path missing: pref 2000 from 10.100.0.0/16 to 192.168.20.0/24 lookup main"
+                "return path missing: pref 2000 from 10.100.0.0/16 to 192.168.20.0/24 lookup \
+                 main (workload_return_rules never emitted this rule)"
                     .to_string()
             )
         );
-        // And the healthy case: present in `siblings` and already installed in `r2000`.
+        // Arm 2: the builder emitted this row's rule but `ip rule show pref 2000` does not have
+        // it — reported from the builder's own `r.needle`, never a second reformat.
+        assert_eq!(
+            sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", ""),
+            Some(format!("return path missing: pref 2000 {}", other[0].needle))
+        );
+        // Arm 1: present in `siblings` and already installed in `r2000` — healthy.
         assert_eq!(
             sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", &other[0].needle),
             None
