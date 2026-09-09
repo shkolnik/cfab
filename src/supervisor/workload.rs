@@ -1,0 +1,615 @@
+//! The gateway announcers a member with `[[workload]]` rows runs (spec §5.1 item 8, ruling 12).
+//!
+//! One `Announcer` per row, driven by the supervisor's select loop: the loop sleeps to the
+//! earliest deadline any of them has, fires the ones that are due, and hands each an ownership
+//! change when the neighbor watch reports a MAC learned on one of that row's VM ports. The state
+//! machine and the frame are `workload::announce`; the kernel facts are `workload::neigh` and
+//! `workload::uplink`. What lives here is the glue that owns them: when an announcer may start,
+//! which rows an event belongs to, and what the journal and `status` say.
+//!
+//! **An announcer never starts for a row `apply` deferred** (spec addendum 2026-09-09). A
+//! deferred row has no gateway address on the wire yet — the forwarding watchdog adds it once
+//! the uplink forwards — and announcing an address this host does not hold would point every
+//! VM in the VLAN at a host that cannot answer. The row is picked up on a later tick, once its
+//! name has left `<run_dir>/workload-deferred`.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::derive::View;
+use crate::sys::Sys;
+use crate::workload::Trigger;
+use crate::workload::announce::{AnnounceIo, Announcer};
+use crate::workload::neigh::{self, NeighSignal};
+use crate::workload::uplink::{self, Uplink};
+
+use super::Shared;
+use super::report::WorkloadAnnounce;
+use super::trace_mark;
+
+/// The supervisor's test-trace recorder (`Hooks::trace`), so a test can assert the exact
+/// journal text without capturing the process's stderr. `None` in production.
+type Trace = Option<Arc<Mutex<Vec<String>>>>;
+
+/// Say it on the journal (and to the test trace). `eprintln!`, never `tracing`: the supervisor
+/// installs no subscriber, so a `tracing` line here would go nowhere.
+fn journal(trace: &Trace, line: String) {
+    eprintln!("{line}");
+    trace_mark(trace, line);
+}
+
+/// One running announcer and the facts it is driven by.
+struct Row {
+    name: String,
+    announcer: Announcer,
+    /// The row's bridge and uplink ports, as `apply` identified them. Re-read per event only
+    /// for the port SET (a tap comes and goes); the bridge and uplink do not move under us.
+    up: Uplink,
+    /// The sub-interface's own MAC, read once at start.
+    mac: [u8; 6],
+    /// The FDB poll's memory of `(port, mac)`; untouched on the event trigger.
+    seen: BTreeSet<(String, String)>,
+    /// The last line journaled for a STANDING condition (a send that keeps failing, a bridge
+    /// scan that cannot run), so a broken wire costs one line and not one per period. Cleared
+    /// by the recovery line, so a fault that comes back is said again.
+    standing: Option<String>,
+}
+
+impl Row {
+    /// Say `line` unless it is the line already standing for this row.
+    fn journal_once(&mut self, trace: &Trace, line: String) {
+        if self.standing.as_deref() == Some(line.as_str()) {
+            return;
+        }
+        self.standing = Some(line.clone());
+        journal(trace, line);
+    }
+
+    fn recovered(&mut self, trace: &Trace, line: String) {
+        if self.standing.take().is_some() {
+            journal(trace, line);
+        }
+    }
+}
+
+/// Every announcer this member runs, and the trigger they share.
+pub(crate) struct Workloads {
+    /// `None` on a member with no `[[workload]]` row: nothing was opened and nothing runs.
+    trigger: Option<Trigger>,
+    rows: Vec<Row>,
+    /// Rows already reported as deferred, so the 3 s tick says it once rather than 20 times a
+    /// minute for as long as an uplink takes to forward.
+    deferred_said: BTreeSet<String>,
+    trace: Trace,
+}
+
+impl Workloads {
+    /// Open the member's neighbor subscription (`open`) and start an announcer for every row
+    /// that is installed. A member with no `[[workload]]` row never calls `open` at all — it
+    /// pays nothing for the feature.
+    pub(crate) fn start(
+        sys: &mut dyn Sys,
+        view: &View,
+        trace: Trace,
+        open: impl FnOnce() -> Result<(), String>,
+        now: Instant,
+    ) -> Self {
+        let mut w = Workloads {
+            trigger: None,
+            rows: Vec::new(),
+            deferred_said: BTreeSet::new(),
+            trace,
+        };
+        if view.workload_rows().is_empty() {
+            return w;
+        }
+        w.trigger = Some(match open() {
+            Ok(()) => Trigger::NeighEvents,
+            Err(reason) => Trigger::FdbPoll {
+                reason: format!("RTNLGRP_NEIGH subscription failed: {reason}"),
+            },
+        });
+        w.start_pending(sys, view, now);
+        w
+    }
+
+    /// The 3 s tick: pick up any row the watchdog has installed since the last one, and — on
+    /// the fallback trigger only — poll the FDB for a MAC that has appeared on a VM port.
+    pub(crate) fn tick(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) {
+        self.start_pending(sys, view, now);
+        if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
+            return;
+        }
+        for r in &mut self.rows {
+            if neigh::fdb_poll_changed(sys, &r.up, &mut r.seen) {
+                r.announcer.on_event(now);
+            }
+        }
+    }
+
+    /// Start an announcer for every declared row that has none yet and is not deferred.
+    ///
+    /// The steady state is one comparison: once every row has an announcer nothing is read at
+    /// all, so the tick costs nothing on a converged member.
+    fn start_pending(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) {
+        let rows = view.workload_rows();
+        if rows.len() == self.rows.len() {
+            return;
+        }
+        let Some(trigger) = self.trigger.clone() else {
+            return;
+        };
+        let deferred = deferred_names(sys, view);
+        for row in rows {
+            let name = &row.wl.name;
+            if self.rows.iter().any(|r| &r.name == name) {
+                continue;
+            }
+            if deferred.contains(name) {
+                if self.deferred_said.insert(name.clone()) {
+                    journal(
+                        &self.trace,
+                        format!("cfab: workload {name}: deferred; announcer not started"),
+                    );
+                }
+                continue;
+            }
+            let ifname = &row.wl.ifname;
+            let started = uplink::identify(sys, ifname)
+                .and_then(|up| read_mac(sys, ifname).map(|mac| (up, mac)));
+            match started {
+                Ok((up, mac)) => {
+                    self.rows.push(Row {
+                        name: name.clone(),
+                        announcer: Announcer::new(ifname, row.wl.gw, now),
+                        up,
+                        mac,
+                        seen: BTreeSet::new(),
+                        standing: None,
+                    });
+                    journal(
+                        &self.trace,
+                        format!("cfab: workload {name}: announcer trigger {trigger}"),
+                    );
+                }
+                // Never fatal: the supervisor keeps every other announcer and the fabric
+                // running, and the watchdog's own restores keep trying (availability first).
+                Err(why) => journal(
+                    &self.trace,
+                    format!("cfab: workload {name}: {why}; announcer not started"),
+                ),
+            }
+        }
+    }
+
+    /// When the caller must next wake, or `None` when nothing is running.
+    pub(crate) fn next_due(&self) -> Option<Instant> {
+        self.rows.iter().map(|r| r.announcer.next_due()).min()
+    }
+
+    /// Send whatever is due now. A send failure never stops the schedule: the deadline has
+    /// already advanced, so a dead socket costs frames, never a spin or a stuck beacon.
+    pub(crate) fn fire_due(&mut self, io: &mut dyn AnnounceIo, now: Instant) {
+        let Workloads { rows, trace, .. } = self;
+        for r in rows {
+            let (name, ifname) = (r.name.clone(), r.announcer.ifname.clone());
+            match r.announcer.announce_due(io, r.mac, now) {
+                Ok(true) => r.recovered(
+                    trace,
+                    format!("cfab: workload {name}: announce on {ifname} succeeded again"),
+                ),
+                Ok(false) => {}
+                Err(e) => r.journal_once(
+                    trace,
+                    format!("cfab: workload {name}: announce on {ifname} failed: {e}"),
+                ),
+            }
+        }
+    }
+
+    /// A bridge FDB event, or the gap an ENOBUFS overflow left.
+    ///
+    /// An overflow bursts every row: we cannot know which port the dropped events were for, and
+    /// the rate limit caps the cost at one burst per period per row. An add bursts the rows
+    /// whose bridge has that ifindex as a NON-uplink port — a peer's MAC arriving on the uplink
+    /// is not this host's ownership changing, and a permanent entry is not a VM at all.
+    pub(crate) fn on_neigh(&mut self, sys: &mut dyn Sys, sig: &NeighSignal, now: Instant) {
+        let ev = match sig {
+            NeighSignal::Overflow => {
+                for r in &mut self.rows {
+                    r.announcer.on_event(now);
+                }
+                return;
+            }
+            NeighSignal::Add(ev) if ev.permanent => return,
+            NeighSignal::Add(ev) => ev,
+        };
+        let Workloads { rows, trace, .. } = self;
+        for r in rows {
+            match uplink::non_uplink_ifindexes(sys, &r.up) {
+                Ok(ports) => {
+                    if ports.contains(&ev.ifindex) {
+                        r.announcer.on_event(now);
+                    }
+                }
+                // The scan is how we tell a VM port from the uplink. Without it the honest
+                // move is to skip the burst and let the beacon converge within one period —
+                // the same cost ruling 12 accepts for an ENOBUFS.
+                Err(why) => {
+                    let name = r.name.clone();
+                    r.journal_once(trace, format!("cfab: workload {name}: {why}; burst skipped"));
+                }
+            }
+        }
+    }
+
+    /// The `components` rows (`status` and `/metrics` read these).
+    pub(crate) fn rows_for_status(&self) -> Vec<WorkloadAnnounce> {
+        let trigger = self.trigger.as_ref().map(Trigger::to_string).unwrap_or_default();
+        self.rows
+            .iter()
+            .map(|r| {
+                let (announces, bursts) = r.announcer.counters();
+                WorkloadAnnounce {
+                    name: r.name.clone(),
+                    ifname: r.announcer.ifname.clone(),
+                    trigger: trigger.clone(),
+                    announces,
+                    bursts,
+                }
+            })
+            .collect()
+    }
+
+    /// Publish those rows into the shared state the socket server and `/metrics` read.
+    pub(crate) fn publish(&self, shared: &Arc<Mutex<Shared>>) {
+        shared.lock().unwrap().workloads = self.rows_for_status();
+    }
+}
+
+/// The rows `apply` (or a previous watchdog tick) left deferred. No file — the normal case on a
+/// member whose rows all applied — is no deferred row.
+fn deferred_names(sys: &mut dyn Sys, view: &View) -> BTreeSet<String> {
+    let path = format!("{}/workload-deferred", view.fabric.run_dir);
+    sys.read(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// The sub-interface's own MAC, from sysfs. It is the sender MAC of every frame this row
+/// announces, so a row whose MAC cannot be read starts no announcer rather than announce a
+/// wrong one.
+fn read_mac(sys: &dyn Sys, ifname: &str) -> Result<[u8; 6], String> {
+    let path = format!("/sys/class/net/{ifname}/address");
+    sys.read(&path)
+        .ok()
+        .as_deref()
+        .and_then(parse_mac)
+        .ok_or_else(|| format!("cannot read the MAC of {ifname} from {path}"))
+}
+
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut n = 0;
+    for (i, byte) in text.trim().split(':').enumerate() {
+        if i >= 6 {
+            return None;
+        }
+        out[i] = u8::from_str_radix(byte, 16).ok()?;
+        n = i + 1;
+    }
+    (n == 6).then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Fabric;
+    use crate::sys::mock::MockSys;
+    use crate::workload::announce::{PERIOD, mock::RecordingIo};
+    use crate::workload::neigh::{NeighEvent, NeighSignal};
+    use std::time::Duration;
+
+    fn rec() -> Arc<Mutex<Vec<String>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn said(t: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        t.lock().unwrap().clone()
+    }
+
+    /// pve1-tb carrying the "vms" row: `apply`'s own workload fixture (bridge `primary`, uplink
+    /// eth0 forwarding at ifindex 2, one VM tap `tap100i0` at ifindex 10) plus the two files the
+    /// announcer itself reads — the sub-interface's MAC and the watchdog's deferred-row list.
+    fn wl(deferred: Option<&str>) -> (MockSys, View<'static>) {
+        let (sys, view) = crate::commands::apply::tests::wl_sys_and_view("pve1-tb");
+        let mut sys = sys.file("/sys/class/net/primary.3/address", "00:11:22:33:44:55\n");
+        if let Some(names) = deferred {
+            sys = sys.file(&deferred_path(&view), names);
+        }
+        (sys, view)
+    }
+
+    fn deferred_path(view: &View) -> String {
+        format!("{}/workload-deferred", view.fabric.run_dir)
+    }
+
+    fn opens() -> Result<(), String> {
+        Ok(())
+    }
+
+    const EPERM: &str = "Operation not permitted (os error 1)";
+
+    /// The addendum (2026-09-09): `apply` may leave a row deferred — no gateway address on the
+    /// wire — and the forwarding watchdog installs it later. Announcing a gateway this host does
+    /// not yet hold would be a lie, so the row gets no announcer and the journal says which.
+    #[test]
+    fn a_row_listed_in_workload_deferred_gets_no_announcer_and_says_so() {
+        let (mut sys, view) = wl(Some("vms"));
+        let trace = rec();
+        let w = Workloads::start(
+            &mut sys,
+            &view,
+            Some(trace.clone()),
+            opens,
+            Instant::now(),
+        );
+        assert!(w.rows_for_status().is_empty(), "no announcer for a deferred row");
+        assert_eq!(w.next_due(), None, "and nothing to wake for");
+        assert_eq!(
+            said(&trace),
+            vec!["cfab: workload vms: deferred; announcer not started"]
+        );
+    }
+
+    /// …and it starts on the tick after the watchdog installs it (the name leaves the file),
+    /// journaling the trigger line then. The deferred line is said once, not every 3 s.
+    #[test]
+    fn a_deferred_row_starts_its_announcer_once_the_watchdog_installs_it() {
+        let (mut sys, view) = wl(Some("vms"));
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, t0);
+        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        assert!(w.rows_for_status().is_empty(), "still deferred");
+        assert_eq!(said(&trace).len(), 1, "the deferred line is said once");
+
+        sys.files.insert(deferred_path(&view), String::new());
+        let t = t0 + Duration::from_secs(6);
+        w.tick(&mut sys, &view, t);
+        let rows = w.rows_for_status();
+        assert_eq!(
+            (rows[0].name.as_str(), rows[0].ifname.as_str(), rows[0].trigger.as_str()),
+            ("vms", "primary.3", "neigh events")
+        );
+        assert_eq!(w.next_due(), Some(t), "the first beacon is immediate");
+        assert_eq!(
+            said(&trace)[1],
+            "cfab: workload vms: announcer trigger neigh events"
+        );
+        w.tick(&mut sys, &view, t0 + Duration::from_secs(9));
+        assert_eq!(said(&trace).len(), 2, "started once, said once");
+        assert_eq!(w.rows_for_status().len(), 1);
+    }
+
+    /// An uplink that cannot be identified after a successful apply (the bridge was torn down
+    /// under us): journal the reason, start nothing, never panic.
+    #[test]
+    fn an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer() {
+        let (mut sys, view) = wl(None);
+        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        let trace = rec();
+        let w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, Instant::now());
+        assert!(w.rows_for_status().is_empty());
+        assert_eq!(
+            said(&trace),
+            vec![
+                "cfab: workload vms: workload interface primary.3 is not a VLAN sub-interface \
+                 of a bridge (no lower link in /sys/class/net/primary.3); announcer not started"
+            ]
+        );
+    }
+
+    /// The same, for a sub-interface whose MAC cannot be read: one condition, one spelling.
+    #[test]
+    fn a_mac_that_cannot_be_read_journals_the_reason_and_starts_no_announcer() {
+        let (mut sys, view) = wl(None);
+        sys.files.remove("/sys/class/net/primary.3/address");
+        let trace = rec();
+        let w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, Instant::now());
+        assert!(w.rows_for_status().is_empty());
+        assert_eq!(
+            said(&trace),
+            vec![
+                "cfab: workload vms: cannot read the MAC of primary.3 from \
+                 /sys/class/net/primary.3/address; announcer not started"
+            ]
+        );
+    }
+
+    /// Ruling 12's fallback: the subscription could not be opened, so the trigger is the FDB
+    /// poll, `status` says so, and a new MAC on a VM port still bursts.
+    #[test]
+    fn the_fdb_poll_fallback_names_its_reason_and_bursts_on_a_new_mac() {
+        let (sys, view) = wl(None);
+        let mut sys = sys.on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev tap100i0 vlan 3 master primary\n",
+        );
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            Some(trace.clone()),
+            || Err(EPERM.to_string()),
+            t0,
+        );
+        assert_eq!(
+            w.rows_for_status()[0].trigger,
+            format!("fdb poll (RTNLGRP_NEIGH subscription failed: {EPERM})")
+        );
+        assert_eq!(
+            said(&trace),
+            vec![format!(
+                "cfab: workload vms: announcer trigger fdb poll (RTNLGRP_NEIGH subscription \
+                 failed: {EPERM})"
+            )]
+        );
+        assert_eq!(w.rows_for_status()[0].bursts, 0);
+        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        assert_eq!(w.rows_for_status()[0].bursts, 1, "the VM MAC is new");
+        w.tick(&mut sys, &view, t0 + Duration::from_secs(3) + PERIOD);
+        assert_eq!(
+            w.rows_for_status()[0].bursts,
+            1,
+            "nothing new: the poll does not re-burst on a MAC it has already seen"
+        );
+    }
+
+    /// A member on the event trigger does NOT poll the FDB: the poll is the fallback, never a
+    /// belt-and-braces second source (ruling 12 — `status` says which path is active, and a
+    /// member that says "neigh events" must not be quietly doing both).
+    #[test]
+    fn the_event_trigger_runs_no_fdb_poll() {
+        let (sys, view) = wl(None);
+        let mut sys = sys.on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev tap100i0 vlan 3 master primary\n",
+        );
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        assert_eq!(w.rows_for_status()[0].bursts, 0);
+        assert!(!sys.ran("bridge fdb show"));
+    }
+
+    /// Only a learned MAC on a non-uplink port of OUR bridge is an ownership change. A peer's
+    /// MAC on the uplink, a permanent entry, and a port on some other bridge are not.
+    #[test]
+    fn only_a_learned_mac_on_a_non_uplink_port_starts_a_burst() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        let add = |ifindex, permanent| {
+            NeighSignal::Add(NeighEvent {
+                ifindex,
+                mac: [2, 0xcf, 0xab, 0, 0, 1],
+                permanent,
+            })
+        };
+        w.on_neigh(&mut sys, &add(2, false), t0); // eth0: the uplink
+        w.on_neigh(&mut sys, &add(10, true), t0); // the tap, but a permanent entry
+        w.on_neigh(&mut sys, &add(4242, false), t0); // not a port of this bridge
+        assert_eq!(w.rows_for_status()[0].bursts, 0);
+        w.on_neigh(&mut sys, &add(10, false), t0); // a VM starts talking
+        assert_eq!(w.rows_for_status()[0].bursts, 1);
+    }
+
+    /// ENOBUFS: the kernel dropped events we will never see, so the gap itself is the signal.
+    /// One burst, no bridge scan (there is no ifindex to scan for).
+    #[test]
+    fn an_enobufs_overflow_starts_one_burst() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        w.on_neigh(&mut sys, &NeighSignal::Overflow, t0);
+        assert_eq!(w.rows_for_status()[0].bursts, 1);
+    }
+
+    /// A dead send socket must cost one journal line per distinct error, not one per beacon:
+    /// at 0.2 Hz per row an undeduplicated line would be 17 000 a day.
+    #[test]
+    fn a_send_failure_is_journaled_once_per_distinct_error_text() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, t0);
+        let mut io = RecordingIo {
+            fail: Some("primary.3: cannot send probe: ENODEV".into()),
+            ..Default::default()
+        };
+        w.fire_due(&mut io, t0);
+        w.fire_due(&mut io, t0 + PERIOD);
+        let failures: Vec<String> = said(&trace)
+            .into_iter()
+            .filter(|l| l.contains("announce on"))
+            .collect();
+        assert_eq!(
+            failures,
+            vec![
+                "cfab: workload vms: announce on primary.3 failed: FATAL: primary.3: cannot \
+                 send probe: ENODEV"
+            ],
+            "the same error twice is one line"
+        );
+        assert_eq!(
+            w.rows_for_status()[0].announces,
+            2,
+            "the schedule advances whether or not the socket takes the frame"
+        );
+
+        io.fail = Some("primary.3: cannot send probe: ENETDOWN".into());
+        w.fire_due(&mut io, t0 + 2 * PERIOD);
+        assert_eq!(
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("announce on"))
+                .count(),
+            2,
+            "a different error is a different fact"
+        );
+    }
+
+    /// The frame on the wire is the gratuitous request for `gw`, sourced from the
+    /// sub-interface's own MAC, on the sub-interface itself.
+    #[test]
+    fn the_beacon_puts_the_gratuitous_request_on_the_workload_interface() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        let mut io = RecordingIo::default();
+        w.fire_due(&mut io, t0);
+        assert_eq!(io.sent.len(), 1);
+        assert_eq!(io.sent[0].0, "primary.3");
+        assert_eq!(
+            io.sent[0].1,
+            crate::workload::announce::gratuitous(
+                [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                "192.168.20.254".parse().unwrap()
+            )
+        );
+        w.fire_due(&mut io, t0 + Duration::from_secs(1));
+        assert_eq!(io.sent.len(), 1, "not due");
+    }
+
+    /// A member with no `[[workload]]` row opens no subscription at all: `open` is never
+    /// called, so a member that carries no VM VLAN pays nothing for the feature.
+    #[test]
+    fn a_member_without_a_workload_row_opens_nothing() {
+        let f: &'static Fabric = Box::leak(Box::new(
+            Fabric::from_decl(
+                &crate::decl::Declaration::parse(&crate::decl::fixtures::with_workload(
+                    &crate::decl::fixtures::example(),
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+        ));
+        let view = View::new(f, "pve3-tb").unwrap();
+        let mut sys = MockSys::default();
+        let w = Workloads::start(
+            &mut sys,
+            &view,
+            None,
+            || panic!("a member with no workload row must not open a subscription"),
+            Instant::now(),
+        );
+        assert!(w.rows_for_status().is_empty());
+        assert_eq!(w.next_due(), None);
+    }
+}
