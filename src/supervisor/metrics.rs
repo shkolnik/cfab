@@ -607,8 +607,12 @@ impl FabricCollector {
         family(
             enc,
             "cfab_workload_vms_seen",
-            "Neighbor entries on this row's ifname resolved to something other than a \
-             declared member, gw or router (one `ip -j neigh show dev` read per gather); \
+            "IPv4 neighbor entries inside this row's prefix, on its ifname, in a resolved \
+             state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared \
+             member address, gw or router (one `ip -j neigh show dev` read per gather); a \
+             departed VM lingers as STALE until the kernel garbage-collects the entry \
+             (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is \
+             the alert (\"gateway up, nobody home\"), a nonzero value is an upper bound; \
              absent when the row is not up or the read failed.",
             &vms_seen,
         )?;

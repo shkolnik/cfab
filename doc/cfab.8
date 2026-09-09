@@ -628,13 +628,18 @@ the row's classification, one of
 .BR up / deferred / announcer_not_started / broken
 with exactly one series 1;
 .BR "cfab_workload_vms_seen" ,
-neighbor entries on the row's
-.I ifname
-resolved to something other than a declared member,
+IPv4 neighbor entries inside the row's
+.B prefix ,
+on its
+.I ifname ,
+in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared
+member address,
 .BR gw
 or
-.BR router
-(a VM, presumptively) \(em 0 with the row up means "gateway up, nobody home";
+.BR router ;
+a departed VM lingers as STALE until the kernel garbage\-collects the entry
+(rack\-measured: minutes), so this counts neighbors known, not VMs alive \(em 0 is the
+alert ("gateway up, nobody home"), a nonzero value is an upper bound;
 .BR "cfab_workload_guard_drops_total{kind}" ,
 the bridge guard's
 .B claim

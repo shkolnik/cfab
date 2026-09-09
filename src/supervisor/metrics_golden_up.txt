@@ -106,7 +106,7 @@ cfab_workload_state{name="vms",state="up"} 1
 cfab_workload_state{name="vms",state="deferred"} 0
 cfab_workload_state{name="vms",state="announcer_not_started"} 0
 cfab_workload_state{name="vms",state="broken"} 0
-# HELP cfab_workload_vms_seen Neighbor entries on this row's ifname resolved to something other than a declared member, gw or router (one `ip -j neigh show dev` read per gather); absent when the row is not up or the read failed.
+# HELP cfab_workload_vms_seen IPv4 neighbor entries inside this row's prefix, on its ifname, in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared member address, gw or router (one `ip -j neigh show dev` read per gather); a departed VM lingers as STALE until the kernel garbage-collects the entry (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is the alert ("gateway up, nobody home"), a nonzero value is an upper bound; absent when the row is not up or the read failed.
 # TYPE cfab_workload_vms_seen gauge
 cfab_workload_vms_seen{name="vms"} 3
 # HELP cfab_workload_guard_drops The bridge guard's claim/request drop counters, summed over this row's uplink ports; reset to 0 when apply re-renders the table or the watchdog restores it; absent when the guard table or the row's uplink ports are unknown.

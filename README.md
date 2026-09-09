@@ -149,7 +149,7 @@ fabricated zero; a member with no row carries none of them:
 |---|---|---|
 | `cfab_workload_up` | gauge | 1 when the row's table is present, its addresses and sibling return-path rule are installed, the route-get proof succeeds, and its announcer is running |
 | `cfab_workload_state{state}` | gauge | the row's classification, one of `up`/`deferred`/`announcer_not_started`/`broken`; exactly one series is 1 |
-| `cfab_workload_vms_seen` | gauge | neighbor entries on the row's `ifname` resolved to something other than a declared member, `gw` or `router` (a VM, presumptively); 0 with the row up means "gateway up, nobody home" |
+| `cfab_workload_vms_seen` | gauge | IPv4 neighbor entries inside this row's `prefix`, on its `ifname`, in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared member address, `gw` or `router`; a departed VM lingers as STALE until the kernel garbage-collects the entry (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is the alert ("gateway up, nobody home"), a nonzero value is an upper bound |
 | `cfab_workload_guard_drops_total{kind}` | counter | the bridge guard's `claim`/`request` drop counters, summed over the row's uplink ports; resets to 0 when `apply` re-renders the table or the watchdog restores it |
 | `cfab_workload_rx_bytes_total`, `cfab_workload_tx_bytes_total` | counter | the gateway's own forwarding on the row's `ifname`; not cross-host VM-to-VM traffic, which stays on the physical switch |
 | `cfab_workload_announces_total`, `cfab_workload_bursts_total` | counter | gratuitous ARPs and re-announce bursts the row's announcer has sent; a rising burst rate is flapping (MAC churn, watch deaths) |
