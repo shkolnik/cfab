@@ -13,12 +13,12 @@ use crate::commands::common::{
 };
 use crate::commands::teardown;
 use crate::derive::{GwRow, Port, View};
-use crate::driver_features;
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
+use crate::wire_drivers;
 use crate::workload::uplink;
 
 pub struct ApplyOpts {
@@ -251,12 +251,14 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // ---- preconditions: fail loud, never degrade -------------------------------
     // A host requires `nft`: it installs the whole `table inet cfab` (bulk DSCP clamp + the
     // fallback control-egress ceiling), and a no-nft kernel is a hard refusal for that kind —
-    // there is no iptables path for a forwarding member. `tc`/`ethtool` stay host-only — a
-    // leaf shapes nothing and its wires' qdiscs and offloads belong to its OS.
+    // there is no iptables path for a forwarding member. `tc` stays host-only — a leaf shapes
+    // nothing, its wires' qdiscs belonging to its own OS. `ethtool` is NOT a precondition for
+    // either kind any more: it is a read-only diagnostic dependency (Debian `Recommends`), and
+    // its absence degrades the per-wire driver record below rather than refusing `up`.
     let mut tools: Vec<&str> = vec!["ip"];
     if kind == MemberKind::Host {
         tools.push("nft");
-        tools.extend(["tc", "ethtool"]);
+        tools.push("tc");
         if f.host_forward {
             tools.push("logger");
         }
@@ -321,37 +323,33 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // non-admin wire left to take: cfab adds tagged sub-interfaces and never touches a wire's
     // own L3, so NM and DHCP keep every wire they had. `up` proves it by never running those
     // commands (`up_never_takes_a_wire_from_its_manager`).
-    // ---- per-wire driver features ----------------------------------------------
-    // No adapter and no driver is named here: a NIC that needs scatter-gather off says so in
-    // its own `driver_features` string, which goes to `ethtool -K` as written. Two records go
-    // to the run dir: what was CHANGED (so `down` puts each feature back at the value this
-    // apply found, and nothing else), and which driver each present wire had (so the
-    // forwarding watchdog can tell a re-enumerated wire from a swapped adapter).
+    // ---- per-wire driver record --------------------------------------------------------
+    // cfab sets no NIC feature any more (that is the host's own udev rule now); what it still
+    // records is which driver each present wire had at apply, so the forwarding watchdog can
+    // tell a re-enumerated wire from a swapped adapter. `ethtool` is read-only and optional
+    // (Debian `Recommends`): probed once, and its absence writes an empty record with a
+    // warning rather than failing the bringup — a leaf without ethtool used to fail here
+    // ungracefully with no precondition to explain why; it no longer does.
+    let have_ethtool = have_tool(sys, "ethtool")?;
+    if !have_ethtool {
+        warnings.push("WARNING: ethtool not installed: wire drivers unrecorded".to_string());
+    }
     let mut drivers: Vec<(String, String)> = Vec::new();
-    let mut changed: Vec<driver_features::Change> = Vec::new();
-    for w in view
-        .member
-        .wires
-        .iter()
-        .filter(|w| !absent.contains(w.name.as_str()))
-    {
-        drivers.push((w.name.clone(), driver_features::driver_of(sys, &w.name)?));
-        if let Some(spec) = &w.driver_features {
-            changed.extend(driver_features::apply_to_wire(
-                sys,
-                &w.name,
-                spec,
-                &mut warnings,
-            )?);
+    if have_ethtool {
+        for w in view
+            .member
+            .wires
+            .iter()
+            .filter(|w| !absent.contains(w.name.as_str()))
+        {
+            if let Some(drv) = wire_drivers::driver_of(sys, &w.name) {
+                drivers.push((w.name.clone(), drv));
+            }
         }
     }
     sys.write(
-        &driver_features::drivers_path(&f.run_dir),
-        &driver_features::render_drivers(&drivers),
-    )?;
-    sys.write(
-        &driver_features::changed_path(&f.run_dir),
-        &driver_features::render_changes(&changed),
+        &wire_drivers::drivers_path(&f.run_dir),
+        &wire_drivers::render_drivers(&drivers),
     )?;
 
     // ---- sysctls (host-only: GLOBAL; a leaf shares its kernel with an external owner) --------
@@ -2036,49 +2034,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// The same declaration with the ingress leg on domain `any`.
-    /// The example with `driver_features` on pve1's eth9 — the RTL8157 case the retired `usb`
-    /// flag used to hard-code, now declared instead of inferred.
-    fn fabric_with_driver_features() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-                .unwrap()
-                .replace(
-                    "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
-                    "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
-                     off tso off gso off\" },",
-                );
-        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
-    }
-
-    const ETHTOOL_K: &str = "Features for eth9:\nscatter-gather: on\ntcp-segmentation-offload: on\ngeneric-segmentation-offload: off\n";
-
-    /// The declared words reach `ethtool -K` verbatim — minus the one feature already at the
-    /// declared value — and cfab names no adapter and no driver anywhere in the sequence.
+    /// `up` records the driver of every present wire so the forwarding watchdog can spot a
+    /// swapped adapter later. NIC features are the host's own business now (a udev rule on the
+    /// netdev-add event): no code path in `up` runs `ethtool -k` or `ethtool -K` at all.
     #[test]
-    fn a_wires_declared_driver_features_are_applied_verbatim() {
-        let f = fabric_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = up_sys(&view).on_stdout(&["ethtool", "-k", "eth9"], ETHTOOL_K);
-        run(&mut sys, &view, &opts()).unwrap();
-        assert_eq!(
-            calls_for(&sys, "ethtool -K"),
-            ["ethtool -K eth9 sg off tso off"],
-            "gso is already off: not set"
-        );
-        for c in &sys.calls {
-            assert!(!c.contains("r8152") && !c.contains("8157"), "{c}");
-        }
-    }
-
-    /// `up` records what it CHANGED (the feature and the value it found) so `down` can put it
-    /// back, and the driver of every present wire so the watchdog can spot a swapped adapter.
-    #[test]
-    fn up_records_the_prior_values_and_every_wires_driver() {
-        let f = fabric_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = up_sys(&view)
-            .on_stdout(&["ethtool", "-k", "eth9"], ETHTOOL_K)
+    fn up_records_every_present_wires_driver_and_sets_no_nic_feature() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys
             .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
             .on_stdout(&["ethtool", "-i", "eth1"], "driver: igb\n")
             .on_stdout(&["ethtool", "-i", "eth0"], "driver: igb\n");
@@ -2087,39 +2049,49 @@ pub(crate) mod tests {
             sys.writes_to("/run/cfab/wire-drivers"),
             Some("eth9 r8152\neth1 igb\neth0 igb\n")
         );
-        assert_eq!(
-            sys.writes_to("/run/cfab/wire-driver-features"),
-            Some("eth9 sg on\neth9 tso on\n"),
-            "only what changed, with the value it changed FROM"
-        );
-    }
-
-    /// A wire that declares nothing still gets its driver recorded, and nothing else: no
-    /// `ethtool -k`, no `ethtool -K`, and an empty change record `down` reads as "nothing".
-    #[test]
-    fn a_fabric_declaring_no_driver_features_touches_no_nic_features() {
-        let (mut sys, view) = up_sys_and_view();
-        run(&mut sys, &view, &opts()).unwrap();
         assert!(calls_for(&sys, "ethtool -K").is_empty(), "{:?}", sys.calls);
         assert!(calls_for(&sys, "ethtool -k").is_empty(), "{:?}", sys.calls);
-        assert_eq!(sys.writes_to("/run/cfab/wire-driver-features"), Some(""));
     }
 
     /// An absent wire is not probed and not recorded — same rule the rest of `up` follows.
     #[test]
     fn an_absent_wire_gets_no_driver_probe_and_no_record() {
-        let f = fabric_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = up_sys(&view)
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys
             .on_fail(&["ip", "link", "show", "eth9"], 1, "Device does not exist")
             .on_stdout(&["ethtool", "-i", "eth1"], "driver: igb\n")
             .on_stdout(&["ethtool", "-i", "eth0"], "driver: igb\n");
         run(&mut sys, &view, &opts()).unwrap();
         assert!(!sys.ran("ethtool -i eth9"), "{:?}", sys.calls);
-        assert!(!sys.ran("ethtool -K"), "{:?}", sys.calls);
         assert_eq!(
             sys.writes_to("/run/cfab/wire-drivers"),
             Some("eth1 igb\neth0 igb\n")
+        );
+    }
+
+    /// ethtool is a read-only, OPTIONAL dependency (Debian `Recommends`): absent entirely, `up`
+    /// still succeeds, writes an empty driver record (nothing to compare the watchdog against
+    /// later), and says so once — never a fatal precondition, and never one probe per wire once
+    /// the tool is known missing.
+    #[test]
+    fn ethtool_absent_writes_an_empty_record_and_warns_once() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys.on_fail(&["/usr/bin/env", "sh", "-c", "command -v ethtool"], 1, "");
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert!(!sys.ran("ethtool -i"), "{:?}", sys.calls);
+        assert_eq!(sys.writes_to("/run/cfab/wire-drivers"), Some(""));
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("ethtool not installed"))
+                .count(),
+            1,
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .contains(&"WARNING: ethtool not installed: wire drivers unrecorded".to_string()),
+            "{warnings:?}"
         );
     }
 
@@ -2684,8 +2656,10 @@ pub(crate) mod tests {
         assert!(!sys.ran("iptables-legacy -"), "{:?}", sys.calls);
         assert!(!sys.ran("iptables-legacy-save"), "{:?}", sys.calls);
         // The precondition list, in its old order: `iptables-legacy` is looked for only by
-        // the guarded sweep, never as a host precondition. (The trailing `nmcli` probes are
-        // the per-wire release, unchanged.)
+        // the guarded sweep, never as a host precondition. `ethtool` is not a precondition at
+        // all now — its probe is the per-wire driver record's own `have_tool`, which runs
+        // after the wires are owned, hence last. (The trailing `nmcli` probes are the per-wire
+        // release, unchanged.)
         let mut probes = calls_for(&sys, "command -v");
         probes.retain(|c| !c.ends_with("nmcli") && !c.contains("iptables"));
         assert_eq!(
@@ -2694,8 +2668,8 @@ pub(crate) mod tests {
                 "/usr/bin/env sh -c command -v ip",
                 "/usr/bin/env sh -c command -v nft",
                 "/usr/bin/env sh -c command -v tc",
-                "/usr/bin/env sh -c command -v ethtool",
                 "/usr/bin/env sh -c command -v logger",
+                "/usr/bin/env sh -c command -v ethtool",
             ],
             "{:?}",
             sys.calls

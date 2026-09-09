@@ -101,10 +101,14 @@ pub struct WireDecl {
     /// DECLARED link speed in Mb/s; the observed ethtool speed is only cross-checked
     /// (USB NICs misreport, and a down link reports "Unknown").
     pub speed_mbps: u32,
-    /// Optional `ethtool -K <nic>` words, applied on bringup and put back by `down`:
-    /// `<feature> on|off` pairs, handed to ethtool VERBATIM. cfab knows no adapter and no
-    /// driver — which features a NIC needs is the operator's declaration (`driver_features`).
+    /// RETIRED 2026-09-09. `driver_features` used to be handed to `ethtool -K <nic>` verbatim
+    /// on bringup and put back by `down`; NIC feature quirks are the host's business now (a
+    /// udev rule on the netdev-add event), and a declaration that still carries the key is
+    /// refused by name (`model::Fabric::from_decl`) rather than by `deny_unknown_fields`'s
+    /// generic "unknown field". Kept out of the emitted schema: it is a tombstone for a good
+    /// error message, not a key anyone may write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub driver_features: Option<String>,
     /// RETIRED. `usb = true` used to select a hard-coded r8152 offload mitigation; it is gone,
     /// and a declaration that still carries it is refused by name (`model::Fabric::from_decl`)
@@ -463,8 +467,11 @@ mod tests {
         assert_eq!(d.members[0].wires[0].nic, "eth9");
         assert_eq!(d.members[0].wires[0].speed_mbps, 5000);
         assert!(
-            d.members[0].wires[0].driver_features.is_none(),
-            "the example declares no driver_features on a live wire"
+            d.members
+                .iter()
+                .flat_map(|m| &m.wires)
+                .all(|w| w.driver_features.is_none()),
+            "the retired `driver_features` key is absent from the example"
         );
         assert!(
             d.members
@@ -754,8 +761,7 @@ pub mod fixtures {
         text.replace(needle, "gw = { domain = \"c\"")
     }
 
-    /// Replace one member's whole wire set (and, with it, any `driver_features` those wires
-    /// carried).
+    /// Replace one member's whole wire set.
     pub fn with_wires(text: &str, member: &str, spec: &str) -> String {
         let at = text
             .find(&format!("name = \"{member}\""))

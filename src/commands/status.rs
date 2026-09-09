@@ -2230,6 +2230,10 @@ fn link_speeds(
     c: &mut Ctx,
     absent: &BTreeSet<String>,
 ) -> Result<()> {
+    // ethtool is a read-only, OPTIONAL dependency (Debian `Recommends`): a read it cannot make
+    // (the binary is absent, or this device errors) degrades the speed-mismatch line to
+    // `driver ?` instead of failing the whole gather. Told once per gather, not once per wire.
+    let mut ethtool_absent = false;
     for wire in view.wires() {
         // Task 5b (RULED, James 2026-09-05): an absent wire gets its own spelling, distinct
         // from a present-but-carrierless one — an operator must tell "unplugged" from "gone".
@@ -2253,18 +2257,28 @@ fn link_speeds(
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         if carrier && obs != decl {
-            let drv = sys.run(&["ethtool", "-i", &wire])?.stdout;
-            let driver = drv
-                .lines()
-                .find_map(|l| l.strip_prefix("driver:"))
-                .map(str::trim)
-                .unwrap_or("?");
+            let driver = match sys.run(&["ethtool", "-i", &wire]) {
+                Ok(out) if out.ok() => out
+                    .stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("driver:"))
+                    .map(str::trim)
+                    .unwrap_or("?")
+                    .to_string(),
+                _ => {
+                    ethtool_absent = true;
+                    "?".to_string()
+                }
+            };
             // Standing: the wire negotiated what it negotiated; the declaration is what
             // disagrees with it.
             c.standing(format!(
                 "{wire}: link speed {obs} != declared {decl} (driver {driver})"
             ));
         }
+    }
+    if ethtool_absent {
+        c.standing("ethtool not installed: driver changes unchecked".to_string());
     }
     Ok(())
 }
@@ -2368,6 +2382,58 @@ mod tests {
         let mut f = fabric();
         f.bfd_port = port;
         f
+    }
+
+    /// A link-speed mismatch with ethtool present names the driver, exactly as before.
+    #[test]
+    fn a_link_speed_mismatch_names_the_driver() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "1000\n")
+            .on_stdout(
+                &["ethtool", "-i", "eth9"],
+                "driver: r8152\nversion: 6.12.0\n",
+            );
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert_eq!(
+            lines,
+            ["eth9: link speed 1000 != declared 5000 (driver r8152)"]
+        );
+    }
+
+    /// ethtool absent (or erroring) degrades the speed-mismatch line to `driver ?` instead of
+    /// failing the whole gather, and says so once — never once per wire.
+    #[test]
+    fn ethtool_absent_gives_one_standing_line_and_a_successful_gather() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "1000\n")
+            .on_fail(
+                &["ethtool", "-i", "eth9"],
+                127,
+                "ethtool: command not found",
+            );
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert!(
+            lines.contains(&"eth9: link speed 1000 != declared 5000 (driver ?)".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|m| m.as_str() == "ethtool not installed: driver changes unchecked")
+                .count(),
+            1,
+            "one line per gather, not per wire: {lines:?}"
+        );
     }
 
     /// `/proc/net/udp` as the kernel prints it (captured shape, pve1-tb 2026-09-06): a header

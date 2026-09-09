@@ -21,13 +21,13 @@ use crate::commands::common::{
 use crate::commands::common::{link_exists, link_kind_is};
 use crate::commands::{apply, engine_ctl};
 use crate::derive::{Port, View};
-use crate::driver_features;
 use crate::emit;
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
 use crate::prober::HeldPrimaries;
 use crate::sys::{Sys, run_ignore, run_ok};
+use crate::wire_drivers;
 use crate::workload::{deferred_names, uplink};
 
 pub struct WatchdogReport {
@@ -716,64 +716,39 @@ fn restore_missing_legs(
             )?;
         }
         if rebuilt.len() > rebuilt_before {
-            returned_wire(sys, view, &wire, rebuilt, unrestored)?;
+            returned_wire(sys, view, &wire, unrestored)?;
         }
     }
     Ok(())
 }
 
 /// A wire whose legs had all vanished and were just rebuilt is a wire whose NETDEV returned —
-/// a USB adapter re-enumerated, a driver reloaded. Two things follow from it being a *new*
-/// netdev, and neither belongs on the ordinary tick (this runs only on the tick that rebuilt
-/// a leg, so the steady state stays one `ip link show` per wire and per leg):
+/// a USB adapter re-enumerated, a driver reloaded. That makes it worth asking whether it is
+/// still the same ADAPTER: `apply` recorded the driver each wire had, and a different one back
+/// on the same name is reported (James 2026-09-07) and never silently accepted — the operator's
+/// own udev rule (NIC features are its business now, not cfab's) may not have fired for a NIC
+/// it does not recognize. This runs only on the tick that rebuilt a leg, so the steady state
+/// stays one `ip link show` per wire and per leg.
 ///
-///   - its `ethtool -K` features are back at the driver's defaults, so a declared
-///     `driver_features` string is put in force again — `apply` would have set it, and this
-///     restore exists exactly so a returned wire ends up where `apply` would have left it;
-///   - it may not be the same ADAPTER. `apply` recorded the driver each wire had; a different
-///     one back on the same name is reported (James 2026-09-07) and never silently accepted —
-///     the settings this member is about to re-apply were chosen for a different NIC.
-///
-/// The driver record is deliberately NOT rewritten here: it says what `apply` found, which is
-/// what `down`'s restore was computed against.
+/// The driver record is deliberately NOT rewritten here: it says what `apply` found.
 fn returned_wire(
     sys: &mut dyn Sys,
     view: &View,
     wire: &str,
-    rebuilt: &mut Vec<String>,
     unrestored: &mut Vec<String>,
 ) -> Result<()> {
-    let Some(w) = view.member.wire_named(wire) else {
+    if view.member.wire_named(wire).is_none() {
         return Ok(());
-    };
-    let now = driver_features::driver_of(sys, wire).unwrap_or_default();
+    }
+    let now = wire_drivers::driver_of(sys, wire).unwrap_or_default();
     if !now.is_empty()
-        && let Some(was) = driver_features::recorded_driver(sys, &view.fabric.run_dir, wire)
+        && let Some(was) = wire_drivers::recorded_driver(sys, &view.fabric.run_dir, wire)
         && was != now
     {
         unrestored.push(format!(
             "wire {wire} came back under driver '{now}', not the '{was}' apply recorded — this \
              is a different adapter, check it before trusting its settings"
         ));
-    }
-    if let Some(spec) = &w.driver_features {
-        let mut warnings = Vec::new();
-        let changes = driver_features::apply_to_wire(sys, wire, spec, &mut warnings)?;
-        rebuilt.push(format!("re-applied driver_features on {wire}: {spec}"));
-        unrestored.extend(warnings);
-        // A change made HERE is as much cfab's doing as one `up` made, so it goes in the same
-        // record — otherwise `down` would put back only what `up` touched and leave this
-        // wire's features exactly as the watchdog set them. Merging keeps the prior `up`
-        // recorded for a feature already there: that is the value the NIC had before cfab
-        // first touched it, not the driver default a re-created netdev came up with.
-        if !changes.is_empty()
-            && let Err(e) = driver_features::merge_changes(sys, &view.fabric.run_dir, &changes)
-        {
-            unrestored.push(format!(
-                "could not record the driver features re-applied on {wire} ({e}) — `down` will \
-                 not put them back"
-            ));
-        }
     }
     Ok(())
 }
@@ -2541,121 +2516,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// The example with `driver_features` on every member's eth9.
-    fn fixture_with_driver_features() -> Fabric {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
-                .unwrap()
-                .replace(
-                    "domain = \"a\", speed_mbps = 5000 },",
-                    "domain = \"a\", speed_mbps = 5000, driver_features = \"sg off\" },",
-                );
-        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
-    }
-
-    /// A returned netdev comes up at the driver's defaults, so the declared `driver_features`
-    /// go back on with the legs — otherwise a re-enumerated USB NIC silently runs with the
-    /// scatter-gather that was turned off for it, and only a reload would put it back.
-    #[test]
-    fn a_returned_wire_gets_its_declared_driver_features_back() {
-        let f = fixture_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
-            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
-            .on_stdout(
-                &["ethtool", "-k", "eth9"],
-                "Features for eth9:\nscatter-gather: on\n",
-            )
-            .file("/run/cfab/wire-drivers", "eth9 r8152\n");
-        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert_eq!(calls_for(&sys, "ethtool -K"), ["ethtool -K eth9 sg off"]);
-        assert!(
-            report
-                .rebuilt
-                .contains(&"re-applied driver_features on eth9: sg off".to_string()),
-            "{:?}",
-            report.rebuilt
-        );
-        assert!(
-            report.unrestored.is_empty(),
-            "the same driver is not a finding: {:?}",
-            report.unrestored
-        );
-    }
-
-    /// A change the watchdog made must reach the record, or the operator's NIC keeps cfab's
-    /// settings after `cfab down`. Proved end to end through the very function `down` calls:
-    /// the watchdog re-applies, then `driver_features::restore` — `down`'s own restore step —
-    /// puts it back on the same `Sys`.
-    #[test]
-    fn a_driver_feature_the_watchdog_re_applied_is_restored_by_down() {
-        let f = fixture_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
-            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
-            .on_stdout(
-                &["ethtool", "-k", "eth9"],
-                "Features for eth9:\nscatter-gather: on\n",
-            )
-            .file("/run/cfab/wire-drivers", "eth9 r8152\n");
-        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert_eq!(
-            sys.writes_to("/run/cfab/wire-driver-features"),
-            Some("eth9 sg on\n"),
-            "the watchdog's change reached the record"
-        );
-        let calls_before = sys.calls.len();
-        let notes = driver_features::restore(&mut sys, &view.fabric.run_dir);
-        assert_eq!(
-            sys.calls[calls_before..],
-            ["ethtool -K eth9 sg on".to_string()]
-        );
-        assert_eq!(notes, ["note: driver features put back on eth9: sg on"]);
-    }
-
-    /// The prior `up` recorded survives a watchdog re-apply: `down` owes the operator the
-    /// value the NIC had before cfab touched it, not the driver default the returned netdev
-    /// came up with.
-    #[test]
-    fn a_re_apply_keeps_the_prior_up_recorded() {
-        let f = fixture_with_driver_features();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
-            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
-            .on_stdout(
-                &["ethtool", "-k", "eth9"],
-                "Features for eth9:\nscatter-gather: on\n",
-            )
-            .file("/run/cfab/wire-drivers", "eth9 r8152\n")
-            // `up` found sg OFF on this NIC and turned it on... then the wire re-enumerated
-            // with the driver default (on) and the watchdog set it off again.
-            .file("/run/cfab/wire-driver-features", "eth9 sg off\n");
-        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(
-            sys.ran("write /run/cfab/wire-driver-features"),
-            "the record was rewritten, not merely left alone: {:?}",
-            sys.calls
-        );
-        assert_eq!(
-            sys.writes_to("/run/cfab/wire-driver-features"),
-            Some("eth9 sg off\n"),
-            "the original prior stands"
-        );
-    }
-
     /// James 2026-09-07: a wire that comes back under a DIFFERENT driver is a different
     /// adapter wearing the same name. Loud (journal + the report `status` reads), never
-    /// silently accepted — the features about to be re-applied were chosen for the old NIC.
+    /// silently accepted — NIC features are the host's own udev rule now, and a rule keyed on
+    /// the old NIC may never fire for this one.
     #[test]
     fn a_wire_that_returns_under_a_different_driver_is_reported() {
-        let f = fixture_with_driver_features();
+        let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
             .on_stdout(&["ethtool", "-i", "eth9"], "driver: cdc_ncm\n")
-            .on_stdout(
-                &["ethtool", "-k", "eth9"],
-                "Features for eth9:\nscatter-gather: on\n",
-            )
             .file("/run/cfab/wire-drivers", "eth9 r8152\n");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert_eq!(
@@ -2665,9 +2535,7 @@ pub(crate) mod tests {
                  this is a different adapter, check it before trusting its settings"
             ]
         );
-        // Reported AND still put in the declared state: a warning is not a reason to leave the
-        // NIC at defaults.
-        assert_eq!(calls_for(&sys, "ethtool -K"), ["ethtool -K eth9 sg off"]);
+        assert!(!sys.ran("ethtool -K"), "{:?}", sys.calls);
         // The journal carries it, like every other watchdog finding.
         assert!(
             sys.ran("logger -t cfab-fwd-watchdog wire eth9 came back under driver"),
@@ -2676,11 +2544,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// The ordinary tick asks ethtool nothing: the driver comparison and the feature re-apply
-    /// happen only on the tick that rebuilt a leg, so the steady state stays as cheap as it was.
+    /// A wire that returns under the SAME driver earns no finding — the comparison only
+    /// reports a difference.
+    #[test]
+    fn a_returned_wire_under_the_same_driver_earns_no_finding() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")
+            .on_stdout(&["ethtool", "-i", "eth9"], "driver: r8152\n")
+            .file("/run/cfab/wire-drivers", "eth9 r8152\n");
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
+    }
+
+    /// The ordinary tick asks ethtool nothing: the driver comparison happens only on the tick
+    /// that rebuilt a leg, so the steady state stays as cheap as it was.
     #[test]
     fn a_tick_that_rebuilds_nothing_runs_no_ethtool() {
-        let f = fixture_with_driver_features();
+        let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = healthy_sys(&view);
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
@@ -2688,10 +2569,11 @@ pub(crate) mod tests {
         assert!(!sys.ran("ethtool"), "{:?}", sys.calls);
     }
 
-    /// A wire with no `driver_features` and no driver record (an older run dir) returns with
-    /// no ethtool traffic beyond the one `-i` probe and no finding.
+    /// A returned wire with no driver record at all (an older run dir, or one `up` could not
+    /// read) gets the one `-i` probe and no finding: nothing to compare against is not a
+    /// difference.
     #[test]
-    fn a_returned_wire_with_nothing_declared_only_probes_the_driver() {
+    fn a_returned_wire_with_no_record_only_probes_the_driver() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wire_legs_missing(healthy_sys(&view), &view, "eth9")

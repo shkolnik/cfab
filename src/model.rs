@@ -108,9 +108,6 @@ pub struct Wire {
     pub name: String,
     pub domain: DomainId,
     pub speed_mbps: u32,
-    /// The declared `ethtool -K` words for this NIC, validated at load, applied on bringup and
-    /// restored by `down`. `None` = cfab does not touch this NIC's features at all.
-    pub driver_features: Option<String>,
 }
 
 /// The widest ifname a bond leg (a universal segment, or a migrating ingress leg) may carry.
@@ -561,24 +558,28 @@ impl Fabric {
             for w in &m.wires {
                 let ctx = || format!("member {}: wire {}: ", m.name, w.nic);
                 let domain = DomainId::parse(&w.domain).map_err(|e| Error::context(ctx(), e))?;
-                // The retired `usb` flag: refuse by name with the replacement, rather than let
-                // `deny_unknown_fields` say "unknown field `usb`" and leave the operator
-                // guessing what the mitigation became.
-                if w.usb.is_some() {
+                // Both retired keys used to let a declaration set NIC features; that is now the
+                // host's business (a udev rule on the netdev-add event), and cfab only monitors
+                // the driver and link speed it finds. Refuse by name rather than let
+                // `deny_unknown_fields` say "unknown field" and leave the operator guessing.
+                if w.driver_features.is_some() {
                     return Err(Error::config(format!(
-                        "{}'usb' is gone; declare driver_features = \"sg off tso off gso off\" \
-                         instead (the words go to `ethtool -K <nic>` as written)",
+                        "{}'driver_features' is gone: cfab no longer sets NIC features; set \
+                         them on the host (a udev rule on the netdev add event, see README)",
                         ctx()
                     )));
                 }
-                if let Some(spec) = &w.driver_features {
-                    crate::driver_features::parse(spec).map_err(|e| Error::context(ctx(), e))?;
+                if w.usb.is_some() {
+                    return Err(Error::config(format!(
+                        "{}'usb' is gone: cfab no longer sets NIC features; set them on the \
+                         host (a udev rule on the netdev add event, see README)",
+                        ctx()
+                    )));
                 }
                 wires.push(Wire {
                     name: w.nic.clone(),
                     domain,
                     speed_mbps: w.speed_mbps,
-                    driver_features: w.driver_features.clone(),
                 });
             }
             // A zone appears at most once per member (a TOML table has one key per name), so
@@ -1390,31 +1391,30 @@ mod tests {
         assert_eq!(f.forward_allow.len(), 3);
     }
 
-    /// A `driver_features` string reaches the model on the wire that declared it, and only
-    /// there — it is per-NIC, not a member-wide or fabric-wide list.
+    /// The retired `driver_features` key fails LOUD at load, naming the wire and the host-side
+    /// replacement — not `deny_unknown_fields`'s "unknown field `driver_features`", which says
+    /// nothing about what to do instead.
     #[test]
-    fn driver_features_land_on_the_wire_that_declared_them() {
-        let f = parse_fabric(|t| {
+    fn the_retired_driver_features_key_is_refused_by_name_with_the_remedy() {
+        let err = parse_fabric(|t| {
             *t = t.replace(
                 "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
                 "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
                  off tso off\" },",
             )
         })
-        .unwrap();
+        .unwrap_err()
+        .to_string();
         assert_eq!(
-            f.member("pve1-tb").unwrap().wires[0]
-                .driver_features
-                .as_deref(),
-            Some("sg off tso off")
+            err,
+            "fabric.toml: member pve1-tb: wire eth9: 'driver_features' is gone: cfab no longer \
+             sets NIC features; set them on the host (a udev rule on the netdev add event, see \
+             README)"
         );
-        assert_eq!(f.member("pve1-tb").unwrap().wires[1].driver_features, None);
-        assert_eq!(f.member("pve3-tb").unwrap().wires[0].driver_features, None);
     }
 
-    /// The retired `usb` key fails LOUD at load, naming the wire and the replacement — not
-    /// `deny_unknown_fields`' "unknown field `usb`", which says nothing about what to write
-    /// instead.
+    /// The retired `usb` key fails LOUD at load too, naming the wire and the same host-side
+    /// replacement.
     #[test]
     fn the_retired_usb_key_is_refused_by_name_with_the_remedy() {
         let err = parse_fabric(|t| {
@@ -1427,8 +1427,8 @@ mod tests {
         .to_string();
         assert_eq!(
             err,
-            "fabric.toml: member pve1-tb: wire eth9: 'usb' is gone; declare driver_features = \
-             \"sg off tso off gso off\" instead (the words go to `ethtool -K <nic>` as written)"
+            "fabric.toml: member pve1-tb: wire eth9: 'usb' is gone: cfab no longer sets NIC \
+             features; set them on the host (a udev rule on the netdev add event, see README)"
         );
     }
 
@@ -1444,25 +1444,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("wire eth1: 'usb' is gone"), "{err}");
-    }
-
-    /// A malformed `driver_features` string is a DECLARATION error (`cfab check`), not a
-    /// surprise from ethtool half way through a bringup. The message names the member and
-    /// the wire, like every other wire error.
-    #[test]
-    fn a_malformed_driver_features_string_is_refused_at_load() {
-        let err = parse_fabric(|t| {
-            *t = t.replace(
-                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
-                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"sg \
-                 off tso\" },",
-            )
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("member pve1-tb: wire eth9: "), "{err}");
-        assert!(err.contains("3 words"), "{err}");
-        assert!(err.contains("<feature> on|off pairs"), "{err}");
     }
 
     #[test]

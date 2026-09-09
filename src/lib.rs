@@ -12,7 +12,6 @@ pub mod cluster;
 pub mod commands;
 pub mod decl;
 pub mod derive;
-pub mod driver_features;
 pub mod emit;
 pub mod engine;
 pub mod error;
@@ -22,6 +21,7 @@ pub mod prober;
 pub mod sock_frame;
 pub mod supervisor;
 pub mod sys;
+pub mod wire_drivers;
 pub mod workload;
 
 use std::path::Path;
