@@ -24,7 +24,7 @@ use crate::derive::{Port, View, segments_of};
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
-use crate::model::{Fabric, MemberKind};
+use crate::model::{Fabric, Ipv4Prefix, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
 use crate::sys::{Output, Sys, run_optional};
@@ -1717,7 +1717,8 @@ fn workload_posture(
         .read("/proc/sys/net/ipv4/conf/all/arp_ignore")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unreadable".to_string());
-    let bridge_ok = sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+    let bridge = sys.run(&["nft", "list", "table", "bridge", "cfab"])?;
+    let bridge_ok = bridge.ok();
 
     for row in rows {
         let wl = row.wl;
@@ -1825,12 +1826,31 @@ fn workload_posture(
             WorkloadState::Up
         };
         let up = state == WorkloadState::Up;
-        // Task 1 item 3 fills these in from live reads, gated the same way (`vms_seen` only
-        // once `up` above is final, and only for an up row); item 2 only adds the fields and
-        // the classification they will be gated on.
-        let guard_drops = None;
-        let bytes = None;
-        let vms_seen = None;
+
+        // Observability, never a health condition (availability first): a failed read is a
+        // `None`, never a fault line and never a change to `up`. The neighbor read is taken
+        // only once the row's `up` is final, and only for an up row — a row that is not up
+        // skips it rather than taking it and discarding it.
+        let guard_drops = if bridge_ok {
+            let mut claim = 0u64;
+            let mut request = 0u64;
+            for port in &uplinks {
+                claim += counter_packets_for(&bridge.stdout, "gw-claim-from-uplink", port);
+                request += counter_packets_for(&bridge.stdout, "gw-request-from-uplink", port);
+            }
+            Some(GuardDrops { claim, request })
+        } else {
+            None
+        };
+        let bytes = sysfs_bytes(sys, &wl.ifname);
+        let vms_seen = if up {
+            let mut exclude = workload_member_addresses(view.fabric, name);
+            exclude.push(wl.gw);
+            exclude.push(wl.router);
+            neighbors_seen(sys, &wl.ifname, &wl.prefix, &exclude)
+        } else {
+            None
+        };
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
@@ -1850,6 +1870,94 @@ fn workload_posture(
     Ok(())
 }
 
+/// Every declared member's address on workload `name`, across the whole fabric (not just this
+/// member — `View::workload_rows` is this-member-only). The exclusion set for `vms_seen`: without
+/// it a peer's own resolution of the gateway counts as a VM (a 3-host testbed would read 1 with
+/// zero VMs).
+fn workload_member_addresses(fabric: &Fabric, name: &str) -> Vec<std::net::Ipv4Addr> {
+    fabric
+        .members
+        .iter()
+        .flat_map(|m| m.workloads.iter())
+        .filter(|mw| mw.name == name)
+        .map(|mw| mw.address)
+        .collect()
+}
+
+/// `/sys/class/net/<ifname>/statistics/{rx,tx}_bytes`, as `(rx, tx)`; `None` if either read or
+/// parse fails.
+fn sysfs_bytes(sys: &dyn Sys, ifname: &str) -> Option<(u64, u64)> {
+    let rx = sys
+        .read(&format!("/sys/class/net/{ifname}/statistics/rx_bytes"))
+        .ok()?;
+    let tx = sys
+        .read(&format!("/sys/class/net/{ifname}/statistics/tx_bytes"))
+        .ok()?;
+    Some((rx.trim().parse().ok()?, tx.trim().parse().ok()?))
+}
+
+/// One neighbor read on `ifname` (`ip -j neigh show dev`, JSON), counting IPv4 entries inside
+/// `prefix` whose state is REACHABLE/STALE/DELAY/PROBE and whose address is not in `exclude`
+/// (every declared member's address on this workload, `gw`, `router`). Out-of-prefix entries are
+/// excluded by the `prefix.contains` check, not a separate list. `None` on a read or parse
+/// failure — this is observability, never a health condition.
+fn neighbors_seen(
+    sys: &mut dyn Sys,
+    ifname: &str,
+    prefix: &Ipv4Prefix,
+    exclude: &[std::net::Ipv4Addr],
+) -> Option<u32> {
+    let out = sys.run(&["ip", "-j", "neigh", "show", "dev", ifname]).ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let doc: Value = serde_json::from_str(&out.stdout).ok()?;
+    let entries = doc.as_array()?;
+    let mut count = 0u32;
+    for e in entries {
+        let Some(dst) = e["dst"]
+            .as_str()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        if !prefix.contains(dst) || exclude.contains(&dst) {
+            continue;
+        }
+        let resolved = e["state"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str())
+            .any(|s| matches!(s, "REACHABLE" | "STALE" | "DELAY" | "PROBE"));
+        if resolved {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// `counter_packets`, restricted to the rule(s) on one uplink port: the bridge guard emits one
+/// rule pair per port carrying the same two comments, so telling ports apart needs the port too
+/// (`counter_packets` alone always reads the first-listed port's rule). Sums every matching
+/// line's counter — in practice there is one rule per (port, comment) pair.
+fn counter_packets_for(chain: &str, comment: &str, iifname: &str) -> u64 {
+    chain
+        .lines()
+        .filter(|l| l.contains(&format!("iifname \"{iifname}\"")))
+        .filter_map(|line| {
+            if !line.contains(&format!("comment \"{comment}\"")) {
+                return None;
+            }
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let i = words.iter().position(|w| *w == "counter")?;
+            if words.get(i + 1) != Some(&"packets") {
+                return None;
+            }
+            words.get(i + 2)?.parse::<u64>().ok()
+        })
+        .sum()
+}
 
 /// What one gw zone's ingress row says, in words.
 fn ingress_reasons(i: &Ingress) -> Vec<(Class, String)> {
@@ -2186,6 +2294,7 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip rule show pref ",
         "ip -4 -br addr show dev ",
         "ip -br link show dev ",
+        "ip -j neigh show dev ",
         "nft list ",
         "nft -s list ",
         "nft -j list ",
@@ -3900,6 +4009,219 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    /// `counter_packets_for` sums over both rules a port earns (claim and request are asked
+    /// separately, one call each) and tells two ports with different counts apart — the thing
+    /// plain `counter_packets` cannot do, since the bridge guard emits one rule pair per port
+    /// with the same two comments.
+    #[test]
+    fn counter_packets_for_sums_one_ports_rules_and_tells_ports_apart() {
+        let chain = "\
+table bridge cfab {
+    chain pre {
+        type filter hook prerouting priority filter; policy accept;
+        iifname \"eth0\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter packets 3 bytes 126 drop comment \"gw-claim-from-uplink\"
+        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \"gw-request-from-uplink\"
+        iifname \"eth1\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter packets 11 bytes 462 drop comment \"gw-claim-from-uplink\"
+        iifname \"eth1\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter packets 0 bytes 0 drop comment \"gw-request-from-uplink\"
+    }
+}
+";
+        assert_eq!(counter_packets_for(chain, "gw-claim-from-uplink", "eth0"), 3);
+        assert_eq!(counter_packets_for(chain, "gw-request-from-uplink", "eth0"), 5);
+        assert_eq!(counter_packets_for(chain, "gw-claim-from-uplink", "eth1"), 11);
+        assert_eq!(counter_packets_for(chain, "gw-request-from-uplink", "eth1"), 0);
+        // A port with no rule of its own (never emitted for it) sums to zero, not a fault.
+        assert_eq!(counter_packets_for(chain, "gw-claim-from-uplink", "eth2"), 0);
+    }
+
+    /// Every declared member's address on the workload, across the whole fabric — not just this
+    /// member's own row.
+    #[test]
+    fn workload_member_addresses_covers_every_member_not_just_this_one() {
+        let f = wl_fabric();
+        let mut addrs = workload_member_addresses(&f, "vms");
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "192.168.20.2".parse::<std::net::Ipv4Addr>().unwrap(),
+                "192.168.20.3".parse().unwrap(),
+            ]
+        );
+        assert!(workload_member_addresses(&f, "no-such-workload").is_empty());
+    }
+
+    /// `sysfs_bytes`: both reads must succeed and parse, or the row gets `None` — never a
+    /// partial pair.
+    #[test]
+    fn sysfs_bytes_is_none_unless_both_counters_read_and_parse() {
+        let sys = MockSys::default()
+            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1000\n")
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&sys, "primary.3"), Some((1000, 2000)));
+        // tx missing entirely.
+        let half = MockSys::default().file("/sys/class/net/primary.3/statistics/rx_bytes", "1\n");
+        assert_eq!(sysfs_bytes(&half, "primary.3"), None);
+        // Present but unparseable.
+        let garbage = MockSys::default()
+            .file("/sys/class/net/primary.3/statistics/rx_bytes", "not-a-number\n")
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&garbage, "primary.3"), None);
+    }
+
+    /// `neighbors_seen`: excludes every member address, `gw` and `router`, excludes
+    /// out-of-prefix entries via `prefix.contains` alone, and only counts a resolved state
+    /// (never `FAILED`/`INCOMPLETE`). Fixture: one VM, two peer members, the router, and one
+    /// out-of-prefix entry → 1.
+    #[test]
+    fn neighbors_seen_excludes_members_gw_router_and_out_of_prefix() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let exclude: Vec<std::net::Ipv4Addr> = vec![
+            "192.168.20.2".parse().unwrap(), // this member
+            "192.168.20.3".parse().unwrap(), // a peer member
+            "192.168.20.1".parse().unwrap(), // router
+        ];
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.2", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.3", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
+            {"dst": "192.168.20.1", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
+            {"dst": "192.168.21.5", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default()
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], &neigh_json);
+        assert_eq!(
+            neighbors_seen(&mut sys, "primary.3", &prefix, &exclude),
+            Some(1)
+        );
+    }
+
+    /// A state that never resolved anything (`FAILED`, `INCOMPLETE`) is not counted.
+    #[test]
+    fn neighbors_seen_does_not_count_an_unresolved_entry() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["FAILED"]},
+            {"dst": "192.168.20.51", "dev": "primary.3", "state": ["INCOMPLETE"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default()
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], &neigh_json);
+        assert_eq!(
+            neighbors_seen(&mut sys, "primary.3", &prefix, &[]),
+            Some(0)
+        );
+    }
+
+    /// A read or parse failure is `None`, never a fault and never a fabricated zero.
+    #[test]
+    fn neighbors_seen_is_none_on_a_read_failure() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let mut sys = MockSys::default().on_fail(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            1,
+            "Device \"primary.3\" does not exist.",
+        );
+        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), None);
+
+        let mut garbled =
+            MockSys::default().on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], "{");
+        assert_eq!(
+            neighbors_seen(&mut garbled, "primary.3", &prefix, &[]),
+            None
+        );
+    }
+
+    /// A healthy row carries all three new fields, read from the fixture: the guard sum over the
+    /// row's one uplink port, the sysfs byte counters, and `vms_seen` from the neighbor read
+    /// (one VM plus this member's own address, which is excluded, leaving 1).
+    #[test]
+    fn a_healthy_row_carries_guard_drops_bytes_and_vms_seen_from_the_fixture() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.2", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view)
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n    chain pre {\n        iifname \"eth0\" vlan id 3 vlan \
+                 type arp arp saddr ip 192.168.20.254 counter packets 3 bytes 126 drop comment \
+                 \"gw-claim-from-uplink\"\n        iifname \"eth0\" vlan id 3 vlan type arp arp \
+                 daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \
+                 \"gw-request-from-uplink\"\n    }\n}\n",
+            )
+            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1234\n")
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "5678\n")
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], &neigh_json);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let row = &m.workloads[0];
+        assert!(row.up, "{row:?}");
+        assert_eq!(row.guard_drops, Some(GuardDrops { claim: 3, request: 5 }));
+        assert_eq!(row.bytes, Some((1234, 5678)));
+        assert_eq!(row.vms_seen, Some(1));
+    }
+
+    /// A row that is not up never takes the neighbor read at all (never takes it and discards
+    /// it): `vms_seen` is `None` and no `ip -j neigh` call is made.
+    #[test]
+    fn a_row_that_is_not_up_never_takes_the_neighbor_read() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].vms_seen, None);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip -j neigh show dev")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// A failed sysfs byte read on an otherwise healthy row is `None`, and never changes `up`
+    /// (observability, not health).
+    #[test]
+    fn a_failed_bytes_read_is_none_and_never_changes_up() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // wl_status_sys never files the sysfs statistics paths, so the reads fail by default.
+        let mut sys = wl_status_sys(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].bytes, None);
+    }
+
+    /// `guard_drops` is `None` only when the whole table is absent — never a per-port fault.
+    #[test]
+    fn guard_drops_is_none_only_when_the_table_is_absent() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_fail(
+            &["nft", "list", "table", "bridge", "cfab"],
+            1,
+            "Error: No such file or directory",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].guard_drops, None);
+    }
+
+    /// The `ip -j neigh show dev` prefix is on the read-only allowlist; `ip neigh flush` (a
+    /// write) is still refused.
+    #[test]
+    fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
+        assert!(is_read_only("ip -j neigh show dev primary.3"));
+        assert!(!is_read_only("ip neigh flush dev primary.3"));
     }
 
     /// Spec §12 (b), the reporting half. A host whose forward policy is gone has failed closed:
