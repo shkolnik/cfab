@@ -1175,6 +1175,33 @@ pub(crate) mod tests {
         assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
     }
 
+    // C1 (whole-branch review): a row `apply` deferred because its own interface was
+    // LOWERLAYERDOWN (not because the uplink was unidentified or not forwarding) is installed
+    // the same way any other deferred row is, once the underlying carrier fault clears. The
+    // watchdog's readiness check never inspects the workload interface's own operstate — only
+    // the bridge/port facts (`uplink::identify` + `stp_forwarding`) — so no LOWERLAYERDOWN-
+    // specific path is needed: the carrier fault that caused LOWERLAYERDOWN also keeps the
+    // bridge port from reaching the STP forwarding state, so the row naturally stays pending
+    // until the link is really back.
+    #[test]
+    fn the_watchdog_installs_a_row_deferred_for_a_lower_layer_carrier_fault_once_the_link_is_up() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(report.restored.contains(&"installed workload vms".to_string()));
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
+    }
+
     #[test]
     fn the_watchdog_leaves_a_still_unready_deferred_row_alone() {
         let f = wl_fabric();

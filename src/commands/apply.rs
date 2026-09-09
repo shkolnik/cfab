@@ -407,12 +407,22 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             )));
         }
         let state = out.stdout.split_whitespace().nth(1).unwrap_or("");
+        if state == "LOWERLAYERDOWN" {
+            // James's ruling 2026-09-09 ("bias towards availability", C1 whole-branch review):
+            // a lower-layer carrier fault is not an admin-down or a missing stanza — it is the
+            // same class as an uplink that cannot yet be identified or is not yet forwarding,
+            // and joins the deferral path instead of refusing every other row's apply. A site
+            // power cut brings the switch up tens of seconds after the hosts; without this, the
+            // whole member would exit fatal for a condition that clears itself.
+            warnings.push(format!(
+                "workload {name}: interface {ifname} is LOWERLAYERDOWN (fix the carrier of its \
+                 lower device); row deferred to the watchdog"
+            ));
+            deferred_names.push(name.clone());
+            continue;
+        }
         if state != "UP" {
-            let remedy = if state == "LOWERLAYERDOWN" {
-                "fix the carrier of its lower device".to_string()
-            } else {
-                format!("ip link set {ifname} up, or fix its stanza")
-            };
+            let remedy = format!("ip link set {ifname} up, or fix its stanza");
             // A blank field (unparsable `ip -br link show` output) must never surface as an
             // empty word between "is" and the parenthesized remedy.
             let label = if state.is_empty() { "unknown state" } else { state };
@@ -1569,16 +1579,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn up_names_a_lower_layer_carrier_fault_with_its_own_remedy() {
+    fn up_defers_a_lower_layer_carrier_fault_instead_of_refusing_the_whole_apply() {
+        // James's ruling 2026-09-09 ("bias towards availability"): LOWERLAYERDOWN is not an
+        // admin-down or a missing stanza — it is the same class as an uplink that is not yet
+        // identified or not yet forwarding, and joins the deferral path (C1, whole-branch
+        // review). A site power cut brings the switch up ~40 s after the hosts; without this,
+        // every member with a workload row would exit 3 and stay down for a condition that
+        // clears itself.
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut lowerdown = sys.on_stdout(
             &["ip", "-br", "link", "show", "dev", "primary.3"],
             "primary.3@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
         );
-        assert_eq!(
-            run(&mut lowerdown, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of its lower device)"
+        let warnings = run(&mut lowerdown, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of \
+                    its lower device); row deferred to the watchdog"),
+            "{warnings:#?}"
         );
+        assert!(!lowerdown.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert_eq!(
+            lowerdown.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // Everything else still applies: the policy loaded, forwarding still went on.
+        assert!(lowerdown.ran("nft -f /run/cfab/policy.nft"));
     }
 
     #[test]

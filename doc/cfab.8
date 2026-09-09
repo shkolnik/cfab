@@ -677,6 +677,19 @@ row at all: reaching a zone requires forwarding, so no
 .B allow
 value is ever valid once it is off.
 .PP
+.B cfab up
+refuses if
+.I ifname
+does not exist, lacks the member's declared address, or is administratively
+down (or in an unparsable state) \(em a stanza problem needing a fix and a
+re\-apply. A lower\-layer carrier fault
+.RB ( LOWERLAYERDOWN )
+is not a declaration fault, and neither is an uplink that cannot yet be
+identified or is not yet STP\-forwarding: each defers that one row to the
+watchdog (a warning names the reason, no gw address goes live) and applies
+everything else, and the watchdog installs the row once the condition
+clears.
+.PP
 The VLAN interface itself is baseline\-owned (Proxmox, systemd\-networkd,
 whatever already brought it up); cfab only points at it, and never creates or
 deletes it.

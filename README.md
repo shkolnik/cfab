@@ -197,6 +197,13 @@ enabled = false` cannot declare a `[[workload]]` row at all — a workload with 
 refused, and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is
 off.
 
+`cfab up` refuses if `ifname` does not exist, lacks the member's declared address, or is
+administratively down (or in an unparsable state) — a stanza problem needing a fix and a
+re-apply. A lower-layer carrier fault (`LOWERLAYERDOWN`) is not a declaration fault, and neither
+is an uplink that cannot yet be identified or is not yet STP-forwarding: each defers that one row
+to the watchdog (a warning names the reason, no gw address goes live) and applies everything
+else, and the watchdog installs the row once the condition clears.
+
 - **`up` adds:** IPv4 forwarding on `ifname`; a passive OSPF entry for `ifname` in every allowed
   zone's instance, so every member and leaf learns the prefix; a pref-2000 sibling return-path
   rule per (zone, workload prefix) on every member and leaf, ahead of the general egress rule, so
