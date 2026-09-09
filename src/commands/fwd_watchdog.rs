@@ -417,7 +417,13 @@ fn guarded_ports_for(bridge_nft: &str, gw: &std::net::Ipv4Addr) -> Vec<String> {
     let mut ports: Vec<String> = bridge_nft
         .lines()
         .filter(|l| l.contains(&needle))
-        .filter_map(|l| l.split("iifname \"").nth(1)?.split('"').next().map(str::to_string))
+        .filter_map(|l| {
+            l.split("iifname \"")
+                .nth(1)?
+                .split('"')
+                .next()
+                .map(str::to_string)
+        })
         .collect();
     ports.sort();
     ports.dedup();
@@ -435,8 +441,21 @@ fn install_ready_rows(
     still_pending: &mut Vec<String>,
 ) {
     for name in ready_names {
-        let row = rows.iter().find(|r| &r.wl.name == name).expect("checked above");
-        match run_ok(sys, &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", &row.wl.ifname]) {
+        let row = rows
+            .iter()
+            .find(|r| &r.wl.name == name)
+            .expect("checked above");
+        match run_ok(
+            sys,
+            &[
+                "ip",
+                "addr",
+                "replace",
+                &row.wl.gw_cidr(),
+                "dev",
+                &row.wl.ifname,
+            ],
+        ) {
             Ok(_) => restored.push(format!("installed workload {name}")),
             Err(e) => {
                 unrestored.push(format!("unrestored workload {name}: {e}"));
@@ -519,7 +538,14 @@ fn reconcile_workload_guard(
             let old = sys.read(&bridge_path).unwrap_or_default();
             let new_nft = emit::workload::bridge_table(&guards);
             if old == new_nft {
-                install_ready_rows(sys, rows, &ready_names, restored, unrestored, &mut still_pending);
+                install_ready_rows(
+                    sys,
+                    rows,
+                    &ready_names,
+                    restored,
+                    unrestored,
+                    &mut still_pending,
+                );
             } else {
                 // I1: journal per-row port changes only for rows that were already fully
                 // installed (not in `pending`) — a still-deferred row's first guard entry is
@@ -547,7 +573,14 @@ fn reconcile_workload_guard(
                 match reload_bridge_guard(sys, &bridge_path, &new_nft) {
                     Ok(()) => {
                         restored.extend(drifted);
-                        install_ready_rows(sys, rows, &ready_names, restored, unrestored, &mut still_pending);
+                        install_ready_rows(
+                            sys,
+                            rows,
+                            &ready_names,
+                            restored,
+                            unrestored,
+                            &mut still_pending,
+                        );
                     }
                     Err(e) => {
                         // The guard did not load: not one row installs this tick, all stay
@@ -1390,7 +1423,11 @@ pub(crate) mod tests {
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
         assert_eq!(
-            report.restored.iter().filter(|l| *l == "installed workload vms").count(),
+            report
+                .restored
+                .iter()
+                .filter(|l| *l == "installed workload vms")
+                .count(),
             1,
             "{:?}",
             report.restored
@@ -1456,7 +1493,11 @@ pub(crate) mod tests {
             );
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
-        assert!(report.restored.contains(&"installed workload vms".to_string()));
+        assert!(
+            report
+                .restored
+                .contains(&"installed workload vms".to_string())
+        );
         assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
     }
 
@@ -1532,7 +1573,11 @@ pub(crate) mod tests {
             written.last().copied(),
             "the rename left the canonical file holding the newly loaded content"
         );
-        assert!(report.restored.contains(&"installed workload vms".to_string()));
+        assert!(
+            report
+                .restored
+                .contains(&"installed workload vms".to_string())
+        );
     }
 
     #[test]
@@ -1557,15 +1602,16 @@ pub(crate) mod tests {
         assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
         assert!(!sys.ran("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft"));
         assert!(
-            report
-                .unrestored
-                .iter()
-                .any(|l| l == "unrestored workload vms: guard not loaded: nft -f \
+            report.unrestored.iter().any(|l| l
+                == "unrestored workload vms: guard not loaded: nft -f \
                      /run/cfab/workload-bridge.nft.new: exit 1 — Error: syntax error"),
             "{:#?}",
             report.unrestored
         );
-        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), Vec::<&str>::new());
+        assert_eq!(
+            sys.writes_of("/run/cfab/workload-deferred"),
+            Vec::<&str>::new()
+        );
         // Round 3: the canonical file a future tick's `restore_workloads` would read is exactly
         // what it was before this failed reload — untouched by the temp file's content.
         assert_eq!(

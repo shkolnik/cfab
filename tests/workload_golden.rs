@@ -92,7 +92,10 @@ fn golden_at(path: &str, got: String) {
 }
 
 fn golden(member: &str) {
-    golden_at(&format!("tests/fixtures/workload-golden-{member}.txt"), render(member));
+    golden_at(
+        &format!("tests/fixtures/workload-golden-{member}.txt"),
+        render(member),
+    );
 }
 
 #[test]
@@ -111,8 +114,14 @@ fn the_leaf_workload_rendering_is_pinned() {
 /// `WORKLOAD_BLOCK`'s single-zone one.
 #[test]
 fn the_multi_zone_allow_workload_rendering_is_pinned() {
-    let got = render_text(&fixtures::with_multi_zone_allow_workload(&fixtures::example()), "pve1-tb");
-    golden_at("tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt", got);
+    let got = render_text(
+        &fixtures::with_multi_zone_allow_workload(&fixtures::example()),
+        "pve1-tb",
+    );
+    golden_at(
+        "tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt",
+        got,
+    );
 }
 
 /// The multi-zone golden actually differs from the single-zone one in exactly the ways `allow =
@@ -126,9 +135,13 @@ fn the_multi_zone_allow_workload_rendering_is_pinned() {
 fn the_multi_zone_allow_golden_actually_differs_from_the_single_zone_one() {
     let one = std::fs::read_to_string("tests/fixtures/workload-golden-pve1-tb.txt")
         .expect("the single-zone golden exists");
-    let two = std::fs::read_to_string("tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt")
-        .expect("the multi-zone golden exists");
-    assert_ne!(one, two, "allow = [\"storage\", \"mgmt\"] rendered no differently than one zone");
+    let two =
+        std::fs::read_to_string("tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt")
+            .expect("the multi-zone golden exists");
+    assert_ne!(
+        one, two,
+        "allow = [\"storage\", \"mgmt\"] rendered no differently than one zone"
+    );
     for needle in [
         "from 10.249.0.0/16 to 192.168.20.0/24 lookup main",
         "allow-vms-mgmt",

@@ -24,7 +24,7 @@ use crate::derive::{Port, View, segments_of};
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
-use crate::model::{Fabric, MemberKind};
+use crate::model::{Fabric, Ipv4Prefix, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
 use crate::sys::{Output, Sys, have_tool, run_optional};
@@ -42,8 +42,8 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 pub mod model;
 
 pub use model::{
-    Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
-    LegPort, MemberInfo, Reach, State, StatusModel, WorkloadStatus,
+    Adjacency, BondLeg, Bonding, Class, Condition, GuardDrops, Headline, HomeCarrier, Ingress,
+    LegKind, LegPort, MemberInfo, Reach, State, StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -386,8 +386,7 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             Some(t) if !t.is_empty() => t,
             _ => "-",
         };
-        let _ = writeln!(
-            out,
+        let mut line = format!(
             "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
              trigger {trigger}",
             w.name,
@@ -396,6 +395,13 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             w.gw,
             w.zones.join(", ")
         );
+        // One spelling for every N, including 0 and 1 (metrics addendum 2026-09-09): scripts
+        // grep it, so "vms seen" never turns into "vm seen" for the singular. Nothing appended
+        // when the row is not up or the neighbor read failed (`None`).
+        if let Some(n) = w.vms_seen {
+            let _ = write!(line, ", {n} vms seen");
+        }
+        let _ = writeln!(out, "{line}");
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
@@ -1510,7 +1516,12 @@ fn reachability(
 /// construction (both call sites filter the same (zone, workload) pairs from the same
 /// `view.fabric`), so this is the two filters having drifted — report the needle this call site
 /// derives AND say plainly that the builder never emitted it, so the two facts are not confused.
-fn sibling_return_reason(siblings: &[FabricRule], blk: &str, prefix: &str, r2000: &str) -> Option<String> {
+fn sibling_return_reason(
+    siblings: &[FabricRule],
+    blk: &str,
+    prefix: &str,
+    r2000: &str,
+) -> Option<String> {
     let needle = format!("from {blk} to {prefix} lookup main");
     match siblings.iter().find(|r| r.needle == needle) {
         Some(r) if r2000.contains(&r.needle) => None,
@@ -1556,7 +1567,11 @@ fn return_path_and_ingress(
         // <vm> from <identity>`. `sibling_return_reason` matches the workload's prefix against
         // `siblings` (built once above) the same `starts_with` way `return_path_rules` splices
         // it, never a panic if the two filters ever drift.
-        for w in f.workloads.iter().filter(|w| w.allow.iter().any(|a| a == &z.name)) {
+        for w in f
+            .workloads
+            .iter()
+            .filter(|w| w.allow.iter().any(|a| a == &z.name))
+        {
             let prefix = w.prefix.to_string();
             if let Some(reason) = sibling_return_reason(&siblings, &blk, &prefix, &r2000) {
                 c.settling(reason);
@@ -1569,9 +1584,7 @@ fn return_path_and_ingress(
             let route_get = sys.run(&["ip", "route", "get", &target, "from", &ident])?;
             if !route_get.ok() {
                 let stderr = route_get.stderr.trim();
-                let err = stderr
-                    .strip_prefix("RTNETLINK answers: ")
-                    .unwrap_or(stderr);
+                let err = stderr.strip_prefix("RTNETLINK answers: ").unwrap_or(stderr);
                 c.settling(format!(
                     "workload {}: no route to {} from {ident} (ip route get {target} from \
                      {ident}: {err})",
@@ -1719,9 +1732,14 @@ fn workload_posture(
         .unwrap_or_else(|_| "unreadable".to_string());
     // M2 (whole-branch review): `have_tool`-guarded like teardown.rs's mark removal — a host
     // with no `nft` binary must report this as a condition on the row, never propagate the exec
-    // error and abort the whole `status` gather before any other line renders.
-    let bridge_ok =
-        have_tool(sys, "nft")? && sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+    // error and abort the whole `status` gather before any other line renders. The output text is
+    // kept for the guard counters (metrics addendum).
+    let bridge = if have_tool(sys, "nft")? {
+        Some(sys.run(&["nft", "list", "table", "bridge", "cfab"])?)
+    } else {
+        None
+    };
+    let bridge_ok = bridge.as_ref().is_some_and(|b| b.ok());
 
     for row in rows {
         let wl = row.wl;
@@ -1738,15 +1756,24 @@ fn workload_posture(
                 ifname: wl.ifname.clone(),
                 address: row.address.clone(),
                 gw: gw_cidr,
-                up: false,
+                up: WorkloadState::Deferred.is_up(),
+                state: WorkloadState::Deferred,
                 zones: wl.allow.clone(),
                 uplinks: Vec::new(),
                 trigger: None,
+                vms_seen: None,
+                guard_drops: None,
+                bytes: None,
             });
             continue;
         }
 
-        let mut up = true;
+        // `broken` is every `up = false` reason below the deferral check (the seven sites the
+        // plan enumerates, including `c.broken_workloads`, which pushes no condition of its own
+        // but still makes the row `Broken`, never `Up`); `announcer_not_started` is tracked
+        // apart so precedence (`Broken` over `AnnouncerNotStarted`) is a fact of the code, not
+        // an accident of evaluation order.
+        let mut broken = false;
         let link = sys.run(&["ip", "-br", "link", "show", "dev", &wl.ifname])?;
         let mut uplinks = Vec::new();
         if !link.ok() {
@@ -1756,7 +1783,7 @@ fn workload_posture(
                 "workload {name}: interface {} does not exist",
                 wl.ifname
             ));
-            up = false;
+            broken = true;
         } else {
             let addr = sys
                 .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
@@ -1766,20 +1793,20 @@ fn workload_posture(
                     "workload {name}: address {} missing on {}",
                     row.address, wl.ifname
                 ));
-                up = false;
+                broken = true;
             }
             if !has_ip_addr(&addr, &gw_cidr) {
                 c.settling(format!(
                     "workload {name}: gw {gw_cidr} missing on {}",
                     wl.ifname
                 ));
-                up = false;
+                broken = true;
             }
             match crate::workload::uplink::identify(&*sys, &wl.ifname) {
                 Ok(u) => uplinks = u.ports,
                 Err(e) => {
                     c.standing(format!("workload {name}: {e}"));
-                    up = false;
+                    broken = true;
                 }
             }
         }
@@ -1788,16 +1815,16 @@ fn workload_posture(
             c.settling(format!(
                 "workload {name}: net.ipv4.conf.all.arp_ignore is {arp} (want 1)"
             ));
-            up = false;
+            broken = true;
         }
         if !bridge_ok {
             c.settling(format!(
                 "workload {name}: bridge table cfab missing (uplink ARP guard down)"
             ));
-            up = false;
+            broken = true;
         }
         if c.broken_workloads.contains(name) {
-            up = false;
+            broken = true;
         }
 
         // A row `apply` did not defer, but whose announcer the supervisor never started (Task
@@ -1806,23 +1833,160 @@ fn workload_posture(
         // With no supervisor answering the announcer's state is unknown, and that fault already
         // has its own line: only an answering supervisor with no entry means "not started".
         let announce = comps.and_then(|k| k.workloads.iter().find(|w| w.name == name));
-        if comps.is_some() && announce.is_none() {
+        let announcer_not_started = comps.is_some() && announce.is_none();
+        if announcer_not_started {
             c.settling(format!("workload {name}: announcer not started"));
-            up = false;
         }
         let trigger = announce.map(|w| w.trigger.clone());
+
+        let state = if broken {
+            WorkloadState::Broken
+        } else if announcer_not_started {
+            WorkloadState::AnnouncerNotStarted
+        } else {
+            WorkloadState::Up
+        };
+        let up = state.is_up();
+
+        // Observability, never a health condition (availability first): a failed read is a
+        // `None`, never a fault line and never a change to `up`. The neighbor read is taken
+        // only once the row's `up` is final, and only for an up row — a row that is not up
+        // skips it rather than taking it and discarding it.
+        // `None` when the table is absent OR this row's uplink ports are unknown (review M1): an
+        // identify failure leaves `uplinks` empty, and summing over zero ports would otherwise
+        // report a fabricated `Some { claim: 0, request: 0 }` indistinguishable from "the guard
+        // ran and dropped nothing".
+        let guard_drops =
+            if let Some(table) = bridge.as_ref().filter(|b| b.ok() && !uplinks.is_empty()) {
+                let mut claim = 0u64;
+                let mut request = 0u64;
+                for port in &uplinks {
+                    claim += counter_packets_for(&table.stdout, "gw-claim-from-uplink", port);
+                    request += counter_packets_for(&table.stdout, "gw-request-from-uplink", port);
+                }
+                Some(GuardDrops { claim, request })
+            } else {
+                None
+            };
+        let bytes = sysfs_bytes(sys, &wl.ifname);
+        let vms_seen = if up {
+            let mut exclude = workload_member_addresses(view.fabric, name);
+            exclude.push(wl.gw);
+            exclude.push(wl.router);
+            neighbors_seen(sys, &wl.ifname, &wl.prefix, &exclude)
+        } else {
+            None
+        };
+
         c.workload(WorkloadStatus {
             name: name.to_string(),
             ifname: wl.ifname.clone(),
             address: row.address.clone(),
             gw: gw_cidr,
             up,
+            state,
             zones: wl.allow.clone(),
             uplinks,
             trigger,
+            vms_seen,
+            guard_drops,
+            bytes,
         });
     }
     Ok(())
+}
+
+/// Every declared member's address on workload `name`, across the whole fabric (not just this
+/// member — `View::workload_rows` is this-member-only). The exclusion set for `vms_seen`: without
+/// it a peer's own resolution of the gateway counts as a VM (a 3-host testbed would read 1 with
+/// zero VMs).
+fn workload_member_addresses(fabric: &Fabric, name: &str) -> Vec<std::net::Ipv4Addr> {
+    fabric
+        .members
+        .iter()
+        .flat_map(|m| m.workloads.iter())
+        .filter(|mw| mw.name == name)
+        .map(|mw| mw.address)
+        .collect()
+}
+
+/// `/sys/class/net/<ifname>/statistics/{rx,tx}_bytes`, as `(rx, tx)`; `None` if either read or
+/// parse fails.
+fn sysfs_bytes(sys: &dyn Sys, ifname: &str) -> Option<(u64, u64)> {
+    let rx = sys
+        .read(&format!("/sys/class/net/{ifname}/statistics/rx_bytes"))
+        .ok()?;
+    let tx = sys
+        .read(&format!("/sys/class/net/{ifname}/statistics/tx_bytes"))
+        .ok()?;
+    Some((rx.trim().parse().ok()?, tx.trim().parse().ok()?))
+}
+
+/// One neighbor read on `ifname` (`ip -j neigh show dev`, JSON), counting IPv4 entries inside
+/// `prefix` whose state is REACHABLE/STALE/DELAY/PROBE/PERMANENT (RULED, gate M1 review I1,
+/// research commit 0e9bced: a static neighbor is a resolved host too) and whose address is not
+/// in `exclude` (every declared member's address on this workload, `gw`, `router`). NOARP,
+/// FAILED and INCOMPLETE never carry a resolved lladdr and do not count. Out-of-prefix entries
+/// are excluded by the `prefix.contains` check, not a separate list. `None` on a read or parse
+/// failure — this is observability, never a health condition.
+fn neighbors_seen(
+    sys: &mut dyn Sys,
+    ifname: &str,
+    prefix: &Ipv4Prefix,
+    exclude: &[std::net::Ipv4Addr],
+) -> Option<u32> {
+    let out = sys
+        .run(&["ip", "-j", "neigh", "show", "dev", ifname])
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let doc: Value = serde_json::from_str(&out.stdout).ok()?;
+    let entries = doc.as_array()?;
+    let mut count = 0u32;
+    for e in entries {
+        let Some(dst) = e["dst"]
+            .as_str()
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        if !prefix.contains(dst) || exclude.contains(&dst) {
+            continue;
+        }
+        let resolved = e["state"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str())
+            .any(|s| matches!(s, "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT"));
+        if resolved {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// `counter_packets`, restricted to the rule(s) on one uplink port: the bridge guard emits one
+/// rule pair per port carrying the same two comments, so telling ports apart needs the port too
+/// (`counter_packets` alone always reads the first-listed port's rule). Sums every matching
+/// line's counter — in practice there is one rule per (port, comment) pair.
+fn counter_packets_for(chain: &str, comment: &str, iifname: &str) -> u64 {
+    chain
+        .lines()
+        .filter(|l| l.contains(&format!("iifname \"{iifname}\"")))
+        .filter_map(|line| {
+            if !line.contains(&format!("comment \"{comment}\"")) {
+                return None;
+            }
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let i = words.iter().position(|w| *w == "counter")?;
+            if words.get(i + 1) != Some(&"packets") {
+                return None;
+            }
+            words.get(i + 2)?.parse::<u64>().ok()
+        })
+        .sum()
 }
 
 /// What one gw zone's ingress row says, in words.
@@ -2160,6 +2324,7 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip rule show pref ",
         "ip -4 -br addr show dev ",
         "ip -br link show dev ",
+        "ip -j neigh show dev ",
         "nft list ",
         "nft -s list ",
         "nft -j list ",
@@ -2978,8 +3143,10 @@ mod tests {
     /// `storage`), carried by pve1-tb and pve2-tb; pve3-tb (a leaf) carries none, but still
     /// needs the sibling rule and the route-get proof (spec §5.1 item 5, R4).
     fn wl_fabric() -> Fabric {
-        Fabric::from_decl(&Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap())
-            .unwrap()
+        Fabric::from_decl(
+            &Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap(),
+        )
+        .unwrap()
     }
 
     /// This member's identity address in the storage zone, the one every route-get proof is
@@ -3039,6 +3206,7 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert_eq!(m.workloads.len(), 1);
         assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Up);
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
@@ -3051,6 +3219,62 @@ mod tests {
             text.matches("workload vms:").count(),
             1,
             "the line, and no reason lines: {text}"
+        );
+        assert_eq!(
+            m.workloads[0].vms_seen, None,
+            "wl_status_sys mocks no neigh read"
+        );
+        assert!(
+            !text.contains("vms seen"),
+            "a None vms_seen must append nothing: {text}"
+        );
+    }
+
+    /// The status-line addendum (2026-09-09): a row that read `vms_seen` appends `, N vms seen`
+    /// after the trigger, one spelling for every N including 0 (never "0 vms seen" vs "1 vm
+    /// seen" — scripts grep the noun).
+    #[test]
+    fn a_row_with_vms_seen_appends_n_vms_seen_to_the_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].vms_seen, Some(1));
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
+                 to storage, uplink eth0, announce trigger neigh events, 1 vms seen\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `0 vms seen` is not a fault and is not omitted: one spelling for every N (spec addendum).
+    #[test]
+    fn zero_vms_seen_still_appends_the_same_spelling() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([]).to_string();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].vms_seen, Some(0));
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains("announce trigger neigh events, 0 vms seen\n"),
+            "{text}"
         );
     }
 
@@ -3083,8 +3307,11 @@ mod tests {
     fn a_missing_nft_binary_is_reported_not_an_error() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wl_status_sys(&f, &view)
-            .on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "");
+        let mut sys = wl_status_sys(&f, &view).on_fail(
+            &["/usr/bin/env", "sh", "-c", "command -v nft"],
+            1,
+            "",
+        );
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(
@@ -3092,9 +3319,9 @@ mod tests {
             "have_tool must short-circuit the nft call, exactly like teardown.rs"
         );
         assert!(
-            m.conditions
-                .iter()
-                .any(|c| c.text == "workload vms: bridge table cfab missing (uplink ARP guard down)"),
+            m.conditions.iter().any(
+                |c| c.text == "workload vms: bridge table cfab missing (uplink ARP guard down)"
+            ),
         );
         assert!(!m.workloads[0].up);
     }
@@ -3193,6 +3420,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
             assert_eq!(hit.class, class, "{want}");
             assert!(!m.workloads[0].up, "{want}");
+            assert_eq!(m.workloads[0].state, WorkloadState::Broken, "{want}");
             // Exactly one condition about THIS workload — an extra reason line for the one
             // thing perturbed would pass the `find` above and still be a regression. Scoped to
             // "vms" / its prefix, never the fixture's other zones' own (always-missing in this
@@ -3200,7 +3428,9 @@ mod tests {
             let related: Vec<&Condition> = m
                 .conditions
                 .iter()
-                .filter(|c| c.text.starts_with("workload vms:") || c.text.contains("192.168.20.0/24"))
+                .filter(|c| {
+                    c.text.starts_with("workload vms:") || c.text.contains("192.168.20.0/24")
+                })
                 .collect();
             assert_eq!(related.len(), 1, "{want}: {related:#?}");
         }
@@ -3223,6 +3453,7 @@ mod tests {
                 .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
         );
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
     }
 
     /// A row `apply` did not defer, but whose announcer the supervisor never started — Task 8b's
@@ -3244,11 +3475,14 @@ mod tests {
             .unwrap_or_else(|| panic!("{:#?}", m.conditions));
         assert_eq!(hit.class, Class::Settling);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::AnnouncerNotStarted);
         assert_eq!(m.workloads[0].trigger, None);
     }
 
     /// No supervisor answering is one fault with its own line; the announcer's state is then
     /// unknown, not "not started", so the row does not earn a second reason for the same cause.
+    /// With no supervisor answering the row is classified from the live checks alone (all
+    /// healthy here), so it is still `Up`.
     #[test]
     fn no_supervisor_does_not_also_read_as_announcer_not_started() {
         let f = wl_fabric();
@@ -3257,11 +3491,36 @@ mod tests {
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(
-            !m.conditions.iter().any(|c| c.text == "workload vms: announcer not started"),
+            !m.conditions
+                .iter()
+                .any(|c| c.text == "workload vms: announcer not started"),
             "{:#?}",
             m.conditions
         );
         assert_eq!(m.workloads[0].trigger, None);
+        assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Up);
+    }
+
+    /// Precedence: a row that is both `Broken` (bridge guard table missing) and has no announcer
+    /// entry is `Broken`, never `AnnouncerNotStarted` — the more severe fault wins even though
+    /// the announcer check runs last and would otherwise "see" the row's `up` already false.
+    #[test]
+    fn a_broken_row_with_no_announcer_is_broken_not_announcer_not_started() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let no_announcer = components_doc(true, serde_json::json!([]));
+        let mut sys = wl_status_sys(&f, &view)
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .socket("/run/cfab/cfab.sock", &no_announcer);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
     }
 
     /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy
@@ -3271,17 +3530,23 @@ mod tests {
     fn a_deferred_row_is_neither_healthy_nor_an_error() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n");
+        let mut sys =
+            wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n");
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert_eq!(m.workloads.len(), 1);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Deferred);
         let deferred: Vec<&Condition> = m
             .conditions
             .iter()
             .filter(|c| c.text.starts_with("workload vms:"))
             .collect();
-        assert_eq!(deferred.len(), 1, "one line, not a pile of live-check faults: {deferred:?}");
+        assert_eq!(
+            deferred.len(),
+            1,
+            "one line, not a pile of live-check faults: {deferred:?}"
+        );
         assert_eq!(
             deferred[0].text,
             "workload vms: deferred (uplink not forwarding yet; the watchdog installs it once \
@@ -3290,12 +3555,55 @@ mod tests {
         assert_eq!(deferred[0].class, Class::Settling);
     }
 
+    /// Each of the four `WorkloadState` variants actually gets produced by its named scenario
+    /// (not just "some non-`Up` state or other" — review M2, this used to assert only
+    /// `up == (state == Up)`, a near-tautology of `status.rs`'s own `let up = state.is_up();`
+    /// that would still pass if the deferred scenario silently classified as `Broken`), and
+    /// `up == (state == Up)` holds at every one of them, over a real `gather()`. The sibling
+    /// tests pin each scenario's full detail (reason lines, class); this one is the general
+    /// property, checked on the same code path, for all four at once.
+    #[test]
+    fn up_is_exactly_state_equals_up() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let expected = expected_links(&view).unwrap();
+        let no_announcer = components_doc(true, serde_json::json!([]));
+        let scenarios: Vec<(&str, MockSys, WorkloadState)> = vec![
+            ("healthy", wl_status_sys(&f, &view), WorkloadState::Up),
+            (
+                "deferred",
+                wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n"),
+                WorkloadState::Deferred,
+            ),
+            (
+                "broken (bridge guard missing)",
+                wl_status_sys(&f, &view).on_fail(
+                    &["nft", "list", "table", "bridge", "cfab"],
+                    1,
+                    "Error: No such file or directory",
+                ),
+                WorkloadState::Broken,
+            ),
+            (
+                "announcer not started",
+                wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer),
+                WorkloadState::AnnouncerNotStarted,
+            ),
+        ];
+        for (label, mut sys, want_state) in scenarios {
+            let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+            let row = &m.workloads[0];
+            assert_eq!(row.state, want_state, "{label}: {row:?}");
+            assert_eq!(row.up, row.state == WorkloadState::Up, "{label}: {row:?}");
+        }
+    }
+
     /// A leaf carries no `[[workload]]` row of its own, but the sibling rule and the route-get
     /// proof are still checked from its own identity, and no workload line is ever rendered for
     /// it.
     #[test]
     fn a_leaf_checks_the_sibling_rule_and_the_route_from_its_identity_and_renders_no_workload_line()
-     {
+    {
         let f = wl_fabric();
         let view = View::new(&f, "pve3-tb").unwrap();
         let id = identity_of(&f, &view);
@@ -3369,6 +3677,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
         assert_eq!(hit.class, Class::Standing);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].state, WorkloadState::Broken);
+        // review M1: an identify failure leaves `uplinks` empty, so `guard_drops` must be `None`
+        // — never a fabricated `Some { claim: 0, request: 0 }` — even though the bridge table
+        // itself (unrelated to this row's own ports) is present in this fixture.
+        assert_eq!(m.workloads[0].guard_drops, None);
     }
 
     /// `sibling_return_reason` never panics, and its three arms are distinct: never emitted by
@@ -3402,7 +3715,10 @@ mod tests {
         // it — reported from the builder's own `r.needle`, never a second reformat.
         assert_eq!(
             sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", ""),
-            Some(format!("return path missing: pref 2000 {}", other[0].needle))
+            Some(format!(
+                "return path missing: pref 2000 {}",
+                other[0].needle
+            ))
         );
         // Arm 1: present in `siblings` and already installed in `r2000` — healthy.
         assert_eq!(
@@ -3418,7 +3734,12 @@ mod tests {
     fn workload_checks_never_write() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        assert_never_writes("healthy workload (host)", &mut wl_status_sys(&f, &view), &view, 0);
+        assert_never_writes(
+            "healthy workload (host)",
+            &mut wl_status_sys(&f, &view),
+            &view,
+            0,
+        );
         let leaf = View::new(&f, "pve3-tb").unwrap();
         let id = identity_of(&f, &leaf);
         assert_never_writes(
@@ -3866,6 +4187,279 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    /// `counter_packets_for` sums over both rules a port earns (claim and request are asked
+    /// separately, one call each) and tells two ports with different counts apart — the thing
+    /// plain `counter_packets` cannot do, since the bridge guard emits one rule pair per port
+    /// with the same two comments.
+    #[test]
+    fn counter_packets_for_sums_one_ports_rules_and_tells_ports_apart() {
+        let chain = "\
+table bridge cfab {
+    chain pre {
+        type filter hook prerouting priority filter; policy accept;
+        iifname \"eth0\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter packets 3 bytes 126 drop comment \"gw-claim-from-uplink\"
+        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \"gw-request-from-uplink\"
+        iifname \"eth1\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter packets 11 bytes 462 drop comment \"gw-claim-from-uplink\"
+        iifname \"eth1\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter packets 0 bytes 0 drop comment \"gw-request-from-uplink\"
+    }
+}
+";
+        assert_eq!(
+            counter_packets_for(chain, "gw-claim-from-uplink", "eth0"),
+            3
+        );
+        assert_eq!(
+            counter_packets_for(chain, "gw-request-from-uplink", "eth0"),
+            5
+        );
+        assert_eq!(
+            counter_packets_for(chain, "gw-claim-from-uplink", "eth1"),
+            11
+        );
+        assert_eq!(
+            counter_packets_for(chain, "gw-request-from-uplink", "eth1"),
+            0
+        );
+        // A port with no rule of its own (never emitted for it) sums to zero, not a fault.
+        assert_eq!(
+            counter_packets_for(chain, "gw-claim-from-uplink", "eth2"),
+            0
+        );
+    }
+
+    /// Every declared member's address on the workload, across the whole fabric — not just this
+    /// member's own row.
+    #[test]
+    fn workload_member_addresses_covers_every_member_not_just_this_one() {
+        let f = wl_fabric();
+        let mut addrs = workload_member_addresses(&f, "vms");
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec![
+                "192.168.20.2".parse::<std::net::Ipv4Addr>().unwrap(),
+                "192.168.20.3".parse().unwrap(),
+            ]
+        );
+        assert!(workload_member_addresses(&f, "no-such-workload").is_empty());
+    }
+
+    /// `sysfs_bytes`: both reads must succeed and parse, or the row gets `None` — never a
+    /// partial pair.
+    #[test]
+    fn sysfs_bytes_is_none_unless_both_counters_read_and_parse() {
+        let sys = MockSys::default()
+            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1000\n")
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&sys, "primary.3"), Some((1000, 2000)));
+        // tx missing entirely.
+        let half = MockSys::default().file("/sys/class/net/primary.3/statistics/rx_bytes", "1\n");
+        assert_eq!(sysfs_bytes(&half, "primary.3"), None);
+        // Present but unparseable.
+        let garbage = MockSys::default()
+            .file(
+                "/sys/class/net/primary.3/statistics/rx_bytes",
+                "not-a-number\n",
+            )
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&garbage, "primary.3"), None);
+    }
+
+    /// `neighbors_seen`: excludes every member address, `gw` and `router`, excludes
+    /// out-of-prefix entries via `prefix.contains` alone, and only counts a resolved state
+    /// (never `FAILED`/`INCOMPLETE`). Fixture: one VM, two peer members, the router, and one
+    /// out-of-prefix entry → 1.
+    #[test]
+    fn neighbors_seen_excludes_members_gw_router_and_out_of_prefix() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let exclude: Vec<std::net::Ipv4Addr> = vec![
+            "192.168.20.2".parse().unwrap(),   // this member
+            "192.168.20.3".parse().unwrap(),   // a peer member
+            "192.168.20.1".parse().unwrap(),   // router
+            "192.168.20.254".parse().unwrap(), // gw
+        ];
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.2", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.3", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
+            {"dst": "192.168.20.1", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:06", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
+            {"dst": "192.168.21.5", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        assert_eq!(
+            neighbors_seen(&mut sys, "primary.3", &prefix, &exclude),
+            Some(1)
+        );
+    }
+
+    /// A state that never resolved anything (`FAILED`, `INCOMPLETE`) is not counted.
+    #[test]
+    fn neighbors_seen_does_not_count_an_unresolved_entry() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["FAILED"]},
+            {"dst": "192.168.20.51", "dev": "primary.3", "state": ["INCOMPLETE"]},
+            // NOARP never carries a resolved lladdr either (RULED, gate M1 review I1): a
+            // no-ARP interface entry, not a host that answered.
+            {"dst": "192.168.20.52", "dev": "primary.3", "state": ["NOARP"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(0));
+    }
+
+    /// A `PERMANENT` (statically pinned) neighbor counts (RULED, gate M1 review I1, research
+    /// commit 0e9bced): a static neighbor is a resolved host, and a statically-pinned VM must
+    /// not read as absent.
+    #[test]
+    fn neighbors_seen_counts_a_permanent_entry() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["PERMANENT"]},
+        ])
+        .to_string();
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &neigh_json,
+        );
+        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(1));
+    }
+
+    /// A read or parse failure is `None`, never a fault and never a fabricated zero.
+    #[test]
+    fn neighbors_seen_is_none_on_a_read_failure() {
+        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
+        let mut sys = MockSys::default().on_fail(
+            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            1,
+            "Device \"primary.3\" does not exist.",
+        );
+        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), None);
+
+        let mut garbled =
+            MockSys::default().on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], "{");
+        assert_eq!(
+            neighbors_seen(&mut garbled, "primary.3", &prefix, &[]),
+            None
+        );
+    }
+
+    /// A healthy row carries all three new fields, read from the fixture: the guard sum over the
+    /// row's one uplink port, the sysfs byte counters, and `vms_seen` from the neighbor read
+    /// (one VM, this member's own address, the gw and the router — all three of the latter
+    /// excluded by `workload_posture` itself, not a hand-built slice — leaving 1). This is the
+    /// end-to-end proof that `exclude.push(wl.gw)` / `exclude.push(wl.router)` in
+    /// `workload_posture` do something: deleting either push turns this red (`vms_seen` would go
+    /// to `Some(2)`), which `neighbors_seen_excludes_members_gw_router_and_out_of_prefix` alone
+    /// cannot show since it hands `neighbors_seen` a hand-built `exclude` slice.
+    #[test]
+    fn a_healthy_row_carries_guard_drops_bytes_and_vms_seen_from_the_fixture() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.2", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.1", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view)
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n    chain pre {\n        iifname \"eth0\" vlan id 3 vlan \
+                 type arp arp saddr ip 192.168.20.254 counter packets 3 bytes 126 drop comment \
+                 \"gw-claim-from-uplink\"\n        iifname \"eth0\" vlan id 3 vlan type arp arp \
+                 daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \
+                 \"gw-request-from-uplink\"\n    }\n}\n",
+            )
+            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1234\n")
+            .file("/sys/class/net/primary.3/statistics/tx_bytes", "5678\n")
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+                &neigh_json,
+            );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let row = &m.workloads[0];
+        assert!(row.up, "{row:?}");
+        assert_eq!(
+            row.guard_drops,
+            Some(GuardDrops {
+                claim: 3,
+                request: 5
+            })
+        );
+        assert_eq!(row.bytes, Some((1234, 5678)));
+        assert_eq!(row.vms_seen, Some(1));
+    }
+
+    /// A row that is not up never takes the neighbor read at all (never takes it and discards
+    /// it): `vms_seen` is `None` and no `ip -j neigh` call is made.
+    #[test]
+    fn a_row_that_is_not_up_never_takes_the_neighbor_read() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            wl_status_sys(&f, &view).file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].vms_seen, None);
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c.starts_with("ip -j neigh show dev")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// A failed sysfs byte read on an otherwise healthy row is `None`, and never changes `up`
+    /// (observability, not health).
+    #[test]
+    fn a_failed_bytes_read_is_none_and_never_changes_up() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // wl_status_sys never files the sysfs statistics paths, so the reads fail by default.
+        let mut sys = wl_status_sys(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(m.workloads[0].up);
+        assert_eq!(m.workloads[0].bytes, None);
+    }
+
+    /// `guard_drops` is `None` only when the whole table is absent — never a per-port fault.
+    #[test]
+    fn guard_drops_is_none_only_when_the_table_is_absent() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_fail(
+            &["nft", "list", "table", "bridge", "cfab"],
+            1,
+            "Error: No such file or directory",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].guard_drops, None);
+    }
+
+    /// The `ip -j neigh show dev` prefix is on the read-only allowlist; `ip neigh flush` (a
+    /// write) is still refused.
+    #[test]
+    fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
+        assert!(is_read_only("ip -j neigh show dev primary.3"));
+        assert!(!is_read_only("ip neigh flush dev primary.3"));
     }
 
     /// Spec §12 (b), the reporting half. A host whose forward policy is gone has failed closed:

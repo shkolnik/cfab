@@ -499,8 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn workload_return_rules_are_one_pref_2000_sibling_per_allowed_zone_on_every_member_and_leaf()
-     {
+    fn workload_return_rules_are_one_pref_2000_sibling_per_allowed_zone_on_every_member_and_leaf() {
         let f = wl_fabric();
         for m in ["pve1-tb", "pve3-tb"] {
             let v = View::new(&f, m).unwrap();
@@ -517,7 +516,14 @@ mod tests {
             );
             assert_eq!(
                 r[0].add,
-                vec!["from", "10.99.0.0/16", "to", "192.168.20.0/24", "lookup", "main"]
+                vec![
+                    "from",
+                    "10.99.0.0/16",
+                    "to",
+                    "192.168.20.0/24",
+                    "lookup",
+                    "main"
+                ]
             );
         }
     }
@@ -531,7 +537,9 @@ mod tests {
         // storage (allowed): 2000, sibling 2000, 2001, 2002; cluster and mgmt: 2000, 2001, 2002
         assert_eq!(
             prefs,
-            ["2000", "2000", "2001", "2002", "2000", "2001", "2002", "2000", "2001", "2002"]
+            [
+                "2000", "2000", "2001", "2002", "2000", "2001", "2002", "2000", "2001", "2002"
+            ]
         );
         assert_eq!(
             rules[1].needle,
@@ -767,7 +775,10 @@ mod tests {
 
     #[test]
     fn has_ip_addr_is_token_exact_not_substring() {
-        assert!(has_ip_addr("primary.3 UP 192.168.20.2/24\n", "192.168.20.2/24"));
+        assert!(has_ip_addr(
+            "primary.3 UP 192.168.20.2/24\n",
+            "192.168.20.2/24"
+        ));
         assert!(has_ip_addr(
             "primary.3 UP 10.0.0.1/24 192.168.20.2/24\n",
             "192.168.20.2/24"

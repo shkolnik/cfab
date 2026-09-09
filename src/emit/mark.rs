@@ -281,9 +281,35 @@ mod tests {
     #[test]
     fn no_emitted_chain_is_named_by_an_nft_keyword() {
         const NFT_KEYWORDS: &[&str] = &[
-            "fwd", "dup", "jump", "goto", "return", "accept", "drop", "reject", "continue", "queue",
-            "notrack", "log", "limit", "counter", "meta", "ct", "set", "map", "flowtable", "type",
-            "hook", "priority", "policy", "table", "chain", "rule", "add", "delete", "flush",
+            "fwd",
+            "dup",
+            "jump",
+            "goto",
+            "return",
+            "accept",
+            "drop",
+            "reject",
+            "continue",
+            "queue",
+            "notrack",
+            "log",
+            "limit",
+            "counter",
+            "meta",
+            "ct",
+            "set",
+            "map",
+            "flowtable",
+            "type",
+            "hook",
+            "priority",
+            "policy",
+            "table",
+            "chain",
+            "rule",
+            "add",
+            "delete",
+            "flush",
         ];
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
@@ -291,7 +317,10 @@ mod tests {
         for line in t.lines() {
             if let Some(rest) = line.trim_start().strip_prefix("chain ") {
                 let name = rest.split_whitespace().next().unwrap();
-                assert!(!NFT_KEYWORDS.contains(&name), "chain named by an nft keyword: {line}");
+                assert!(
+                    !NFT_KEYWORDS.contains(&name),
+                    "chain named by an nft keyword: {line}"
+                );
             }
         }
     }

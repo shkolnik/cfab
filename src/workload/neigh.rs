@@ -331,7 +331,10 @@ mod tests {
             &["bridge", "fdb", "show", "br", "primary"],
             "02:cf:ab:00:00:01 dev cnfvm1-h vlan 3 master primary\n",
         );
-        assert!(fdb_poll_changed(&mut sys1, &up, &mut seen), "first sighting");
+        assert!(
+            fdb_poll_changed(&mut sys1, &up, &mut seen),
+            "first sighting"
+        );
         // The VM migrates away: the bridge FDB ages the entry out entirely.
         let mut sys2 =
             MockSys::default().on_stdout(&["bridge", "fdb", "show", "br", "primary"], "");

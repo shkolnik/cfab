@@ -17,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
 use crate::commands::status::model::{
-    BondLeg, Class, Condition, HomeCarrier, Ingress, LegKind, State, StatusModel,
+    BondLeg, Class, Condition, HomeCarrier, Ingress, LegKind, State, StatusModel, WorkloadState,
 };
 use crate::prober::ProbeRows;
 use crate::supervisor::child::State as ChildState;
@@ -148,6 +148,25 @@ const BGP_STATES: [&str; 7] = [
 
 /// The forwarding watchdog's own vocabulary.
 const WATCHDOG_RESULTS: [&str; 5] = ["ok", "actuated", "failed-closed", "blocked", "error"];
+
+/// Every `WorkloadState` a `cfab_workload_state` scrape must be able to compare against, in the
+/// order the enum declares them (metrics addendum 2026-09-09).
+const WORKLOAD_STATES: [WorkloadState; 4] = [
+    WorkloadState::Up,
+    WorkloadState::Deferred,
+    WorkloadState::AnnouncerNotStarted,
+    WorkloadState::Broken,
+];
+
+/// The label word the spec addendum ratifies for each `WorkloadState`.
+fn workload_state_word(s: WorkloadState) -> &'static str {
+    match s {
+        WorkloadState::Up => "up",
+        WorkloadState::Deferred => "deferred",
+        WorkloadState::AnnouncerNotStarted => "announcer_not_started",
+        WorkloadState::Broken => "broken",
+    }
+}
 
 /// The enumerated series of a one-of-N family: every known value, plus the observed one when it
 /// is outside the set — the emitter's vocabulary wins over this list, and a value that has
@@ -538,14 +557,20 @@ impl FabricCollector {
     }
 
     /// One series per `[[workload]]` row this member carries (spec §5.1 item 10); an absent
-    /// family on a member with none, including every leaf.
+    /// family on a member with none, including every leaf. The health metrics addendum
+    /// (2026-09-09) adds five more series from the same rows; each is absent (not zero) for a
+    /// row whose source field is `None` — a deferred or unread row reports nothing rather than
+    /// a fabricated observation.
     fn workloads(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
-        let up: Vec<(Labels, i64)> = self
-            .snap
-            .model
-            .workloads
+        let ws = &self.snap.model.workloads;
+        let up: Vec<(Labels, i64)> = ws
             .iter()
-            .map(|w| (lbl(&[("name", w.name.as_str())]), i64::from(w.up)))
+            .map(|w| {
+                (
+                    lbl(&[("name", w.name.as_str())]),
+                    i64::from(w.state.is_up()),
+                )
+            })
             .collect();
         family(
             enc,
@@ -553,6 +578,119 @@ impl FabricCollector {
             "1 when the workload row is installed (table present, address, sibling, \
              route-get) and its announcer is running.",
             &up,
+        )?;
+
+        let state: Vec<(Labels, i64)> = ws
+            .iter()
+            .flat_map(|w| {
+                WORKLOAD_STATES.iter().map(move |s| {
+                    (
+                        lbl(&[
+                            ("name", w.name.as_str()),
+                            ("state", workload_state_word(*s)),
+                        ]),
+                        i64::from(*s == w.state),
+                    )
+                })
+            })
+            .collect();
+        family(
+            enc,
+            "cfab_workload_state",
+            "The row's classification (up/deferred/announcer_not_started/broken); exactly \
+             one series is 1 per name.",
+            &state,
+        )?;
+
+        let vms_seen: Vec<(Labels, i64)> = ws
+            .iter()
+            .filter_map(|w| {
+                w.vms_seen
+                    .map(|n| (lbl(&[("name", w.name.as_str())]), i64::from(n)))
+            })
+            .collect();
+        family(
+            enc,
+            "cfab_workload_vms_seen",
+            "IPv4 neighbor entries inside this row's prefix, on its ifname, in a resolved \
+             state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared \
+             member address, gw or router (one `ip -j neigh show dev` read per gather); a \
+             departed VM lingers as STALE until the kernel garbage-collects the entry \
+             (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is \
+             the alert (\"gateway up, nobody home\"), a nonzero value is an upper bound; \
+             absent when the row is not up or the read failed.",
+            &vms_seen,
+        )?;
+
+        let mut guard_drops: Vec<(Labels, u64)> = Vec::new();
+        for w in ws {
+            if let Some(gd) = &w.guard_drops {
+                guard_drops.push((
+                    lbl(&[("name", w.name.as_str()), ("kind", "claim")]),
+                    gd.claim,
+                ));
+                guard_drops.push((
+                    lbl(&[("name", w.name.as_str()), ("kind", "request")]),
+                    gd.request,
+                ));
+            }
+        }
+        counter_family(
+            enc,
+            "cfab_workload_guard_drops",
+            "The bridge guard's claim/request drop counters, summed over this row's uplink \
+             ports; reset to 0 when apply re-renders the table or the watchdog restores it; \
+             absent when the guard table or the row's uplink ports are unknown.",
+            &guard_drops,
+        )?;
+
+        let mut rx_bytes: Vec<(Labels, u64)> = Vec::new();
+        let mut tx_bytes: Vec<(Labels, u64)> = Vec::new();
+        for w in ws {
+            if let Some((rx, tx)) = w.bytes {
+                rx_bytes.push((lbl(&[("name", w.name.as_str())]), rx));
+                tx_bytes.push((lbl(&[("name", w.name.as_str())]), tx));
+            }
+        }
+        counter_family(
+            enc,
+            "cfab_workload_rx_bytes",
+            "`/sys/class/net/<ifname>/statistics/rx_bytes` for this row; the gateway's own \
+             forwarding, not cross-host VM-to-VM traffic, which stays on the physical switch.",
+            &rx_bytes,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_tx_bytes",
+            "`/sys/class/net/<ifname>/statistics/tx_bytes` for this row; the gateway's own \
+             forwarding, not cross-host VM-to-VM traffic, which stays on the physical switch.",
+            &tx_bytes,
+        )?;
+
+        let mut announces: Vec<(Labels, u64)> = Vec::new();
+        let mut bursts: Vec<(Labels, u64)> = Vec::new();
+        if let Some(c) = &self.snap.model.components {
+            for w in ws {
+                if let Some(a) = c.workloads.iter().find(|a| a.name == w.name) {
+                    announces.push((lbl(&[("name", w.name.as_str())]), a.announces));
+                    bursts.push((lbl(&[("name", w.name.as_str())]), a.bursts));
+                }
+            }
+        }
+        counter_family(
+            enc,
+            "cfab_workload_announces",
+            "Gratuitous ARPs this row's announcer has sent since the supervisor started; \
+             absent when no supervisor answered or the announcer has not started.",
+            &announces,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_bursts",
+            "Re-announce bursts this row's announcer has sent; a rising rate is flapping \
+             (MAC churn, watch deaths); absent under the same condition as \
+             cfab_workload_announces.",
+            &bursts,
         )
     }
 
@@ -939,12 +1077,13 @@ mod tests {
     }
 
     use crate::commands::status::model::{
-        Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach, WorkloadStatus,
+        Adjacency, Bonding, GuardDrops, Headline, LegPort, MemberInfo, Reach, WorkloadState,
+        WorkloadStatus,
     };
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
     use crate::supervisor::report::{
-        Component, Components, ProbedPort, SupervisorInfo, WatchdogInfo,
+        Component, Components, ProbedPort, SupervisorInfo, WatchdogInfo, WorkloadAnnounce,
     };
 
     fn component(
@@ -1001,7 +1140,13 @@ mod tests {
             },
             ingress: Vec::new(),
             fallback: Vec::new(),
-            workloads: Vec::new(),
+            workloads: vec![WorkloadAnnounce {
+                name: "vms".to_string(),
+                ifname: "primary.3".to_string(),
+                trigger: "neigh events".to_string(),
+                announces: 42,
+                bursts: 1,
+            }],
             metrics_error: None,
         }
     }
@@ -1153,9 +1298,16 @@ mod tests {
                     address: "192.168.20.2/24".to_string(),
                     gw: "192.168.20.254/24".to_string(),
                     up: true,
+                    state: WorkloadState::Up,
                     zones: vec!["storage".to_string()],
                     uplinks: vec!["eth0".to_string()],
                     trigger: Some("neigh events".to_string()),
+                    vms_seen: Some(3),
+                    guard_drops: Some(GuardDrops {
+                        claim: 2,
+                        request: 7,
+                    }),
+                    bytes: Some((10_000, 20_000)),
                 }]
             } else {
                 Vec::new()
@@ -1270,12 +1422,209 @@ mod tests {
     #[test]
     fn a_down_workload_reports_zero_and_a_model_without_workloads_emits_no_family() {
         let mut s = fixture_up();
+        // `cfab_workload_up` renders `w.state.is_up()` (review M5), so `state` must move with
+        // `up` here exactly as production always constructs the pair.
         s.model.workloads[0].up = false;
+        s.model.workloads[0].state = WorkloadState::Broken;
         let text = render(&s);
         assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
 
         let text = render(&fixture_down());
         assert!(!text.contains("cfab_workload_up"), "{text}");
+    }
+
+    /// A deferred row (metrics addendum 2026-09-09): `state{deferred}` is 1, `up` is 0, and
+    /// none of the three observability fields render — a `None` is absent, never a fabricated
+    /// zero (Task 1's own rule, carried into the collector).
+    #[test]
+    fn a_deferred_row_reports_state_and_no_vms_seen_guard_or_bytes() {
+        let mut s = fixture_up();
+        s.model.workloads[0].up = false;
+        s.model.workloads[0].state = WorkloadState::Deferred;
+        s.model.workloads[0].vms_seen = None;
+        s.model.workloads[0].guard_drops = None;
+        s.model.workloads[0].bytes = None;
+        // A deferred row has no rendered announcer either (Task 1: `apply` never gave it a gw
+        // address), so `Components.workloads` carries no entry for it — realistic, not just
+        // "faithful to a fixture that happens to omit it" (review M2).
+        s.model.components.as_mut().unwrap().workloads.clear();
+        let text = render(&s);
+        assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
+        // Exactly one of the four `state` series is 1 (review M3): pinning all four, not just
+        // the two that changed, so a bug that also flips `broken` or `announcer_not_started`
+        // cannot hide behind an assertion that only checks `deferred` and `up`.
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"up\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"deferred\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"announcer_not_started\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"broken\"} 0"),
+            "{text}"
+        );
+        assert!(!text.contains("cfab_workload_vms_seen"), "{text}");
+        assert!(!text.contains("cfab_workload_guard_drops"), "{text}");
+        assert!(!text.contains("cfab_workload_rx_bytes"), "{text}");
+        assert!(!text.contains("cfab_workload_tx_bytes"), "{text}");
+        assert!(!text.contains("cfab_workload_announces"), "{text}");
+        assert!(!text.contains("cfab_workload_bursts"), "{text}");
+    }
+
+    /// The `AnnouncerNotStarted` arm specifically (review M2): a supervisor is answering, but
+    /// `Components.workloads` carries no entry for this row's name — the row's own announcer
+    /// never started. `announces`/`bursts` must stay absent, never fall back to a stale or
+    /// fabricated value, even though `components` itself is `Some`.
+    #[test]
+    fn an_unstarted_announcer_drops_announces_and_bursts_even_with_a_supervisor_answering() {
+        let mut s = fixture_up();
+        s.model.workloads[0].up = false;
+        s.model.workloads[0].state = WorkloadState::AnnouncerNotStarted;
+        s.model.workloads[0].vms_seen = None;
+        s.model.workloads[0].guard_drops = None;
+        s.model.workloads[0].bytes = None;
+        s.model.components.as_mut().unwrap().workloads.clear();
+        let text = render(&s);
+        assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"announcer_not_started\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("cfab_workload_announces"), "{text}");
+        assert!(!text.contains("cfab_workload_bursts"), "{text}");
+    }
+
+    /// No supervisor answering drops `announces`/`bursts` (their only source), but the other
+    /// four series — read from `status`'s own model, not the socket — stay.
+    #[test]
+    fn no_supervisor_answering_drops_announces_and_bursts_but_keeps_the_rest() {
+        let mut s = fixture_up();
+        s.model.components = None;
+        let text = render(&s);
+        assert!(!text.contains("cfab_workload_announces"), "{text}");
+        assert!(!text.contains("cfab_workload_bursts"), "{text}");
+        assert!(
+            text.contains("cfab_workload_vms_seen{name=\"vms\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"up\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_guard_drops_total{name=\"vms\",kind=\"claim\"} 2"),
+            "{text}"
+        );
+    }
+
+    /// Same values as `status` would read on a second gather, rendered again: the counters this
+    /// collector emits are whatever the snapshot carries, so a rising input renders a rising
+    /// sample (the monotonic guarantee itself belongs to the kernel/nft counters `status` reads,
+    /// out of this module's reach; this proves the collector does not clamp, reset or reorder
+    /// what it is handed).
+    #[test]
+    fn workload_counters_rise_across_two_snapshots() {
+        let mut s1 = fixture_up();
+        s1.model.workloads[0].guard_drops = Some(GuardDrops {
+            claim: 2,
+            request: 5,
+        });
+        s1.model.workloads[0].bytes = Some((100, 200));
+        s1.model.components.as_mut().unwrap().workloads[0].announces = 10;
+        s1.model.components.as_mut().unwrap().workloads[0].bursts = 1;
+        let t1 = render(&s1);
+
+        let mut s2 = s1.clone();
+        s2.model.workloads[0].guard_drops = Some(GuardDrops {
+            claim: 4,
+            request: 9,
+        });
+        s2.model.workloads[0].bytes = Some((150, 260));
+        s2.model.components.as_mut().unwrap().workloads[0].announces = 14;
+        s2.model.components.as_mut().unwrap().workloads[0].bursts = 2;
+        let t2 = render(&s2);
+
+        assert!(t1.contains("cfab_workload_guard_drops_total{name=\"vms\",kind=\"claim\"} 2"));
+        assert!(t2.contains("cfab_workload_guard_drops_total{name=\"vms\",kind=\"claim\"} 4"));
+        assert!(t1.contains("cfab_workload_rx_bytes_total{name=\"vms\"} 100"));
+        assert!(t2.contains("cfab_workload_rx_bytes_total{name=\"vms\"} 150"));
+        assert!(t1.contains("cfab_workload_announces_total{name=\"vms\"} 10"));
+        assert!(t2.contains("cfab_workload_announces_total{name=\"vms\"} 14"));
+    }
+
+    /// Teeth: mutating one health-metric source moves exactly the line(s) that source feeds,
+    /// and nothing else — proven by diffing the whole rendered text line-by-line rather than
+    /// trusting a single `contains`.
+    #[test]
+    fn mutating_each_workload_source_moves_only_its_own_series() {
+        fn changed_lines(before: &str, after: &str) -> Vec<String> {
+            let before: Vec<&str> = before.lines().collect();
+            let after: Vec<&str> = after.lines().collect();
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "a mutation here must not add or remove lines"
+            );
+            before
+                .iter()
+                .zip(after.iter())
+                .filter(|(a, b)| a != b)
+                .map(|(_, b)| (*b).to_string())
+                .collect()
+        }
+
+        let base = render(&fixture_up());
+
+        let mut s = fixture_up();
+        s.model.workloads[0].vms_seen = Some(9);
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_vms_seen{name=\"vms\"} 9"]
+        );
+
+        let mut s = fixture_up();
+        s.model.workloads[0].guard_drops = Some(GuardDrops {
+            claim: 99,
+            request: 7,
+        });
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_guard_drops_total{name=\"vms\",kind=\"claim\"} 99"]
+        );
+
+        let mut s = fixture_up();
+        s.model.workloads[0].bytes = Some((10_000, 99_999));
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_tx_bytes_total{name=\"vms\"} 99999"]
+        );
+
+        let mut s = fixture_up();
+        s.model.components.as_mut().unwrap().workloads[0].announces = 100;
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_announces_total{name=\"vms\"} 100"]
+        );
+
+        // `state` and `up` are structurally coupled (`WorkloadState::is_up`), so mutating state
+        // moves both families — this is the one source expected to touch two lines, not a leak.
+        let mut s = fixture_up();
+        s.model.workloads[0].state = WorkloadState::Broken;
+        s.model.workloads[0].up = false;
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec![
+                "cfab_workload_up{name=\"vms\"} 0",
+                "cfab_workload_state{name=\"vms\",state=\"up\"} 0",
+                "cfab_workload_state{name=\"vms\",state=\"broken\"} 1",
+            ]
+        );
     }
 
     #[test]
@@ -1323,6 +1672,13 @@ mod tests {
             "cfab_bgp_neighbor_state",
             "cfab_bgp_neighbor_prefixes_sent",
             "cfab_workload_up",
+            "cfab_workload_state",
+            "cfab_workload_vms_seen",
+            "cfab_workload_guard_drops_total",
+            "cfab_workload_rx_bytes_total",
+            "cfab_workload_tx_bytes_total",
+            "cfab_workload_announces_total",
+            "cfab_workload_bursts_total",
             "cfab_wire_present",
             "cfab_bond_home_carrier",
             "cfab_component_state",

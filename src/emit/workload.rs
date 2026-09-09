@@ -41,13 +41,11 @@ pub fn aggregate(zone_ids: &[u8]) -> Vec<Ipv4Prefix> {
     out
 }
 
-const HEADER: &str =
-    "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
+const HEADER: &str = "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
      that receives\n";
 /// The one global option definition every workload's subnet block relies on; print it once,
 /// above the blocks, never inside one.
-pub const DHCP_OPTION_121_DEFINITION: &str =
-    "# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a \
+pub const DHCP_OPTION_121_DEFINITION: &str = "# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a \
      subnet block.\n\
      option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n";
 /// The RFC 3442 classless-static-routes (option 121) dhcpd.conf snippet for one workload's
@@ -178,18 +176,25 @@ warning and the lease picks one)
             "192.168.30.1".parse().unwrap(),
         );
         assert!(
-            a.contains("paste the next line inside the existing 'subnet 192.168.20.0 netmask \
-                        255.255.255.0 { ... }'"),
+            a.contains(
+                "paste the next line inside the existing 'subnet 192.168.20.0 netmask \
+                        255.255.255.0 { ... }'"
+            ),
             "{a}"
         );
         assert!(
-            b.contains("paste the next line inside the existing 'subnet 192.168.30.0 netmask \
-                        255.255.255.0 { ... }'"),
+            b.contains(
+                "paste the next line inside the existing 'subnet 192.168.30.0 netmask \
+                        255.255.255.0 { ... }'"
+            ),
             "{b}"
         );
         assert_ne!(a, b);
         // Never a subnet block of its own: no opening brace anywhere but inside that comment.
-        assert!(!a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {\n"), "{a}");
+        assert!(
+            !a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {\n"),
+            "{a}"
+        );
         assert!(!a.trim_end().ends_with('}'), "{a}");
         // dhcpd: `option definitions may not be scoped` — the definition never appears in a block.
         assert!(!a.contains("code 121"), "{a}");
@@ -222,11 +227,11 @@ pub fn bridge_table(guards: &[(std::net::Ipv4Addr, Uplink)]) -> String {
     for (gw, up) in guards {
         for port in &up.ports {
             out.push_str(&format!(
-                "        iifname \"{port}\" vlan id {} vlan type arp arp daddr ip {gw} counter drop comment \"gw-request-from-uplink\"\n",
+                "        iifname \"{port}\" vlan id {} vlan type arp arp saddr ip {gw} counter drop comment \"gw-claim-from-uplink\"\n",
                 up.vid
             ));
             out.push_str(&format!(
-                "        iifname \"{port}\" vlan id {} vlan type arp arp saddr ip {gw} counter drop comment \"gw-claim-from-uplink\"\n",
+                "        iifname \"{port}\" vlan id {} vlan type arp arp daddr ip {gw} counter drop comment \"gw-request-from-uplink\"\n",
                 up.vid
             ));
         }
@@ -255,8 +260,8 @@ delete table bridge cfab
 table bridge cfab {
     chain pre {
         type filter hook prerouting priority filter; policy accept;
-        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment \"gw-request-from-uplink\"
         iifname \"eth0\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter drop comment \"gw-claim-from-uplink\"
+        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment \"gw-request-from-uplink\"
     }
 }
 "

@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn down_removes_the_bridge_table_the_gw_address_and_the_sibling_rules_but_never_the_interface()
-     {
+    {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys();
@@ -444,13 +444,15 @@ mod tests {
         assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
             Some(&"0")
         );
         assert!(!sys.ran("ip link del primary.3"));
         assert!(!sys.ran("ip link set primary.3 down"));
         assert!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore").is_empty(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty(),
             "down leaves arp_ignore (ruling 11)"
         );
     }
@@ -508,7 +510,8 @@ mod tests {
         assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
             Some(&"0")
         );
     }
@@ -962,10 +965,12 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
 
-        let mut present = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no").on_stdout(
-            &["ip", "rule", "show", "pref", "2000"],
-            "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
-        );
+        let mut present = MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "no")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            );
         run(&mut present, &view).unwrap();
         assert!(
             present.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
