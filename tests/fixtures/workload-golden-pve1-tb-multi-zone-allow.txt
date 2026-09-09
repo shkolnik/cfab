@@ -1,0 +1,585 @@
+== check ==
+fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members
+this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 1 ingress leg(s)
+workload vms: primary.3 192.168.20.0/24 gw 192.168.20.254 router 192.168.20.1 allow storage, mgmt; carried by pve1-tb, pve2-tb
+fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, 10.249.0.0/16
+# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
+# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
+# 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
+subnet 192.168.20.0 netmask 255.255.255.0 {
+	option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
+	option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;
+}
+
+== rules ==
+pref 2000 from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0
+pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main
+pref 2001 from 10.99.0.0/16 lookup 99
+pref 2002 from 10.99.0.0/16 unreachable
+pref 2000 from 10.199.0.0/16 to 10.199.0.0/16 lookup main suppress_prefixlength 0
+pref 2001 from 10.199.0.0/16 lookup 199
+pref 2002 from 10.199.0.0/16 unreachable
+pref 2000 from 10.249.0.0/16 to 10.249.0.0/16 lookup main suppress_prefixlength 0
+pref 2000 from 10.249.0.0/16 to 192.168.20.0/24 lookup main
+pref 2001 from 10.249.0.0/16 lookup 249
+pref 2002 from 10.249.0.0/16 unreachable
+== policy ==
+table inet cfab-fwd
+delete table inet cfab-fwd
+table inet cfab-fwd {
+  set admin { type ifname; elements = { "eth9","eth1","eth0" } }
+  set storage { type ifname; elements = { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } }
+  set cluster { type ifname; elements = { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } }
+  set mgmt { type ifname; elements = { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } }
+  set cfab { type ifname; elements = { "cfab-cl","cfab-cl-b2","cfab-cl-bk","cfab-cl-fb","cfab-cl-fb-a","cfab-cl-fb-b","cfab-cl-fb-c","cfab-gw249","cfab-gw249-a","cfab-gw249-b","cfab-gw249-c","cfab-id199","cfab-id199-peer","cfab-id249","cfab-id249-peer","cfab-id99","cfab-id99-peer","cfab-mg","cfab-mg-b2","cfab-mg-bk","cfab-mg-fb","cfab-mg-fb-a","cfab-mg-fb-b","cfab-mg-fb-c","cfab-st","cfab-st-b2","cfab-st-bk","cfab-st-fb","cfab-st-fb-a","cfab-st-fb-b","cfab-st-fb-c","eth0","eth1","eth9","primary.3" } }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    iifname @admin counter drop comment "admin-in"
+    oifname @admin counter drop comment "admin-out"
+    iifname != @cfab oifname != @cfab counter accept comment "foreign-transit"
+    ct state invalid counter comment "ct-invalid-seen"
+    ct state established,related accept comment "return-of-allowed"
+    iifname @storage oifname @storage counter accept comment "allow-storage-storage"
+    iifname @cluster oifname @cluster counter accept comment "allow-cluster-cluster"
+    iifname @mgmt oifname @mgmt counter accept comment "allow-mgmt-mgmt"
+    iifname "primary.3" oifname @storage counter accept comment "allow-vms-storage"
+    iifname @storage oifname "primary.3" counter accept comment "allow-storage-vms"
+    iifname "primary.3" oifname @mgmt counter accept comment "allow-vms-mgmt"
+    iifname @mgmt oifname "primary.3" counter accept comment "allow-mgmt-vms"
+    counter comment "default-deny"
+  }
+}
+
+== mark ==
+table inet cfab
+delete table inet cfab
+table inet cfab {
+  chain out {
+    type filter hook output priority mangle;
+    # ceiling storage: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-st-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-storage"
+    # ceiling cluster: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-cl-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-cluster"
+    # ceiling mgmt: 3 members, 7 LSAs (3 router + 4 network), 2 peers
+    #   base = 1 hello + 2x7 flood + ceil(7x2/5) retx = 18 pkt/s; x4 headroom = 72; floor 20 pkt/s (measured burst) x4 = 80
+    oifname { "cfab-mg-fb" } ip protocol 89 limit rate over 80/second burst 160 packets counter drop comment "ceiling-mgmt"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip protocol 89 return comment "guard-storage-ospf"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } udp dport 3784 return comment "guard-storage-bfd"
+    oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-storage-bulk"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } ip protocol 89 return comment "guard-cluster-ospf"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } udp dport 3784 return comment "guard-cluster-bfd"
+    oifname { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } ip dscp set cs6 comment "dscp-cluster-bulk"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } ip protocol 89 return comment "guard-mgmt-ospf"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } udp dport 3784 return comment "guard-mgmt-bfd"
+    oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } ip dscp set cs2 comment "dscp-mgmt-bulk"
+  }
+  chain forward {
+    type filter hook forward priority mangle; policy accept;
+    iifname "primary.3" oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-vms-storage"
+    iifname "primary.3" oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } ip dscp set cs2 comment "dscp-vms-mgmt"
+  }
+}
+
+== engine ==
+{
+  "ietf-interfaces:interfaces": {
+    "interface": [
+      {
+        "name": "cfab-st",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-bk",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-b2",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-st-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-cl-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-mg-fb",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id99",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id199",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-id249",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "cfab-gw249",
+        "type": "iana-if-type:ethernetCsmacd"
+      },
+      {
+        "name": "primary.3",
+        "type": "iana-if-type:ethernetCsmacd"
+      }
+    ]
+  },
+  "ietf-routing-policy:routing-policy": {
+    "defined-sets": {
+      "prefix-sets": {
+        "prefix-set": [
+          {
+            "name": "cfab-mgmt-id",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "10.249.0.0/24",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
+          },
+          {
+            "name": "cfab-mgmt-leaf",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "10.249.0.3/32",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "policy-definitions": {
+      "policy-definition": [
+        {
+          "name": "cfab-mgmt-import",
+          "statements": {
+            "statement": [
+              {
+                "name": "0",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-leaf"
+                  }
+                },
+                "actions": {
+                  "policy-result": "reject-route"
+                }
+              },
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-med": "igp"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "cfab-mgmt-export",
+          "statements": {
+            "statement": [
+              {
+                "name": "0",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-leaf"
+                  }
+                },
+                "actions": {
+                  "policy-result": "reject-route"
+                }
+              },
+              {
+                "name": "1",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-next-hop": "self"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "ietf-routing:routing": {
+    "control-plane-protocols": {
+      "control-plane-protocol": [
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "storage",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.99.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-st",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 100,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 200,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-st-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 410
+                      },
+                      {
+                        "name": "cfab-id99",
+                        "passive": true
+                      },
+                      {
+                        "name": "primary.3",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "cluster",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.199.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-cl",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 100,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 200,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-cl-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 410
+                      },
+                      {
+                        "name": "cfab-id199",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-ospf:ospfv2",
+          "name": "mgmt",
+          "ietf-ospf:ospf": {
+            "explicit-router-id": "10.249.0.1",
+            "spf-control": {
+              "ietf-spf-delay": {
+                "long-delay": 100,
+                "hold-down": 3000
+              }
+            },
+            "areas": {
+              "area": [
+                {
+                  "area-id": "0.0.0.0",
+                  "interfaces": {
+                    "interface": [
+                      {
+                        "name": "cfab-mg",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 10,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-bk",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 200,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-b2",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 100,
+                        "bfd": {
+                          "enabled": true,
+                          "local-multiplier": 3,
+                          "desired-min-tx-interval": 250000,
+                          "required-min-rx-interval": 250000
+                        }
+                      },
+                      {
+                        "name": "cfab-mg-fb",
+                        "interface-type": "broadcast",
+                        "hello-interval": 1,
+                        "dead-interval": 3,
+                        "cost": 410
+                      },
+                      {
+                        "name": "cfab-id249",
+                        "passive": true
+                      },
+                      {
+                        "name": "cfab-gw249",
+                        "passive": true
+                      },
+                      {
+                        "name": "primary.3",
+                        "passive": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "ietf-bgp:bgp",
+          "name": "cfab",
+          "ietf-bgp:bgp": {
+            "global": {
+              "as": 65000,
+              "identifier": "10.249.0.1",
+              "afi-safis": {
+                "afi-safi": [
+                  {
+                    "name": "iana-bgp-types:ipv4-unicast",
+                    "apply-policy": {
+                      "import-policy": [
+                        "cfab-mgmt-import"
+                      ]
+                    },
+                    "ipv4-unicast": {
+                      "holo-bgp:redistribution": [
+                        {
+                          "type": "ietf-routing:direct"
+                        },
+                        {
+                          "type": "ietf-ospf:ospfv2"
+                        }
+                      ],
+                      "holo-bgp:network": [
+                        "10.249.0.1/32"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "neighbors": {
+              "neighbor": [
+                {
+                  "remote-address": "192.168.249.254",
+                  "peer-as": 65000,
+                  "timers": {
+                    "connect-retry-interval": 3,
+                    "hold-time": 3,
+                    "keepalive": 1
+                  },
+                  "transport": {
+                    "local-address": "192.168.249.1"
+                  },
+                  "afi-safis": {
+                    "afi-safi": [
+                      {
+                        "name": "iana-bgp-types:ipv4-unicast",
+                        "enabled": true,
+                        "apply-policy": {
+                          "export-policy": [
+                            "cfab-mgmt-export"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+== bridge ==
+table bridge cfab
+delete table bridge cfab
+table bridge cfab {
+    chain pre {
+        type filter hook prerouting priority filter; policy accept;
+        iifname "eth0" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment "gw-request-from-uplink"
+        iifname "eth0" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter drop comment "gw-claim-from-uplink"
+    }
+}
+
+== dhcp ==
+# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
+# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
+# 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
+subnet 192.168.20.0 netmask 255.255.255.0 {
+	option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
+	option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;
+}
+

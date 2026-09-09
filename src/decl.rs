@@ -865,7 +865,12 @@ pub mod fixtures {
     /// array table, and the member rows on the two hosts (inserted after their `wires` arrays).
     pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\"]\n";
 
-    pub fn with_workload(text: &str) -> String {
+    /// `WORKLOAD_BLOCK` allowed into a second zone (`mgmt`, alongside `storage`): the fixture
+    /// that exercises "one sibling / passive OSPF entry / forward-policy pair per allowed zone",
+    /// not just the single-zone case `WORKLOAD_BLOCK` covers.
+    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\", \"mgmt\"]\n";
+
+    fn with_workload_block(text: &str, block: &str) -> String {
         let t = with_prefs(
             text,
             "pve1-tb",
@@ -876,7 +881,16 @@ pub mod fixtures {
             "pve2-tb",
             "workloads = [{ name = \"vms\", address = \"192.168.20.3/24\" }]",
         );
-        format!("{t}{WORKLOAD_BLOCK}")
+        format!("{t}{block}")
+    }
+
+    pub fn with_workload(text: &str) -> String {
+        with_workload_block(text, WORKLOAD_BLOCK)
+    }
+
+    /// The `with_workload` fixture with `allow = ["storage"]` instead of one zone.
+    pub fn with_multi_zone_allow_workload(text: &str) -> String {
+        with_workload_block(text, MULTI_ZONE_ALLOW_WORKLOAD_BLOCK)
     }
 
     /// The example with every zone's universal (fallback) leg removed.

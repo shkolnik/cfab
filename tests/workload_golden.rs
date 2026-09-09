@@ -30,10 +30,9 @@ fn fixture_uplink() -> Uplink {
     }
 }
 
-fn render(member: &str) -> String {
-    let decl = Declaration::parse(&fixtures::with_workload(&fixtures::example()))
-        .expect("the with_workload fixture parses");
-    let f = Fabric::from_decl(&decl).expect("the with_workload fixture loads");
+fn render_text(decl_text: &str, member: &str) -> String {
+    let decl = Declaration::parse(decl_text).expect("the fixture parses");
+    let f = Fabric::from_decl(&decl).expect("the fixture loads");
     let v = View::new(&f, member).expect("the member is in the fixture");
 
     let mut out = String::new();
@@ -80,14 +79,20 @@ fn render(member: &str) -> String {
     out
 }
 
-fn golden(member: &str) {
-    let path = format!("tests/fixtures/workload-golden-{member}.txt");
-    let got = render(member);
-    let want = std::fs::read_to_string(&path).unwrap_or_default();
+fn render(member: &str) -> String {
+    render_text(&fixtures::with_workload(&fixtures::example()), member)
+}
+
+fn golden_at(path: &str, got: String) {
+    let want = std::fs::read_to_string(path).unwrap_or_default();
     if got != want {
         std::fs::write(format!("{path}.actual"), &got).expect("the .actual file is writable");
         panic!("{path} differs; read {path}.actual line by line, then copy it into place");
     }
+}
+
+fn golden(member: &str) {
+    golden_at(&format!("tests/fixtures/workload-golden-{member}.txt"), render(member));
 }
 
 #[test]
@@ -98,4 +103,44 @@ fn the_host_workload_rendering_is_pinned() {
 #[test]
 fn the_leaf_workload_rendering_is_pinned() {
     golden("pve3-tb");
+}
+
+/// A workload row allowed into two zones (`storage` and `mgmt`), not just one: one pref-2000
+/// sibling, one passive OSPF entry, and one forward-policy pair per allowed zone, so the
+/// multi-zone case is pinned as its own fixture rather than assumed to generalize from
+/// `WORKLOAD_BLOCK`'s single-zone one.
+#[test]
+fn the_multi_zone_allow_workload_rendering_is_pinned() {
+    let got = render_text(&fixtures::with_multi_zone_allow_workload(&fixtures::example()), "pve1-tb");
+    golden_at("tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt", got);
+}
+
+/// The multi-zone golden actually differs from the single-zone one in exactly the ways `allow =
+/// ["storage", "mgmt"]` should change: a second pref-2000 sibling naming mgmt's block
+/// (`10.249.0.0/16`) and a second symmetric forward-policy pair (`allow-vms-mgmt` /
+/// `allow-mgmt-vms`). Neither is present in the single-zone fixture. A regression that dropped
+/// the second allowed zone back to one would make the multi-zone fixture byte-identical to the
+/// single-zone one, and this test — not just the golden compare — would name exactly what went
+/// missing.
+#[test]
+fn the_multi_zone_allow_golden_actually_differs_from_the_single_zone_one() {
+    let one = std::fs::read_to_string("tests/fixtures/workload-golden-pve1-tb.txt")
+        .expect("the single-zone golden exists");
+    let two = std::fs::read_to_string("tests/fixtures/workload-golden-pve1-tb-multi-zone-allow.txt")
+        .expect("the multi-zone golden exists");
+    assert_ne!(one, two, "allow = [\"storage\", \"mgmt\"] rendered no differently than one zone");
+    for needle in [
+        "from 10.249.0.0/16 to 192.168.20.0/24 lookup main",
+        "allow-vms-mgmt",
+        "allow-mgmt-vms",
+    ] {
+        assert!(
+            two.contains(needle),
+            "multi-zone golden is missing {needle:?} (mgmt's own sibling/policy pair): {two}"
+        );
+        assert!(
+            !one.contains(needle),
+            "single-zone golden unexpectedly already has {needle:?}: {one}"
+        );
+    }
 }
