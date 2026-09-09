@@ -105,6 +105,11 @@ pub(crate) enum Cmd {
     /// (ruling 12). Posted by the watch task; it reaches the loop on the same channel as
     /// every other command so the announcers are driven from exactly one place.
     Neigh(crate::workload::neigh::NeighSignal),
+    /// The neighbor watch task has exited and no event will ever arrive again. Carries why.
+    /// The announcers fall back to the FDB poll and say so — a trigger that has stopped
+    /// working must never keep claiming it is the live one (ruling 12: `status` says which
+    /// path is active).
+    NeighWatchDied(String),
 }
 
 /// A child's exit, reported by its `wait` task to the main loop.
@@ -346,9 +351,10 @@ impl Hooks {
 /// one channel sender and forks nothing, ever, so it belongs on `tokio::spawn` beside the stream
 /// readers and the socket server.
 ///
-/// Failure is never fatal: a subscription that cannot be opened returns its reason, which
-/// becomes the FDB-poll fallback's trigger text, and a watch that later loses its socket says so
-/// once and stops — the 5 s beacon is the correctness floor either way.
+/// Failure is never fatal, and never quiet: a subscription that cannot be opened returns its
+/// reason, which becomes the FDB-poll fallback's trigger text, and a watch that later loses its
+/// socket posts `Cmd::NeighWatchDied`, which moves every row onto the poll. The 5 s beacon is
+/// the correctness floor throughout.
 fn spawn_neigh_watch(tx: mpsc::UnboundedSender<Cmd>) -> std::result::Result<(), String> {
     use crate::workload::neigh::{NeighSignal, NeighWatch};
     use tokio::io::unix::AsyncFd;
@@ -358,12 +364,12 @@ fn spawn_neigh_watch(tx: mpsc::UnboundedSender<Cmd>) -> std::result::Result<(), 
         let mut watch = watch;
         loop {
             let Ok(mut afd) = AsyncFd::new(watch) else {
-                eprintln!("cfab: workload: neighbor watch stopped: the socket cannot be polled");
+                let _ = tx.send(Cmd::NeighWatchDied("the socket cannot be polled".into()));
                 return;
             };
             loop {
                 let Ok(mut guard) = afd.readable_mut().await else {
-                    eprintln!("cfab: workload: neighbor watch stopped: readiness lost");
+                    let _ = tx.send(Cmd::NeighWatchDied("readiness lost".into()));
                     return;
                 };
                 match guard.get_inner_mut().drain() {
@@ -379,7 +385,7 @@ fn spawn_neigh_watch(tx: mpsc::UnboundedSender<Cmd>) -> std::result::Result<(), 
                     Err(e) => {
                         drop(guard);
                         if e.raw_os_error() != Some(nix::errno::Errno::ENOBUFS as i32) {
-                            eprintln!("cfab: workload: neighbor watch stopped: {e}");
+                            let _ = tx.send(Cmd::NeighWatchDied(e.to_string()));
                             return;
                         }
                         // ENOBUFS: `drain` already replaced the socket, so the OLD fd this
@@ -896,6 +902,13 @@ pub(crate) async fn run_with(
                     // else, so it is answered here and never reaches the re-read below.
                     Cmd::Neigh(sig) => {
                         workloads.on_neigh(sys, &sig, Instant::now());
+                        workloads.publish(&shared);
+                        continue;
+                    }
+                    // The event trigger is gone: every row moves to the FDB poll, which the
+                    // 3 s tick below runs from now on.
+                    Cmd::NeighWatchDied(why) => {
+                        workloads.watch_died(&why);
                         workloads.publish(&shared);
                         continue;
                     }
@@ -2066,6 +2079,72 @@ mod tests {
                         "192.168.20.254".parse().unwrap()
                     )[..]),
             "every frame is the gratuitous request for gw, from the sub-interface's own MAC"
+        );
+    }
+
+    /// The watch task can die under a running supervisor. The loop must move every row onto
+    /// the FDB poll and say so — never leave `status` claiming a trigger that stopped working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_neigh_watch_flips_the_reported_trigger_to_the_fdb_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx
+                .send(Cmd::NeighWatchDied("readiness lost".to_string()))
+                .ok();
+            let flipped = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .workloads
+                    .first()
+                    .is_some_and(|w| w.trigger.starts_with("fdb poll"))
+            })
+            .await;
+            let snap = sh.lock().unwrap().components(Instant::now());
+            driver_tx.send(Cmd::Terminate).ok();
+            (flipped, snap)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.trace = Some(trace.clone());
+        hooks.neigh_watch = Arc::new(|_| Ok(()));
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let (flipped, snap) = driver.await.unwrap();
+        assert!(flipped, "the reported trigger must follow the dead watch");
+        assert_eq!(
+            snap.workloads[0].trigger,
+            "fdb poll (neighbor watch died: readiness lost)"
+        );
+        assert!(
+            trace.lock().unwrap().contains(
+                &"cfab: workload vms: announcer trigger fdb poll (neighbor watch died: readiness \
+                   lost)"
+                    .to_string()
+            ),
+            "{:?}",
+            trace.lock().unwrap()
         );
     }
 

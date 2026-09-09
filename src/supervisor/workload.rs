@@ -238,6 +238,32 @@ impl Workloads {
         }
     }
 
+    /// The neighbor watch task has exited: every row moves to the FDB poll and says so.
+    ///
+    /// Without this a member whose subscription died would keep reporting `neigh events` while
+    /// nothing ever woke it again — the beacon would still converge every PERIOD, but the
+    /// ownership-change burst, which is what makes a migration sub-second, would be silently
+    /// gone. Ruling 12 requires `status` to say which path is active; this keeps that true for
+    /// the whole life of the process, not just its first second.
+    pub(crate) fn watch_died(&mut self, why: &str) {
+        if self.trigger.is_none() {
+            return; // no rows on this member: nothing was watching
+        }
+        let trigger = Trigger::FdbPoll {
+            reason: format!("neighbor watch died: {why}"),
+        };
+        if self.trigger.as_ref() == Some(&trigger) {
+            return;
+        }
+        self.trigger = Some(trigger.clone());
+        for r in &self.rows {
+            journal(
+                &self.trace,
+                format!("cfab: workload {}: announcer trigger {trigger}", r.name),
+            );
+        }
+    }
+
     /// When the caller must next wake, or `None` when nothing is running.
     pub(crate) fn next_due(&self) -> Option<Instant> {
         self.rows.iter().map(|r| r.announcer.next_due()).min()
@@ -609,6 +635,45 @@ mod tests {
             1,
             "nothing new: the poll does not re-burst on a MAC it has already seen"
         );
+    }
+
+    /// The event trigger can stop working mid-run (the socket loses readiness, an fd error).
+    /// Every row moves to the FDB poll, `status` says why, and the poll runs from the next tick.
+    #[test]
+    fn a_dead_neigh_watch_moves_every_row_to_the_fdb_poll_and_says_why() {
+        let (sys, view) = wl(None);
+        let mut sys = sys.on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev tap100i0 vlan 3 master primary\n",
+        );
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        assert_eq!(w.rows_for_status()[0].trigger, "neigh events");
+
+        w.watch_died("readiness lost");
+        assert_eq!(
+            w.rows_for_status()[0].trigger,
+            "fdb poll (neighbor watch died: readiness lost)"
+        );
+        assert_eq!(
+            said(&trace)[1],
+            "cfab: workload vms: announcer trigger fdb poll (neighbor watch died: readiness lost)"
+        );
+        // …and the fallback is really running, not just claimed.
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
+        assert!(sys.ran("bridge fdb show br primary"));
+        assert_eq!(w.rows_for_status()[0].bursts, 1);
+        // Said once: a second report of the same death is not a second trigger change.
+        w.watch_died("readiness lost");
+        assert_eq!(said(&trace).len(), 2);
     }
 
     /// A member on the event trigger does NOT poll the FDB: the poll is the fallback, never a
