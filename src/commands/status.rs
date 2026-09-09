@@ -2230,6 +2230,17 @@ fn link_speeds(
     c: &mut Ctx,
     absent: &BTreeSet<String>,
 ) -> Result<()> {
+    // ethtool is a read-only, OPTIONAL dependency (Debian `Recommends`): a read it cannot make
+    // (the binary is absent) degrades the speed-mismatch line to `driver ?` instead of failing
+    // the whole gather, and is told once per gather, not once per wire — and regardless of
+    // whether any wire happens to be mismatched this tick, so a healthy host without ethtool
+    // still says so. A present ethtool that one device refuses (e.g. "Operation not supported")
+    // is a per-wire `driver ?` only; it says nothing about ethtool's own installation.
+    // `have_tool` execs `/usr/bin/env`, which is safe to `?` on its own account — but never
+    // `?`-propagate a failure that traces back to ethtool itself: `unwrap_or(false)` folds an
+    // exec error into "absent", same as the ordinary not-on-PATH answer, so a gather never
+    // fails over a diagnostic dependency it doesn't have.
+    let mut ethtool_absent = !have_tool(sys, "ethtool").unwrap_or(false);
     for wire in view.wires() {
         // Task 5b (RULED, James 2026-09-05): an absent wire gets its own spelling, distinct
         // from a present-but-carrierless one — an operator must tell "unplugged" from "gone".
@@ -2253,18 +2264,34 @@ fn link_speeds(
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         if carrier && obs != decl {
-            let drv = sys.run(&["ethtool", "-i", &wire])?.stdout;
-            let driver = drv
-                .lines()
-                .find_map(|l| l.strip_prefix("driver:"))
-                .map(str::trim)
-                .unwrap_or("?");
+            let driver = match run_optional(sys, &["ethtool", "-i", &wire]) {
+                Some(out) if out.ok() => out
+                    .stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("driver:"))
+                    .map(str::trim)
+                    .unwrap_or("?")
+                    .to_string(),
+                // A nonzero exit is this device's own refusal, not evidence about ethtool's
+                // installation — silent `driver ?`.
+                Some(_) => "?".to_string(),
+                // An exec failure here is redundant with the `have_tool` probe above in the
+                // common case, but a device read can still be the first place ethtool's
+                // absence shows up (e.g. removed between the probe and this call).
+                None => {
+                    ethtool_absent = true;
+                    "?".to_string()
+                }
+            };
             // Standing: the wire negotiated what it negotiated; the declaration is what
             // disagrees with it.
             c.standing(format!(
                 "{wire}: link speed {obs} != declared {decl} (driver {driver})"
             ));
         }
+    }
+    if ethtool_absent {
+        c.standing("ethtool not installed: driver changes unchecked".to_string());
     }
     Ok(())
 }
@@ -2368,6 +2395,110 @@ mod tests {
         let mut f = fabric();
         f.bfd_port = port;
         f
+    }
+
+    /// A link-speed mismatch with ethtool present names the driver, exactly as before.
+    #[test]
+    fn a_link_speed_mismatch_names_the_driver() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "1000\n")
+            .on_stdout(
+                &["ethtool", "-i", "eth9"],
+                "driver: r8152\nversion: 6.12.0\n",
+            );
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert_eq!(
+            lines,
+            ["eth9: link speed 1000 != declared 5000 (driver r8152)"]
+        );
+    }
+
+    /// A present ethtool that one device refuses (nonzero exit, e.g. "Operation not supported")
+    /// degrades that wire's line to `driver ?` — silently. It says nothing about ethtool's own
+    /// installation, so no standing line.
+    #[test]
+    fn a_device_specific_ethtool_failure_gives_driver_unknown_with_no_standing_line() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "1000\n")
+            .on_fail(&["ethtool", "-i", "eth9"], 1, "Operation not supported");
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert_eq!(
+            lines,
+            ["eth9: link speed 1000 != declared 5000 (driver ?)"],
+            "a device's own refusal must not read as ethtool being uninstalled: {lines:?}"
+        );
+    }
+
+    /// ethtool genuinely not installed (exec fails, not a scripted exit) — even with every wire
+    /// at its declared speed, so nothing would otherwise call ethtool this tick — still gets
+    /// told, once, and the gather still succeeds (the metrics gather path depends on that).
+    #[test]
+    fn ethtool_truly_absent_is_told_once_even_with_no_speed_mismatch() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "5000\n")
+            .fail_exec("ethtool");
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert_eq!(lines, ["ethtool not installed: driver changes unchecked"]);
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.as_str() == "/usr/bin/env sh -c command -v ethtool")
+                .count(),
+            1,
+            "one `command -v ethtool` probe per gather: {:?}",
+            sys.calls
+        );
+    }
+
+    /// The combined case: a speed mismatch AND ethtool truly absent — one `driver ?` line for
+    /// the wire, one standing line for ethtool, never duplicated.
+    #[test]
+    fn ethtool_absent_gives_one_standing_line_and_a_successful_gather() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .file("/sys/class/net/eth9/carrier", "1\n")
+            .file("/sys/class/net/eth9/speed", "1000\n")
+            .fail_exec("ethtool");
+        let mut c = Ctx::default();
+        link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
+        let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
+        assert!(
+            lines.contains(&"eth9: link speed 1000 != declared 5000 (driver ?)".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|m| m.as_str() == "ethtool not installed: driver changes unchecked")
+                .count(),
+            1,
+            "one line per gather, not per wire: {lines:?}"
+        );
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.as_str() == "/usr/bin/env sh -c command -v ethtool")
+                .count(),
+            1,
+            "one `command -v ethtool` probe per gather: {:?}",
+            sys.calls
+        );
     }
 
     /// `/proc/net/udp` as the kernel prints it (captured shape, pve1-tb 2026-09-06): a header

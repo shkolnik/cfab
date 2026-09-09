@@ -1,7 +1,6 @@
 /usr/bin/env sh -c command -v ip
 /usr/bin/env sh -c command -v nft
 /usr/bin/env sh -c command -v tc
-/usr/bin/env sh -c command -v ethtool
 /usr/bin/env sh -c command -v logger
 ip -4 -br addr show dev eth9
 ip -4 -br addr show dev eth1
@@ -13,11 +12,11 @@ ip link show eth1
 ip link set eth1 up
 ip link show eth9
 ip link set eth9 up
+/usr/bin/env sh -c command -v ethtool
 ethtool -i eth9
 ethtool -i eth1
 ethtool -i eth0
 write /run/cfab/wire-drivers
-write /run/cfab/wire-driver-features
 write /proc/sys/net/ipv4/conf/all/ignore_routes_with_linkdown
 write /proc/sys/net/ipv4/conf/all/send_redirects
 write /proc/sys/net/ipv4/conf/default/send_redirects

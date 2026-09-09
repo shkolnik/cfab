@@ -61,12 +61,36 @@ in that table: the engine sets DSCP CS6 and skb-priority `[marking] pcp_ctrl` on
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
 The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc`
 for its shaping trees; a **leaf** shapes nothing, its wires' qdiscs being its own OS's business.
-Every kind needs `ethtool`: link speed is cross-checked with it, and a wire may declare
-`driver_features` — a string of `<feature> on|off` pairs handed to `ethtool -K <nic>` as written
-(the case that motivates it: USB adapters that lock up under load with scatter-gather on).
-cfab names no adapter and no driver; it validates the string at `check`, records the value each
-named feature had, and `down` puts those values back. Anything missing is refused by name before
-`up` applies a thing. The Debian package's `Depends` covers all of it.
+Every kind uses `ethtool` if it is installed: `up` records each present wire's driver (so the
+forwarding watchdog can tell a re-enumerated wire from a swapped adapter) and `status`
+cross-checks link speed with it. cfab never sets a NIC feature — an adapter that needs an
+offload turned off (the case that motivates this: USB adapters that lock up under load with
+scatter-gather on) gets a udev rule on the host, fired on the netdev-add event; cfab only
+reports the driver and the speed it finds. `ethtool` is a Debian `Recommends`, not a `Depends`:
+it is a read-only diagnostic, and its absence degrades gracefully — `up` still applies, the
+driver record is empty, and `status` says `driver ?` and names the gap once, rather than
+refusing anything. If ethtool is present but one device refuses `ethtool -i`, `up` warns
+`WARNING: ethtool -i <wire>: driver unrecorded` for that wire alone — it gets no driver record,
+and the forwarding watchdog skips its different-driver check for it. The retired
+`driver_features` and `usb` wire keys are refused at load, naming this.
+
+An example udev rule for an adapter that needs an offload turned off (matched here by USB
+vendor/product ID, not by netdev name, since a re-enumerated NIC can pick up a new one). The
+first rule pins the USB configuration (vendor mode) so the vendor driver binds before any
+interface driver probes; the second applies the offload change on every netdev add:
+
+```
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8157", ATTR{bConfigurationValue}="1"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="8157", RUN+="/usr/local/sbin/nic-offload"
+```
+
+with `/usr/local/sbin/nic-offload` (`chmod 755`) doing the actual work on the interface udev
+hands it in `$INTERFACE`:
+
+```
+#!/bin/sh
+ethtool -K "$INTERFACE" tx off rx off sg off tso off gso off
+```
 
 ## Running it as a service
 

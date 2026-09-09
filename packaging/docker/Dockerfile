@@ -13,16 +13,18 @@ FROM debian:trixie-slim
 ARG CFAB_DEB=cfab.deb
 COPY ${CFAB_DEB} /tmp/cfab.deb
 
-# apt pulls the deb's own Depends (nftables, iproute2, ethtool). iptables is only a Recommends
-# of the deb and this install is --no-install-recommends, so it is named explicitly: without it
-# the leaf's ceiling-only fallback (iptables-legacy, for a kernel without nf_tables — a real
-# Synology, DSM 7.3.2 / 4.4) would silently be missing from the image. Which backend is used is
-# decided at `cfab up` against the host's kernel, not at build time. Add diagnostic tools
-# (tcpdump, iputils-ping, ...) in a derived image if a deployment wants them — they are not part
-# of the generic contract.
+# apt pulls the deb's own Depends (nftables, iproute2). iptables and ethtool are only
+# Recommends of the deb and this install is --no-install-recommends, so both are named
+# explicitly: without iptables the leaf's ceiling-only fallback (iptables-legacy, for a kernel
+# without nf_tables — a real Synology, DSM 7.3.2 / 4.4) would silently be missing from the
+# image; without ethtool the image would run in the degraded no-ethtool mode by design (no
+# driver record, no link-speed cross-check) rather than by an accident of this install line.
+# Which backend is used is decided at `cfab up` against the host's kernel, not at build time.
+# Add diagnostic tools (tcpdump, iputils-ping, ...) in a derived image if a deployment wants
+# them — they are not part of the generic contract.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      /tmp/cfab.deb iptables \
+      /tmp/cfab.deb iptables ethtool \
  && rm -rf /var/lib/apt/lists/* /tmp/cfab.deb
 
 ENTRYPOINT ["/usr/bin/cfab"]

@@ -9,11 +9,11 @@ ip link show eth1
 ip link set eth1 up
 ip link show eth9
 ip link set eth9 up
+/usr/bin/env sh -c command -v ethtool
 ethtool -i eth9
 ethtool -i eth1
 ethtool -i eth0
 write /run/cfab/wire-drivers
-write /run/cfab/wire-driver-features
 ip link show cfab-id99
 ip link show cfab-id99
 ip link add cfab-id99 type veth peer name cfab-id99-peer

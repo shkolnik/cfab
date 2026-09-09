@@ -49,12 +49,35 @@ not by that table, which lets them past the clamp untouched. A
 .B host
 additionally needs
 .BR tc (8)
-and
-.BR ethtool (8)
-for its shaping trees and per-NIC offload posture; a
+for its shaping trees; a
 .B leaf
-shapes nothing \(em its wires' qdiscs belong to its own OS. A missing tool is
-refused by name before anything is applied.
+shapes nothing \(em its wires' qdiscs belong to its own OS. A missing
+.BR nft (8)
+or
+.BR tc (8)
+is refused by name before anything is applied.
+.PP
+.BR ethtool (8)
+is used by both kinds if it is installed, to record each present wire's
+driver and cross-check its link speed \(em cfab sets no NIC feature any
+more (that is a host\-side udev rule now, fired on the netdev\-add event).
+It is a read\-only diagnostic dependency (Debian
+.BR Recommends ,
+not
+.BR Depends ):
+absent, \fBup\fR still applies with an empty driver record and one
+warning, and
+.B status
+reports
+.B "driver ?"
+and names the gap once instead of refusing anything. If ethtool is present
+but one device refuses
+.BR "ethtool \-i" ,
+.B up
+warns
+.B "WARNING: ethtool \-i <wire>: driver unrecorded"
+for that wire alone; it gets no driver record, and the forwarding watchdog
+skips its different\-driver check for it.
 .PP
 Most subcommands require root. The generators
 .RB ( "cfab gen" ,
@@ -487,25 +510,16 @@ and has an unparseable file leaves nothing on disk to say where the copy is, and
 .B status
 then fails on the parse error as before. Never re\-read by anything else.
 .TP
-.I RUN_DIR/wire\-drivers, RUN_DIR/wire\-driver\-features
+.I RUN_DIR/wire\-drivers
 Written by
-.BR up ,
-one line each.
-.I wire\-drivers
-records the
-.BR "ethtool \-i" " driver every present wire had at apply; the forwarding"
-watchdog compares it when a wire's netdev returns and reports an adapter that
-is not the one that was configured.
-.I wire\-driver\-features
-records
-.RI "\(dq" "wire feature prior" "\(dq for every feature"
-.B up
-actually changed from a
-.B driver_features
-string, and
+.BR up :
+the
+.BR "ethtool \-i" " driver every present wire had at apply (empty when ethtool"
+was not installed). The forwarding watchdog compares it when a wire's netdev
+returns and reports an adapter that is not the one that was configured.
 .B down
-replays each line as
-.BR "ethtool \-K" .
+never reads it \(em NIC features are the host's own business now, not
+cfab's.
 .TP
 .I RUN_DIR/conf\-sync\-attempted, RUN_DIR/conf\-sync\-committed
 The daemon's generation state (decimal), under the declaration's run

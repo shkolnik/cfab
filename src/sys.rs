@@ -296,6 +296,12 @@ pub mod mock {
         /// Ports whose state cannot be read at all (`EIO`) — the socket is there but the answer
         /// is not, which is neither "no carrier" nor "the netdev is gone".
         pub unreadable_ports: Vec<String>,
+        /// Substrings that make `run` fail the exec itself (`Err`, never a scripted `Output`)
+        /// for any argv containing one of them in any position — the binary genuinely is not
+        /// there, as opposed to `on_fail`'s nonzero exit (the binary ran and refused). Matches
+        /// on the raw argv element, not the shell-quoted line, so `fail_exec("ethtool")` also
+        /// catches a `command -v ethtool` probe run through `sh -c`.
+        pub exec_fails: Vec<String>,
     }
 
     impl MockSys {
@@ -339,6 +345,14 @@ pub mod mock {
         /// the live-but-slow supervisor a `cfab down` must refuse rather than tear down under.
         pub fn socket_unreachable(mut self, path: &str) -> Self {
             self.unreachable_sockets.push(path.to_string());
+            self
+        }
+
+        /// Make any argv naming `needle` anywhere (including inside a `sh -c "..."` string)
+        /// fail as an exec error, not a scripted exit — the case a real host hits when the
+        /// binary simply is not installed.
+        pub fn fail_exec(mut self, needle: &str) -> Self {
+            self.exec_fails.push(needle.to_string());
             self
         }
 
@@ -455,6 +469,13 @@ pub mod mock {
 
         fn run(&mut self, argv: &[&str]) -> Result<Output> {
             self.calls.push(argv.join(" "));
+            if self
+                .exec_fails
+                .iter()
+                .any(|needle| argv.iter().any(|a| a.contains(needle.as_str())))
+            {
+                return Err(Error::fatal(format!("cannot exec {}: not found", argv[0])));
+            }
             // A deleted netdev stops existing. Without this the mock answers `ip link show
             // <dev>` for a device cfab has just removed, and any path that deletes and then
             // rebuilds under the same name (the ingress leg's two shapes) could not be tested

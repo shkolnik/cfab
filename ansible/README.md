@@ -7,6 +7,10 @@ particular site: the declaration (`fabric.toml`) is the operator's and comes in 
 package: a release is the git tag `ansible/v<version>` on this repository (interim, until the
 collection is published to Ansible Galaxy from CI). The role works with cfab package 0.5.1 or newer
 (it needs the packaged unit's `EnvironmentFile=/etc/default/cfab`); pin the package with `cfab_version`.
+0.10.1 installs the declaration before the package (no ordering requirement it depends on, just no
+reason to prefer the other way) and rejects the ethtool-absent status line from `apply`'s local-failure
+check (cfab 0.5.2 made `ethtool` an optional read-only dependency, so its absence is not a fabric
+problem).
 
 ## Use from your own repository
 
@@ -16,7 +20,7 @@ collection is published to Ansible Galaxy from CI). The role works with cfab pac
 collections:
   - name: https://github.com/shkolnik/cfab.git#/ansible/
     type: git
-    version: ansible/v0.10.0
+    version: ansible/v0.10.1
 ```
 
 ```

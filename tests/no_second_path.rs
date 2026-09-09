@@ -11,52 +11,15 @@
 //! (the running supervisor unit is `cfab.service`; the watchdog's live syslog tag is bare
 //! `cfab-fwd-watchdog`, which has no `.timer`).
 //!
-//! Production code only: each source is truncated at its first `#[cfg(test)]` line before the
-//! grep, so a test that names a forbidden mechanism to prove the production side never emits it
-//! (e.g. `apply_starts_no_daemon_and_names_no_unit`) is not itself a false positive.
+//! Production code only, via `tests/support/mod.rs`'s `#[cfg(test)]`-mod stripper (shared with
+//! `no_ethtool_dash_k.rs`): a test that names a forbidden mechanism to prove the production side
+//! never emits it (e.g. `apply_starts_no_daemon_and_names_no_unit`) is not itself a false
+//! positive.
 
-use std::path::Path;
+#[path = "support/mod.rs"]
+mod support;
 
-/// Every `.rs` under `src/`, as `(display path, production text)` — the text truncated at the
-/// first line that opens a `#[cfg(test)]` module (tests live in a bottom `mod tests` here).
-fn rust_sources() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).unwrap();
-                out.push((display(&path), production_only(&text)));
-            }
-        }
-    }
-    out
-}
-
-fn display(path: &Path) -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Everything up to (not including) the first line that contains `#[cfg(test)]`.
-fn production_only(text: &str) -> String {
-    let mut kept = String::new();
-    for line in text.lines() {
-        if line.contains("#[cfg(test)]") {
-            break;
-        }
-        kept.push_str(line);
-        kept.push('\n');
-    }
-    kept
-}
+use support::rust_sources;
 
 #[test]
 fn no_transient_units_no_detached_spawn_no_systemd_branch() {

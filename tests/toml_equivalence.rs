@@ -267,7 +267,7 @@ fn the_minimal_declaration_generates_the_same_artifacts() {
 /// Every check `Fabric::from_decl`/`validate` still makes, each with the declaration that
 /// trips it and the words its message must carry. Deleting a check makes its case fail;
 /// deleting a CASE fails the count below. Grow both together when a check is added.
-const CASES: usize = 30;
+const CASES: usize = 32;
 
 fn edited(edits: &[(&str, &str)]) -> String {
     let mut text = example();
@@ -294,8 +294,8 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
     // pve1's whole wire set, so a member can be given more or fewer of them. Taken from the
     // file rather than spelled out: pve2 declares an IDENTICAL set of wires and `edited`
     // replaces every match, so a hard-coded array would edit both members and the error would
-    // name whichever comes first. pve1's array is the only one carrying the commented
-    // `driver_features` alternative, which is what makes this slice unique.
+    // name whichever comes first. pve1's array is the only one carrying the NIC-quirks
+    // comment, which is what makes this slice unique.
     let ex = example();
     let start = ex.find("wires = [").expect("the example declares wires");
     let end = start + ex[start..].find("\n]").expect("the array ends") + 2;
@@ -500,6 +500,22 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
             "a node id used twice",
             edited(&[("node = 2\n", "node = 1\n")]),
             "node id 1 used twice",
+        ),
+        (
+            "the retired driver_features wire key",
+            edited(&[(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"gro off\" },",
+            )]),
+            "'driver_features' is gone",
+        ),
+        (
+            "the retired usb wire key",
+            edited(&[(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },",
+            )]),
+            "'usb' is gone",
         ),
     ];
     assert_eq!(

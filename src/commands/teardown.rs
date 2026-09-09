@@ -263,12 +263,9 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             lock_path.display()
         )));
     }
-    // Driver features go back to what `up` FOUND, from the record cfab wrote — only the
-    // features it really changed, and only on the wires it changed them on, one `ethtool -K`
-    // per wire. Last read of the run dir, so it happens after the refusal above and before the
-    // dir is removed. Never fails the teardown (the wire may already be gone), but a restore
-    // that did not happen comes back as a WARNING line rather than a success note.
-    notes.extend(crate::driver_features::restore(sys, &f.run_dir));
+    // NIC features are the host's own business now (a udev rule on the netdev-add event): `up`
+    // never sets one, so `down` has nothing to put back. The driver record (`wire-drivers`)
+    // goes with the rest of the run dir below, unread — `down` never runs ethtool at all.
     sys.remove(&f.run_dir)?;
 
     // Netdevs, prove-ownership-before-destroy: expected kind or refuse.
@@ -535,11 +532,12 @@ mod tests {
             )
     }
 
-    /// `down` puts each feature back at the value cfab RECORDED — not at some default, and not
-    /// at whatever the wire happens to read now — in ONE `ethtool -K` per wire, and it says so
-    /// in the teardown message.
+    /// A run dir from an OLDER cfab version may still carry the retired `wire-driver-features`
+    /// record (features `up` used to change and `down` used to put back). NIC features are the
+    /// host's own business now, so `down` never reads it: no ethtool call, nothing said about
+    /// features, legacy record or not.
     #[test]
-    fn down_restores_every_driver_feature_up_changed() {
+    fn down_ignores_a_legacy_wire_driver_features_record_and_runs_no_ethtool() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg()
@@ -549,46 +547,13 @@ mod tests {
                 "eth9 sg on\neth9 tso on\n",
             );
         let msg = run(&mut sys, &view).unwrap();
-        assert_eq!(
-            sys.calls
-                .iter()
-                .filter(|c| c.starts_with("ethtool"))
-                .collect::<Vec<_>>(),
-            ["ethtool -K eth9 sg on tso on"],
-            "one call per wire: ethtool resolves the dependencies between features inside it"
-        );
-        assert!(
-            msg.contains("note: driver features put back on eth9: sg on, tso on"),
-            "{msg}"
-        );
+        assert!(!sys.ran("ethtool"), "{:?}", sys.calls);
+        assert!(!msg.contains("driver features"), "{msg}");
     }
 
-    /// A restore that FAILED is never reported as one: the teardown still completes (the fabric
-    /// must come down), and the operator is told which wire kept cfab's settings.
+    /// The ordinary case, no legacy record at all: still no ethtool, still nothing said.
     #[test]
-    fn down_warns_about_a_driver_feature_it_could_not_put_back() {
-        let f = fabric();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = sys_with_a_storage_fallback_leg()
-            .file("/run/cfab/mark.backend", "nft\n")
-            .file("/run/cfab/wire-driver-features", "eth9 sg on\n")
-            .on_fail(&["ethtool", "-K", "eth9"], 1, "no such device");
-        let msg = run(&mut sys, &view).unwrap();
-        assert!(
-            msg.contains("WARNING: eth9: driver features could not be put back (sg on)"),
-            "{msg}"
-        );
-        assert!(!msg.contains("put back on eth9"), "{msg}");
-        assert!(
-            msg.contains("teardown OK"),
-            "the teardown still finished: {msg}"
-        );
-    }
-
-    /// Nothing was changed, or the run dir predates the record: `down` runs no ethtool at all
-    /// and says nothing about features. A missing record is not an error (`mark.backend`'s rule).
-    #[test]
-    fn down_without_a_feature_record_runs_no_ethtool() {
+    fn down_without_any_feature_record_runs_no_ethtool() {
         let f = fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = sys_with_a_storage_fallback_leg().file("/run/cfab/mark.backend", "nft\n");

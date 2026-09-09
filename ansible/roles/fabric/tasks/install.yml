@@ -67,17 +67,9 @@
 
 - name: Install and configure cfab
   block:
-    # Unpinned = the newest the repository serves (`state: present` would leave an older installed
-    # cfab in place: R13 2026-09-07 kept pve1 on 0.4.1 after 0.4.2 was published). Pinned = exactly
-    # that version. Either way apt will not replace a package with the SAME version string, e.g.
-    # a locally built 0.1.0-1: bump the version (or `dpkg -i`) to move a host onto another build.
-    - name: cfab package
-      ansible.builtin.apt:
-        name: "cfab{{ ('=' + cfab_version) if cfab_version | length > 0 else '' }}"
-        state: "{{ 'present' if cfab_version | length > 0 else 'latest' }}"
-        update_cache: true
-        cache_valid_time: 0
-
+    # Declaration before package, by ruling — this role runs no `cfab check` itself, so nothing
+    # here depends on the order. No upgrade semantics either way (no existing installs to
+    # disturb): apt only ever moves a host onto a version it did not already have.
     - name: /etc/cfab
       ansible.builtin.file:
         path: /etc/cfab
@@ -90,6 +82,17 @@
         dest: /etc/cfab/fabric.toml
         mode: "0644"
       register: cfab_conf
+
+    # Unpinned = the newest the repository serves (`state: present` would leave an older installed
+    # cfab in place: R13 2026-09-07 kept pve1 on 0.4.1 after 0.4.2 was published). Pinned = exactly
+    # that version. Either way apt will not replace a package with the SAME version string, e.g.
+    # a locally built 0.1.0-1: bump the version (or `dpkg -i`) to move a host onto another build.
+    - name: cfab package
+      ansible.builtin.apt:
+        name: "cfab{{ ('=' + cfab_version) if cfab_version | length > 0 else '' }}"
+        state: "{{ 'present' if cfab_version | length > 0 else 'latest' }}"
+        update_cache: true
+        cache_valid_time: 0
 
     - name: cfab-revert (what the timed revert and --tags rollback run)
       ansible.builtin.template:
