@@ -13,7 +13,7 @@
 //! VM in the VLAN at a host that cannot answer. The row is picked up on a later tick, once its
 //! name has left `<run_dir>/workload-deferred`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -46,29 +46,71 @@ struct Row {
     /// The row's bridge and uplink ports, as `apply` identified them. Re-read per event only
     /// for the port SET (a tap comes and goes); the bridge and uplink do not move under us.
     up: Uplink,
-    /// The sub-interface's own MAC, read once at start.
+    /// The MAC the last frame went out with. Re-read at every beacon (a sub-interface's MAC
+    /// follows its parent bridge, which can change under us); this is the fallback the row
+    /// keeps announcing with when a read fails, never a permanent cache.
     mac: [u8; 6],
     /// The FDB poll's memory of `(port, mac)`; untouched on the event trigger.
     seen: BTreeSet<(String, String)>,
-    /// The last line journaled for a STANDING condition (a send that keeps failing, a bridge
-    /// scan that cannot run), so a broken wire costs one line and not one per period. Cleared
-    /// by the recovery line, so a fault that comes back is said again.
-    standing: Option<String>,
+    /// The line standing for each repeating condition, so a fault that lasts costs one line
+    /// and not one per period. Keyed, because the conditions are independent: a MAC that
+    /// cannot be read while the socket works must not be un-deduplicated by the send's own
+    /// recovery, and vice versa.
+    standing: BTreeMap<Cond, String>,
+}
+
+/// The repeating conditions a row deduplicates its journal on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Cond {
+    /// The send socket refused the frame.
+    Send,
+    /// The interface's MAC could not be read.
+    Mac,
+    /// The bridge's port set could not be scanned.
+    Scan,
 }
 
 impl Row {
-    /// Say `line` unless it is the line already standing for this row.
-    fn journal_once(&mut self, trace: &Trace, line: String) {
-        if self.standing.as_deref() == Some(line.as_str()) {
+    /// Say `line` unless it is the line already standing for `cond` on this row.
+    fn journal_once(&mut self, cond: Cond, trace: &Trace, line: String) {
+        if self.standing.get(&cond).map(String::as_str) == Some(line.as_str()) {
             return;
         }
-        self.standing = Some(line.clone());
+        self.standing.insert(cond, line.clone());
         journal(trace, line);
     }
 
-    fn recovered(&mut self, trace: &Trace, line: String) {
-        if self.standing.take().is_some() {
+    /// `cond` is over: say so, once, and only if it was ever standing.
+    fn recovered(&mut self, cond: Cond, trace: &Trace, line: String) {
+        if self.standing.remove(&cond).is_some() {
             journal(trace, line);
+        }
+    }
+
+    /// Re-read the interface's MAC before announcing with it.
+    ///
+    /// A change is an ownership change like any other: the frames already on their way out
+    /// carry a MAC the VLAN is about to stop answering for, so it is said once and burst on.
+    /// A read that FAILS keeps the last known MAC and announces anyway — a beacon from a
+    /// possibly stale MAC beats no beacon at all (availability first), and the line says so.
+    fn refresh_mac(&mut self, io: &mut dyn AnnounceIo, trace: &Trace, now: Instant) {
+        let (name, ifname) = (self.name.clone(), self.announcer.ifname.clone());
+        match read_mac(io, &ifname) {
+            Ok(mac) if mac == self.mac => {}
+            Ok(mac) => {
+                let (old, new) = (hex_mac(self.mac), hex_mac(mac));
+                self.mac = mac;
+                self.announcer.on_event(now);
+                journal(
+                    trace,
+                    format!("cfab: workload {name}: {ifname} MAC changed {old} -> {new}"),
+                );
+            }
+            Err(why) => self.journal_once(
+                Cond::Mac,
+                trace,
+                format!("cfab: workload {name}: {why}; announcing the last known MAC"),
+            ),
         }
     }
 }
@@ -91,6 +133,7 @@ impl Workloads {
     pub(crate) fn start(
         sys: &mut dyn Sys,
         view: &View,
+        io: &mut dyn AnnounceIo,
         trace: Trace,
         open: impl FnOnce() -> Result<(), String>,
         now: Instant,
@@ -110,14 +153,20 @@ impl Workloads {
                 reason: format!("RTNLGRP_NEIGH subscription failed: {reason}"),
             },
         });
-        w.start_pending(sys, view, now);
+        w.start_pending(sys, view, io, now);
         w
     }
 
     /// The 3 s tick: pick up any row the watchdog has installed since the last one, and — on
     /// the fallback trigger only — poll the FDB for a MAC that has appeared on a VM port.
-    pub(crate) fn tick(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) {
-        self.start_pending(sys, view, now);
+    pub(crate) fn tick(
+        &mut self,
+        sys: &mut dyn Sys,
+        view: &View,
+        io: &mut dyn AnnounceIo,
+        now: Instant,
+    ) {
+        self.start_pending(sys, view, io, now);
         if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
             return;
         }
@@ -132,7 +181,13 @@ impl Workloads {
     ///
     /// The steady state is one comparison: once every row has an announcer nothing is read at
     /// all, so the tick costs nothing on a converged member.
-    fn start_pending(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) {
+    fn start_pending(
+        &mut self,
+        sys: &mut dyn Sys,
+        view: &View,
+        io: &mut dyn AnnounceIo,
+        now: Instant,
+    ) {
         let rows = view.workload_rows();
         if rows.len() == self.rows.len() {
             return;
@@ -157,7 +212,7 @@ impl Workloads {
             }
             let ifname = &row.wl.ifname;
             let started = uplink::identify(sys, ifname)
-                .and_then(|up| read_mac(sys, ifname).map(|mac| (up, mac)));
+                .and_then(|up| read_mac(io, ifname).map(|mac| (up, mac)));
             match started {
                 Ok((up, mac)) => {
                     self.rows.push(Row {
@@ -166,7 +221,7 @@ impl Workloads {
                         up,
                         mac,
                         seen: BTreeSet::new(),
-                        standing: None,
+                        standing: BTreeMap::new(),
                     });
                     journal(
                         &self.trace,
@@ -194,13 +249,16 @@ impl Workloads {
         let Workloads { rows, trace, .. } = self;
         for r in rows {
             let (name, ifname) = (r.name.clone(), r.announcer.ifname.clone());
+            r.refresh_mac(io, trace, now);
             match r.announcer.announce_due(io, r.mac, now) {
                 Ok(true) => r.recovered(
+                    Cond::Send,
                     trace,
                     format!("cfab: workload {name}: announce on {ifname} succeeded again"),
                 ),
                 Ok(false) => {}
                 Err(e) => r.journal_once(
+                    Cond::Send,
                     trace,
                     format!("cfab: workload {name}: announce on {ifname} failed: {e}"),
                 ),
@@ -238,7 +296,11 @@ impl Workloads {
                 // the same cost ruling 12 accepts for an ENOBUFS.
                 Err(why) => {
                     let name = r.name.clone();
-                    r.journal_once(trace, format!("cfab: workload {name}: {why}; burst skipped"));
+                    r.journal_once(
+                        Cond::Scan,
+                        trace,
+                        format!("cfab: workload {name}: {why}; burst skipped"),
+                    );
                 }
             }
         }
@@ -280,29 +342,20 @@ fn deferred_names(sys: &mut dyn Sys, view: &View) -> BTreeSet<String> {
         .collect()
 }
 
-/// The sub-interface's own MAC, from sysfs. It is the sender MAC of every frame this row
-/// announces, so a row whose MAC cannot be read starts no announcer rather than announce a
-/// wrong one.
-fn read_mac(sys: &dyn Sys, ifname: &str) -> Result<[u8; 6], String> {
-    let path = format!("/sys/class/net/{ifname}/address");
-    sys.read(&path)
-        .ok()
-        .as_deref()
-        .and_then(parse_mac)
-        .ok_or_else(|| format!("cannot read the MAC of {ifname} from {path}"))
+/// The sub-interface's own MAC, through the same seam the frame goes out of (`getifaddrs` in
+/// production). It is the sender MAC of every frame this row announces, so a row whose MAC
+/// cannot be read at all starts no announcer rather than announce a wrong one.
+fn read_mac(io: &mut dyn AnnounceIo, ifname: &str) -> Result<[u8; 6], String> {
+    io.mac(ifname)
+        .map_err(|e| format!("cannot read the MAC of {ifname}: {e}"))
 }
 
-fn parse_mac(text: &str) -> Option<[u8; 6]> {
-    let mut out = [0u8; 6];
-    let mut n = 0;
-    for (i, byte) in text.trim().split(':').enumerate() {
-        if i >= 6 {
-            return None;
-        }
-        out[i] = u8::from_str_radix(byte, 16).ok()?;
-        n = i + 1;
-    }
-    (n == 6).then_some(out)
+/// `00:11:22:33:44:55` — the spelling every other tool prints a MAC in.
+fn hex_mac(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 #[cfg(test)]
@@ -323,11 +376,11 @@ mod tests {
     }
 
     /// pve1-tb carrying the "vms" row: `apply`'s own workload fixture (bridge `primary`, uplink
-    /// eth0 forwarding at ifindex 2, one VM tap `tap100i0` at ifindex 10) plus the two files the
-    /// announcer itself reads — the sub-interface's MAC and the watchdog's deferred-row list.
+    /// eth0 forwarding at ifindex 2, one VM tap `tap100i0` at ifindex 10), plus the watchdog's
+    /// deferred-row list where a test wants one. The MAC comes from the io seam, not from sysfs.
     fn wl(deferred: Option<&str>) -> (MockSys, View<'static>) {
         let (sys, view) = crate::commands::apply::tests::wl_sys_and_view("pve1-tb");
-        let mut sys = sys.file("/sys/class/net/primary.3/address", "00:11:22:33:44:55\n");
+        let mut sys = sys;
         if let Some(names) = deferred {
             sys = sys.file(&deferred_path(&view), names);
         }
@@ -354,6 +407,7 @@ mod tests {
         let w = Workloads::start(
             &mut sys,
             &view,
+            &mut RecordingIo::default(),
             Some(trace.clone()),
             opens,
             Instant::now(),
@@ -373,14 +427,14 @@ mod tests {
         let (mut sys, view) = wl(Some("vms"));
         let trace = rec();
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, t0);
-        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, t0);
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
         assert!(w.rows_for_status().is_empty(), "still deferred");
         assert_eq!(said(&trace).len(), 1, "the deferred line is said once");
 
         sys.files.insert(deferred_path(&view), String::new());
         let t = t0 + Duration::from_secs(6);
-        w.tick(&mut sys, &view, t);
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t);
         let rows = w.rows_for_status();
         assert_eq!(
             (rows[0].name.as_str(), rows[0].ifname.as_str(), rows[0].trigger.as_str()),
@@ -391,7 +445,7 @@ mod tests {
             said(&trace)[1],
             "cfab: workload vms: announcer trigger neigh events"
         );
-        w.tick(&mut sys, &view, t0 + Duration::from_secs(9));
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(9));
         assert_eq!(said(&trace).len(), 2, "started once, said once");
         assert_eq!(w.rows_for_status().len(), 1);
     }
@@ -403,7 +457,7 @@ mod tests {
         let (mut sys, view) = wl(None);
         sys.links.remove("/sys/class/net/primary.3/lower_primary");
         let trace = rec();
-        let w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, Instant::now());
+        let w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, Instant::now());
         assert!(w.rows_for_status().is_empty());
         assert_eq!(
             said(&trace),
@@ -418,15 +472,100 @@ mod tests {
     #[test]
     fn a_mac_that_cannot_be_read_journals_the_reason_and_starts_no_announcer() {
         let (mut sys, view) = wl(None);
-        sys.files.remove("/sys/class/net/primary.3/address");
         let trace = rec();
-        let w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, Instant::now());
+        let mut io = RecordingIo {
+            mac: None,
+            ..Default::default()
+        };
+        let w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut io,
+            Some(trace.clone()),
+            opens,
+            Instant::now(),
+        );
         assert!(w.rows_for_status().is_empty());
         assert_eq!(
             said(&trace),
             vec![
-                "cfab: workload vms: cannot read the MAC of primary.3 from \
-                 /sys/class/net/primary.3/address; announcer not started"
+                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                 link-layer address (no netdev?); announcer not started"
+            ]
+        );
+    }
+
+    /// The MAC a row announces is re-read at every beacon, because a VLAN sub-interface's MAC
+    /// follows its parent bridge and a bridge adopts the lowest MAC among its ports. A change
+    /// is said once, bursts like any other ownership change, and the NEXT frame carries it.
+    #[test]
+    fn a_mac_that_changes_under_us_is_said_once_burst_on_and_announced() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut io = RecordingIo::default();
+        let mut w = Workloads::start(&mut sys, &view, &mut io, Some(trace.clone()), opens, t0);
+        w.fire_due(&mut io, t0);
+        assert_eq!(w.rows_for_status()[0].bursts, 0);
+
+        const NEW: [u8; 6] = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x09];
+        io.mac = Some(NEW);
+        w.fire_due(&mut io, t0 + PERIOD);
+        assert_eq!(
+            io.sent.last().unwrap().1,
+            crate::workload::announce::gratuitous(NEW, "192.168.20.254".parse().unwrap()),
+            "the frame carries the new MAC"
+        );
+        assert_eq!(
+            w.rows_for_status()[0].bursts,
+            1,
+            "a MAC change is an ownership change: burst on it"
+        );
+        assert_eq!(
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("MAC changed"))
+                .collect::<Vec<_>>(),
+            vec![
+                "cfab: workload vms: primary.3 MAC changed 00:11:22:33:44:55 -> 02:cf:ab:00:00:09"
+            ]
+        );
+        // Unchanged from here on: the line is said once per change, not once per beacon.
+        w.fire_due(&mut io, t0 + 2 * PERIOD);
+        assert_eq!(
+            said(&trace).iter().filter(|l| l.contains("MAC changed")).count(),
+            1
+        );
+    }
+
+    /// A MAC read that fails does not silence the beacon: the row keeps announcing with the
+    /// last MAC it had, and says so once (availability first).
+    #[test]
+    fn a_mac_read_failure_keeps_announcing_with_the_last_known_mac() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut io = RecordingIo::default();
+        let mut w = Workloads::start(&mut sys, &view, &mut io, Some(trace.clone()), opens, t0);
+        w.fire_due(&mut io, t0);
+        io.mac = None;
+        w.fire_due(&mut io, t0 + PERIOD);
+        w.fire_due(&mut io, t0 + 2 * PERIOD);
+        assert_eq!(io.sent.len(), 3, "the beacon does not stop");
+        assert!(
+            io.sent
+                .iter()
+                .all(|(_, f)| f[22..28] == crate::workload::announce::mock::MOCK_MAC),
+            "every frame keeps the last known MAC"
+        );
+        assert_eq!(
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("cannot read the MAC"))
+                .collect::<Vec<_>>(),
+            vec![
+                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                 link-layer address (no netdev?); announcing the last known MAC"
             ]
         );
     }
@@ -445,6 +584,7 @@ mod tests {
         let mut w = Workloads::start(
             &mut sys,
             &view,
+            &mut RecordingIo::default(),
             Some(trace.clone()),
             || Err(EPERM.to_string()),
             t0,
@@ -461,9 +601,9 @@ mod tests {
             )]
         );
         assert_eq!(w.rows_for_status()[0].bursts, 0);
-        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
         assert_eq!(w.rows_for_status()[0].bursts, 1, "the VM MAC is new");
-        w.tick(&mut sys, &view, t0 + Duration::from_secs(3) + PERIOD);
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3) + PERIOD);
         assert_eq!(
             w.rows_for_status()[0].bursts,
             1,
@@ -482,8 +622,8 @@ mod tests {
             "02:cf:ab:00:00:01 dev tap100i0 vlan 3 master primary\n",
         );
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
-        w.tick(&mut sys, &view, t0 + Duration::from_secs(3));
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
         assert_eq!(w.rows_for_status()[0].bursts, 0);
         assert!(!sys.ran("bridge fdb show"));
     }
@@ -494,7 +634,7 @@ mod tests {
     fn only_a_learned_mac_on_a_non_uplink_port_starts_a_burst() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
         let add = |ifindex, permanent| {
             NeighSignal::Add(NeighEvent {
                 ifindex,
@@ -516,7 +656,7 @@ mod tests {
     fn an_enobufs_overflow_starts_one_burst() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
         w.on_neigh(&mut sys, &NeighSignal::Overflow, t0);
         assert_eq!(w.rows_for_status()[0].bursts, 1);
     }
@@ -528,7 +668,7 @@ mod tests {
         let (mut sys, view) = wl(None);
         let trace = rec();
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, Some(trace.clone()), opens, t0);
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, t0);
         let mut io = RecordingIo {
             fail: Some("primary.3: cannot send probe: ENODEV".into()),
             ..Default::default()
@@ -571,7 +711,7 @@ mod tests {
     fn the_beacon_puts_the_gratuitous_request_on_the_workload_interface() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, None, opens, t0);
+        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
         let mut io = RecordingIo::default();
         w.fire_due(&mut io, t0);
         assert_eq!(io.sent.len(), 1);
@@ -605,6 +745,7 @@ mod tests {
         let w = Workloads::start(
             &mut sys,
             &view,
+            &mut RecordingIo::default(),
             None,
             || panic!("a member with no workload row must not open a subscription"),
             Instant::now(),

@@ -754,6 +754,7 @@ pub(crate) async fn run_with(
     let mut workloads = workload::Workloads::start(
         sys,
         view,
+        &mut *announce_io,
         trace.clone(),
         move || neigh_watch(neigh_tx),
         Instant::now(),
@@ -972,7 +973,7 @@ pub(crate) async fn run_with(
             // Same arm shape and the same bounded-tick reasoning as the watchdog above: a
             // handful of sysfs reads, or one `bridge fdb show` on the fallback trigger.
             _ = wl_tick.tick(), if workload_active => {
-                workloads.tick(sys, view, Instant::now());
+                workloads.tick(sys, view, &mut *announce_io, Instant::now());
                 workloads.publish(&shared);
             }
             _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
@@ -1881,7 +1882,6 @@ mod tests {
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/eth0/ifindex", "2\n")
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
-            .file("/sys/class/net/primary.3/address", "00:11:22:33:44:55\n")
             .file(
                 "/proc/net/vlan/primary.3",
                 "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
