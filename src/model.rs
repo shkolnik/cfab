@@ -271,6 +271,12 @@ pub fn identity_ifnames(zone_id: u8) -> (String, String) {
     (id, peer)
 }
 
+/// The ingress bond name for a zone id: `cfab-gw<id>`. The one producer, so `derive::gw_rows_of`
+/// and `Fabric::validate`'s collision/length checks cannot drift apart.
+pub fn gw_ifname(zone_id: u8) -> String {
+    format!("cfab-gw{zone_id}")
+}
+
 /// One a zone's `segments` row: zone `zone` on scope `scope`, addressed 10.<id>.<seg>.<node>/24,
 /// tagged `vid`. A segment carries no role and no cost: both are derived (spec §4).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -910,7 +916,7 @@ impl Fabric {
                 .map(|s| s.ifname.clone())
                 .chain(self.zones.iter().filter_map(|z| {
                     let gw = z.gw.as_ref()?;
-                    gw.scope.is_universal().then(|| format!("cfab-gw{}", z.id))
+                    gw.scope.is_universal().then(|| gw_ifname(z.id))
                 }))
                 .collect::<Vec<_>>();
             // An ifname cfab already creates or owns by declaration: a declared wire, a
@@ -926,7 +932,7 @@ impl Fabric {
                     .any(|b| self.domains.iter().any(|d| wl.ifname == format!("{b}-{d}")))
                 || self.zones.iter().any(|z| {
                     let (id, peer) = identity_ifnames(z.id);
-                    wl.ifname == format!("cfab-gw{}", z.id) || wl.ifname == id || wl.ifname == peer
+                    wl.ifname == gw_ifname(z.id) || wl.ifname == id || wl.ifname == peer
                 });
             if collides {
                 return Err(Error::config(format!(
@@ -1068,7 +1074,7 @@ impl Fabric {
             // scope `any` = a migrating ingress leg: a bond over one tagged sub-interface
             // per wire, named like a universal segment's ports, so the derived bond name must
             // leave room for the `-<domain>` suffix.
-            if gw.scope.is_universal() && bond_ifname_too_long(&format!("cfab-gw{}", z.id)) {
+            if gw.scope.is_universal() && bond_ifname_too_long(&gw_ifname(z.id)) {
                 return Err(Error::config(format!(
                     "zone {}: ingress bond cfab-gw{} must be {MAX_BOND_IFNAME} \
                      characters or fewer (ports are named <ifname>-<domain>, IFNAMSIZ 15)",
@@ -1915,6 +1921,12 @@ mod tests {
             e,
             "fabric.toml: workload vms: ifname 'cfab-id249' collides with an interface cfab \
              creates"
+        );
+        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249-peer\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: ifname 'cfab-id249-peer' collides with an interface \
+             cfab creates"
         );
     }
 

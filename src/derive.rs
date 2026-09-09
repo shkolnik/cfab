@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
-use crate::model::{Fabric, Member, MemberKind, SegScope, Workload, Zone};
+use crate::model::{Fabric, Member, MemberKind, SegScope, Workload, Zone, gw_ifname};
 
 /// A a zone's `segments` row resolved for one member: domain → that member's wire. A member with no
 /// wire on a row's domain simply has no such row (heterogeneity is generated, not branched).
@@ -499,7 +499,7 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
         .iter()
         .filter_map(|z| {
             let gw = z.gw.as_ref()?;
-            let ifname = format!("cfab-gw{}", z.id);
+            let ifname = gw_ifname(z.id);
             let (home, ports) = match &gw.scope {
                 // One domain: the leg is that wire's sub-interface, as it has always been.
                 SegScope::Domain(d) => (member.wire_on(d)?.name.clone(), Vec::new()),

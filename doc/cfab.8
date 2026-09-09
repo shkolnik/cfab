@@ -657,7 +657,10 @@ an
 naming an unknown zone; an
 .B ifname
 colliding with a declared wire, a declared segment, or a cfab\-generated
-bond/identity interface; a workload row no member carries; a member
+bond/identity interface; two
+.B [[workload]]
+rows sharing a name; a workload name that is also a zone name (workload and
+zone names share one vocabulary); a workload row no member carries; a member
 declaring the same workload row twice; a member workload naming an unknown
 row; and a leaf carrying one (a leaf never transits); with rows declared it
 also prints the fabric aggregate (the smallest set of prefixes covering
