@@ -199,8 +199,10 @@ pub fn generate(view: &View) -> Result<String> {
     // able to reach the control DSCP/queue by tagging its own traffic, clamp or no clamp.
     // Omitted entirely when there is no workload row, so a fabric without one renders
     // byte-identical to today.
+    // `forward`, not `fwd`: `fwd` is the nft verdict keyword (`fwd to <dev>`) and nft 1.1.3
+    // refuses it as a chain name, quoted or not (pve1-tb 2026-09-09; string tests never saw it).
     if !view.workload_rows().is_empty() {
-        out.push_str("  chain fwd {\n");
+        out.push_str("  chain forward {\n");
         out.push_str("    type filter hook forward priority mangle; policy accept;\n");
         for row in view.workload_rows() {
             for zname in &row.wl.allow {
@@ -249,7 +251,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Spec §5 item 7: a `chain fwd` at the forward hook overwrites DSCP toward each allowed
+    /// Spec §5 item 7: a `chain forward` at the forward hook overwrites DSCP toward each allowed
     /// zone for a workload's traffic, so a DSCP-trusting switch queues VM egress the same way
     /// it queues that zone's own bulk. `oifname { … }` is the same `zone_ifs(zone)` spelling
     /// the `out` chain's guards use, on the shipped example's storage zone (segments +
@@ -259,7 +261,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let t = generate(&v).unwrap();
-        let fwd = t.split("chain fwd {").nth(1).expect("fwd chain");
+        let fwd = t.split("chain forward {").nth(1).expect("fwd chain");
         assert!(
             fwd.starts_with("\n    type filter hook forward priority mangle; policy accept;\n"),
             "{fwd}"
@@ -273,8 +275,29 @@ mod tests {
         );
     }
 
+    /// nft parses chain names as identifiers, so a name that is also an nft keyword fails to
+    /// load with a syntax error no string comparison can see. The rack caught `fwd`; this
+    /// pins the verdict and statement keywords a mangle table is most likely to reach for.
     #[test]
-    fn without_workloads_the_table_has_no_fwd_chain() {
+    fn no_emitted_chain_is_named_by_an_nft_keyword() {
+        const NFT_KEYWORDS: &[&str] = &[
+            "fwd", "dup", "jump", "goto", "return", "accept", "drop", "reject", "continue", "queue",
+            "notrack", "log", "limit", "counter", "meta", "ct", "set", "map", "flowtable", "type",
+            "hook", "priority", "policy", "table", "chain", "rule", "add", "delete", "flush",
+        ];
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        for line in t.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("chain ") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(!NFT_KEYWORDS.contains(&name), "chain named by an nft keyword: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_workloads_the_table_has_no_forward_chain() {
         let f = fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert!(!generate(&v).unwrap().contains("chain fwd"));
@@ -319,7 +342,7 @@ mod tests {
         let f = wl_fabric_with_an_unreachable_allowed_zone();
         let v = View::new(&f, "pve1").unwrap();
         let t = generate(&v).unwrap();
-        assert!(t.contains("chain fwd"), "the table still renders: {t}");
+        assert!(t.contains("chain forward"), "the table still renders: {t}");
         assert!(!t.contains("otherz"), "{t}");
         assert!(
             t.contains(

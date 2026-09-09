@@ -70,7 +70,7 @@ table inet cfab {
     oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } udp dport 3784 return comment "guard-mgmt-bfd"
     oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } ip dscp set cs2 comment "dscp-mgmt-bulk"
   }
-  chain fwd {
+  chain forward {
     type filter hook forward priority mangle; policy accept;
     iifname "primary.3" oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-vms-storage"
   }
