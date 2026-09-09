@@ -67,17 +67,10 @@
 
 - name: Install and configure cfab
   block:
-    # Unpinned = the newest the repository serves (`state: present` would leave an older installed
-    # cfab in place: R13 2026-09-07 kept pve1 on 0.4.1 after 0.4.2 was published). Pinned = exactly
-    # that version. Either way apt will not replace a package with the SAME version string, e.g.
-    # a locally built 0.1.0-1: bump the version (or `dpkg -i`) to move a host onto another build.
-    - name: cfab package
-      ansible.builtin.apt:
-        name: "cfab{{ ('=' + cfab_version) if cfab_version | length > 0 else '' }}"
-        state: "{{ 'present' if cfab_version | length > 0 else 'latest' }}"
-        update_cache: true
-        cache_valid_time: 0
-
+    # The declaration goes down FIRST: a package whose `cfab check` refuses it (a retired key,
+    # e.g. `driver_features` — 2026-09-09) is more useful to diagnose against the declaration
+    # already on disk than against one that is not there yet. No upgrade semantics needed here
+    # (James: no existing installs), but there is no reason to prefer the other order either.
     - name: /etc/cfab
       ansible.builtin.file:
         path: /etc/cfab
@@ -90,6 +83,17 @@
         dest: /etc/cfab/fabric.toml
         mode: "0644"
       register: cfab_conf
+
+    # Unpinned = the newest the repository serves (`state: present` would leave an older installed
+    # cfab in place: R13 2026-09-07 kept pve1 on 0.4.1 after 0.4.2 was published). Pinned = exactly
+    # that version. Either way apt will not replace a package with the SAME version string, e.g.
+    # a locally built 0.1.0-1: bump the version (or `dpkg -i`) to move a host onto another build.
+    - name: cfab package
+      ansible.builtin.apt:
+        name: "cfab{{ ('=' + cfab_version) if cfab_version | length > 0 else '' }}"
+        state: "{{ 'present' if cfab_version | length > 0 else 'latest' }}"
+        update_cache: true
+        cache_valid_time: 0
 
     - name: cfab-revert (what the timed revert and --tags rollback run)
       ansible.builtin.template:

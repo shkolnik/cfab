@@ -89,6 +89,9 @@
 # gw, a stale declaration. `mark: <backend>`, `prefs …` and `components: …` are printed on every
 # status, so only the healthy spelling of each is structural; `mark: iptables-legacy` and a
 # components line carrying a restart, an exit or a refused apply are local problems like any other.
+# `ethtool not installed: …` (2026-09-09, ethtool moved to a read-only Recommends) is excluded
+# too, but for the opposite reason: it is accepted degraded diagnostics, not a fabric problem —
+# cfab still applies, it just cannot cross-check a driver or a link speed.
 - name: Sort the reason lines into peer-absence and local problems
   set_fact:
     cfab_peer_field: "{{ cfab_status_lines | first | default('') | regex_search('[0-9]+/[0-9]+') | default('-1/-1', true) }}"
@@ -98,7 +101,7 @@
     cfab_local_reasons: >-
       {{ (cfab_status_lines[1:] | reject('match', '^down [^:]+:[^:]+:\.[0-9]+$')
           | reject('match', '^prefs ') | reject('match', '^components: ')
-          | reject('match', '^mark: nft$') | list)
+          | reject('match', '^mark: nft$') | reject('match', '^ethtool not installed') | list)
          + (cfab_status_lines[1:] | select('match', '^components: ')
             | select('search', 'restarting|last exit|last apply:|no supervisor answering') | list) }}
 
