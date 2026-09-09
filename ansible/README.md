@@ -13,7 +13,7 @@ particular site: the declaration (`fabric.toml`) is the operator's and comes in 
 collections:
   - name: https://github.com/shkolnik/cfab.git#/ansible/
     type: git
-    version: v0.5.0
+    version: v0.5.1
 ```
 
 ```
@@ -51,7 +51,7 @@ is written into the unit's environment). Requires ansible-core >= 2.15 on the co
 |---|---|---|
 | `cfab_declaration` | **required** | path on the control node of this host's `fabric.toml` |
 | `cfab_nics` | the `nic = "…"` names in the declaration | wires the probe inspects |
-| `cfab_version` | `""` = newest in the repository | pin, e.g. `0.5.0-1`; equal version = apt no-op |
+| `cfab_version` | `""` = newest in the repository | pin, e.g. `0.5.1-1`; equal version = apt no-op |
 | `cfab_apt_uri` / `cfab_apt_suite` / `cfab_apt_component` | `https://pkg.jshkol.com` `stable` `main` | where the package comes from |
 | `cfab_conf_path` | `/etc/cfab/fabric.toml` | where the declaration lands |
 | `cfab_host` | `inventory_hostname` | the `[[member]]` row this host runs as |
