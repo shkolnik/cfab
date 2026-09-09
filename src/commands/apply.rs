@@ -351,10 +351,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 // nonzero exit, e.g. "Operation not supported") — named per wire rather than
                 // silently skipped, so the watchdog's later "different driver" report isn't the
                 // first anyone hears of it.
-                None => warnings.push(format!(
-                    "WARNING: ethtool -i {}: driver unrecorded",
-                    w.name
-                )),
+                None => warnings.push(format!("WARNING: ethtool -i {}: driver unrecorded", w.name)),
             }
         }
     }
