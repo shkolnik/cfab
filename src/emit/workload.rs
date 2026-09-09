@@ -201,11 +201,11 @@ pub fn bridge_table(guards: &[(std::net::Ipv4Addr, Uplink)]) -> String {
     for (gw, up) in guards {
         for port in &up.ports {
             out.push_str(&format!(
-                "        iifname \"{port}\" vlan id {} vlan type arp arp daddr ip {gw} counter drop comment \"gw-request-from-uplink\"\n",
+                "        iifname \"{port}\" vlan id {} vlan type arp arp saddr ip {gw} counter drop comment \"gw-claim-from-uplink\"\n",
                 up.vid
             ));
             out.push_str(&format!(
-                "        iifname \"{port}\" vlan id {} vlan type arp arp saddr ip {gw} counter drop comment \"gw-claim-from-uplink\"\n",
+                "        iifname \"{port}\" vlan id {} vlan type arp arp daddr ip {gw} counter drop comment \"gw-request-from-uplink\"\n",
                 up.vid
             ));
         }
@@ -234,8 +234,8 @@ delete table bridge cfab
 table bridge cfab {
     chain pre {
         type filter hook prerouting priority filter; policy accept;
-        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment \"gw-request-from-uplink\"
         iifname \"eth0\" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter drop comment \"gw-claim-from-uplink\"
+        iifname \"eth0\" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment \"gw-request-from-uplink\"
     }
 }
 "

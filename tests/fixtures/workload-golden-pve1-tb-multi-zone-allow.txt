@@ -570,8 +570,8 @@ delete table bridge cfab
 table bridge cfab {
     chain pre {
         type filter hook prerouting priority filter; policy accept;
-        iifname "eth0" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment "gw-request-from-uplink"
         iifname "eth0" vlan id 3 vlan type arp arp saddr ip 192.168.20.254 counter drop comment "gw-claim-from-uplink"
+        iifname "eth0" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment "gw-request-from-uplink"
     }
 }
 
