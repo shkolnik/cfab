@@ -61,12 +61,16 @@ in that table: the engine sets DSCP CS6 and skb-priority `[marking] pcp_ctrl` on
 sockets, and the segment sub-interface's egress-qos-map carries that priority onto the wire.
 The table's `return` guards keep the bulk clamp off those packets.) A **host** additionally needs `tc`
 for its shaping trees; a **leaf** shapes nothing, its wires' qdiscs being its own OS's business.
-Every kind needs `ethtool`: link speed is cross-checked with it, and a wire may declare
-`driver_features` — a string of `<feature> on|off` pairs handed to `ethtool -K <nic>` as written
-(the case that motivates it: USB adapters that lock up under load with scatter-gather on).
-cfab names no adapter and no driver; it validates the string at `check`, records the value each
-named feature had, and `down` puts those values back. Anything missing is refused by name before
-`up` applies a thing. The Debian package's `Depends` covers all of it.
+Every kind uses `ethtool` if it is installed: `up` records each present wire's driver (so the
+forwarding watchdog can tell a re-enumerated wire from a swapped adapter) and `status`
+cross-checks link speed with it. cfab never sets a NIC feature — an adapter that needs an
+offload turned off (the case that motivates this: USB adapters that lock up under load with
+scatter-gather on) gets a udev rule on the host, fired on the netdev-add event; cfab only
+reports the driver and the speed it finds. `ethtool` is a Debian `Recommends`, not a `Depends`:
+it is a read-only diagnostic, and its absence degrades gracefully — `up` still applies, the
+driver record is empty, and `status` says `driver ?` and names the gap once, rather than
+refusing anything. The retired `driver_features` and `usb` wire keys are refused at load,
+naming this.
 
 ## Running it as a service
 
