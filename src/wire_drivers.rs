@@ -8,15 +8,19 @@
 //! wire that comes back under a different driver instead of silently trusting it.
 //!
 //! Every read in this module degrades instead of failing: `ethtool` is a read-only diagnostic
-//! dependency (`Recommends`, not `Depends`), and its absence — or a single device erroring — is
-//! not a reason to fail a bringup, a teardown, or a status gather.
+//! dependency (`Recommends`, not `Depends`). Neither its absence nor a single device erroring is
+//! a reason to fail a bringup, a teardown, or a status gather — but the two are not the same
+//! fact: ethtool being unable to run at all is worth telling the operator once (`status` does,
+//! via a standing line), while one device refusing the read (e.g. "Operation not supported") is
+//! that device's own business and stays silent.
+use crate::sys::{Sys, run_optional};
 
-use crate::sys::Sys;
-
-/// The driver `ethtool -i <dev>` reports, or `None` when it cannot be read: ethtool is not
-/// installed, or this device errored. cfab does not fail a caller over a read it cannot make.
+/// The driver `ethtool -i <dev>` reports, or `None` when it cannot be read — ethtool could not
+/// run at all, or this device refused the read. Both degrade the same way here: cfab does not
+/// fail a caller over a read it cannot make, and this module has no standing line to carry the
+/// distinction (unlike `status::link_speeds`, which does).
 pub fn driver_of(sys: &mut dyn Sys, dev: &str) -> Option<String> {
-    let out = sys.run(&["ethtool", "-i", dev]).ok()?;
+    let out = run_optional(sys, &["ethtool", "-i", dev])?;
     if !out.ok() {
         return None;
     }
