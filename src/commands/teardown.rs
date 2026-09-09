@@ -155,9 +155,13 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     // is left exactly as `up` set it (ruling 11) — `down` never touches it. The interface itself
     // is never a delete candidate: cfab did not create it and never runs `ip link del` on it.
     if !view.workload_rows().is_empty() {
-        let bridge_present = sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
-        if bridge_present {
-            run_ok(sys, &["nft", "delete", "table", "bridge", "cfab"])?;
+        // M2 (whole-branch review): `have_tool`-guarded like the mark removal above — a missing
+        // nft must never abort `down` before the gw address and rule removal below it run.
+        if have_tool(sys, "nft")? {
+            let bridge_present = sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+            if bridge_present {
+                run_ok(sys, &["nft", "delete", "table", "bridge", "cfab"])?;
+            }
         }
         for row in view.workload_rows() {
             let ifname = &row.wl.ifname;
@@ -431,7 +435,7 @@ mod tests {
 
     #[test]
     fn down_removes_the_bridge_table_the_gw_address_and_the_sibling_rules_but_never_the_interface()
-     {
+    {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys();
@@ -440,13 +444,15 @@ mod tests {
         assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
             Some(&"0")
         );
         assert!(!sys.ran("ip link del primary.3"));
         assert!(!sys.ran("ip link set primary.3 down"));
         assert!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore").is_empty(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty(),
             "down leaves arp_ignore (ruling 11)"
         );
     }
@@ -487,6 +493,27 @@ mod tests {
         );
         run(&mut sys, &view).unwrap();
         assert!(!sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+    }
+
+    // M2 (whole-branch review): the bridge-guard presence read used a bare `?`, unlike the
+    // `have_tool`-guarded mark removal right above it — with nft removed, `RealSys::run` maps
+    // the exec failure to `Err`, and `down` aborted BEFORE the gw address and rule removal below
+    // it ever ran, leaving a half-torn-down host. `have_tool`-guard it the same way.
+    #[test]
+    fn down_continues_past_a_missing_nft_and_still_removes_the_gw_address_and_rules() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys().on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "");
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("nft list table bridge cfab"));
+        assert!(!sys.ran("nft delete table bridge cfab"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
+            Some(&"0")
+        );
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
@@ -938,10 +965,12 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
 
-        let mut present = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no").on_stdout(
-            &["ip", "rule", "show", "pref", "2000"],
-            "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
-        );
+        let mut present = MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "no")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            );
         run(&mut present, &view).unwrap();
         assert!(
             present.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),

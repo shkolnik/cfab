@@ -141,7 +141,10 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
         // `allow` names (spec §5.1 item 3): holo advertises every address on a passive
         // interface as a stub link (R6), so the workload's /24 secondary reaches that zone's
         // OSPF without the workload ever forming an adjacency.
-        for r in workload_rows.iter().filter(|r| r.wl.allow.contains(&z.name)) {
+        for r in workload_rows
+            .iter()
+            .filter(|r| r.wl.allow.contains(&z.name))
+        {
             ospf_ifs.push(json!({ "name": r.wl.ifname, "passive": true }));
         }
         protocols.push(json!({
@@ -588,9 +591,14 @@ mod tests {
         assert!(if_names(&cfg).contains(&"primary.3".to_string()));
         // A member that carries no row (the leaf pve3-tb) emits nothing for the ifname.
         let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
-        assert!(!if_names(&leaf).contains(&"primary.3".to_string()), "{leaf}");
         assert!(
-            !ospf_ifs(instance(&leaf, "storage")).iter().any(|i| i["name"] == "primary.3"),
+            !if_names(&leaf).contains(&"primary.3".to_string()),
+            "{leaf}"
+        );
+        assert!(
+            !ospf_ifs(instance(&leaf, "storage"))
+                .iter()
+                .any(|i| i["name"] == "primary.3"),
             "primary.3 passive on a non-carrier"
         );
     }

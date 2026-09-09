@@ -647,10 +647,21 @@ refuses a
 .B router
 or member address outside
 .BR prefix ;
-any of them on the prefix's network or broadcast address; a member address
+any of them on the prefix's network or broadcast address; a
+.B gw
+or
+.B router
+that is not a bare IPv4 address (no mask \(em
+.BR prefix 's
+mask is applied to both); a member address
 without the prefix's mask or equal to
-.BR gw ;
-an empty
+.B gw
+or
+.BR router ;
+.B gw
+equal to
+.BR router ;
+two members declaring the same address on one workload row; an empty
 .BR allow ;
 an
 .B allow
@@ -659,13 +670,26 @@ naming an unknown zone; an
 colliding with a declared wire, a declared segment, or a cfab\-generated
 bond/identity interface; two
 .B [[workload]]
-rows sharing a name; a workload name that is also a zone name (workload and
-zone names share one vocabulary); a workload row no member carries; a member
-declaring the same workload row twice; a member workload naming an unknown
-row; and a leaf carrying one (a leaf never transits); with rows declared it
-also prints the fabric aggregate (the smallest set of prefixes covering
-every declared zone block) and the DHCP option 121 snippet. Names share the
-zone vocabulary, so
+rows sharing a name or an
+.BR ifname ;
+a workload name that is also a zone name (workload and zone names share one
+vocabulary); a workload
+.B prefix
+overlapping a zone's own
+.B 10.<id>.0.0/16
+block; a workload row no member carries; a member declaring the same
+workload row twice; a member workload naming an unknown row;
+.B "span = \(dqhost\(dq"
+(phase 2, not built yet \(em omit
+.B span
+or write
+.BR \(dqswitch\(dq );
+an unrecognized
+.B span
+value; and a leaf
+carrying one (a leaf never transits); with rows declared it also prints the
+fabric aggregate (the smallest set of prefixes covering every declared zone
+block) and the DHCP option 121 snippet. Names share the zone vocabulary, so
 .B vms>storage
 reads like
 .BR storage>storage .
@@ -676,6 +700,19 @@ cannot declare a
 row at all: reaching a zone requires forwarding, so no
 .B allow
 value is ever valid once it is off.
+.PP
+.B cfab up
+refuses if
+.I ifname
+does not exist, lacks the member's declared address, or is administratively
+down (or in an unparsable state) \(em a stanza problem needing a fix and a
+re\-apply. A lower\-layer carrier fault
+.RB ( LOWERLAYERDOWN )
+is not a declaration fault, and neither is an uplink that cannot yet be
+identified or is not yet STP\-forwarding: each defers that one row to the
+watchdog (a warning names the reason, no gw address goes live) and applies
+everything else, and the watchdog installs the row once the condition
+clears.
 .PP
 The VLAN interface itself is baseline\-owned (Proxmox, systemd\-networkd,
 whatever already brought it up); cfab only points at it, and never creates or
@@ -716,7 +753,14 @@ option: a client that receives option 121 ignores option 3, so a 121 lease
 with no default route inside it leaves the VM with none at all. A VM without
 option 121 still reaches fabric identities via the declared
 .BR router ,
-degraded, not broken.
+degraded, not broken. The aggregate is fabric\-wide: it covers every declared
+zone block regardless of this row's own
+.BR allow ,
+so a zone the row does not reach still routes through
+.B gw
+rather than falling to the default route \(em traffic this workload is not
+allowed into is dropped at the host, not carried off toward
+.BR router .
 .SH SEE ALSO
 .BR ip (8),
 .BR nft (8),

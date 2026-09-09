@@ -716,13 +716,29 @@ mod tests {
     #[test]
     fn the_mock_records_every_write_in_order_with_its_content() {
         let mut sys = MockSys::default();
-        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1").unwrap();
-        sys.write("/proc/sys/net/ipv4/conf/eth0/forwarding", "0").unwrap();
-        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "0").unwrap();
-        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"), vec!["1", "0"]);
-        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/forwarding"), vec!["0"]);
-        assert!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/rp_filter").is_empty());
-        assert_eq!(sys.writes_to("/proc/sys/net/ipv4/conf/all/arp_ignore"), Some("0"), "writes_to keeps its last-value meaning");
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1")
+            .unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/eth0/forwarding", "0")
+            .unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "0")
+            .unwrap();
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1", "0"]
+        );
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/eth0/forwarding"),
+            vec!["0"]
+        );
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/eth0/rp_filter")
+                .is_empty()
+        );
+        assert_eq!(
+            sys.writes_to("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            Some("0"),
+            "writes_to keeps its last-value meaning"
+        );
     }
 
     #[test]

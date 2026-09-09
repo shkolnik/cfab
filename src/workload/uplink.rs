@@ -104,9 +104,8 @@ pub fn identify(sys: &dyn Sys, ifname: &str) -> Result<Uplink, String> {
     let vlan_text = sys.read(&vlan_proc).map_err(|_| {
         format!("workload interface {ifname} is not an 802.1Q sub-interface (no {vlan_proc})")
     })?;
-    let vid = parse_vid(&vlan_text).ok_or_else(|| {
-        format!("workload interface {ifname}: {vlan_proc} has no VID field")
-    })?;
+    let vid = parse_vid(&vlan_text)
+        .ok_or_else(|| format!("workload interface {ifname}: {vlan_proc} has no VID field"))?;
 
     Ok(Uplink {
         bridge,
@@ -215,7 +214,10 @@ mod tests {
             vid: 3,
             ports: vec!["eth0".into()],
         };
-        assert_eq!(non_uplink_ifindexes(&sys, &up).unwrap(), BTreeSet::from([10]));
+        assert_eq!(
+            non_uplink_ifindexes(&sys, &up).unwrap(),
+            BTreeSet::from([10])
+        );
     }
 
     #[test]

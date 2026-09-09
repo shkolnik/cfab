@@ -344,6 +344,14 @@ impl Ipv4Prefix {
         (u32::from(a) & Self::mask(self.len)) == u32::from(self.net)
     }
 
+    /// Does any address exist in both prefixes? Compared under the SHORTER (less specific) of
+    /// the two masks, so a `/16` and a `/24` inside it overlap even though neither `contains`
+    /// the other's network address.
+    pub fn overlaps(&self, other: &Ipv4Prefix) -> bool {
+        let len = self.len.min(other.len);
+        (u32::from(self.net) & Self::mask(len)) == (u32::from(other.net) & Self::mask(len))
+    }
+
     /// The network address plus one — the lowest usable host in the prefix.
     pub fn first_host(&self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.net).saturating_add(1))
@@ -899,6 +907,7 @@ impl Fabric {
         }
         // ---- workloads ----
         let mut seen = BTreeSet::new();
+        let mut seen_ifnames: BTreeMap<String, String> = BTreeMap::new();
         for wl in &self.workloads {
             if self.zone(&wl.name).is_ok() {
                 return Err(Error::config(format!(
@@ -911,6 +920,15 @@ impl Fabric {
                 return Err(Error::config(format!(
                     "workload {}: declared twice",
                     wl.name
+                )));
+            }
+            // I2 (whole-branch review): two rows sharing an ifname is a plausible "two subnets
+            // on one VLAN" declaration nothing else refuses — `emit::engine` would push two
+            // OSPF passive entries for the same interface into one instance.
+            if let Some(other) = seen_ifnames.insert(wl.ifname.clone(), wl.name.clone()) {
+                return Err(Error::config(format!(
+                    "workload {}: ifname '{}' is also used by workload {other}",
+                    wl.name, wl.ifname
                 )));
             }
             // Every bond ifname that fans out into per-domain ports (a universal/fallback
@@ -969,6 +987,27 @@ impl Fabric {
                     "workload {}: router {} is the network or broadcast address of {}",
                     wl.name, wl.router, wl.prefix
                 )));
+            }
+            // I2: `router` is the natural first read of "the gateway" — accepting gw == router
+            // would have cfab hijack the VLAN's real router for every device on the segment.
+            if wl.gw == wl.router {
+                return Err(Error::config(format!(
+                    "workload {}: gw {} equals router {}; the anycast gateway and the VLAN's \
+                     existing default router must differ",
+                    wl.name, wl.gw, wl.router
+                )));
+            }
+            // I2: a workload prefix overlapping a zone's own `10.<id>.0.0/16` block would make
+            // the sibling return-path rule and the option-121 aggregate self-contradictory.
+            for z in &self.zones {
+                let block = Ipv4Prefix::parse(&format!("{}.0.0/16", z.block()))
+                    .expect("a zone block is always a valid /16");
+                if wl.prefix.overlaps(&block) {
+                    return Err(Error::config(format!(
+                        "workload {}: prefix {} overlaps zone {} block {}",
+                        wl.name, wl.prefix, z.name, block
+                    )));
+                }
             }
             if wl.allow.is_empty() {
                 return Err(Error::config(format!(
@@ -1063,6 +1102,17 @@ impl Fabric {
                         wl.gw
                     )));
                 }
+                // I2: as wrong as address == gw (checked above) — cfab would put a VM address
+                // on the VLAN's own router.
+                if mw.address == wl.router {
+                    return Err(Error::config(format!(
+                        "member {}: workload {}: address {} is the router {}",
+                        m.name,
+                        wl.name,
+                        mw.address_cidr(),
+                        wl.router
+                    )));
+                }
                 if mw.address == wl.prefix.net || mw.address == wl.prefix.broadcast() {
                     return Err(Error::config(format!(
                         "member {}: workload {}: address {} is the network or broadcast \
@@ -1071,6 +1121,24 @@ impl Fabric {
                         wl.name,
                         mw.address_cidr(),
                         wl.prefix
+                    )));
+                }
+            }
+        }
+        // I2: two members declaring the same address on one workload row is a duplicate IP on
+        // the VM VLAN (ARP flapping between two hosts) — every other cfab address is derived
+        // from the node id, these are the only hand-written ones, and nothing else cross-checks
+        // them.
+        for wl in &self.workloads {
+            let mut seen_addrs: BTreeMap<Ipv4Addr, &str> = BTreeMap::new();
+            for m in &self.members {
+                let Some(mw) = m.workloads.iter().find(|w| w.name == wl.name) else {
+                    continue;
+                };
+                if let Some(prev) = seen_addrs.insert(mw.address, m.name.as_str()) {
+                    return Err(Error::config(format!(
+                        "workload {}: address {} is declared by both member {} and member {}",
+                        wl.name, mw.address, prev, m.name
                     )));
                 }
             }
@@ -1894,6 +1962,87 @@ mod tests {
             e,
             "fabric.toml: workload vms: router 192.168.20.255 is the network or broadcast \
              address of 192.168.20.0/24"
+        );
+    }
+
+    // I2 (whole-branch review): `gw == router` is the one the reviewer would fix before tagging
+    // — `router` is the natural first read of "the gateway", and cfab would then hijack the
+    // VLAN's real router for every device on the segment, not just VMs.
+    #[test]
+    fn check_refuses_gw_equal_to_router() {
+        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.20.1\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: gw 192.168.20.1 equals router 192.168.20.1; the anycast \
+             gateway and the VLAN's existing default router must differ"
+        );
+    }
+
+    // I2: a member address equal to the declared router is as wrong as one equal to gw (already
+    // refused above) — cfab would put a VM address on the router's own IP.
+    #[test]
+    fn check_refuses_a_member_address_equal_to_the_router() {
+        let e = wl_err(|t| t.replace("192.168.20.2/24", "192.168.20.1/24"));
+        assert_eq!(
+            e,
+            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.1/24 is the router \
+             192.168.20.1"
+        );
+    }
+
+    // I2: two members declaring the same address on one workload row is a duplicate IP on the
+    // VM VLAN — ARP flapping between two hosts. Every other cfab address is derived from the
+    // node id; these are the only hand-written ones.
+    #[test]
+    fn check_refuses_two_members_sharing_a_workload_address() {
+        let e = wl_err(|t| t.replace("192.168.20.3/24", "192.168.20.2/24"));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: address 192.168.20.2 is declared by both member \
+             pve1-tb and member pve2-tb"
+        );
+    }
+
+    // I2: two `[[workload]]` rows sharing an `ifname` is a plausible "two subnets on one VLAN"
+    // declaration that nothing refused — `emit::engine` would push two OSPF passive entries for
+    // the same interface into one instance, which most likely fails at engine start rather than
+    // at `check` (fail-loud, but too late).
+    #[test]
+    fn check_refuses_two_workload_rows_sharing_an_ifname() {
+        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
+        let base = base.replace(
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
+             { name = \"vms2\", address = \"192.168.30.2/24\" }]",
+        );
+        let second_block = "\n[[workload]]\nname = \"vms2\"\nifname = \"primary.3\"\n\
+             prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\n\
+             allow = [\"storage\"]\n";
+        let text = format!("{base}{second_block}");
+        let e = Fabric::from_decl(&Declaration::parse(&text).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms2: ifname 'primary.3' is also used by workload vms"
+        );
+    }
+
+    // I2: a workload `prefix` overlapping a zone block would make the sibling return-path rule
+    // and the option-121 aggregate self-contradictory (spec's own `10.<id>.0.0/16` reservation).
+    #[test]
+    fn check_refuses_a_workload_prefix_overlapping_a_zone_block() {
+        let e = wl_err(|t| {
+            t.replace("prefix = \"192.168.20.0/24\"", "prefix = \"10.99.20.0/24\"")
+                .replace("gw = \"192.168.20.254\"", "gw = \"10.99.20.254\"")
+                .replace("router = \"192.168.20.1\"", "router = \"10.99.20.1\"")
+                .replace("192.168.20.2/24", "10.99.20.2/24")
+                .replace("192.168.20.3/24", "10.99.20.3/24")
+        });
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: prefix 10.99.20.0/24 overlaps zone storage block \
+             10.99.0.0/16"
         );
     }
 

@@ -83,13 +83,16 @@ mod workload_lifecycle {
             .position(|c| c.contains("nft delete table bridge cfab"))
             .unwrap();
         assert!(
-            !calls[down_at..].iter().any(|c| c.contains("workload-bridge.nft")
-                || c.contains("rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24")),
+            !calls[down_at..]
+                .iter()
+                .any(|c| c.contains("workload-bridge.nft")
+                    || c.contains("rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24")),
             "nothing re-adds after down: {:#?}",
             &calls[down_at..]
         );
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
             Some(&"0"),
             "down leaves forwarding off"
         );

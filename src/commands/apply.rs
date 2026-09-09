@@ -407,15 +407,29 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             )));
         }
         let state = out.stdout.split_whitespace().nth(1).unwrap_or("");
+        if state == "LOWERLAYERDOWN" {
+            // James's ruling 2026-09-09 ("bias towards availability", C1 whole-branch review):
+            // a lower-layer carrier fault is not an admin-down or a missing stanza — it is the
+            // same class as an uplink that cannot yet be identified or is not yet forwarding,
+            // and joins the deferral path instead of refusing every other row's apply. A site
+            // power cut brings the switch up tens of seconds after the hosts; without this, the
+            // whole member would exit fatal for a condition that clears itself.
+            warnings.push(format!(
+                "workload {name}: interface {ifname} is LOWERLAYERDOWN (fix the carrier of its \
+                 lower device); row deferred to the watchdog"
+            ));
+            deferred_names.push(name.clone());
+            continue;
+        }
         if state != "UP" {
-            let remedy = if state == "LOWERLAYERDOWN" {
-                "fix the carrier of its lower device".to_string()
-            } else {
-                format!("ip link set {ifname} up, or fix its stanza")
-            };
+            let remedy = format!("ip link set {ifname} up, or fix its stanza");
             // A blank field (unparsable `ip -br link show` output) must never surface as an
             // empty word between "is" and the parenthesized remedy.
-            let label = if state.is_empty() { "unknown state" } else { state };
+            let label = if state.is_empty() {
+                "unknown state"
+            } else {
+                state
+            };
             return Err(Error::fatal(format!(
                 "workload {name}: interface {ifname} is {label} ({remedy})"
             )));
@@ -611,7 +625,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         )?;
     }
     for plan in &ready {
-        run_ok(sys, &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.ifname])?;
+        run_ok(
+            sys,
+            &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.ifname],
+        )?;
     }
     // Matches the watchdog's own restore condition (`restore_workloads`): arp_ignore is
     // member-wide, not per-row, and is set whenever ANY workload row is declared at all — ready
@@ -1455,7 +1472,7 @@ pub(crate) mod tests {
 
     #[test]
     fn up_with_a_workload_adds_gw_forwarding_arp_ignore_and_the_bridge_guard_before_the_mark_table()
-     {
+    {
         let (mut sys, view) = wl_sys_and_view("pve1-tb");
         run(&mut sys, &view, &opts()).unwrap();
         assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
@@ -1464,7 +1481,8 @@ pub(crate) mod tests {
             vec!["1"]
         );
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+                .last(),
             Some(&"1")
         );
         assert!(sys.ran("nft -f /run/cfab/workload-bridge.nft"));
@@ -1516,7 +1534,10 @@ pub(crate) mod tests {
         // pass 3 (the gw address + arp_ignore writes) ever starts.
         assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
-        assert!(sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore").is_empty());
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty()
+        );
         assert!(
             sys.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir))
                 .is_empty()
@@ -1569,23 +1590,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn up_names_a_lower_layer_carrier_fault_with_its_own_remedy() {
+    fn up_defers_a_lower_layer_carrier_fault_instead_of_refusing_the_whole_apply() {
+        // James's ruling 2026-09-09 ("bias towards availability"): LOWERLAYERDOWN is not an
+        // admin-down or a missing stanza — it is the same class as an uplink that is not yet
+        // identified or not yet forwarding, and joins the deferral path (C1, whole-branch
+        // review). A site power cut brings the switch up ~40 s after the hosts; without this,
+        // every member with a workload row would exit 3 and stay down for a condition that
+        // clears itself.
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut lowerdown = sys.on_stdout(
             &["ip", "-br", "link", "show", "dev", "primary.3"],
             "primary.3@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
         );
-        assert_eq!(
-            run(&mut lowerdown, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of its lower device)"
+        let warnings = run(&mut lowerdown, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of \
+                    its lower device); row deferred to the watchdog"),
+            "{warnings:#?}"
         );
+        assert!(!lowerdown.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert_eq!(
+            lowerdown.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // Everything else still applies: the policy loaded, forwarding still went on.
+        assert!(lowerdown.ran("nft -f /run/cfab/policy.nft"));
     }
 
     #[test]
     fn up_names_an_unparseable_link_state_without_printing_an_empty_word() {
         let (sys, view) = wl_sys_and_view("pve1-tb");
         // no second whitespace-separated field at all
-        let mut blank = sys.on_stdout(&["ip", "-br", "link", "show", "dev", "primary.3"], "primary.3\n");
+        let mut blank = sys.on_stdout(
+            &["ip", "-br", "link", "show", "dev", "primary.3"],
+            "primary.3\n",
+        );
         assert_eq!(
             run(&mut blank, &view, &opts()).unwrap_err().to_string(),
             "FATAL: workload vms: interface primary.3 is unknown state (ip link set primary.3 up, or fix its stanza)"
@@ -1633,10 +1673,19 @@ pub(crate) mod tests {
             .iter()
             .find(|w| w.starts_with("workload vms: uplink not identified: "))
             .unwrap_or_else(|| panic!("{warnings:#?}"));
-        assert!(warning.contains("bridge primary has no uplink port"), "{warning}");
-        assert!(warning.ends_with("; row deferred to the watchdog"), "{warning}");
+        assert!(
+            warning.contains("bridge primary has no uplink port"),
+            "{warning}"
+        );
+        assert!(
+            warning.ends_with("; row deferred to the watchdog"),
+            "{warning}"
+        );
         assert!(!no_uplink.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
-        assert!(!no_uplink.ran("nft -f /run/cfab/workload-bridge.nft"), "no uplink to guard");
+        assert!(
+            !no_uplink.ran("nft -f /run/cfab/workload-bridge.nft"),
+            "no uplink to guard"
+        );
     }
 
     #[test]

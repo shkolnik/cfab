@@ -186,16 +186,26 @@ workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's ow
 ```
 
 `cfab check` refuses a `gw`, `router`, or member address outside `prefix`; any of them landing on
-`prefix`'s network or broadcast address; a member address without the prefix's mask or equal to
-`gw`; an empty `allow`; an `allow` naming an unknown zone; an `ifname` colliding with a declared
+`prefix`'s network or broadcast address; a `gw` or `router` that is not a bare IPv4 address (no
+mask — `prefix`'s mask is applied to both); a member address without the prefix's mask or equal to
+`gw` or `router`; `gw` equal to `router`; two members declaring the same address on one workload
+row; an empty `allow`; an `allow` naming an unknown zone; an `ifname` colliding with a declared
 wire, a declared segment, or a cfab-generated bond/identity interface; two `[[workload]]` rows
-sharing a name; a workload name that is also a zone name (workload and zone names share one
-vocabulary); a workload row no member carries; a member declaring the same workload row twice; a
-member workload naming an unknown row; and a leaf carrying one (a leaf never transits). Names
-share the zone vocabulary, so `vms>storage` reads like `storage>storage`. A fabric with `[forward]
-enabled = false` cannot declare a `[[workload]]` row at all — a workload with nothing to reach is
-refused, and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is
-off.
+sharing a name or an `ifname`; a workload name that is also a zone name (workload and zone names
+share one vocabulary); a workload `prefix` overlapping a zone's own `10.<id>.0.0/16` block; a
+workload row no member carries; a member declaring the same workload row twice; a member workload
+naming an unknown row; `span = "host"` (phase 2, not built yet — omit `span` or write `"switch"`);
+an unrecognized `span` value; and a leaf carrying one (a leaf never transits). Names share the zone
+vocabulary, so `vms>storage` reads like `storage>storage`. A fabric with `[forward] enabled =
+false` cannot declare a `[[workload]]` row at all — a workload with nothing to reach is refused,
+and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is off.
+
+`cfab up` refuses if `ifname` does not exist, lacks the member's declared address, or is
+administratively down (or in an unparsable state) — a stanza problem needing a fix and a
+re-apply. A lower-layer carrier fault (`LOWERLAYERDOWN`) is not a declaration fault, and neither
+is an uplink that cannot yet be identified or is not yet STP-forwarding: each defers that one row
+to the watchdog (a warning names the reason, no gw address goes live) and applies everything
+else, and the watchdog installs the row once the condition clears.
 
 - **`up` adds:** IPv4 forwarding on `ifname`; a passive OSPF entry for `ifname` in every allowed
   zone's instance, so every member and leaf learns the prefix; a pref-2000 sibling return-path
@@ -218,7 +228,11 @@ off.
   plus the default route via the declared `router` inside the *same* option: a client that
   receives option 121 ignores option 3 (VERIFIED: isc-dhclient and systemd-networkd both do,
   so a 121 lease with no default route inside it leaves the VM with none at all). A VM without
-  option 121 still reaches fabric identities via the declared `router`, degraded, not broken.
+  option 121 still reaches fabric identities via the declared `router`, degraded, not broken. The
+  aggregate is fabric-wide: it covers every declared zone block regardless of this row's own
+  `allow`, so a zone the row does not reach still routes through `gw` rather than falling to the
+  default route — traffic this workload is not allowed into is dropped at the host, not carried
+  off toward `router`.
 
 ## Design
 

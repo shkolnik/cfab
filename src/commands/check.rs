@@ -11,8 +11,10 @@ use crate::model::{Fabric, MemberKind};
 /// prefix, gw, router, allow, and the members that carry it), then the fabric aggregate — the
 /// smallest set of prefixes covering every declared zone block — followed by one RFC 3442
 /// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw`, `router`,
-/// and the row's own `prefix` differ per row, so each snippet carries its own `subnet … netmask
-/// …` definition line and the snippets never collide when pasted into one dhcpd.conf).
+/// and the row's own `prefix` differ per row): each snippet is a comment naming the EXISTING
+/// subnet block (of that row's own VLAN) the `option` line pastes into, never a `subnet { … }`
+/// block of its own — a second declaration of an existing subnet loads with only a warning and
+/// the lease silently picks one (I3, whole-branch review, VERIFIED pve3-tb isc-dhcpd 4.4.3-P1).
 pub fn report(fabric: &Fabric, view: &View) -> String {
     let kind = match view.kind() {
         MemberKind::Host => "host",
@@ -114,10 +116,11 @@ mod tests {
              is INSIDE 121 (last entry).\n\
              # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, \
              10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1\n\
-             subnet 192.168.20.0 netmask 255.255.255.0 {\n\
+             # paste the next line inside the existing 'subnet 192.168.20.0 netmask \
+             255.255.255.0 { ... }' block of this VLAN (do not add a second subnet block: \
+             dhcpd loads overlapping subnets with a warning and the lease picks one)\n\
              \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, \
-             199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n\
-             }\n"
+             199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n"
         );
     }
 }

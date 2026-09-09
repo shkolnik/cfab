@@ -1612,8 +1612,8 @@ mod tests {
     use super::*;
     use crate::commands::engine_ctl::tests::healthy_doc;
     use crate::decl::Declaration;
-    use crate::workload::announce::mock::RecordingIo;
     use crate::sys::mock::MockSys;
+    use crate::workload::announce::mock::RecordingIo;
     use std::path::Path;
 
     const EXE: &str = "/usr/bin/cfab";

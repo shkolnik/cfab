@@ -111,16 +111,22 @@ pub fn decode(buf: &[u8]) -> Vec<NeighEvent> {
 }
 
 /// The fallback trigger (ruling 12), taken ONLY when the subscription cannot be opened: has any
-/// MAC appeared on a non-uplink port of `up`'s bridge since the last poll?
+/// MAC appeared on a non-uplink port of `up`'s bridge since the LAST poll?
 ///
-/// `seen` is the caller's memory of `(port, mac)` pairs, so the first poll of a bridge that
-/// already has VMs on it reports a change once and then goes quiet. Two lines are never a
-/// change: an entry on one of `up.ports` (the uplink carries every peer's MAC, and a peer's MAC
-/// is not our ownership changing) and a ` permanent` entry (the bridge's own address on the
-/// port, or one an admin pinned) — neither is a VM starting to talk here.
+/// `seen` is the caller's memory of the PREVIOUS poll's `(port, mac)` pairs (M4, whole-branch
+/// review) — never an ever-growing "seen since the process started" set. An ever-growing set
+/// would silence a VM that migrated away (its FDB entry ages out) and later returned to the very
+/// same port with the same MAC, since that pair was already in the set from before it left; a
+/// snapshot comparison re-fires exactly like a genuinely new MAC would. The first poll of a
+/// bridge that already has VMs on it still reports a change once (nothing was in the previous,
+/// empty snapshot) and then goes quiet as long as nothing moves. Two lines are never a change:
+/// an entry on one of `up.ports` (the uplink carries every peer's MAC, and a peer's MAC is not
+/// our ownership changing) and a ` permanent` entry (the bridge's own address on the port, or
+/// one an admin pinned) — neither is a VM starting to talk here.
 ///
-/// A poll that cannot run at all (`bridge` absent, a netlink refusal) reports NO change rather
-/// than a false one: the beacon is the correctness floor and a failed poll costs one period.
+/// A poll that cannot run at all (`bridge` absent, a netlink refusal) reports NO change and
+/// leaves `seen` untouched rather than reporting a false change: the beacon is the correctness
+/// floor and a failed poll costs one period, not a lost snapshot.
 pub fn fdb_poll_changed(
     sys: &mut dyn crate::sys::Sys,
     up: &crate::workload::uplink::Uplink,
@@ -132,7 +138,7 @@ pub fn fdb_poll_changed(
     if !out.ok() {
         return false;
     }
-    let mut changed = false;
+    let mut current: BTreeSet<(String, String)> = BTreeSet::new();
     for line in out.stdout.lines() {
         if line.contains(" permanent") {
             continue;
@@ -145,8 +151,10 @@ pub fn fdb_poll_changed(
         if up.ports.iter().any(|p| p == port) {
             continue;
         }
-        changed |= seen.insert((port.to_string(), mac.to_string()));
+        current.insert((port.to_string(), mac.to_string()));
     }
+    let changed = current.iter().any(|pair| !seen.contains(pair));
+    *seen = current;
     changed
 }
 
@@ -304,6 +312,45 @@ mod tests {
         let mut broken =
             MockSys::default().on_fail(&["bridge", "fdb", "show"], 1, "Cannot open netlink");
         assert!(!fdb_poll_changed(&mut broken, &up, &mut seen));
+    }
+
+    // M4 (whole-branch review): `seen` was an ever-growing "seen since the process started" set
+    // (`changed |= seen.insert(...)`), so a VM that migrated away (its FDB entry ages out) and
+    // later comes BACK to the very same port with the same MAC never re-triggered — the pair was
+    // already in `seen` from before it left. The fallback must compare each poll only against
+    // the PREVIOUS poll's set, so a returning VM bursts again exactly like a new one would.
+    #[test]
+    fn a_mac_that_leaves_and_returns_on_the_same_port_bursts_again() {
+        let up = crate::workload::uplink::Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sys1 = MockSys::default().on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev cnfvm1-h vlan 3 master primary\n",
+        );
+        assert!(
+            fdb_poll_changed(&mut sys1, &up, &mut seen),
+            "first sighting"
+        );
+        // The VM migrates away: the bridge FDB ages the entry out entirely.
+        let mut sys2 =
+            MockSys::default().on_stdout(&["bridge", "fdb", "show", "br", "primary"], "");
+        assert!(
+            !fdb_poll_changed(&mut sys2, &up, &mut seen),
+            "gone: no new entries this poll"
+        );
+        // It returns to the SAME port with the SAME MAC.
+        let mut sys3 = MockSys::default().on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev cnfvm1-h vlan 3 master primary\n",
+        );
+        assert!(
+            fdb_poll_changed(&mut sys3, &up, &mut seen),
+            "returned: must burst again, an ever-growing seen set must never silence this"
+        );
     }
 
     /// THE PROBE (ruling 12). Root, a bridge, and a MAC that starts talking on a non-uplink port.

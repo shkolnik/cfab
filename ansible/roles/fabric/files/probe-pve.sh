@@ -96,7 +96,15 @@ if [ ! -f "$CONF" ]; then
   echo "  $CONF absent"
   WLIFS=""
 else
-  WLIFS=$(awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && $1=="ifname"{gsub(/"/,"",$3); print $3}' "$CONF")
+  # M5 (whole-branch review): the old `$1=="ifname"` field-position match needed a space either
+  # side of `=` (legal TOML with none, e.g. `ifname="primary.3"`, silently produced ONE field
+  # and no match at all) — match the key by regex instead of by field count.
+  WLIFS=$(awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && /^ifname[ \t]*=/{
+    line=$0
+    sub(/^ifname[ \t]*=[ \t]*"/, "", line)
+    sub(/".*/, "", line)
+    print line
+  }' "$CONF")
   [ -z "$WLIFS" ] && echo "  no [[workload]] rows in $CONF"
 fi
 for ifn in $WLIFS; do

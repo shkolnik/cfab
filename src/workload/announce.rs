@@ -421,7 +421,11 @@ mod tests {
         assert_eq!(io.sent.len(), 3);
 
         let coincide = a0 + 5 * S;
-        assert_eq!(coincide, a0 + PERIOD, "the third burst frame IS a beacon deadline");
+        assert_eq!(
+            coincide,
+            a0 + PERIOD,
+            "the third burst frame IS a beacon deadline"
+        );
         assert!(a.announce_due(&mut io, mac, coincide).unwrap());
         assert_eq!(io.sent.len(), 4, "one frame, not two");
         assert_eq!(a.counters(), (4, 1), "one announce counted, not two");

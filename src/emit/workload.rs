@@ -41,13 +41,11 @@ pub fn aggregate(zone_ids: &[u8]) -> Vec<Ipv4Prefix> {
     out
 }
 
-const HEADER: &str =
-    "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
+const HEADER: &str = "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
      that receives\n";
 /// The one global option definition every workload's subnet block relies on; print it once,
 /// above the blocks, never inside one.
-pub const DHCP_OPTION_121_DEFINITION: &str =
-    "# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a \
+pub const DHCP_OPTION_121_DEFINITION: &str = "# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a \
      subnet block.\n\
      option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n";
 /// The RFC 3442 classless-static-routes (option 121) dhcpd.conf snippet for one workload's
@@ -55,10 +53,15 @@ pub const DHCP_OPTION_121_DEFINITION: &str =
 /// spec §4 and §10 call 14: `router` is a declared key, refused outside `prefix`, printed only
 /// here). A client that receives option 121 ignores option 3 entirely, so the default route
 /// must be inside 121 or a client loses its existing default when it picks up this VLAN's lease.
-/// The value sits inside a `subnet <net> netmask <mask> { … }` block keyed on `prefix` (the
-/// workload's own VLAN, not the aggregate): with more than one `[[workload]]` row, each row's
-/// values differ, so without a subnet block to scope them, dhcpd would take only the last row's
-/// `option` statement as a global default and silently drop the others. The option DEFINITION is
+///
+/// I3 (whole-branch review): the value does NOT come wrapped in its own `subnet <net> netmask
+/// <mask> { … }` block. VERIFIED (pve3-tb, isc-dhcpd 4.4.3-P1, `dhcpd -t`): the real target's
+/// dhcpd.conf already declares a `subnet` block for this VLAN (with the pool), and a SECOND
+/// `subnet` block for an existing or overlapping subnet LOADS with only a warning, so the lease
+/// silently picks one of the two competing blocks — a fault a string test run standalone cannot
+/// see. So the snippet is a comment naming the existing block this `option` line belongs inside,
+/// followed by the bare, indented `option` statement — one line an operator pastes into the
+/// VLAN's own `subnet { … }` block, never a block of its own. The option DEFINITION is
 /// [`DHCP_OPTION_121_DEFINITION`], printed once and globally by the caller: isc-dhcpd 4.4.3
 /// refuses a scoped one (`option definitions may not be scoped`, pve3-tb 2026-09-09).
 pub fn dhcp_option_121(
@@ -98,9 +101,10 @@ pub fn dhcp_option_121(
         "{HEADER}# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via {router}) is \
          INSIDE 121 (last entry).\n\
          # {routes}\n\
-         subnet {} netmask {} {{\n\
-         \toption rfc3442-classless-static-routes {items}, 0, {r};\n\
-         }}\n",
+         # paste the next line inside the existing 'subnet {} netmask {} {{ ... }}' block of \
+         this VLAN (do not add a second subnet block: dhcpd loads overlapping subnets with a \
+         warning and the lease picks one)\n\
+         \toption rfc3442-classless-static-routes {items}, 0, {r};\n",
         prefix.net,
         prefix.netmask(),
     )
@@ -143,17 +147,21 @@ mod tests {
 # dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
 # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
 # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
-subnet 192.168.20.0 netmask 255.255.255.0 {
+# paste the next line inside the existing 'subnet 192.168.20.0 netmask 255.255.255.0 { ... }' \
+block of this VLAN (do not add a second subnet block: dhcpd loads overlapping subnets with a \
+warning and the lease picks one)
 \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 0, 192, 168, 20, 1;
-}
 "
         );
     }
 
-    /// Two rows never collide inside one dhcpd.conf: each gets its own `subnet … { … }`
-    /// definition line, keyed on its own VLAN, not the shared aggregate.
+    /// I3: two rows never collide inside one dhcpd.conf — each names a DIFFERENT existing
+    /// subnet block in its paste-here comment, keyed on its own VLAN, not the shared aggregate —
+    /// and neither one ever opens a `subnet { … }` block of its own (VERIFIED, pve3-tb,
+    /// isc-dhcpd 4.4.3-P1: a second declaration of an existing/overlapping subnet loads with
+    /// only a warning and the lease picks one, so cfab must never emit one).
     #[test]
-    fn two_rows_get_two_distinct_subnet_definition_lines() {
+    fn two_rows_name_two_different_subnet_blocks() {
         let agg = [Ipv4Prefix::parse("10.99.0.0/16").unwrap()];
         let a = dhcp_option_121(
             Ipv4Prefix::parse("192.168.20.0/24").unwrap(),
@@ -167,9 +175,27 @@ subnet 192.168.20.0 netmask 255.255.255.0 {
             "192.168.30.254".parse().unwrap(),
             "192.168.30.1".parse().unwrap(),
         );
-        assert!(a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {"), "{a}");
-        assert!(b.contains("subnet 192.168.30.0 netmask 255.255.255.0 {"), "{b}");
+        assert!(
+            a.contains(
+                "paste the next line inside the existing 'subnet 192.168.20.0 netmask \
+                        255.255.255.0 { ... }'"
+            ),
+            "{a}"
+        );
+        assert!(
+            b.contains(
+                "paste the next line inside the existing 'subnet 192.168.30.0 netmask \
+                        255.255.255.0 { ... }'"
+            ),
+            "{b}"
+        );
         assert_ne!(a, b);
+        // Never a subnet block of its own: no opening brace anywhere but inside that comment.
+        assert!(
+            !a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {\n"),
+            "{a}"
+        );
+        assert!(!a.trim_end().ends_with('}'), "{a}");
         // dhcpd: `option definitions may not be scoped` — the definition never appears in a block.
         assert!(!a.contains("code 121"), "{a}");
         assert!(DHCP_OPTION_121_DEFINITION.contains("code 121 = array of unsigned integer 8;"));

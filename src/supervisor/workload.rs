@@ -19,10 +19,10 @@ use std::time::Instant;
 
 use crate::derive::View;
 use crate::sys::Sys;
-use crate::workload::{Trigger, deferred_names};
 use crate::workload::announce::{AnnounceIo, Announcer};
 use crate::workload::neigh::{self, NeighSignal};
 use crate::workload::uplink::{self, Uplink};
+use crate::workload::{Trigger, deferred_names};
 
 use super::Shared;
 use super::report::WorkloadAnnounce;
@@ -392,7 +392,11 @@ impl Workloads {
 
     /// The `components` rows (`status` and `/metrics` read these).
     pub(crate) fn rows_for_status(&self) -> Vec<WorkloadAnnounce> {
-        let trigger = self.trigger.as_ref().map(Trigger::to_string).unwrap_or_default();
+        let trigger = self
+            .trigger
+            .as_ref()
+            .map(Trigger::to_string)
+            .unwrap_or_default();
         self.rows
             .iter()
             .map(|r| {
@@ -484,7 +488,10 @@ mod tests {
             opens,
             Instant::now(),
         );
-        assert!(w.rows_for_status().is_empty(), "no announcer for a deferred row");
+        assert!(
+            w.rows_for_status().is_empty(),
+            "no announcer for a deferred row"
+        );
         assert_eq!(w.next_due(), None, "and nothing to wake for");
         assert_eq!(
             said(&trace),
@@ -499,8 +506,20 @@ mod tests {
         let (mut sys, view) = wl(Some("vms"));
         let trace = rec();
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, t0);
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
         assert!(w.rows_for_status().is_empty(), "still deferred");
         assert_eq!(said(&trace).len(), 1, "the deferred line is said once");
 
@@ -509,7 +528,11 @@ mod tests {
         w.tick(&mut sys, &view, &mut RecordingIo::default(), t);
         let rows = w.rows_for_status();
         assert_eq!(
-            (rows[0].name.as_str(), rows[0].ifname.as_str(), rows[0].trigger.as_str()),
+            (
+                rows[0].name.as_str(),
+                rows[0].ifname.as_str(),
+                rows[0].trigger.as_str()
+            ),
             ("vms", "primary.3", "neigh events")
         );
         assert_eq!(w.next_due(), Some(t), "the first beacon is immediate");
@@ -517,7 +540,12 @@ mod tests {
             said(&trace)[1],
             "cfab: workload vms: announcer trigger neigh events"
         );
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(9));
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(9),
+        );
         assert_eq!(said(&trace).len(), 2, "started once, said once");
         assert_eq!(w.rows_for_status().len(), 1);
     }
@@ -529,7 +557,14 @@ mod tests {
         let (mut sys, view) = wl(None);
         sys.links.remove("/sys/class/net/primary.3/lower_primary");
         let trace = rec();
-        let w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, Instant::now());
+        let w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            Instant::now(),
+        );
         assert!(w.rows_for_status().is_empty());
         assert_eq!(
             said(&trace),
@@ -605,7 +640,10 @@ mod tests {
         // Unchanged from here on: the line is said once per change, not once per beacon.
         w.fire_due(&mut io, t0 + 2 * PERIOD);
         assert_eq!(
-            said(&trace).iter().filter(|l| l.contains("MAC changed")).count(),
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("MAC changed"))
+                .count(),
             1
         );
     }
@@ -673,9 +711,19 @@ mod tests {
             )]
         );
         assert_eq!(w.rows_for_status()[0].bursts, 0);
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
         assert_eq!(w.rows_for_status()[0].bursts, 1, "the VM MAC is new");
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3) + PERIOD);
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3) + PERIOD,
+        );
         assert_eq!(
             w.rows_for_status()[0].bursts,
             1,
@@ -714,7 +762,12 @@ mod tests {
             "cfab: workload vms: announcer trigger fdb poll (neighbor watch died: readiness lost)"
         );
         // …and the fallback is really running, not just claimed.
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
         assert!(sys.ran("bridge fdb show br primary"));
         assert_eq!(w.rows_for_status()[0].bursts, 1);
         // Said once: a second report of the same death is not a second trigger change.
@@ -733,8 +786,20 @@ mod tests {
             "02:cf:ab:00:00:01 dev tap100i0 vlan 3 master primary\n",
         );
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
-        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0 + Duration::from_secs(3));
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            None,
+            opens,
+            t0,
+        );
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
         assert_eq!(w.rows_for_status()[0].bursts, 0);
         assert!(!sys.ran("bridge fdb show"));
     }
@@ -745,7 +810,14 @@ mod tests {
     fn only_a_learned_mac_on_a_non_uplink_port_starts_a_burst() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            None,
+            opens,
+            t0,
+        );
         let add = |ifindex, permanent| {
             NeighSignal::Add(NeighEvent {
                 ifindex,
@@ -784,12 +856,16 @@ mod tests {
             })
         };
         // A second physical NIC joins the bridge (ifindex 3), and a VM tap beside it (10).
-        sys.files
-            .insert("/sys/class/net/primary/brif/eth1/state".into(), "3\n".into());
+        sys.files.insert(
+            "/sys/class/net/primary/brif/eth1/state".into(),
+            "3\n".into(),
+        );
         sys.files
             .insert("/sys/class/net/eth1/ifindex".into(), "3\n".into());
-        sys.links
-            .insert("/sys/class/net/eth1/device".into(), "../../../0000:02:00.0".into());
+        sys.links.insert(
+            "/sys/class/net/eth1/device".into(),
+            "../../../0000:02:00.0".into(),
+        );
 
         let trace = rec();
         w.trace = Some(trace.clone());
@@ -836,7 +912,11 @@ mod tests {
             t0,
         );
         assert_eq!(w.rows_for_status()[0].bursts, 0);
-        assert_eq!(said(&trace).len(), 1, "only the start line: no second alarm");
+        assert_eq!(
+            said(&trace).len(),
+            1,
+            "only the start line: no second alarm"
+        );
     }
 
     /// ENOBUFS: the kernel dropped events we will never see, so the gap itself is the signal.
@@ -845,7 +925,14 @@ mod tests {
     fn an_enobufs_overflow_starts_one_burst() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            None,
+            opens,
+            t0,
+        );
         w.on_neigh(&mut sys, &NeighSignal::Overflow, t0);
         assert_eq!(w.rows_for_status()[0].bursts, 1);
     }
@@ -857,7 +944,14 @@ mod tests {
         let (mut sys, view) = wl(None);
         let trace = rec();
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), Some(trace.clone()), opens, t0);
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
         let mut io = RecordingIo {
             fail: Some("primary.3: cannot send probe: ENODEV".into()),
             ..Default::default()
@@ -922,7 +1016,9 @@ mod tests {
 
         let said = said(&trace);
         assert_eq!(
-            said.iter().filter(|l| l.contains("cannot read the MAC")).count(),
+            said.iter()
+                .filter(|l| l.contains("cannot read the MAC"))
+                .count(),
             2,
             "the second vanish is a second fact, not a swallowed duplicate: {said:?}"
         );
@@ -954,10 +1050,16 @@ mod tests {
             mac: [2, 0xcf, 0xab, 0, 0, 1],
             permanent: false,
         });
-        sys.files
-            .insert("/sys/class/net/tap100i0/ifindex".into(), "not-a-number\n".into());
+        sys.files.insert(
+            "/sys/class/net/tap100i0/ifindex".into(),
+            "not-a-number\n".into(),
+        );
         w.on_neigh(&mut sys, &ev, t0);
-        assert_eq!(w.rows_for_status()[0].bursts, 0, "no burst without the scan");
+        assert_eq!(
+            w.rows_for_status()[0].bursts,
+            0,
+            "no burst without the scan"
+        );
         assert_eq!(
             said(&trace)[1],
             "cfab: workload vms: port tap100i0: cannot read ifindex from \
@@ -967,7 +1069,10 @@ mod tests {
         sys.files
             .insert("/sys/class/net/tap100i0/ifindex".into(), "10\n".into());
         w.on_neigh(&mut sys, &ev, t0);
-        assert_eq!(said(&trace)[2], "cfab: workload vms: bridge port scan recovered");
+        assert_eq!(
+            said(&trace)[2],
+            "cfab: workload vms: bridge port scan recovered"
+        );
         assert_eq!(w.rows_for_status()[0].bursts, 1);
     }
 
@@ -977,7 +1082,14 @@ mod tests {
     fn the_beacon_puts_the_gratuitous_request_on_the_workload_interface() {
         let (mut sys, view) = wl(None);
         let t0 = Instant::now();
-        let mut w = Workloads::start(&mut sys, &view, &mut RecordingIo::default(), None, opens, t0);
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            None,
+            opens,
+            t0,
+        );
         let mut io = RecordingIo::default();
         w.fire_due(&mut io, t0);
         assert_eq!(io.sent.len(), 1);
