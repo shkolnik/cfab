@@ -1695,7 +1695,6 @@ fn workload_posture(
     comps: Option<&Components>,
     c: &mut Ctx,
 ) -> Result<()> {
-    let f = view.fabric;
     let rows = view.workload_rows();
     if rows.is_empty() {
         return Ok(());
@@ -1704,16 +1703,9 @@ fn workload_posture(
     // was not forwarding at apply time and the watchdog installs it once it is. One reason, one
     // spelling, and none of the checks below — they would only restate the same fact as a pile
     // of unrelated-looking faults (missing gw, missing sibling, dead route) instead of the one
-    // true one.
-    let deferred: BTreeSet<String> = sys
-        .read(&format!("{}/workload-deferred", f.run_dir))
-        .map(|t| {
-            t.lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    // true one. `crate::workload::deferred_names` is the one parser the supervisor and `status`
+    // both read, so the file's shape is never two spellings that can drift.
+    let deferred = crate::workload::deferred_names(sys, view);
     // Member-wide (ruling 11, spec §5.1 item 8): one read and one run, shared by every row —
     // never re-asked per row.
     let arp = sys
