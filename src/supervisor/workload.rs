@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use crate::derive::View;
 use crate::sys::Sys;
-use crate::workload::Trigger;
+use crate::workload::{Trigger, deferred_names};
 use crate::workload::announce::{AnnounceIo, Announcer};
 use crate::workload::neigh::{self, NeighSignal};
 use crate::workload::uplink::{self, Uplink};
@@ -412,18 +412,6 @@ impl Workloads {
     pub(crate) fn publish(&self, shared: &Arc<Mutex<Shared>>) {
         shared.lock().unwrap().workloads = self.rows_for_status();
     }
-}
-
-/// The rows `apply` (or a previous watchdog tick) left deferred. No file — the normal case on a
-/// member whose rows all applied — is no deferred row.
-fn deferred_names(sys: &mut dyn Sys, view: &View) -> BTreeSet<String> {
-    let path = format!("{}/workload-deferred", view.fabric.run_dir);
-    sys.read(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
-        .collect()
 }
 
 /// The sub-interface's own MAC, through the same seam the frame goes out of (`getifaddrs` in
