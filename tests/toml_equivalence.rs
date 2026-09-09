@@ -267,7 +267,7 @@ fn the_minimal_declaration_generates_the_same_artifacts() {
 /// Every check `Fabric::from_decl`/`validate` still makes, each with the declaration that
 /// trips it and the words its message must carry. Deleting a check makes its case fail;
 /// deleting a CASE fails the count below. Grow both together when a check is added.
-const CASES: usize = 30;
+const CASES: usize = 32;
 
 fn edited(edits: &[(&str, &str)]) -> String {
     let mut text = example();
@@ -500,6 +500,22 @@ fn every_surviving_validation_has_a_declaration_that_trips_it() {
             "a node id used twice",
             edited(&[("node = 2\n", "node = 1\n")]),
             "node id 1 used twice",
+        ),
+        (
+            "the retired driver_features wire key",
+            edited(&[(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, driver_features = \"gro off\" },",
+            )]),
+            "'driver_features' is gone",
+        ),
+        (
+            "the retired usb wire key",
+            edited(&[(
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000 },",
+                "{ nic = \"eth9\", domain = \"a\", speed_mbps = 5000, usb = true },",
+            )]),
+            "'usb' is gone",
         ),
     ];
     assert_eq!(
