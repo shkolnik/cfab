@@ -3245,6 +3245,30 @@ mod tests {
         assert!(!sys.calls.iter().any(|c| c.contains("iif lo")));
     }
 
+    /// The uplink's own failure text (`workload::uplink::identify`) is reported verbatim, never
+    /// reworded here — one spelling shared with `apply` and the watchdog. Same MockSys shape the
+    /// watchdog's own test for this fault uses: the lower link torn out from under a running
+    /// bridge (`an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer`
+    /// in `src/supervisor/workload.rs`).
+    #[test]
+    fn an_unidentifiable_uplink_reports_its_own_message() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view);
+        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let want = "workload vms: workload interface primary.3 is not a VLAN sub-interface of a \
+                    bridge (no lower link in /sys/class/net/primary.3)";
+        let hit = m
+            .conditions
+            .iter()
+            .find(|c| c.text == want)
+            .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
+        assert_eq!(hit.class, Class::Standing);
+        assert!(!m.workloads[0].up);
+    }
+
     /// The `status` never-writes invariant holds over the workload checks too: every new call
     /// (`ip -br link show dev`, the workload's own `ip route get … from …`) is on the read-only
     /// allowlist and no file changes.
