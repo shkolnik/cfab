@@ -609,7 +609,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     for plan in &ready {
         run_ok(sys, &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.ifname])?;
     }
-    if !ready.is_empty() {
+    // Matches the watchdog's own restore condition (`restore_workloads`): arp_ignore is
+    // member-wide, not per-row, and is set whenever ANY workload row is declared at all — ready
+    // or still deferred — never gated on this apply having a ready row of its own.
+    if !view.workload_rows().is_empty() {
         sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1")?;
     }
 
@@ -1600,11 +1603,13 @@ pub(crate) mod tests {
             "{warnings:#?}"
         );
         assert!(!listening.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
-        assert!(
-            listening
-                .writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
-                .is_empty(),
-            "no ready row on this member; arp_ignore is not this row's to set"
+        // MINOR 1 (re-review): arp_ignore matches the watchdog's own restore condition — set
+        // whenever ANY workload row is declared, ready or not, never gated on this row alone.
+        // Every row on this member is deferred here (there is only the one, "vms"), so this is
+        // also the all-rows-deferred case.
+        assert_eq!(
+            listening.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
         );
         assert_eq!(
             listening.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
