@@ -121,6 +121,9 @@ pub(crate) struct Shared {
     /// The port the prober holds each bond's `primary` on. Read by the forwarding watchdog,
     /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
+    /// One row per running gateway announcer, republished whenever an announcer starts or
+    /// fires. Empty on a member with no `[[workload]]` row.
+    workloads: Vec<report::WorkloadAnnounce>,
     /// Why the metrics endpoint is not listening, if it is not: the bind errno, for as long as
     /// the bind keeps failing. `cfab status` prints it as a standing line.
     metrics_error: Option<String>,
@@ -151,6 +154,7 @@ impl Shared {
             wd_last_tick: None,
             probed: crate::prober::ProbeRows::default(),
             held: crate::prober::HeldPrimaries::default(),
+            workloads: Vec::new(),
             metrics_error: None,
             metrics_collect_failures: 0,
             metrics_gather_failing: false,
@@ -212,6 +216,7 @@ impl Shared {
             },
             ingress: self.probed.ingress.clone(),
             fallback: self.probed.fallback.clone(),
+            workloads: self.workloads.clone(),
             metrics_error: self.metrics_error.clone(),
         }
     }
