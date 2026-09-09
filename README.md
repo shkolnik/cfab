@@ -141,6 +141,11 @@ a standing `cfab status` line `metrics endpoint not listening on :23232 (...)` f
 the bind keeps failing, and retries every 60 s. The fabric is unaffected: a bind failure is
 never fatal and never delays the apply.
 
+A member carrying at least one `[[workload]]` row also serves `cfab_workload_up{name}` (1 when
+the row's table is present, its addresses and sibling return-path rule are installed, the
+route-get proof succeeds, and its announcer is running); a member with no row carries no series
+at all.
+
 ```
 curl -s http://10.249.0.1:23232/metrics | grep -E 'cfab_fabric_state|cfab_links_up'
 ```
@@ -158,6 +163,76 @@ the point of use, with identical single-host behavior when absent:
   cluster-wide bad config (one the switches cannot forward) self-heals: every member reverts.
 - `measure-cap` serializes floods behind a cluster lease and publishes measured capacities so
   they survive reboots.
+
+## VM workloads
+
+A `[[workload]]` row declares a VM VLAN cfab reaches into the fabric — an anycast gateway every
+member answers, a passive OSPF advertisement into the zones it may reach, and a symmetric
+forward policy. The VLAN interface itself is baseline-owned (Proxmox/systemd-networkd/whatever
+already brought it up); cfab only points at it.
+
+```toml
+[[workload]]
+name   = "vms"
+ifname = "primary.3"          # host-side interface on the workload VLAN; preconfigured, required
+prefix = "192.168.20.0/24"
+gw     = "192.168.20.254"     # the anycast gateway every host answers
+router = "192.168.20.1"       # the VLAN's existing default router, printed inside DHCP option 121
+allow  = ["storage"]          # zones this workload may reach; default deny, counted
+
+[[member]]
+name = "pve1"
+workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on ifname
+```
+
+`cfab check` refuses a `gw`, `router`, or member address outside `prefix`; any of them landing on
+`prefix`'s network or broadcast address; a `gw` or `router` that is not a bare IPv4 address (no
+mask — `prefix`'s mask is applied to both); a member address without the prefix's mask or equal to
+`gw` or `router`; `gw` equal to `router`; two members declaring the same address on one workload
+row; an empty `allow`; an `allow` naming an unknown zone; an `ifname` colliding with a declared
+wire, a declared segment, or a cfab-generated bond/identity interface; two `[[workload]]` rows
+sharing a name or an `ifname`; a workload name that is also a zone name (workload and zone names
+share one vocabulary); a workload `prefix` overlapping a zone's own `10.<id>.0.0/16` block; a
+workload row no member carries; a member declaring the same workload row twice; a member workload
+naming an unknown row; `span = "host"` (phase 2, not built yet — omit `span` or write `"switch"`);
+an unrecognized `span` value; and a leaf carrying one (a leaf never transits). Names share the zone
+vocabulary, so `vms>storage` reads like `storage>storage`. A fabric with `[forward] enabled =
+false` cannot declare a `[[workload]]` row at all — a workload with nothing to reach is refused,
+and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is off.
+
+`cfab up` refuses if `ifname` does not exist, lacks the member's declared address, or is
+administratively down (or in an unparsable state) — a stanza problem needing a fix and a
+re-apply. A lower-layer carrier fault (`LOWERLAYERDOWN`) is not a declaration fault, and neither
+is an uplink that cannot yet be identified or is not yet STP-forwarding: each defers that one row
+to the watchdog (a warning names the reason, no gw address goes live) and applies everything
+else, and the watchdog installs the row once the condition clears.
+
+- **`up` adds:** IPv4 forwarding on `ifname`; a passive OSPF entry for `ifname` in every allowed
+  zone's instance, so every member and leaf learns the prefix; a pref-2000 sibling return-path
+  rule per (zone, workload prefix) on every member and leaf, ahead of the general egress rule, so
+  a reply that ECMPs to a host that never saw the flow still finds its way back; a symmetric
+  stateless accept pair in the forward policy (`vms>storage` emits both directions, because the
+  reply may arrive on a different host than the request left from); a forward-hook DSCP
+  overwrite (a workload's own marking is never trusted); the anycast `gw` as a second address on
+  `ifname`, answered with the host's own MAC, with `net.ipv4.conf.all.arp_ignore=1` so a host
+  answers `gw` only on the interface that holds it; an nft bridge rule that drops ARP for `gw`
+  arriving on the bridge's uplink port, so hosts never contend over who answers it; and a
+  gratuitous-ARP announcer, a beacon every few seconds plus a burst when the bridge learns a new
+  MAC, so a migrated VM's fabric-side neighbor entries converge onto its new host.
+- **`down` removes** everything `up` added on this member: the OSPF entry, the return-path
+  rules, the forward accepts, the DSCP hook, the second address, the bridge guard, and stops the
+  announcer. It never touches `ifname` itself.
+- **The watchdog restores** anything of the above it finds missing or wrong, the same way it
+  restores every other cfab-owned interface, rule, or sysctl.
+- A VM's DHCP lease should carry option 121 (RFC 3442) with the fabric aggregate routed via `gw`,
+  plus the default route via the declared `router` inside the *same* option: a client that
+  receives option 121 ignores option 3 (VERIFIED: isc-dhclient and systemd-networkd both do,
+  so a 121 lease with no default route inside it leaves the VM with none at all). A VM without
+  option 121 still reaches fabric identities via the declared `router`, degraded, not broken. The
+  aggregate is fabric-wide: it covers every declared zone block regardless of this row's own
+  `allow`, so a zone the row does not reach still routes through `gw` rather than falling to the
+  default route — traffic this workload is not allowed into is dropped at the host, not carried
+  off toward `router`.
 
 ## Design
 

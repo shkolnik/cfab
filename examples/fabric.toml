@@ -146,3 +146,19 @@ connect_s = 3         # FRR's default 120 s makes a returned wire re-peer slowly
 
 [runtime]
 run_dir = "/run/cfab"
+
+# ---- Optional: VM workload VLANs (phase 1) -----------------------------------------------
+# A [[workload]] row reaches a VM VLAN into the fabric: an anycast gw every host answers, a
+# passive OSPF advertisement into the allowed zones, and a symmetric forward policy. ifname is
+# preconfigured (baseline-owned); cfab never creates or deletes it. Each carrying member adds
+# its own address on ifname under workloads = [...] in its [[member]] block.
+#[[workload]]
+#name   = "vms"
+#ifname = "primary.3"
+#prefix = "192.168.20.0/24"
+#gw     = "192.168.20.254"
+#router = "192.168.20.1"
+#allow  = ["storage"]
+#
+# ...and in the carrying member's [[member]] block:
+#workloads = [{ name = "vms", address = "192.168.20.2/24" }]

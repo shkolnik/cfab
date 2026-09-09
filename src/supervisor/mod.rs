@@ -32,6 +32,7 @@ pub mod lock;
 pub(crate) mod metrics;
 pub mod report;
 pub mod sock;
+mod workload;
 
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
@@ -74,6 +75,14 @@ const POLL_MS: u64 = 500;
 /// (spec §13 step 4). `TimeoutStopSec=60` in the unit carries the worst case with margin.
 const CHILD_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// How the announcers learn that a MAC was learned on a VM port (ruling 12). Production opens
+/// one `RTNLGRP_NEIGH` socket for the member and spawns the reader that forwards `Cmd::Neigh`;
+/// a test substitutes a closure that fails (exercising the FDB-poll fallback) or one that
+/// succeeds and posts the events by hand on the same channel. `Err` carries the text `status`
+/// and the journal print, so the fallback always names why it was taken.
+type NeighWatchFn =
+    Arc<dyn Fn(mpsc::UnboundedSender<Cmd>) -> std::result::Result<(), String> + Send + Sync>;
+
 /// How the supervisor pokes the systemd watchdog. One injectable seam for EVERY feed — the
 /// select-loop `feed` arm and the in-reapply feeds — so a test can observe them; production
 /// sends `WATCHDOG=1`. It carries no data because the decision of *whether* to feed is made by
@@ -92,6 +101,15 @@ pub(crate) enum Cmd {
     Hangup,
     /// SIGTERM/SIGINT: begin the stop sequence and exit 0.
     Terminate,
+    /// A bridge FDB add from the neighbor watch, or the gap an ENOBUFS overflow left
+    /// (ruling 12). Posted by the watch task; it reaches the loop on the same channel as
+    /// every other command so the announcers are driven from exactly one place.
+    Neigh(crate::workload::neigh::NeighSignal),
+    /// The neighbor watch task has exited and no event will ever arrive again. Carries why.
+    /// The announcers fall back to the FDB poll and say so — a trigger that has stopped
+    /// working must never keep claiming it is the live one (ruling 12: `status` says which
+    /// path is active).
+    NeighWatchDied(String),
 }
 
 /// A child's exit, reported by its `wait` task to the main loop.
@@ -121,6 +139,9 @@ pub(crate) struct Shared {
     /// The port the prober holds each bond's `primary` on. Read by the forwarding watchdog,
     /// which must re-assert THAT and not the declared home.
     held: crate::prober::HeldPrimaries,
+    /// One row per running gateway announcer, republished whenever an announcer starts or
+    /// fires. Empty on a member with no `[[workload]]` row.
+    workloads: Vec<report::WorkloadAnnounce>,
     /// Why the metrics endpoint is not listening, if it is not: the bind errno, for as long as
     /// the bind keeps failing. `cfab status` prints it as a standing line.
     metrics_error: Option<String>,
@@ -151,6 +172,7 @@ impl Shared {
             wd_last_tick: None,
             probed: crate::prober::ProbeRows::default(),
             held: crate::prober::HeldPrimaries::default(),
+            workloads: Vec::new(),
             metrics_error: None,
             metrics_collect_failures: 0,
             metrics_gather_failing: false,
@@ -212,6 +234,7 @@ impl Shared {
             },
             ingress: self.probed.ingress.clone(),
             fallback: self.probed.fallback.clone(),
+            workloads: self.workloads.clone(),
             metrics_error: self.metrics_error.clone(),
         }
     }
@@ -290,6 +313,11 @@ pub(crate) struct Hooks {
     /// The watchdog feed seam (see `FeedFn`). Production sends `WATCHDOG=1`; a test installs a
     /// recorder so the in-reapply feeds are observable.
     pub feed: FeedFn,
+    /// The neighbor subscription seam (see `NeighWatchFn`).
+    pub neigh_watch: NeighWatchFn,
+    /// Where the announcers' frames go. `None` ⇒ the production `AF_PACKET` socket (the
+    /// prober's `PacketIo`); a test installs a recorder, so no test ever opens a real socket.
+    pub announce_io: Option<Box<dyn crate::workload::announce::AnnounceIo + Send>>,
 }
 
 impl Hooks {
@@ -309,8 +337,71 @@ impl Hooks {
             feed: Arc::new(|| {
                 let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
             }),
+            neigh_watch: Arc::new(spawn_neigh_watch),
+            announce_io: None,
         }
     }
+}
+
+/// Production `Hooks::neigh_watch`: open the member's `RTNLGRP_NEIGH` subscription and forward
+/// what it reports onto the command channel (ruling 12: one socket, one idle reader task per
+/// member).
+///
+/// **Spawn-site invariant (§7):** this task spawns no process. It owns one netlink socket and
+/// one channel sender and forks nothing, ever, so it belongs on `tokio::spawn` beside the stream
+/// readers and the socket server.
+///
+/// Failure is never fatal, and never quiet: a subscription that cannot be opened returns its
+/// reason, which becomes the FDB-poll fallback's trigger text, and a watch that later loses its
+/// socket posts `Cmd::NeighWatchDied`, which moves every row onto the poll. The 5 s beacon is
+/// the correctness floor throughout.
+fn spawn_neigh_watch(tx: mpsc::UnboundedSender<Cmd>) -> std::result::Result<(), String> {
+    use crate::workload::neigh::{NeighSignal, NeighWatch};
+    use tokio::io::unix::AsyncFd;
+
+    let watch = NeighWatch::open().map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        let mut watch = watch;
+        loop {
+            let Ok(mut afd) = AsyncFd::new(watch) else {
+                let _ = tx.send(Cmd::NeighWatchDied("the socket cannot be polled".into()));
+                return;
+            };
+            loop {
+                let Ok(mut guard) = afd.readable_mut().await else {
+                    let _ = tx.send(Cmd::NeighWatchDied("readiness lost".into()));
+                    return;
+                };
+                match guard.get_inner_mut().drain() {
+                    Ok(events) => {
+                        // `drain` reads to `EWOULDBLOCK`, so the readiness is spent.
+                        guard.clear_ready();
+                        for ev in events {
+                            if tx.send(Cmd::Neigh(NeighSignal::Add(ev))).is_err() {
+                                return; // the supervisor is stopping
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        drop(guard);
+                        if e.raw_os_error() != Some(nix::errno::Errno::ENOBUFS as i32) {
+                            let _ = tx.send(Cmd::NeighWatchDied(e.to_string()));
+                            return;
+                        }
+                        // ENOBUFS: `drain` already replaced the socket, so the OLD fd this
+                        // `AsyncFd` is registered on is gone — take the watch back out and
+                        // register the new one. The gap itself is the signal.
+                        if tx.send(Cmd::Neigh(NeighSignal::Overflow)).is_err() {
+                            return;
+                        }
+                        watch = afd.into_inner();
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Feed the watchdog from inside a reapply, at a safe point, iff the apply is still within
@@ -657,6 +748,25 @@ pub(crate) async fn run_with(
         }
     }
 
+    // 5c. The workload gateway announcers (spec §5.1 item 8, ruling 12). One subscription for
+    // the member; every row shares the trigger it produced, and a row `apply` deferred gets no
+    // announcer until the forwarding watchdog installs it. Built BEFORE the ready signal so a
+    // `status` taken the instant the supervisor is up already reports them.
+    let mut announce_io: Box<dyn crate::workload::announce::AnnounceIo + Send> = hooks
+        .announce_io
+        .unwrap_or_else(|| Box::new(PacketIo::new()));
+    let neigh_watch = hooks.neigh_watch.clone();
+    let neigh_tx = cmd_tx.clone();
+    let mut workloads = workload::Workloads::start(
+        sys,
+        view,
+        &mut *announce_io,
+        trace.clone(),
+        move || neigh_watch(neigh_tx),
+        Instant::now(),
+    );
+    workloads.publish(&shared);
+
     // The watchdog feed (spec §8): only when systemd set WATCHDOG_USEC, so `WatchdogSec` lives
     // in the unit file alone. Absent that, the feed never runs.
     let feed_period = feed_period();
@@ -707,6 +817,15 @@ pub(crate) async fn run_with(
         tokio::time::Instant::now() + metrics::REFRESH,
         metrics::REFRESH,
     );
+    // The announcers' housekeeping: pick up a row the forwarding watchdog has installed since
+    // the last tick, and run the FDB poll on the members that took the fallback trigger. Same
+    // 3 s cadence as the watchdog that installs those rows, and never ticked at all on a member
+    // with no `[[workload]]` row.
+    let workload_active = !view.workload_rows().is_empty();
+    let mut wl_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(3),
+        Duration::from_secs(3),
+    );
 
     // Set by a reload that found a changed declaration: the stop sequence below runs unchanged,
     // and the exit status asks systemd for the restart that applies the new file.
@@ -716,6 +835,17 @@ pub(crate) async fn run_with(
         let next_respawn = pending.iter().map(|(_, d)| *d).min();
         let respawn_sleep = async {
             match next_respawn {
+                Some(d) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        // The earliest announce deadline of any running announcer; a member with none sleeps
+        // on a never-ready future, exactly as the respawn arm does.
+        let announce_due = workloads.next_due();
+        let announce_sleep = async {
+            match announce_due {
                 Some(d) => {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
                 }
@@ -768,6 +898,20 @@ pub(crate) async fn run_with(
                     Cmd::Terminate => break,
                     Cmd::Hangup => None,
                     Cmd::Reapply(tx) => Some(tx),
+                    // An FDB event is not a reload: it drives the announcers and nothing
+                    // else, so it is answered here and never reaches the re-read below.
+                    Cmd::Neigh(sig) => {
+                        workloads.on_neigh(sys, &sig, Instant::now());
+                        workloads.publish(&shared);
+                        continue;
+                    }
+                    // The event trigger is gone: every row moves to the FDB poll, which the
+                    // 3 s tick below runs from now on.
+                    Cmd::NeighWatchDied(why) => {
+                        workloads.watch_died(&why);
+                        workloads.publish(&shared);
+                        continue;
+                    }
                 };
                 match read_reload(&*sys, view, config) {
                     // `Identical` means the re-read fabric is `Eq` to `view.fabric`, so the
@@ -831,6 +975,19 @@ pub(crate) async fn run_with(
             // gather is read-only and bounded, and it must not pin the runtime thread.
             _ = metrics_tick.tick() => {
                 refresh_snapshot(sys, view, &shared, &metrics_tx);
+            }
+            // The announce beacon and burst (spec §5.1 item 8). Bounded by construction: at
+            // most one 42-byte frame per row per wake, and the schedule advances before the
+            // send, so a dead socket costs frames and never a spin.
+            _ = announce_sleep, if announce_due.is_some() => {
+                workloads.fire_due(&mut *announce_io, Instant::now());
+                workloads.publish(&shared);
+            }
+            // Same arm shape and the same bounded-tick reasoning as the watchdog above: a
+            // handful of sysfs reads, or one `bridge fdb show` on the fallback trigger.
+            _ = wl_tick.tick(), if workload_active => {
+                workloads.tick(sys, view, &mut *announce_io, Instant::now());
+                workloads.publish(&shared);
             }
             _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
                 if let Ok(l) = metrics::bind(hooks.metrics_port) {
@@ -1455,6 +1612,7 @@ mod tests {
     use super::*;
     use crate::commands::engine_ctl::tests::healthy_doc;
     use crate::decl::Declaration;
+    use crate::workload::announce::mock::RecordingIo;
     use crate::sys::mock::MockSys;
     use std::path::Path;
 
@@ -1688,6 +1846,12 @@ mod tests {
         }
     }
 
+    /// A `neigh_watch` seam that opens nothing. Every test that carries no `[[workload]]` row
+    /// never calls it; the two that do call it name their own.
+    fn no_neigh_watch() -> NeighWatchFn {
+        Arc::new(|_| Err("test: no subscription".to_string()))
+    }
+
     fn quiet_hooks(shared: Arc<Mutex<Shared>>, ready: tokio::sync::oneshot::Sender<()>) -> Hooks {
         Hooks {
             on_ready: Some(ready),
@@ -1702,7 +1866,298 @@ mod tests {
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
             feed: Arc::new(|| {}),
+            neigh_watch: no_neigh_watch(),
+            announce_io: Some(Box::new(RecordingIo::default())),
         }
+    }
+
+    // ---- the workload announcers (spec §5.1 item 8, ruling 12) ---------------------------
+
+    /// The example declaration with the "vms" row on pve1-tb/pve2-tb, in the test's run dir.
+    fn wl_decl_text(run_dir: &Path) -> String {
+        crate::decl::fixtures::with_workload(&decl_text(run_dir))
+    }
+
+    fn wl_fabric_at(run_dir: &Path) -> Fabric {
+        Fabric::from_decl(&Declaration::parse(&wl_decl_text(run_dir)).unwrap()).unwrap()
+    }
+
+    /// `fresh_sys` plus the host facts a workload row needs (the same shape as
+    /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and one
+    /// VM tap, and `primary.3` up, addressed, with its own MAC.
+    fn wl_fresh_sys(view: &View, run_dir: &Path) -> MockSys {
+        fresh_sys(view, run_dir)
+            .file(CONFIG, &wl_decl_text(run_dir))
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file("/sys/class/net/eth0/ifindex", "2\n")
+            .file("/sys/class/net/tap100i0/ifindex", "10\n")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .on_stdout(
+                &["ip", "-br", "link", "show", "dev", "primary.3"],
+                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                "primary.3 UP 192.168.20.2/24\n",
+            )
+    }
+
+    /// Run a whole supervisor lifecycle on the workload declaration and hand back the
+    /// `components` document as it stood the instant the member came up, plus every journal
+    /// line the run produced.
+    async fn wl_run(member: &str, neigh: NeighWatchFn) -> (Components, Vec<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, member).unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let snap = sh.lock().unwrap().components(Instant::now());
+            driver_tx.send(Cmd::Terminate).ok();
+            snap
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.trace = Some(trace.clone());
+        hooks.neigh_watch = neigh;
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0, "the workload lifecycle must stop cleanly");
+        let snap = driver.await.unwrap();
+        let lines = trace.lock().unwrap().clone();
+        (snap, lines)
+    }
+
+    /// A member carrying a workload row runs an announcer, and `components` says what wakes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_with_a_workload_reports_its_announcer_trigger_in_components() {
+        let (c, said) = wl_run("pve1-tb", Arc::new(|_| Ok(()))).await;
+        assert_eq!(c.workloads.len(), 1);
+        assert_eq!(
+            (
+                c.workloads[0].name.as_str(),
+                c.workloads[0].ifname.as_str(),
+                c.workloads[0].trigger.as_str()
+            ),
+            ("vms", "primary.3", "neigh events")
+        );
+        assert!(
+            said.contains(&"cfab: workload vms: announcer trigger neigh events".to_string()),
+            "{said:?}"
+        );
+    }
+
+    /// Ruling 12: the FDB poll is taken only when the subscription cannot be opened, and both
+    /// `status` and the journal name the reason — never a silent switch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn when_the_neighbor_subscription_cannot_open_the_trigger_is_fdb_poll_and_says_why() {
+        let (c, said) = wl_run(
+            "pve1-tb",
+            Arc::new(|_| Err("Operation not permitted (os error 1)".to_string())),
+        )
+        .await;
+        assert_eq!(
+            c.workloads[0].trigger,
+            "fdb poll (RTNLGRP_NEIGH subscription failed: Operation not permitted (os error 1))"
+        );
+        assert!(
+            said.contains(
+                &"cfab: workload vms: announcer trigger fdb poll (RTNLGRP_NEIGH subscription \
+                   failed: Operation not permitted (os error 1))"
+                    .to_string()
+            ),
+            "{said:?}"
+        );
+    }
+
+    /// Poll `ready` until it holds or the deadline passes; the answer is whether it holds.
+    async fn until(ms: u64, mut ready: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            if ready() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ready()
+    }
+
+    /// The wiring itself, through the running select loop rather than the state machine: the
+    /// first beacon reaches the socket without anybody asking, and a `Cmd::Neigh` for a VM port
+    /// — the shape the watch task posts — turns into a burst whose frames also reach it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_select_loop_sends_the_first_beacon_and_bursts_on_a_neigh_event() {
+        use crate::workload::announce::mock::SharedIo;
+        use crate::workload::neigh::{NeighEvent, NeighSignal};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let io = SharedIo::default();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let (sh, obs) = (shared.clone(), io.clone());
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let beacon = until(2000, || !obs.sent().is_empty()).await;
+            // ifindex 10 is `tap100i0`, a non-uplink port of `primary` in `wl_fresh_sys`.
+            driver_tx
+                .send(Cmd::Neigh(NeighSignal::Add(NeighEvent {
+                    ifindex: 10,
+                    mac: [2, 0xcf, 0xab, 0, 0, 1],
+                    permanent: false,
+                })))
+                .ok();
+            let burst = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .workloads
+                    .first()
+                    .is_some_and(|w| w.bursts == 1)
+            })
+            .await;
+            let frames = until(2000, || obs.sent().len() >= 2).await;
+            let sent = obs.sent();
+            driver_tx.send(Cmd::Terminate).ok();
+            (beacon, burst, frames, sent)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.neigh_watch = Arc::new(|_| Ok(()));
+        hooks.announce_io = Some(Box::new(io.clone()));
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let (beacon, burst, frames, sent) = driver.await.unwrap();
+        assert!(beacon, "the first beacon must go out without prompting");
+        assert!(burst, "a neigh event on a VM port must start a burst");
+        assert!(frames, "and the burst's first frame must reach the socket");
+        assert!(
+            sent.iter().all(|(port, frame)| port == "primary.3"
+                && frame[..]
+                    == crate::workload::announce::gratuitous(
+                        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                        "192.168.20.254".parse().unwrap()
+                    )[..]),
+            "every frame is the gratuitous request for gw, from the sub-interface's own MAC"
+        );
+    }
+
+    /// The watch task can die under a running supervisor. The loop must move every row onto
+    /// the FDB poll and say so — never leave `status` claiming a trigger that stopped working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_neigh_watch_flips_the_reported_trigger_to_the_fdb_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            driver_tx
+                .send(Cmd::NeighWatchDied("readiness lost".to_string()))
+                .ok();
+            let flipped = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .workloads
+                    .first()
+                    .is_some_and(|w| w.trigger.starts_with("fdb poll"))
+            })
+            .await;
+            let snap = sh.lock().unwrap().components(Instant::now());
+            driver_tx.send(Cmd::Terminate).ok();
+            (flipped, snap)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.trace = Some(trace.clone());
+        hooks.neigh_watch = Arc::new(|_| Ok(()));
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let (flipped, snap) = driver.await.unwrap();
+        assert!(flipped, "the reported trigger must follow the dead watch");
+        assert_eq!(
+            snap.workloads[0].trigger,
+            "fdb poll (neighbor watch died: readiness lost)"
+        );
+        assert!(
+            trace.lock().unwrap().contains(
+                &"cfab: workload vms: announcer trigger fdb poll (neighbor watch died: readiness \
+                   lost)"
+                    .to_string()
+            ),
+            "{:?}",
+            trace.lock().unwrap()
+        );
+    }
+
+    /// A member the declaration gives no workload row opens no subscription and runs nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_without_a_workload_starts_no_announcer() {
+        let (c, said) = wl_run(
+            "pve3-tb",
+            Arc::new(|_| panic!("a member with no workload row must open no subscription")),
+        )
+        .await;
+        assert!(c.workloads.is_empty());
+        assert!(!said.iter().any(|l| l.contains("workload")), "{said:?}");
     }
 
     /// Spec §10: an initial apply refusal exits 3 and no child is ever started.
@@ -1740,6 +2195,8 @@ mod tests {
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
                 feed: Arc::new(|| {}),
+                neigh_watch: no_neigh_watch(),
+                announce_io: Some(Box::new(RecordingIo::default())),
             },
         )
         .await;
@@ -1972,6 +2429,8 @@ mod tests {
                 trace: None,
                 stop_grace: CHILD_STOP_GRACE,
                 feed: Arc::new(|| {}),
+                neigh_watch: no_neigh_watch(),
+                announce_io: Some(Box::new(RecordingIo::default())),
             },
         )
         .await;
@@ -3022,6 +3481,8 @@ mod tests {
             trace: Some(calls.clone()),
             stop_grace: grace,
             feed: Arc::new(|| {}),
+            neigh_watch: no_neigh_watch(),
+            announce_io: Some(Box::new(RecordingIo::default())),
         };
         let code = run_with(
             &mut sys,
@@ -3156,6 +3617,8 @@ mod tests {
             trace: None,
             stop_grace: CHILD_STOP_GRACE,
             feed,
+            neigh_watch: no_neigh_watch(),
+            announce_io: Some(Box::new(RecordingIo::default())),
         };
         let code = run_with(
             &mut sys,

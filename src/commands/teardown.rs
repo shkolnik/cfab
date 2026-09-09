@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::common::{
-    conf_interfaces, drop_rules, link_exists, link_kind_is, remove_foreign_transit_accept,
+    conf_interfaces, drop_rules, has_ip_addr, link_exists, link_kind_is,
+    remove_foreign_transit_accept,
 };
 use crate::commands::engine_ctl;
 use crate::derive::{Port, View};
@@ -146,13 +147,42 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     if backend != Some(MarkBackend::Nft) {
         crate::commands::common::remove_mark_ipt(sys)?;
     }
+    // Workload bridge ARP guard and gw address (the exact reverse of apply's order): the guard
+    // table is one per member, not one per row, so it comes off once, gated on the FIRST row
+    // (an empty `workload_rows()` skips this entirely — a member with no `[[workload]]` row
+    // never ran `nft list table bridge cfab` at all). `forwarding_off` above already covers the
+    // ifname (it iterates `owned_forwarding()`, which lists every workload row); `arp_ignore`
+    // is left exactly as `up` set it (ruling 11) — `down` never touches it. The interface itself
+    // is never a delete candidate: cfab did not create it and never runs `ip link del` on it.
+    if !view.workload_rows().is_empty() {
+        // M2 (whole-branch review): `have_tool`-guarded like the mark removal above — a missing
+        // nft must never abort `down` before the gw address and rule removal below it run.
+        if have_tool(sys, "nft")? {
+            let bridge_present = sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+            if bridge_present {
+                run_ok(sys, &["nft", "delete", "table", "bridge", "cfab"])?;
+            }
+        }
+        for row in view.workload_rows() {
+            let ifname = &row.wl.ifname;
+            let gw_cidr = row.wl.gw_cidr();
+            let addr = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
+            if has_ip_addr(&addr.stdout, &gw_cidr) {
+                run_ok(sys, &["ip", "addr", "del", &gw_cidr, "dev", ifname])?;
+            }
+        }
+    }
     // The engine stops (and its routes are swept) before any interface goes away, so it never
     // acts on vanished links. A zone's table now holds two things cfab owns: the engine's
     // routes (swept here with the engine) and, on a gw zone, cfab's own proto-205 return-path
     // default (deleted explicitly below). Anything else left in the table is not ours and is
     // left alone (the leftover-note loop says so).
     engine_ctl::stop_and_sweep(sys, f)?;
-    // return-path rules (both kinds)
+    // return-path rules (both kinds), plus the pref-2000 workload siblings (spec §5 item 4):
+    // computed once, fabric-wide, then filtered per zone below — one `FabricRule` shape (tail-
+    // only `.add`), so `drop_rules` (which prepends `ip rule del pref <pref>` itself) is the
+    // only way any of these rules is added to or removed from the kernel.
+    let workload_rules = crate::commands::common::workload_return_rules(view);
     for z in &f.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -171,6 +201,13 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
                 "0",
             ],
         )?;
+        for r in workload_rules
+            .iter()
+            .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
+        {
+            let del: Vec<&str> = r.add.iter().map(String::as_str).collect();
+            drop_rules(sys, &r.pref, &r.needle, &del)?;
+        }
         drop_rules(
             sys,
             "2001",
@@ -359,6 +396,121 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
                 .unwrap();
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The state `up` leaves: every netdev absent (the `.on_fail(ip link show)` baseline the
+    /// rest of this file's minimal-state tests share — there is no separate "healthy teardown"
+    /// fixture here), guard table present, gw on the interface, both 2000 rules.
+    fn wl_down_sys() -> MockSys {
+        MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "no")
+            // `primary.3` is a real conf entry left by `up`'s `enable_forwarding` (the interface
+            // is not cfab's own creation, but the kernel already has a conf/<ifname>/ dir for
+            // it) — `forwarding_off`'s `conf_interfaces` scan needs it present to find it.
+            .file("/proc/sys/net/ipv4/conf/primary.3/forwarding", "1\n")
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n}\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            )
+    }
+
+    #[test]
+    fn down_removes_the_bridge_table_the_gw_address_and_the_sibling_rules_but_never_the_interface()
+     {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys();
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("nft delete table bridge cfab"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            Some(&"0")
+        );
+        assert!(!sys.ran("ip link del primary.3"));
+        assert!(!sys.ran("ip link set primary.3 down"));
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore").is_empty(),
+            "down leaves arp_ignore (ruling 11)"
+        );
+    }
+
+    #[test]
+    fn down_skips_what_is_already_gone() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys()
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                "primary.3 UP 192.168.20.2/24\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("nft delete table bridge cfab"));
+        assert!(!sys.ran("ip addr del 192.168.20.254/24"));
+        assert!(!sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24"));
+    }
+
+    #[test]
+    fn down_does_not_mistake_a_substring_collision_for_the_gw_address_being_present() {
+        // 192.168.20.254/24 is a SUBSTRING of 1192.168.20.254/24; a `.contains()` check would
+        // wrongly try to delete an address that was never applied.
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys().on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 192.168.20.2/24 1192.168.20.254/24\n",
+        );
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+    }
+
+    // M2 (whole-branch review): the bridge-guard presence read used a bare `?`, unlike the
+    // `have_tool`-guarded mark removal right above it — with nft removed, `RealSys::run` maps
+    // the exec failure to `Err`, and `down` aborted BEFORE the gw address and rule removal below
+    // it ever ran, leaving a half-torn-down host. `have_tool`-guard it the same way.
+    #[test]
+    fn down_continues_past_a_missing_nft_and_still_removes_the_gw_address_and_rules() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys().on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "");
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("nft list table bridge cfab"));
+        assert!(!sys.ran("nft delete table bridge cfab"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding").last(),
+            Some(&"0")
+        );
     }
 
     /// Every netdev absent except the fallback leg of the storage zone, correctly typed.
@@ -799,6 +951,34 @@ mod tests {
                 .iter()
                 .filter(|c| c.contains("route del default"))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The pref-2000 workload sibling (spec §5 item 4) comes off when it is there, and `down`
+    /// issues no delete for it when it is not — the same idempotent shape as every other
+    /// `drop_rules` caller here.
+    #[test]
+    fn teardown_drops_the_workload_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+
+        let mut present = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no").on_stdout(
+            &["ip", "rule", "show", "pref", "2000"],
+            "100:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+        );
+        run(&mut present, &view).unwrap();
+        assert!(
+            present.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
+            "{:?}",
+            present.calls
+        );
+
+        let mut absent = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut absent, &view).unwrap();
+        assert!(
+            !absent.ran("rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24"),
+            "{:?}",
+            absent.calls
         );
     }
 

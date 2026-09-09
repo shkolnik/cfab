@@ -25,6 +25,35 @@ impl FabricRule {
     }
 }
 
+/// Pref-2000 siblings (spec §5 item 4): fabric-sourced traffic to a workload prefix leaves via
+/// main on every member and leaf, before the 2001 per-zone table catches it. One per (allowed
+/// zone, workload), fabric-wide: leaves need it too, to answer `ip route get <vm> from
+/// <identity>`. Tail-only `.add`, the same convention every other rule in this file uses:
+/// `return_path_rules` splices this function's own output (never re-formats the same needle
+/// itself), and teardown passes `.add` straight to `drop_rules`, which prepends `ip rule del
+/// pref <pref>` itself — one `FabricRule` shape, one place that decides which (zone, workload)
+/// pairs get a sibling.
+pub fn workload_return_rules(view: &View) -> Vec<FabricRule> {
+    let mut out = Vec::new();
+    for z in &view.fabric.zones {
+        let blk = format!("{}.0.0/16", z.block());
+        for w in view
+            .fabric
+            .workloads
+            .iter()
+            .filter(|w| w.allow.iter().any(|a| a == &z.name))
+        {
+            let prefix = w.prefix.to_string();
+            out.push(FabricRule::new(
+                "2000",
+                format!("from {blk} to {prefix} lookup main"),
+                &["from", &blk, "to", &prefix, "lookup", "main"],
+            ));
+        }
+    }
+    out
+}
+
 /// The leaf leak guard: a fabric block is looked up in main ONLY when locally originated;
 /// anything arriving on another interface bound for a fabric block is refused. Leaf only.
 pub fn leak_guard_rules(view: &View) -> Vec<FabricRule> {
@@ -52,6 +81,10 @@ pub fn leak_guard_rules(view: &View) -> Vec<FabricRule> {
 /// outside reaches a leaf at the leaf's own addresses; only members use its identities.
 pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
     let mut out = Vec::new();
+    // Fabric-wide, computed once: `workload_return_rules` is the one place that decides which
+    // (zone, workload) pairs get a pref-2000 sibling, so this splices its own output rather
+    // than re-formatting the same needle a second time.
+    let siblings = workload_return_rules(view);
     for z in &view.fabric.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -69,6 +102,14 @@ pub fn return_path_rules(view: &View) -> Vec<FabricRule> {
                 "0",
             ],
         ));
+        // The sibling: fabric-sourced traffic bound for a workload this zone may reach leaves
+        // via main too, before it can fall through to this zone's 2001/2002 pair below.
+        out.extend(
+            siblings
+                .iter()
+                .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
+                .cloned(),
+        );
         // The substring "lookup <id>" is unique within this pref's rules.
         out.push(FabricRule::new(
             "2001",
@@ -211,6 +252,14 @@ pub fn proc_sysctl(sys: &mut dyn Sys, ifname: &str, key: &str, value: &str) -> R
 /// Interface names under /proc/sys/net/ipv4/conf (the kernel's per-interface view).
 pub fn conf_interfaces(sys: &mut dyn Sys) -> Result<Vec<String>> {
     sys.list_dir("/proc/sys/net/ipv4/conf")
+}
+
+/// Is `cidr` one of the whitespace-separated tokens of an `ip -br addr show` line? A substring
+/// check false-positives: `10.0.0.1/24` is a substring of `110.0.0.1/24`, and `ip -br addr`
+/// packs every address for the device onto one line with no other separator, so token-exact is
+/// the only correct match.
+pub fn has_ip_addr(stdout: &str, cidr: &str) -> bool {
+    stdout.split_whitespace().any(|tok| tok == cidr)
 }
 
 /// A base chain at the netfilter `forward` hook that cfab does not own and whose policy is
@@ -435,7 +484,60 @@ pub fn remove_mark_ipt(sys: &mut dyn Sys) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decl::Declaration;
+    use crate::model::Fabric;
     use crate::sys::mock::MockSys;
+
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn workload_return_rules_are_one_pref_2000_sibling_per_allowed_zone_on_every_member_and_leaf()
+     {
+        let f = wl_fabric();
+        for m in ["pve1-tb", "pve3-tb"] {
+            let v = View::new(&f, m).unwrap();
+            let r = workload_return_rules(&v);
+            assert_eq!(
+                r.len(),
+                1,
+                "{m}: one per allowed zone (storage), none for cluster or mgmt"
+            );
+            assert_eq!(r[0].pref, "2000");
+            assert_eq!(
+                r[0].needle,
+                "from 10.99.0.0/16 to 192.168.20.0/24 lookup main"
+            );
+            assert_eq!(
+                r[0].add,
+                vec!["from", "10.99.0.0/16", "to", "192.168.20.0/24", "lookup", "main"]
+            );
+        }
+    }
+
+    #[test]
+    fn return_path_rules_place_the_sibling_after_the_allowed_zones_2000_and_before_its_2001() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve3-tb").unwrap();
+        let rules = return_path_rules(&v);
+        let prefs: Vec<&str> = rules.iter().map(|r| r.pref.as_str()).collect();
+        // storage (allowed): 2000, sibling 2000, 2001, 2002; cluster and mgmt: 2000, 2001, 2002
+        assert_eq!(
+            prefs,
+            ["2000", "2000", "2001", "2002", "2000", "2001", "2002", "2000", "2001", "2002"]
+        );
+        assert_eq!(
+            rules[1].needle,
+            "from 10.99.0.0/16 to 192.168.20.0/24 lookup main"
+        );
+    }
 
     /// Shape of `nft -j list chains`, as captured on pve1-tb. `cfab-fwd`'s own forward chain is
     /// policy drop and must never be reported; Docker's `ip filter FORWARD` is the foreign one.
@@ -661,5 +763,18 @@ mod tests {
         let r = foreign_forward_remedy(&["cfab-st".to_string()]);
         assert!(r.contains("-i cfab-st -o cfab-st"), "{r}");
         assert!(foreign_forward_remedy(&[]).contains("<cfab-if>"));
+    }
+
+    #[test]
+    fn has_ip_addr_is_token_exact_not_substring() {
+        assert!(has_ip_addr("primary.3 UP 192.168.20.2/24\n", "192.168.20.2/24"));
+        assert!(has_ip_addr(
+            "primary.3 UP 10.0.0.1/24 192.168.20.2/24\n",
+            "192.168.20.2/24"
+        ));
+        // A substring collision must not false-positive: 10.0.0.1/24 is a substring of
+        // 110.0.0.1/24, and the reverse.
+        assert!(!has_ip_addr("primary.3 UP 110.0.0.1/24\n", "10.0.0.1/24"));
+        assert!(!has_ip_addr("primary.3 UP 10.0.0.1/24\n", "110.0.0.1/24"));
     }
 }

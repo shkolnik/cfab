@@ -22,6 +22,13 @@ pub struct Components {
     /// construction: one leg reader, one set of conditions, one spelling each.
     #[serde(default)]
     pub fallback: Vec<ProbedLeg>,
+    /// One row per workload announcer this member runs (spec §5.1 item 8). A member with no
+    /// `[[workload]]` row has none, and a row whose announcer has not started — deferred, or
+    /// its uplink unidentifiable — has none either: the journal says why, and `status` reports
+    /// the row's own condition from the model. `#[serde(default)]` so an older supervisor's
+    /// document still parses.
+    #[serde(default)]
+    pub workloads: Vec<WorkloadAnnounce>,
     /// Why the metrics endpoint is not listening, if it is not. `None` is the normal case —
     /// bound, or never asked for. `#[serde(default)]` so an older supervisor's document parses.
     #[serde(default)]
@@ -70,6 +77,20 @@ pub struct ProbedPort {
     /// Milliseconds since this wire last showed life — a reply to a probe, or a frame heard on
     /// the passive channel; `null` = never, this run.
     pub last_reply_ms: Option<u64>,
+}
+
+/// One running gateway announcer, as the supervisor publishes it.
+///
+/// `announces` counts frames the schedule produced, not frames the socket took (the announcer's
+/// own contract): a send failure still counts one and is journaled where it happens.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkloadAnnounce {
+    pub name: String,
+    pub ifname: String,
+    /// `neigh events`, or `fdb poll (<why the subscription failed>)` — never silently either.
+    pub trigger: String,
+    pub announces: u64,
+    pub bursts: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +266,36 @@ mod tests {
         assert_eq!(back.ingress[0].ports[0].last_reply_ms, Some(2));
         // The rows are their own document: nothing about them reaches the components line.
         assert_eq!(render_line(&back), render_line(&c));
+    }
+
+    /// The announcer's row (spec §5.1 item 8, Task 9 renders it): optional like the prober's,
+    /// and invisible to the always-printed components line.
+    #[test]
+    fn the_workload_announce_rows_round_trip_and_are_optional() {
+        let c: Components = serde_json::from_str(FIXTURE).unwrap();
+        assert!(c.workloads.is_empty(), "an absent workloads key is no rows");
+        let with_rows = FIXTURE.replace(
+            "\"watchdog\":",
+            "\"workloads\": [{\"name\": \"vms\", \"ifname\": \"primary.3\",
+              \"trigger\": \"neigh events\", \"announces\": 7, \"bursts\": 2}],
+             \"watchdog\":",
+        );
+        let c: Components = serde_json::from_str(&with_rows).unwrap();
+        assert_eq!(
+            (
+                c.workloads[0].name.as_str(),
+                c.workloads[0].ifname.as_str(),
+                c.workloads[0].trigger.as_str(),
+                c.workloads[0].announces,
+                c.workloads[0].bursts
+            ),
+            ("vms", "primary.3", "neigh events", 7, 2)
+        );
+        let back: Components = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.workloads[0].announces, 7);
+        // The rows are their own document: nothing about them reaches the components line.
+        let plain: Components = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(render_line(&back), render_line(&plain));
     }
 
     /// `cfab status` deserializes what the supervisor serializes: the document must survive

@@ -40,6 +40,9 @@ pub struct Declaration {
     /// `[[zone]]` — the traffic classes, each with its own segments.
     #[serde(rename = "zone")]
     pub zones: Vec<ZoneDecl>,
+    /// `[[workload]]` — a VM workload VLAN and the zones it may reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload: Vec<WorkloadDecl>,
     /// Required: whether hosts transit between zones, and which pairs may. Not a tunable
     /// with a default — a default would let an omitted table decide the isolation posture.
     pub forward: ForwardDecl,
@@ -83,6 +86,9 @@ pub struct MemberDecl {
     /// (a partial list is an error, never blended with the derived order). Absent = derived.
     #[serde(default)]
     pub prefs: BTreeMap<String, Vec<String>>,
+    /// This member's addresses on `[[workload]]` interfaces it carries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workloads: Vec<MemberWorkloadDecl>,
 }
 
 /// One wire: a physical NIC, the switch domain it is plugged into, its DECLARED link speed.
@@ -170,6 +176,30 @@ pub struct GwDecl {
     /// The router's address with its prefix, e.g. `192.168.249.254/24` (/24 is the only
     /// length the design supports).
     pub router: String,
+}
+
+/// One VM workload VLAN (spec §4). `span` is phase 2; phase 1 accepts only its absence or "switch".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadDecl {
+    pub name: String,
+    pub ifname: String,
+    pub prefix: String,
+    pub gw: String,
+    /// The VLAN's existing default router, listed inside DHCP option 121 (a client with 121
+    /// ignores option 3). RULED (spec §10 call 14): declared, like any static IP configuration.
+    pub router: String,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemberWorkloadDecl {
+    pub name: String,
+    pub address: String,
 }
 
 /// `[forward]` — the isolation posture. Required.
@@ -606,9 +636,71 @@ mod tests {
         assert_eq!(json["additionalProperties"], serde_json::json!(false));
         // ...and every property the example states is described.
         let props = json["properties"].as_object().expect("properties");
-        for key in ["dns_domain", "domains", "member", "zone", "forward"] {
+        for key in [
+            "dns_domain",
+            "domains",
+            "member",
+            "zone",
+            "forward",
+            "workload",
+        ] {
             assert!(props.contains_key(key), "{key}");
         }
+    }
+
+    #[test]
+    fn a_workload_row_and_member_workloads_parse() {
+        let d = Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap();
+        let wl = &d.workload[0];
+        assert_eq!(
+            (
+                wl.name.as_str(),
+                wl.ifname.as_str(),
+                wl.prefix.as_str(),
+                wl.gw.as_str(),
+                wl.router.as_str()
+            ),
+            (
+                "vms",
+                "primary.3",
+                "192.168.20.0/24",
+                "192.168.20.254",
+                "192.168.20.1"
+            )
+        );
+        assert_eq!(wl.allow, vec!["storage".to_string()]);
+        assert_eq!(wl.span, None);
+        let m = d.members.iter().find(|m| m.name == "pve1-tb").unwrap();
+        assert_eq!(m.workloads[0].name, "vms");
+        assert_eq!(m.workloads[0].address, "192.168.20.2/24");
+        assert!(
+            d.members
+                .iter()
+                .find(|m| m.name == "pve3-tb")
+                .unwrap()
+                .workloads
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn span_is_accepted_by_the_schema() {
+        let text = fixtures::with_workload(&fixtures::example()).replace(
+            "gw = \"192.168.20.254\"",
+            "gw = \"192.168.20.254\"\nspan = \"switch\"",
+        );
+        let d = Declaration::parse(&text).unwrap();
+        assert_eq!(d.workload[0].span.as_deref(), Some("switch"));
+    }
+
+    #[test]
+    fn a_workload_row_rejects_unknown_keys() {
+        let text = fixtures::with_workload(&fixtures::example()).replace(
+            "gw = \"192.168.20.254\"",
+            "gw = \"192.168.20.254\"\nvid = 3",
+        );
+        let err = Declaration::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("unknown field `vid`"), "{err}");
     }
 
     /// The retired shell format is not a declaration: it fails at parse, loudly.
@@ -624,8 +716,12 @@ mod tests {
 /// Declaration fixtures shared by the unit tests of every module: the shipped example, and
 /// the few edits tests make to it. Centralized so a change to the file's shape breaks one
 /// helper instead of thirty string literals.
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// Not `#[cfg(test)]`: the gate B golden (`tests/workload_golden.rs`) is an integration test and
+/// so links the crate as an external library, where a test-gated module does not exist. These are
+/// three string builders and a `read_to_string` of `examples/fabric.toml` resolved at call time,
+/// so the shipped binary gains nothing but the code.
+#[doc(hidden)]
+pub mod fixtures {
     /// The example declaration shipped with the crate.
     pub fn example() -> String {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
@@ -763,6 +859,38 @@ pub(crate) mod fixtures {
             members.trim_end(),
             &text[end..]
         )
+    }
+
+    /// The `[[workload]]` block the tests share (`vms` on `primary.3`), appended as a top-level
+    /// array table, and the member rows on the two hosts (inserted after their `wires` arrays).
+    pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\"]\n";
+
+    /// `WORKLOAD_BLOCK` allowed into a second zone (`mgmt`, alongside `storage`): the fixture
+    /// that exercises "one sibling / passive OSPF entry / forward-policy pair per allowed zone",
+    /// not just the single-zone case `WORKLOAD_BLOCK` covers.
+    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\", \"mgmt\"]\n";
+
+    fn with_workload_block(text: &str, block: &str) -> String {
+        let t = with_prefs(
+            text,
+            "pve1-tb",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+        );
+        let t = with_prefs(
+            &t,
+            "pve2-tb",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.3/24\" }]",
+        );
+        format!("{t}{block}")
+    }
+
+    pub fn with_workload(text: &str) -> String {
+        with_workload_block(text, WORKLOAD_BLOCK)
+    }
+
+    /// The `with_workload` fixture with `allow = ["storage"]` instead of one zone.
+    pub fn with_multi_zone_allow_workload(text: &str) -> String {
+        with_workload_block(text, MULTI_ZONE_ALLOW_WORKLOAD_BLOCK)
     }
 
     /// The example with every zone's universal (fallback) leg removed.

@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::commands::common::{conf_interfaces, foreign_forward_remedy, unresolved_forward_drops};
+use crate::commands::common::{
+    FabricRule, conf_interfaces, foreign_forward_remedy, has_ip_addr, unresolved_forward_drops,
+    workload_return_rules,
+};
 use crate::commands::engine_ctl;
 use crate::derive::{Port, View, segments_of};
 use crate::emit;
@@ -24,7 +27,7 @@ use crate::error::Result;
 use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
-use crate::sys::{Output, Sys, run_optional};
+use crate::sys::{Output, Sys, have_tool, run_optional};
 
 /// The re-read cadence of `--wait`.
 const POLL_SECS: u64 = 2;
@@ -40,7 +43,7 @@ pub mod model;
 
 pub use model::{
     Adjacency, BondLeg, Bonding, Class, Condition, Headline, HomeCarrier, Ingress, LegKind,
-    LegPort, MemberInfo, Reach, State, StatusModel,
+    LegPort, MemberInfo, Reach, State, StatusModel, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -62,6 +65,14 @@ struct Ctx {
     fallbacks: Vec<BondLeg>,
     /// One row per gw zone on a host.
     ingress: Vec<Ingress>,
+    /// One row per `[[workload]]` this member carries.
+    workloads: Vec<WorkloadStatus>,
+    /// Workload names `return_path_and_ingress` found a broken sibling rule or route-get for,
+    /// fabric-wide (a leaf earns one with no row of its own). `workload_posture` reads this to
+    /// fold that fact into its OWN row's `up` — without re-running or re-wording the check, so
+    /// the reason text has exactly one source (the trap `common::workload_return_rules` warns
+    /// against: don't re-derive the sibling needle a second time).
+    broken_workloads: BTreeSet<String>,
 }
 
 impl Ctx {
@@ -106,6 +117,13 @@ impl Ctx {
     fn ingress(&mut self, row: Ingress) {
         self.reasons.extend(ingress_reasons(&row));
         self.ingress.push(row);
+    }
+
+    /// One `[[workload]]` row this member carries. Its reasons are pushed at the point each
+    /// check runs (`workload_posture`), not derived here: unlike `ingress`, the row alone
+    /// cannot re-state the sibling/route-get reasons `return_path_and_ingress` already worded.
+    fn workload(&mut self, row: WorkloadStatus) {
+        self.workloads.push(row);
     }
 }
 
@@ -223,6 +241,7 @@ fn gather_with(
         adjacencies: c.adjacencies,
         fallbacks: c.fallbacks,
         ingress: c.ingress,
+        workloads: c.workloads,
         conditions,
         components,
         prefs: view.prefs(),
@@ -352,6 +371,32 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
     for p in &m.prefs {
         let _ = writeln!(out, "  prefs {}", p.render());
     }
+    // One line per `[[workload]]` row this member carries (spec §5.1 item 10); the reasons for
+    // a `down` row are the conditions above, not repeated here.
+    for w in &m.workloads {
+        let word = if w.up { "up" } else { "down" };
+        let uplinks = if w.uplinks.is_empty() {
+            "-".to_string()
+        } else {
+            w.uplinks.join(", ")
+        };
+        // `Some("")` (the announcer entry exists but its trigger has not been set yet) reads
+        // the same as `None` here — one dash, not an empty word in the middle of the line.
+        let trigger = match w.trigger.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => "-",
+        };
+        let _ = writeln!(
+            out,
+            "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
+             trigger {trigger}",
+            w.name,
+            w.ifname,
+            w.address,
+            w.gw,
+            w.zones.join(", ")
+        );
+    }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
         match &m.components {
@@ -439,6 +484,7 @@ fn read(
     let absent = absent_ifs(&*sys, view);
     posture(sys, view, doc.as_ref(), comps, c, &absent)?;
     return_path_and_ingress(sys, view, doc.as_ref(), comps, c, &absent)?;
+    workload_posture(sys, view, comps, c)?;
     mark_drift(sys, view, c)?;
     ceiling_counters(sys, view, c)?;
     shape_posture(sys, view, comps, c)?;
@@ -1455,6 +1501,26 @@ fn reachability(
     Ok(())
 }
 
+/// The workload's own pref-2000 sibling, sourced from `siblings` (`common::workload_return_rules`'s
+/// own output — never a second reformat of the needle) rather than an `.expect()`: `status` only
+/// ever reads, so three cases, never a panic. (1) the builder emitted this row's rule and it is
+/// installed: healthy. (2) the builder emitted it but `ip rule show pref 2000` does not have it:
+/// dropped, report the builder's own needle (`r.needle`, not a needle formatted here a second
+/// time). (3) the builder emitted no rule for this row at all — it should always exist by
+/// construction (both call sites filter the same (zone, workload) pairs from the same
+/// `view.fabric`), so this is the two filters having drifted — report the needle this call site
+/// derives AND say plainly that the builder never emitted it, so the two facts are not confused.
+fn sibling_return_reason(siblings: &[FabricRule], blk: &str, prefix: &str, r2000: &str) -> Option<String> {
+    let needle = format!("from {blk} to {prefix} lookup main");
+    match siblings.iter().find(|r| r.needle == needle) {
+        Some(r) if r2000.contains(&r.needle) => None,
+        Some(r) => Some(format!("return path missing: pref 2000 {}", r.needle)),
+        None => Some(format!(
+            "return path missing: pref 2000 {needle} (workload_return_rules never emitted this rule)"
+        )),
+    }
+}
+
 /// Return-path rules per zone; a gw zone's table must hold the engine's default, its leg must carry
 /// the address, and the router must be peering.
 #[allow(clippy::too_many_arguments)]
@@ -1468,6 +1534,10 @@ fn return_path_and_ingress(
 ) -> Result<()> {
     let f = view.fabric;
     let n = view.node();
+    // Fabric-wide, computed once: the exact pref-2000 sibling text per (allowed zone, workload)
+    // comes from `common::workload_return_rules` alone — never reformatted here — so a change to
+    // that builder's needle cannot silently stop matching what `up` actually installed.
+    let siblings = workload_return_rules(view);
     for z in &f.zones {
         let blk = format!("{}.0.0/16", z.block());
         let id = z.id.to_string();
@@ -1479,6 +1549,36 @@ fn return_path_and_ingress(
                 "return path missing: pref 2000 from {blk} to {blk} lookup main \
                  suppress_prefixlength 0"
             ));
+        }
+        // The pref-2000 siblings for this zone: one per workload this zone is in the `allow`
+        // list of, on every member AND every leaf (spec §5.1 item 5) — the leaf has no
+        // `[[workload]]` row of its own, but still needs the sibling to answer `ip route get
+        // <vm> from <identity>`. `sibling_return_reason` matches the workload's prefix against
+        // `siblings` (built once above) the same `starts_with` way `return_path_rules` splices
+        // it, never a panic if the two filters ever drift.
+        for w in f.workloads.iter().filter(|w| w.allow.iter().any(|a| a == &z.name)) {
+            let prefix = w.prefix.to_string();
+            if let Some(reason) = sibling_return_reason(&siblings, &blk, &prefix, &r2000) {
+                c.settling(reason);
+                c.broken_workloads.insert(w.name.clone());
+            }
+            // The route-get proof (R4): fabric-sourced traffic from this member's OWN identity
+            // in `z` must reach the workload prefix over main, on every member and every leaf.
+            let ident = view.identity_addr(z);
+            let target = w.prefix.first_host().to_string();
+            let route_get = sys.run(&["ip", "route", "get", &target, "from", &ident])?;
+            if !route_get.ok() {
+                let stderr = route_get.stderr.trim();
+                let err = stderr
+                    .strip_prefix("RTNETLINK answers: ")
+                    .unwrap_or(stderr);
+                c.settling(format!(
+                    "workload {}: no route to {} from {ident} (ip route get {target} from \
+                     {ident}: {err})",
+                    w.name, w.prefix
+                ));
+                c.broken_workloads.insert(w.name.clone());
+            }
         }
         let r2001 = sys.run(&["ip", "rule", "show", "pref", "2001"])?.stdout;
         if !r2001
@@ -1585,6 +1685,142 @@ fn return_path_and_ingress(
         );
         row.bgp_pfx_snt = Some(entry.and_then(|n| n["pfx_snt"].as_u64()).unwrap_or(0));
         c.ingress(row);
+    }
+    Ok(())
+}
+
+/// Every `[[workload]]` row this member carries (spec §5.1 item 10): the interface, its
+/// addresses, the ARP guard (ruling 11) and the bridge table (item 8), plus whatever
+/// `return_path_and_ingress` already found broken for this workload's own allowed zones
+/// (`c.broken_workloads` — never re-worded here, see that function). A member with no row has
+/// nothing to add; those checks above still ran fabric-wide and cover a leaf that carries none.
+fn workload_posture(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<&Components>,
+    c: &mut Ctx,
+) -> Result<()> {
+    let rows = view.workload_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // A row named here has no gw address yet (James's ruling 2026-09-09, addendum): its uplink
+    // was not forwarding at apply time and the watchdog installs it once it is. One reason, one
+    // spelling, and none of the checks below — they would only restate the same fact as a pile
+    // of unrelated-looking faults (missing gw, missing sibling, dead route) instead of the one
+    // true one. `crate::workload::deferred_names` is the one parser the supervisor and `status`
+    // both read, so the file's shape is never two spellings that can drift.
+    let deferred = crate::workload::deferred_names(sys, view);
+    // Member-wide (ruling 11, spec §5.1 item 8): one read and one run, shared by every row —
+    // never re-asked per row.
+    let arp = sys
+        .read("/proc/sys/net/ipv4/conf/all/arp_ignore")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unreadable".to_string());
+    // M2 (whole-branch review): `have_tool`-guarded like teardown.rs's mark removal — a host
+    // with no `nft` binary must report this as a condition on the row, never propagate the exec
+    // error and abort the whole `status` gather before any other line renders.
+    let bridge_ok =
+        have_tool(sys, "nft")? && sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+
+    for row in rows {
+        let wl = row.wl;
+        let name = wl.name.as_str();
+        let gw_cidr = wl.gw_cidr();
+
+        if deferred.contains(name) {
+            c.settling(format!(
+                "workload {name}: deferred (uplink not forwarding yet; the watchdog installs it \
+                 once it is)"
+            ));
+            c.workload(WorkloadStatus {
+                name: name.to_string(),
+                ifname: wl.ifname.clone(),
+                address: row.address.clone(),
+                gw: gw_cidr,
+                up: false,
+                zones: wl.allow.clone(),
+                uplinks: Vec::new(),
+                trigger: None,
+            });
+            continue;
+        }
+
+        let mut up = true;
+        let link = sys.run(&["ip", "-br", "link", "show", "dev", &wl.ifname])?;
+        let mut uplinks = Vec::new();
+        if !link.ok() {
+            // Standing: `ifname` is baseline-owned (cfab never creates or deletes it), so its
+            // disappearance is an external fact the fabric itself never clears.
+            c.standing(format!(
+                "workload {name}: interface {} does not exist",
+                wl.ifname
+            ));
+            up = false;
+        } else {
+            let addr = sys
+                .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
+                .stdout;
+            if !has_ip_addr(&addr, &row.address) {
+                c.settling(format!(
+                    "workload {name}: address {} missing on {}",
+                    row.address, wl.ifname
+                ));
+                up = false;
+            }
+            if !has_ip_addr(&addr, &gw_cidr) {
+                c.settling(format!(
+                    "workload {name}: gw {gw_cidr} missing on {}",
+                    wl.ifname
+                ));
+                up = false;
+            }
+            match crate::workload::uplink::identify(&*sys, &wl.ifname) {
+                Ok(u) => uplinks = u.ports,
+                Err(e) => {
+                    c.standing(format!("workload {name}: {e}"));
+                    up = false;
+                }
+            }
+        }
+
+        if arp != "1" {
+            c.settling(format!(
+                "workload {name}: net.ipv4.conf.all.arp_ignore is {arp} (want 1)"
+            ));
+            up = false;
+        }
+        if !bridge_ok {
+            c.settling(format!(
+                "workload {name}: bridge table cfab missing (uplink ARP guard down)"
+            ));
+            up = false;
+        }
+        if c.broken_workloads.contains(name) {
+            up = false;
+        }
+
+        // A row `apply` did not defer, but whose announcer the supervisor never started (Task
+        // 8b's own journal says why) has no entry here — that is its own fault, not "healthy
+        // with nothing to show for the trigger": one settling line, and the row counts down.
+        // With no supervisor answering the announcer's state is unknown, and that fault already
+        // has its own line: only an answering supervisor with no entry means "not started".
+        let announce = comps.and_then(|k| k.workloads.iter().find(|w| w.name == name));
+        if comps.is_some() && announce.is_none() {
+            c.settling(format!("workload {name}: announcer not started"));
+            up = false;
+        }
+        let trigger = announce.map(|w| w.trigger.clone());
+        c.workload(WorkloadStatus {
+            name: name.to_string(),
+            ifname: wl.ifname.clone(),
+            address: row.address.clone(),
+            gw: gw_cidr,
+            up,
+            zones: wl.allow.clone(),
+            uplinks,
+            trigger,
+        });
     }
     Ok(())
 }
@@ -1923,6 +2159,7 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip route show table ",
         "ip rule show pref ",
         "ip -4 -br addr show dev ",
+        "ip -br link show dev ",
         "nft list ",
         "nft -s list ",
         "nft -j list ",
@@ -1930,6 +2167,10 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "systemctl is-enabled ",
         "tc class show dev ",
         "ethtool -i ",
+        // M2 (whole-branch review): `have_tool`'s `command -v` probe, added so `bridge_ok` can
+        // check for `nft` without a bare `sys.run` that aborts the whole gather when it is
+        // absent (see `workload_posture`) — a query, never a write.
+        "/usr/bin/env sh -c command -v ",
     ];
     if let Some(rest) = call.strip_prefix("unix_request ") {
         // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
@@ -2197,12 +2438,13 @@ mod tests {
         sys
     }
 
-    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
-    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
-    /// (this testbed is not clustered), and the forwarding watchdog ticking. Uptimes are 3600 s
-    /// so the line renders `1h00m`.
-    fn healthy_components(view: &View) -> String {
-        let shape = if view.kind() == MemberKind::Host {
+    /// The `components` document a healthy supervisor publishes, with the given `workloads`
+    /// array spliced in verbatim: the one place the supervisor/components/watchdog shape is
+    /// spelled out, so `healthy_components` and any fixture that only needs a different
+    /// `workloads` entry (a blank trigger, a missing announcer) never re-type the rest of the
+    /// document a second time. Uptimes are 3600 s so the line renders `1h00m`.
+    fn components_doc(shape_running: bool, workloads: serde_json::Value) -> String {
+        let shape = if shape_running {
             serde_json::json!({"name": "shape-daemon", "state": "running", "pid": 1250,
                 "uptime_s": 3600, "restarts": 0, "last_exit": null})
         } else {
@@ -2219,9 +2461,27 @@ mod tests {
                 {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
                  "restarts": 0, "last_exit": null, "why": "not clustered"}
             ],
-            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null}
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
+            "workloads": workloads
         })
         .to_string()
+    }
+
+    /// The `components` document a healthy supervisor publishes for `view` (spec §9): the
+    /// engine running, shape-daemon running on a host and stopped on a leaf, conf-sync stopped
+    /// (this testbed is not clustered), and the forwarding watchdog ticking.
+    fn healthy_components(view: &View) -> String {
+        // One running announcer per `[[workload]]` row THIS member carries (Task 8b): none on a
+        // view whose fabric declares no workload, and none on a leaf, which carries no row.
+        let workloads: Vec<serde_json::Value> = view
+            .workload_rows()
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({"name": r.wl.name, "ifname": r.wl.ifname,
+                    "trigger": "neigh events", "announces": 12, "bursts": 1})
+            })
+            .collect();
+        components_doc(view.kind() == MemberKind::Host, workloads.into())
     }
 
     /// The `components` document of a supervisor whose engine is down: it keeps failing to
@@ -2712,6 +2972,467 @@ mod tests {
         }
         sys.socket("/run/cfab/engine.sock", &engine_doc(view, &bfd))
             .socket("/run/cfab/cfab.sock", &healthy_components(view))
+    }
+
+    /// The example fabric plus one `[[workload]]` row (`vms` on `primary.3`, allowed into
+    /// `storage`), carried by pve1-tb and pve2-tb; pve3-tb (a leaf) carries none, but still
+    /// needs the sibling rule and the route-get proof (spec §5.1 item 5, R4).
+    fn wl_fabric() -> Fabric {
+        Fabric::from_decl(&Declaration::parse(&fixtures::with_workload(&fixtures::example())).unwrap())
+            .unwrap()
+    }
+
+    /// This member's identity address in the storage zone, the one every route-get proof is
+    /// sourced from.
+    fn identity_of(f: &Fabric, view: &View) -> String {
+        view.identity_addr(f.zone("storage").unwrap())
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `healthy_host` plus the workload facts in their healthy state: the interface up, both its
+    /// addresses, the ARP guard, the sibling return-path rule, and the route-get proof.
+    fn wl_status_sys(f: &Fabric, view: &View) -> MockSys {
+        let identity = identity_of(f, view);
+        healthy_host(f, view)
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
+            .on_stdout(
+                &["ip", "-br", "link", "show", "dev", "primary.3"],
+                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+            )
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n}\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "route", "get", "192.168.20.1", "from", &identity],
+                "192.168.20.1 from 10.99.0.1 dev primary.3 uid 0\n    cache\n",
+            )
+    }
+
+    /// A healthy workload row renders one line, exactly the spec's example plus the trigger, and
+    /// carries no reason line.
+    #[test]
+    fn a_healthy_workload_renders_one_line_and_no_reasons() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads.len(), 1);
+        assert!(m.workloads[0].up);
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
+                 to storage, uplink eth0, announce trigger neigh events\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("workload vms:").count(),
+            1,
+            "the line, and no reason lines: {text}"
+        );
+    }
+
+    // M1 (whole-branch review): the address/gw reads used `.contains(" <cidr>")`, a substring
+    // match, while apply/teardown were hardened to the whitespace-token-exact `has_ip_addr`
+    // (gate C). `192.168.20.2/2400` (an implausible mask, but the mock can say it) contains
+    // ` 192.168.20.2/24` as a literal substring — a token-exact reader must not be fooled.
+    #[test]
+    fn a_workload_address_reading_is_token_exact_not_substring() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 192.168.20.2/2400 192.168.20.254/2400\n",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !m.workloads[0].up,
+            "a mangled token must never satisfy a substring match"
+        );
+    }
+
+    // M2 (whole-branch review): a host with no `nft` binary made `bridge_ok`'s bare `sys.run`
+    // propagate an exec error (`RealSys::run` maps a missing binary to `Err`), aborting the
+    // WHOLE `status` gather before any other line rendered — the same class of bug fixed in
+    // teardown.rs's mark removal. `have_tool`-guard it: a missing `nft` is a condition this row
+    // reports (the same settling line the "table missing" case already uses), never a hard stop.
+    #[test]
+    fn a_missing_nft_binary_is_reported_not_an_error() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view)
+            .on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !sys.ran("nft list table bridge cfab"),
+            "have_tool must short-circuit the nft call, exactly like teardown.rs"
+        );
+        assert!(
+            m.conditions
+                .iter()
+                .any(|c| c.text == "workload vms: bridge table cfab missing (uplink ARP guard down)"),
+        );
+        assert!(!m.workloads[0].up);
+    }
+
+    /// An announcer entry that exists but has not published a trigger yet (`""`, the zero value
+    /// before its first tick) renders the same dash a missing entry would, not an empty word
+    /// sitting in the middle of the line.
+    #[test]
+    fn an_empty_trigger_renders_the_same_dash_as_no_entry() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let blank_trigger = components_doc(
+            true,
+            serde_json::json!([
+                {"name": "vms", "ifname": "primary.3", "trigger": "", "announces": 0, "bursts": 0}
+            ]),
+        );
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &blank_trigger);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].trigger.as_deref(), Some(""));
+        assert!(m.workloads[0].up, "an empty trigger is not itself a fault");
+        let text = render_text(&m, false, true).output;
+        assert!(text.contains("announce trigger -\n"), "{text}");
+    }
+
+    /// Each workload fault earns exactly one reason line and takes the row down — never more
+    /// than one line for the one thing that broke.
+    #[test]
+    fn each_workload_fault_is_one_reason_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let id = identity_of(&f, &view);
+        let route_get = ["ip", "route", "get", "192.168.20.1", "from", id.as_str()];
+        let cases: Vec<(MockSys, String, Class)> = vec![
+            (
+                wl_status_sys(&f, &view).on_fail(
+                    &["ip", "-br", "link", "show", "dev", "primary.3"],
+                    1,
+                    "Device \"primary.3\" does not exist.",
+                ),
+                "workload vms: interface primary.3 does not exist".into(),
+                Class::Standing,
+            ),
+            (
+                wl_status_sys(&f, &view).on_stdout(
+                    &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+                    "primary.3 UP 192.168.20.2/24\n",
+                ),
+                "workload vms: gw 192.168.20.254/24 missing on primary.3".into(),
+                Class::Settling,
+            ),
+            (
+                wl_status_sys(&f, &view).file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n"),
+                "workload vms: net.ipv4.conf.all.arp_ignore is 0 (want 1)".into(),
+                Class::Settling,
+            ),
+            (
+                wl_status_sys(&f, &view).on_fail(
+                    &["nft", "list", "table", "bridge", "cfab"],
+                    1,
+                    "Error: No such file or directory",
+                ),
+                "workload vms: bridge table cfab missing (uplink ARP guard down)".into(),
+                Class::Settling,
+            ),
+            (
+                wl_status_sys(&f, &view).on_stdout(
+                    &["ip", "rule", "show", "pref", "2000"],
+                    "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+                ),
+                "return path missing: pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"
+                    .into(),
+                Class::Settling,
+            ),
+            (
+                wl_status_sys(&f, &view).on_fail(
+                    &route_get,
+                    2,
+                    "RTNETLINK answers: Network is unreachable",
+                ),
+                format!(
+                    "workload vms: no route to 192.168.20.0/24 from {id} (ip route get \
+                     192.168.20.1 from {id}: Network is unreachable)"
+                ),
+                Class::Settling,
+            ),
+        ];
+        let expected = expected_links(&view).unwrap();
+        for (mut sys, want, class) in cases {
+            let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+            let hit = m
+                .conditions
+                .iter()
+                .find(|c| c.text == want)
+                .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
+            assert_eq!(hit.class, class, "{want}");
+            assert!(!m.workloads[0].up, "{want}");
+            // Exactly one condition about THIS workload — an extra reason line for the one
+            // thing perturbed would pass the `find` above and still be a regression. Scoped to
+            // "vms" / its prefix, never the fixture's other zones' own (always-missing in this
+            // mock) pref-2000 defaults, which are noise unrelated to any of these cases.
+            let related: Vec<&Condition> = m
+                .conditions
+                .iter()
+                .filter(|c| c.text.starts_with("workload vms:") || c.text.contains("192.168.20.0/24"))
+                .collect();
+            assert_eq!(related.len(), 1, "{want}: {related:#?}");
+        }
+    }
+
+    /// The declared member address is checked exactly like the gw, and by the same call.
+    #[test]
+    fn a_missing_member_address_is_its_own_reason_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 192.168.20.254/24\n",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            m.conditions
+                .iter()
+                .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
+        );
+        assert!(!m.workloads[0].up);
+    }
+
+    /// A row `apply` did not defer, but whose announcer the supervisor never started — Task 8b's
+    /// `Components.workloads` carries no entry for it — is its own fault: `announce trigger -`
+    /// on a `down` row would otherwise look indistinguishable from a healthy row whose trigger
+    /// just was not fetched yet.
+    #[test]
+    fn a_row_with_no_announcer_entry_is_its_own_reason_line() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let no_announcer = components_doc(true, serde_json::json!([]));
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &no_announcer);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let hit = m
+            .conditions
+            .iter()
+            .find(|c| c.text == "workload vms: announcer not started")
+            .unwrap_or_else(|| panic!("{:#?}", m.conditions));
+        assert_eq!(hit.class, Class::Settling);
+        assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].trigger, None);
+    }
+
+    /// No supervisor answering is one fault with its own line; the announcer's state is then
+    /// unknown, not "not started", so the row does not earn a second reason for the same cause.
+    #[test]
+    fn no_supervisor_does_not_also_read_as_announcer_not_started() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", "");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !m.conditions.iter().any(|c| c.text == "workload vms: announcer not started"),
+            "{:#?}",
+            m.conditions
+        );
+        assert_eq!(m.workloads[0].trigger, None);
+    }
+
+    /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy
+    /// nor an error — and none of the live checks pile on: the row has no gw address yet by
+    /// design, not by fault.
+    #[test]
+    fn a_deferred_row_is_neither_healthy_nor_an_error() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads.len(), 1);
+        assert!(!m.workloads[0].up);
+        let deferred: Vec<&Condition> = m
+            .conditions
+            .iter()
+            .filter(|c| c.text.starts_with("workload vms:"))
+            .collect();
+        assert_eq!(deferred.len(), 1, "one line, not a pile of live-check faults: {deferred:?}");
+        assert_eq!(
+            deferred[0].text,
+            "workload vms: deferred (uplink not forwarding yet; the watchdog installs it once \
+             it is)"
+        );
+        assert_eq!(deferred[0].class, Class::Settling);
+    }
+
+    /// A leaf carries no `[[workload]]` row of its own, but the sibling rule and the route-get
+    /// proof are still checked from its own identity, and no workload line is ever rendered for
+    /// it.
+    #[test]
+    fn a_leaf_checks_the_sibling_rule_and_the_route_from_its_identity_and_renders_no_workload_line()
+     {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let id = identity_of(&f, &view);
+        let mut sys = healthy_leaf(&view)
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            )
+            .on_fail(
+                &["ip", "route", "get", "192.168.20.1", "from", id.as_str()],
+                2,
+                "RTNETLINK answers: Network is unreachable",
+            );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(m.workloads.is_empty());
+        assert!(
+            m.conditions.iter().any(|c| c.text
+                == format!(
+                    "workload vms: no route to 192.168.20.0/24 from {id} (ip route get \
+                     192.168.20.1 from {id}: Network is unreachable)"
+                )),
+            "{:#?}",
+            m.conditions
+        );
+        // No PER-ROW line (the leaf carries no row to render one for) — distinct from the
+        // reason line just asserted above, which also starts "workload vms:" once indented.
+        assert!(
+            !render_text(&m, false, true)
+                .output
+                .contains("  workload vms: primary.3 ")
+        );
+    }
+
+    /// The route-get proof is sourced from this member's own identity, never `iif lo` (R4: the
+    /// `iif lo` form says "No route to host" in both states on a leaf and proves nothing).
+    #[test]
+    fn the_route_get_uses_from_identity_never_iif_lo() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view);
+        let expected = expected_links(&view).unwrap();
+        gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(sys.ran(&format!(
+            "ip route get 192.168.20.1 from {}",
+            identity_of(&f, &view)
+        )));
+        assert!(!sys.calls.iter().any(|c| c.contains("iif lo")));
+    }
+
+    /// The uplink's own failure text (`workload::uplink::identify`) is reported verbatim, never
+    /// reworded here — one spelling shared with `apply` and the watchdog. Same MockSys shape the
+    /// watchdog's own test for this fault uses: the lower link torn out from under a running
+    /// bridge (`an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer`
+    /// in `src/supervisor/workload.rs`).
+    #[test]
+    fn an_unidentifiable_uplink_reports_its_own_message() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view);
+        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let want = "workload vms: workload interface primary.3 is not a VLAN sub-interface of a \
+                    bridge (no lower link in /sys/class/net/primary.3)";
+        let hit = m
+            .conditions
+            .iter()
+            .find(|c| c.text == want)
+            .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
+        assert_eq!(hit.class, Class::Standing);
+        assert!(!m.workloads[0].up);
+    }
+
+    /// `sibling_return_reason` never panics, and its three arms are distinct: never emitted by
+    /// the builder, emitted but not installed, and installed.
+    #[test]
+    fn sibling_return_reason_has_three_arms() {
+        // Arm 3: the builder emitted no rule for this (zone, workload) pair at all — report the
+        // needle this call site derives AND say plainly it was never emitted, from an empty
+        // `siblings` (nothing to source a rule from).
+        assert_eq!(
+            sibling_return_reason(&[], "10.99.0.0/16", "192.168.20.0/24", ""),
+            Some(
+                "return path missing: pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup \
+                 main (workload_return_rules never emitted this rule)"
+                    .to_string()
+            )
+        );
+        // Still arm 3: a `siblings` list that has rules, just not this one (a different zone's
+        // block).
+        let other = workload_return_rules(&View::new(&wl_fabric(), "pve1-tb").unwrap());
+        assert_eq!(other.len(), 1, "{other:#?}");
+        assert_eq!(
+            sibling_return_reason(&other, "10.100.0.0/16", "192.168.20.0/24", ""),
+            Some(
+                "return path missing: pref 2000 from 10.100.0.0/16 to 192.168.20.0/24 lookup \
+                 main (workload_return_rules never emitted this rule)"
+                    .to_string()
+            )
+        );
+        // Arm 2: the builder emitted this row's rule but `ip rule show pref 2000` does not have
+        // it — reported from the builder's own `r.needle`, never a second reformat.
+        assert_eq!(
+            sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", ""),
+            Some(format!("return path missing: pref 2000 {}", other[0].needle))
+        );
+        // Arm 1: present in `siblings` and already installed in `r2000` — healthy.
+        assert_eq!(
+            sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", &other[0].needle),
+            None
+        );
+    }
+
+    /// The `status` never-writes invariant holds over the workload checks too: every new call
+    /// (`ip -br link show dev`, the workload's own `ip route get … from …`) is on the read-only
+    /// allowlist and no file changes.
+    #[test]
+    fn workload_checks_never_write() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert_never_writes("healthy workload (host)", &mut wl_status_sys(&f, &view), &view, 0);
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let id = identity_of(&f, &leaf);
+        assert_never_writes(
+            "leaf carrying no row",
+            &mut healthy_leaf(&leaf)
+                .on_stdout(
+                    &["ip", "rule", "show", "pref", "2000"],
+                    "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                     2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+                )
+                .on_stdout(&["ip", "route", "get", "192.168.20.1", "from", &id], ""),
+            &leaf,
+            0,
+        );
     }
 
     /// The prose is rendered from the model and from nothing else, byte for byte. The literal

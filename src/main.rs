@@ -4,7 +4,6 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use cfab::derive::View;
-use cfab::model::MemberKind;
 use cfab::sys::RealSys;
 use cfab::{Error, commands, emit, load_fabric_text};
 
@@ -31,7 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and validate fabric.toml; print the resolved view for this member
+    /// Parse and validate fabric.toml; print the resolved view for this member; with
+    /// [[workload]] rows, also print the fabric aggregate and the DHCP option 121 snippet
     Check,
     /// Print the fabric.toml declaration schema as JSON Schema
     Schema,
@@ -342,7 +342,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Check => {
-            print!("{}", check_report(&fabric, &view));
+            print!("{}", commands::check::report(&fabric, &view));
             Ok(ExitCode::SUCCESS)
         }
         Command::Gen { artifact } => {
@@ -496,37 +496,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
-/// The two lines `cfab check` prints: the fabric as declared, then what THIS member gets.
-/// The second line is the last thing an operator sees before `up` creates the netdevs, so it
-/// names every leg `up` will build — the fallback legs included: their ports fan out per wire,
-/// so their count is member-dependent and not derivable from the fabric-wide line.
-fn check_report(fabric: &cfab::model::Fabric, view: &View) -> String {
-    let kind = match view.kind() {
-        MemberKind::Host => "host",
-        MemberKind::Leaf => "leaf",
-    };
-    let fallback_legs = fabric
-        .segments
-        .iter()
-        .filter(|r| r.scope.is_universal())
-        .count();
-    format!(
-        "fabric.toml OK: {} zones, {} segments, {} fallback legs, {} members\n\
-         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
-         {} ingress leg(s)\n",
-        fabric.zones.len(),
-        fabric.segments.len() - fallback_legs,
-        fallback_legs,
-        fabric.members.len(),
-        view.member.name,
-        view.node(),
-        view.class_rows().len(),
-        view.wires().join(" "),
-        view.fallback_rows().len(),
-        view.gw_rows().len(),
-    )
-}
-
 /// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
 /// `[runtime] run_dir` cap files with the cluster-published cap as the absent-local fallback, and
 /// CFAB_UP_IFS as the authoritative up-set, else sysfs carrier, else assume up (never demote
@@ -579,7 +548,7 @@ mod tests {
         let f = fabric_from(&example());
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
-            check_report(&f, &view),
+            commands::check::report(&f, &view),
             "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n"
@@ -621,7 +590,7 @@ mod tests {
         let f = fabric_from(&text);
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
-            check_report(&f, &view),
+            commands::check::report(&f, &view),
             "fabric.toml OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              0 fallback leg(s), 1 ingress leg(s)\n"

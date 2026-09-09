@@ -286,6 +286,9 @@ pub mod mock {
         /// write to — and a poll loop that waits for something to appear (a run dir written by
         /// a restarting supervisor) has no other way to be tested.
         pub appear_after: Vec<(usize, String, String)>,
+        /// Every (path, content) written, in order — a refused write included, so a test can see
+        /// a write was attempted even where `write_fails` blocked it from landing in `files`.
+        pub writes: Vec<(String, String)>,
         /// port netdev -> what `bond_port_state` answers for it. A port that is not in the map
         /// does not exist: the read fails with `ENODEV`, which is how a real kernel reports a
         /// netdev that has gone away.
@@ -411,6 +414,15 @@ pub mod mock {
         pub fn writes_to(&self, path: &str) -> Option<&str> {
             self.files.get(path).map(String::as_str)
         }
+
+        /// Every content written to `path`, in order (a refused write included).
+        pub fn writes_of(&self, path: &str) -> Vec<&str> {
+            self.writes
+                .iter()
+                .filter(|(p, _)| p == path)
+                .map(|(_, c)| c.as_str())
+                .collect()
+        }
     }
 
     impl Sys for MockSys {
@@ -455,6 +467,25 @@ pub mod mock {
                 self.files
                     .retain(|p, _| !p.starts_with(&format!("/sys/class/net/{dev}/")));
             }
+            // Same reason, for `ip rule`: `drop_rules` loops on `ip rule show pref <pref>`
+            // until the needle is gone, so a mock that keeps answering "still there" forever
+            // would hang any test of the present-then-deleted case rather than fail it. Only
+            // the deleted rule's own line is dropped from the stub (never the whole `show`
+            // rule), so a pref stubbed with several rules on one line each survives a single
+            // delete with the others intact.
+            if let ["ip", "rule", "del", "pref", pref, tail @ ..] = argv {
+                let selector = tail.join(" ");
+                for (prefix, out) in &mut self.cmd_rules {
+                    if prefix.as_slice() == ["ip", "rule", "show", "pref", pref] {
+                        out.stdout = out
+                            .stdout
+                            .lines()
+                            .filter(|l| !l.contains(&selector))
+                            .map(|l| format!("{l}\n"))
+                            .collect();
+                    }
+                }
+            }
             let hit = self
                 .cmd_rules
                 .iter()
@@ -476,6 +507,7 @@ pub mod mock {
 
         fn write(&mut self, path: &str, content: &str) -> Result<()> {
             self.calls.push(format!("write {path}"));
+            self.writes.push((path.to_string(), content.to_string()));
             if self.write_fails.iter().any(|p| p == path) {
                 return Err(Error::fatal(format!(
                     "cannot write {path}: permission denied"
@@ -620,6 +652,44 @@ mod tests {
         );
     }
 
+    /// `ip rule del pref <pref> <selector>` drops only the stubbed line naming that selector —
+    /// a pref stubbed with several rules survives a single delete with the others intact,
+    /// which is what lets a `drop_rules` test converge instead of hanging (a static stub that
+    /// never changes loops forever) without losing the other rules at the same pref.
+    #[test]
+    fn deleting_one_rule_at_a_pref_leaves_the_others_stubbed() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "rule", "show", "pref", "2000"],
+            "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main\n\
+             2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+        );
+        sys.run(&[
+            "ip",
+            "rule",
+            "del",
+            "pref",
+            "2000",
+            "from",
+            "10.99.0.0/16",
+            "to",
+            "192.168.20.0/24",
+            "lookup",
+            "main",
+        ])
+        .unwrap();
+        let shown = sys.run(&["ip", "rule", "show", "pref", "2000"]).unwrap();
+        assert!(
+            !shown.stdout.contains("192.168.20.0/24"),
+            "{}",
+            shown.stdout
+        );
+        assert!(
+            shown.stdout.contains("to 10.99.0.0/16 lookup main"),
+            "the other rule at this pref must survive: {}",
+            shown.stdout
+        );
+    }
+
     #[test]
     fn real_unix_request_round_trips_one_line() {
         let dir = std::env::temp_dir().join(format!("cfab-sys-{}", std::process::id()));
@@ -641,6 +711,18 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(reply, "got state\n");
+    }
+
+    #[test]
+    fn the_mock_records_every_write_in_order_with_its_content() {
+        let mut sys = MockSys::default();
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1").unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/eth0/forwarding", "0").unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "0").unwrap();
+        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"), vec!["1", "0"]);
+        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/forwarding"), vec!["0"]);
+        assert!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/rp_filter").is_empty());
+        assert_eq!(sys.writes_to("/proc/sys/net/ipv4/conf/all/arp_ignore"), Some("0"), "writes_to keeps its last-value meaning");
     }
 
     #[test]

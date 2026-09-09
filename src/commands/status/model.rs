@@ -281,6 +281,30 @@ impl Ingress {
     }
 }
 
+/// One `[[workload]]` row on this member, as `status` read it (spec §5.1 item 10). A row exists
+/// only on a member that carries the interface (`view.workload_rows()`) — a member the workload
+/// merely reaches (an allowed zone with no address on `ifname`) has none, and is checked by the
+/// return-path/route-get conditions alone (`return_path_and_ingress`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadStatus {
+    pub name: String,
+    pub ifname: String,
+    /// This member's declared address on `ifname`, e.g. `192.168.20.2/24`.
+    pub address: String,
+    /// The anycast gateway with the prefix's mask, e.g. `192.168.20.254/24`.
+    pub gw: String,
+    /// The interface, its addresses, the ARP guard and the return path are all in place.
+    pub up: bool,
+    /// Zones this workload is advertised into (the declared `allow` list).
+    pub zones: Vec<String>,
+    /// The bridge's uplink port(s), from `uplink::identify`; empty when unidentified.
+    pub uplinks: Vec<String>,
+    /// What wakes the announcer (`neigh events` / `fdb poll (...)`), from the supervisor's
+    /// `components` document; `None` when no supervisor is answering or the announcer has not
+    /// started.
+    pub trigger: Option<String>,
+}
+
 /// Which member this gather describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberInfo {
@@ -315,6 +339,9 @@ pub struct StatusModel {
     pub fallbacks: Vec<BondLeg>,
     /// One row per gw zone on a host.
     pub ingress: Vec<Ingress>,
+    /// One row per `[[workload]]` this member carries (empty on a member that carries none —
+    /// including every leaf, spec §5.1).
+    pub workloads: Vec<WorkloadStatus>,
     /// Every reason line the report prints, in the order the gather found them, each with what
     /// it means for `--wait`. This is the prose: the lines a row earns are rendered from that
     /// row and pushed here at the point the gather made it, so the rows below and this list are

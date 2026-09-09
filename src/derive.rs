@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
-use crate::model::{Fabric, Member, MemberKind, SegScope, Zone};
+use crate::model::{Fabric, Member, MemberKind, SegScope, Workload, Zone, gw_ifname};
 
 /// A a zone's `segments` row resolved for one member: domain → that member's wire. A member with no
 /// wire on a row's domain simply has no such row (heterogeneity is generated, not branched).
@@ -61,6 +61,15 @@ pub struct FallbackRow {
     pub ospf_cost: u32,
     pub home: String,
     pub ports: Vec<Port>,
+}
+
+/// A `[[workload]]` row this member carries: the declared row, joined to this member's own
+/// address on it.
+#[derive(Debug, Clone)]
+pub struct WorkloadRow<'a> {
+    pub wl: &'a Workload,
+    /// This member's address on `wl.ifname`, e.g. `192.168.20.2/24`.
+    pub address: String,
 }
 
 /// Where a (member, zone) wire order came from: the default producer, or a a member's `prefs` row.
@@ -157,6 +166,26 @@ impl<'a> View<'a> {
         prefs_of(self.fabric, self.member)
     }
 
+    /// This member's `[[workload]]` rows, in declaration order (the fabric's row order, not
+    /// the member's `workloads = [...]` order): every declared row this member carries, joined
+    /// to its own address on it.
+    pub fn workload_rows(&self) -> Vec<WorkloadRow<'a>> {
+        self.fabric
+            .workloads
+            .iter()
+            .filter_map(|wl| {
+                self.member
+                    .workloads
+                    .iter()
+                    .find(|mw| mw.name == wl.name)
+                    .map(|mw| WorkloadRow {
+                        wl,
+                        address: mw.address_cidr(),
+                    })
+            })
+            .collect()
+    }
+
     /// This member's interfaces in a zone: segments (table order), then the universal bond, then
     /// the ingress leg — adjacency interfaces before the router-facing one.
     pub fn zone_ifs(&self, zone: &str) -> Vec<String> {
@@ -236,9 +265,12 @@ impl<'a> View<'a> {
                 out.push((s.ifname, false));
             }
         }
+        for r in self.workload_rows() {
+            out.push((r.wl.ifname.clone(), transit));
+        }
         for z in &f.zones {
-            let id = Self::identity_if(z);
-            out.push((format!("{id}-peer"), false));
+            let (id, peer) = crate::model::identity_ifnames(z.id);
+            out.push((peer, false));
             out.push((id, false));
         }
         out.sort();
@@ -267,7 +299,7 @@ impl<'a> View<'a> {
 
     /// The identity netdev for a zone: `cfab-id<id>`.
     pub fn identity_if(zone: &Zone) -> String {
-        format!("cfab-id{}", zone.id)
+        crate::model::identity_ifnames(zone.id).0
     }
 
     /// The identity address for this member in a zone: `10.<id>.0.<node>`.
@@ -467,7 +499,7 @@ pub fn gw_rows_of(fabric: &Fabric, member: &Member) -> Vec<GwRow> {
         .iter()
         .filter_map(|z| {
             let gw = z.gw.as_ref()?;
-            let ifname = format!("cfab-gw{}", z.id);
+            let ifname = gw_ifname(z.id);
             let (home, ports) = match &gw.scope {
                 // One domain: the leg is that wire's sub-interface, as it has always been.
                 SegScope::Domain(d) => (member.wire_on(d)?.name.clone(), Vec::new()),
@@ -904,6 +936,39 @@ mod tests {
                 assert!(s.ifname.len() <= 15, "{}", s.ifname);
             }
         }
+    }
+
+    #[test]
+    fn owned_forwarding_includes_the_workload_ifname() {
+        let text = fixtures::with_workload(&fixtures::example());
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
+        let get = |member: &str, ifname: &str| {
+            View::new(&f, member)
+                .unwrap()
+                .owned_forwarding()
+                .iter()
+                .find(|(n, _)| n == ifname)
+                .map(|(_, t)| *t)
+        };
+        assert_eq!(get("pve1-tb", "primary.3"), Some(true));
+        assert_eq!(get("pve3-tb", "primary.3"), None);
+
+        // host_forward off: the workload row's transit bit follows the same gate as every
+        // other forwarding row, not the workload's own `allow` list. `validate` now refuses any
+        // fabric with `[forward] enabled = false` and a `[[workload]]` row, so this half is a
+        // white-box check on a Fabric constructed past that gate — workload rows are always
+        // transit in a fabric `validate` actually accepts today.
+        let mut f_off = f;
+        f_off.host_forward = false;
+        assert_eq!(
+            View::new(&f_off, "pve1-tb")
+                .unwrap()
+                .owned_forwarding()
+                .iter()
+                .find(|(n, _)| n == "primary.3")
+                .map(|(_, t)| *t),
+            Some(false)
+        );
     }
 
     #[test]
