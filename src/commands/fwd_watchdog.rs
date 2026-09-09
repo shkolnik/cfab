@@ -366,12 +366,16 @@ fn restore_workloads(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if v != "1" {
-        sys.write(arp_path, "1")?;
-        restored.push(format!(
-            "restored net.ipv4.conf.all.arp_ignore=1 (workload {names})"
-        ));
+        match sys.write(arp_path, "1") {
+            Ok(()) => restored.push(format!(
+                "restored net.ipv4.conf.all.arp_ignore=1 (workload {names})"
+            )),
+            Err(e) => unrestored.push(format!("unrestored workload {names}: {e}")),
+        }
     }
-    install_deferred_workloads(sys, view, &rows, restored, unrestored)?;
+    if let Err(e) = install_deferred_workloads(sys, view, &rows, restored, unrestored) {
+        unrestored.push(format!("unrestored workload {names}: {e}"));
+    }
     Ok(())
 }
 
@@ -994,6 +998,30 @@ pub(crate) mod tests {
             log.contains("restored net.ipv4.conf.all.arp_ignore=1 (workload vms)"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn a_failed_arp_ignore_write_is_recorded_and_the_tick_still_journals_the_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .write_fail("/proc/sys/net/ipv4/conf/all/arp_ignore")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(
+            report
+                .unrestored
+                .iter()
+                .any(|l| l.starts_with("unrestored workload vms: FATAL: cannot write")),
+            "{:#?}",
+            report.unrestored
+        );
+        // The tick did not abort: the sibling rule after it in the same function still ran.
+        assert!(sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
     }
 
     #[test]
