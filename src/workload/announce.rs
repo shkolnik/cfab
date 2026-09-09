@@ -193,6 +193,25 @@ pub mod mock {
             Ok(())
         }
     }
+
+    /// The same recorder behind a handle, so a test can hand one copy to the code under test
+    /// (the supervisor's `Hooks` take an owned `Box<dyn AnnounceIo>`) and keep another to read
+    /// what reached the wire.
+    #[derive(Clone, Default)]
+    pub struct SharedIo(pub std::sync::Arc<std::sync::Mutex<RecordingIo>>);
+
+    impl SharedIo {
+        /// The frames recorded so far, `(ifname, frame)` in order.
+        pub fn sent(&self) -> Vec<(String, Vec<u8>)> {
+            self.0.lock().unwrap().sent.clone()
+        }
+    }
+
+    impl AnnounceIo for SharedIo {
+        fn send(&mut self, ifname: &str, frame: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().send(ifname, frame)
+        }
+    }
 }
 
 #[cfg(test)]

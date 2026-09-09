@@ -1982,6 +1982,93 @@ mod tests {
         );
     }
 
+    /// Poll `ready` until it holds or the deadline passes; the answer is whether it holds.
+    async fn until(ms: u64, mut ready: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            if ready() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ready()
+    }
+
+    /// The wiring itself, through the running select loop rather than the state machine: the
+    /// first beacon reaches the socket without anybody asking, and a `Cmd::Neigh` for a VM port
+    /// — the shape the watch task posts — turns into a burst whose frames also reach it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_select_loop_sends_the_first_beacon_and_bursts_on_a_neigh_event() {
+        use crate::workload::announce::mock::SharedIo;
+        use crate::workload::neigh::{NeighEvent, NeighSignal};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let io = SharedIo::default();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let (sh, obs) = (shared.clone(), io.clone());
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let beacon = until(2000, || !obs.sent().is_empty()).await;
+            // ifindex 10 is `tap100i0`, a non-uplink port of `primary` in `wl_fresh_sys`.
+            driver_tx
+                .send(Cmd::Neigh(NeighSignal::Add(NeighEvent {
+                    ifindex: 10,
+                    mac: [2, 0xcf, 0xab, 0, 0, 1],
+                    permanent: false,
+                })))
+                .ok();
+            let burst = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .workloads
+                    .first()
+                    .is_some_and(|w| w.bursts == 1)
+            })
+            .await;
+            let frames = until(2000, || obs.sent().len() >= 2).await;
+            let sent = obs.sent();
+            driver_tx.send(Cmd::Terminate).ok();
+            (beacon, burst, frames, sent)
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.neigh_watch = Arc::new(|_| Ok(()));
+        hooks.announce_io = Some(Box::new(io.clone()));
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        let (beacon, burst, frames, sent) = driver.await.unwrap();
+        assert!(beacon, "the first beacon must go out without prompting");
+        assert!(burst, "a neigh event on a VM port must start a burst");
+        assert!(frames, "and the burst's first frame must reach the socket");
+        assert!(
+            sent.iter().all(|(port, frame)| port == "primary.3"
+                && frame[..]
+                    == crate::workload::announce::gratuitous(
+                        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                        "192.168.20.254".parse().unwrap()
+                    )[..]),
+            "every frame is the gratuitous request for gw, from the sub-interface's own MAC"
+        );
+    }
+
     /// A member the declaration gives no workload row opens no subscription and runs nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_member_without_a_workload_starts_no_announcer() {
