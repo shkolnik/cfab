@@ -59,7 +59,9 @@ struct Row {
     standing: BTreeMap<Cond, String>,
 }
 
-/// The repeating conditions a row deduplicates its journal on.
+/// The repeating conditions a row deduplicates its journal on. Each keeps its own standing
+/// line and its own recovery, because they are independent: a socket that starts working again
+/// says nothing about a netdev whose MAC still cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Cond {
     /// The send socket refused the frame.
@@ -68,6 +70,18 @@ enum Cond {
     Mac,
     /// The bridge's port set could not be scanned.
     Scan,
+}
+
+impl Cond {
+    /// What the recovery line calls this condition. One spelling per condition, and one
+    /// sentence shape for all three.
+    fn as_str(self) -> &'static str {
+        match self {
+            Cond::Send => "announce",
+            Cond::Mac => "MAC read",
+            Cond::Scan => "bridge port scan",
+        }
+    }
 }
 
 impl Row {
@@ -80,10 +94,19 @@ impl Row {
         journal(trace, line);
     }
 
-    /// `cond` is over: say so, once, and only if it was ever standing.
-    fn recovered(&mut self, cond: Cond, trace: &Trace, line: String) {
+    /// `cond` is over: say so once, and only if it was standing.
+    ///
+    /// Clearing it is the load-bearing half. A standing line that is never cleared swallows the
+    /// SECOND occurrence of the same fault for the life of the process — a netdev that vanishes,
+    /// comes back, and vanishes again would be reported once and then never — so every path
+    /// that observes `cond` succeeding must come through here.
+    fn recovered(&mut self, cond: Cond, trace: &Trace) {
         if self.standing.remove(&cond).is_some() {
-            journal(trace, line);
+            let name = &self.name;
+            journal(
+                trace,
+                format!("cfab: workload {name}: {} recovered", cond.as_str()),
+            );
         }
     }
 
@@ -96,8 +119,11 @@ impl Row {
     fn refresh_mac(&mut self, io: &mut dyn AnnounceIo, trace: &Trace, now: Instant) {
         let (name, ifname) = (self.name.clone(), self.announcer.ifname.clone());
         match read_mac(io, &ifname) {
-            Ok(mac) if mac == self.mac => {}
             Ok(mac) => {
+                self.recovered(Cond::Mac, trace);
+                if mac == self.mac {
+                    return;
+                }
                 let (old, new) = (hex_mac(self.mac), hex_mac(mac));
                 self.mac = mac;
                 self.announcer.on_event(now);
@@ -312,11 +338,7 @@ impl Workloads {
             let (name, ifname) = (r.name.clone(), r.announcer.ifname.clone());
             r.refresh_mac(io, trace, now);
             match r.announcer.announce_due(io, r.mac, now) {
-                Ok(true) => r.recovered(
-                    Cond::Send,
-                    trace,
-                    format!("cfab: workload {name}: announce on {ifname} succeeded again"),
-                ),
+                Ok(true) => r.recovered(Cond::Send, trace),
                 Ok(false) => {}
                 Err(e) => r.journal_once(
                     Cond::Send,
@@ -348,6 +370,7 @@ impl Workloads {
         for r in rows {
             match uplink::non_uplink_ifindexes(sys, &r.up) {
                 Ok(ports) => {
+                    r.recovered(Cond::Scan, trace);
                     if ports.contains(&ev.ifindex) {
                         r.announcer.on_event(now);
                     }
@@ -881,6 +904,83 @@ mod tests {
             2,
             "a different error is a different fact"
         );
+
+        io.fail = None;
+        w.fire_due(&mut io, t0 + 3 * PERIOD);
+        assert_eq!(
+            said(&trace).last().unwrap(),
+            "cfab: workload vms: announce recovered"
+        );
+    }
+
+    /// The half that makes the dedupe safe: a fault that ends CLEARS its standing line, so the
+    /// same fault occurring again is reported again. Without this a netdev that vanishes, comes
+    /// back and vanishes again is reported once and then never for the life of the process.
+    #[test]
+    fn a_fault_that_recovers_and_returns_is_journaled_again() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut io = RecordingIo::default();
+        let mut w = Workloads::start(&mut sys, &view, &mut io, Some(trace.clone()), opens, t0);
+        w.fire_due(&mut io, t0);
+
+        io.mac = None; // the netdev vanishes
+        w.fire_due(&mut io, t0 + PERIOD);
+        io.mac = Some(crate::workload::announce::mock::MOCK_MAC); // …and comes back
+        w.fire_due(&mut io, t0 + 2 * PERIOD);
+        io.mac = None; // …and vanishes again, identically
+        w.fire_due(&mut io, t0 + 3 * PERIOD);
+
+        let said = said(&trace);
+        assert_eq!(
+            said.iter().filter(|l| l.contains("cannot read the MAC")).count(),
+            2,
+            "the second vanish is a second fact, not a swallowed duplicate: {said:?}"
+        );
+        assert_eq!(
+            said.iter()
+                .filter(|l| *l == "cfab: workload vms: MAC read recovered")
+                .count(),
+            1,
+            "and the recovery is said once: {said:?}"
+        );
+    }
+
+    /// The third condition, and the proof that all three recoveries have ONE sentence shape.
+    #[test]
+    fn a_bridge_scan_that_recovers_says_so_in_the_same_shape() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        let ev = NeighSignal::Add(NeighEvent {
+            ifindex: 10,
+            mac: [2, 0xcf, 0xab, 0, 0, 1],
+            permanent: false,
+        });
+        sys.files
+            .insert("/sys/class/net/tap100i0/ifindex".into(), "not-a-number\n".into());
+        w.on_neigh(&mut sys, &ev, t0);
+        assert_eq!(w.rows_for_status()[0].bursts, 0, "no burst without the scan");
+        assert_eq!(
+            said(&trace)[1],
+            "cfab: workload vms: port tap100i0: cannot read ifindex from \
+             /sys/class/net/tap100i0/ifindex; burst skipped"
+        );
+
+        sys.files
+            .insert("/sys/class/net/tap100i0/ifindex".into(), "10\n".into());
+        w.on_neigh(&mut sys, &ev, t0);
+        assert_eq!(said(&trace)[2], "cfab: workload vms: bridge port scan recovered");
+        assert_eq!(w.rows_for_status()[0].bursts, 1);
     }
 
     /// The frame on the wire is the gratuitous request for `gw`, sourced from the
