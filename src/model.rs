@@ -353,6 +353,12 @@ impl Ipv4Prefix {
     pub fn broadcast(&self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.net) | !Self::mask(self.len))
     }
+
+    /// The dotted-decimal netmask, e.g. `255.255.255.0` for `/24` — the form ISC dhcpd.conf's
+    /// `subnet … netmask …` declaration line takes (the prefix length alone is not legal there).
+    pub fn netmask(&self) -> Ipv4Addr {
+        Ipv4Addr::from(Self::mask(self.len))
+    }
 }
 
 impl fmt::Display for Ipv4Prefix {
@@ -1209,7 +1215,7 @@ impl Fabric {
     }
 
     /// The smallest set of prefixes covering every declared zone block, for DHCP option 121.
-    pub fn aggregate(&self) -> Vec<String> {
+    pub fn aggregate(&self) -> Vec<Ipv4Prefix> {
         crate::emit::workload::aggregate(&self.zones.iter().map(|z| z.id).collect::<Vec<_>>())
     }
 }
@@ -2171,10 +2177,8 @@ mod tests {
     #[test]
     fn the_aggregate_covers_every_declared_zone_block() {
         let f = wl_fabric_edit(|t| t).unwrap();
-        assert_eq!(
-            f.aggregate(),
-            vec!["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]
-        );
+        let got: Vec<String> = f.aggregate().iter().map(Ipv4Prefix::to_string).collect();
+        assert_eq!(got, vec!["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]);
     }
 
     #[test]

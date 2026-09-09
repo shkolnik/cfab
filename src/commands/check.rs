@@ -10,8 +10,9 @@ use crate::model::{Fabric, MemberKind};
 /// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, ifname,
 /// prefix, gw, router, allow, and the members that carry it), then the fabric aggregate — the
 /// smallest set of prefixes covering every declared zone block — followed by one RFC 3442
-/// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw` and
-/// `router` differ per row, so the snippet does too).
+/// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw`, `router`,
+/// and the row's own `prefix` differ per row, so each snippet carries its own `subnet … netmask
+/// …` definition line and the snippets never collide when pasted into one dhcpd.conf).
 pub fn report(fabric: &Fabric, view: &View) -> String {
     let kind = match view.kind() {
         MemberKind::Host => "host",
@@ -60,11 +61,15 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
         let aggregate = fabric.aggregate();
         out.push_str(&format!(
             "fabric aggregate (for DHCP option 121): {}\n",
-            aggregate.join(", ")
+            aggregate
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         for wl in &fabric.workloads {
             out.push_str(&crate::emit::workload::dhcp_option_121(
-                &aggregate, wl.gw, wl.router,
+                wl.prefix, &aggregate, wl.gw, wl.router,
             ));
         }
     }
@@ -99,15 +104,17 @@ mod tests {
              allow storage; carried by pve1-tb, pve2-tb\n\
              fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, \
              10.249.0.0/16\n\
-             # dhcpd.conf (ISC): RFC 3442 classless static routes for the workload VLAN. A \
+             # dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A \
              client that receives\n\
              # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) \
              is INSIDE 121 (last entry).\n\
              # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, \
              10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1\n\
-             option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
-             option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, \
-             199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n"
+             subnet 192.168.20.0 netmask 255.255.255.0 {\n\
+             \toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
+             \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, \
+             199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n\
+             }\n"
         );
     }
 }

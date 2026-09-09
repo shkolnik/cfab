@@ -4,9 +4,13 @@
 
 use std::net::Ipv4Addr;
 
+use crate::model::Ipv4Prefix;
+
 /// Smallest set of prefixes covering every declared zone block `10.<id>.0.0/16` (spec §5 item
-/// 9). Works on the second octet: a run of `2^k` aligned ids merges to a `/(16-k)`.
-pub fn aggregate(zone_ids: &[u8]) -> Vec<String> {
+/// 9). Works on the second octet: a run of `2^k` aligned ids merges to a `/(16-k)`. Typed
+/// (`Ipv4Prefix`, not a formatted string): `dhcp_option_121` reads `.net`/`.len` straight off
+/// each entry, so a merge here can never desync from how the snippet decodes it.
+pub fn aggregate(zone_ids: &[u8]) -> Vec<Ipv4Prefix> {
     let mut ids: Vec<u16> = zone_ids.iter().map(|&i| u16::from(i)).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -27,19 +31,34 @@ pub fn aggregate(zone_ids: &[u8]) -> Vec<String> {
             }
             k += 1;
         }
-        out.push(format!("10.{start}.0.0/{}", 16 - k));
+        // `start` is always < 256 (built from u8 zone ids), so it always fits the second octet.
+        out.push(Ipv4Prefix {
+            net: Ipv4Addr::new(10, start as u8, 0, 0),
+            len: 16 - k,
+        });
         i += 1usize << k;
     }
     out
 }
 
-const HEADER: &str = "# dhcpd.conf (ISC): RFC 3442 classless static routes for the workload VLAN. A client that receives\n";
+const HEADER: &str =
+    "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
+     that receives\n";
 /// The RFC 3442 classless-static-routes (option 121) dhcpd.conf snippet for one workload's
 /// gateway: every aggregate prefix routed via `gw`, plus the default route via `router` (RULED,
 /// spec §4 and §10 call 14: `router` is a declared key, refused outside `prefix`, printed only
 /// here). A client that receives option 121 ignores option 3 entirely, so the default route
 /// must be inside 121 or a client loses its existing default when it picks up this VLAN's lease.
-pub fn dhcp_option_121(aggregate: &[String], gw: Ipv4Addr, router: Ipv4Addr) -> String {
+/// The options sit inside a `subnet <net> netmask <mask> { … }` definition keyed on `prefix` (the
+/// workload's own VLAN, not the aggregate): with more than one `[[workload]]` row, each row's
+/// values differ, so without a subnet block to scope them, dhcpd would take only the last row's
+/// `option` statements as a global default and silently drop the others.
+pub fn dhcp_option_121(
+    prefix: Ipv4Prefix,
+    aggregate: &[Ipv4Prefix],
+    gw: Ipv4Addr,
+    router: Ipv4Addr,
+) -> String {
     let g = gw.octets();
     let r = router
         .octets()
@@ -58,11 +77,9 @@ pub fn dhcp_option_121(aggregate: &[String], gw: Ipv4Addr, router: Ipv4Addr) -> 
     let items = aggregate
         .iter()
         .map(|p| {
-            let (net, len) = p.split_once('/').expect("prefix with length");
-            let len: u8 = len.parse().expect("length");
-            let o: Vec<u8> = net.split('.').map(|x| x.parse().unwrap()).collect();
-            let sig = usize::from(len.div_ceil(8));
-            let mut e = vec![len];
+            let o = p.net.octets();
+            let sig = usize::from(p.len.div_ceil(8));
+            let mut e = vec![p.len];
             e.extend(&o[..sig]);
             e.extend(g);
             e.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
@@ -73,8 +90,12 @@ pub fn dhcp_option_121(aggregate: &[String], gw: Ipv4Addr, router: Ipv4Addr) -> 
         "{HEADER}# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via {router}) is \
          INSIDE 121 (last entry).\n\
          # {routes}\n\
-         option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
-         option rfc3442-classless-static-routes {items}, 0, {r};\n"
+         subnet {} netmask {} {{\n\
+         \toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
+         \toption rfc3442-classless-static-routes {items}, 0, {r};\n\
+         }}\n",
+        prefix.net,
+        prefix.netmask(),
     )
 }
 
@@ -82,35 +103,67 @@ pub fn dhcp_option_121(aggregate: &[String], gw: Ipv4Addr, router: Ipv4Addr) -> 
 mod tests {
     use super::*;
 
+    fn agg_strs(ids: &[u8]) -> Vec<String> {
+        aggregate(ids).iter().map(Ipv4Prefix::to_string).collect()
+    }
+
     #[test]
     fn aggregate_merges_aligned_neighboring_16s_and_leaves_the_rest() {
         assert_eq!(
-            aggregate(&[99, 199, 249]),
+            agg_strs(&[99, 199, 249]),
             ["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]
         );
-        assert_eq!(aggregate(&[98, 99]), ["10.98.0.0/15"]);
-        assert_eq!(aggregate(&[96, 97, 98, 99]), ["10.96.0.0/14"]);
-        assert_eq!(aggregate(&[99, 100]), ["10.99.0.0/16", "10.100.0.0/16"]);
-        assert_eq!(aggregate(&[199, 99, 99]), ["10.99.0.0/16", "10.199.0.0/16"]);
+        assert_eq!(agg_strs(&[98, 99]), ["10.98.0.0/15"]);
+        assert_eq!(agg_strs(&[96, 97, 98, 99]), ["10.96.0.0/14"]);
+        assert_eq!(agg_strs(&[99, 100]), ["10.99.0.0/16", "10.100.0.0/16"]);
+        assert_eq!(agg_strs(&[199, 99, 99]), ["10.99.0.0/16", "10.199.0.0/16"]);
     }
 
     #[test]
     fn the_dhcp_snippet_carries_the_aggregate_via_gw_and_the_default_inside_option_121() {
         let s = dhcp_option_121(
-            &["10.99.0.0/16".into(), "10.199.0.0/16".into()],
+            Ipv4Prefix::parse("192.168.20.0/24").unwrap(),
+            &[
+                Ipv4Prefix::parse("10.99.0.0/16").unwrap(),
+                Ipv4Prefix::parse("10.199.0.0/16").unwrap(),
+            ],
             "192.168.20.254".parse().unwrap(),
             "192.168.20.1".parse().unwrap(),
         );
         assert_eq!(
             s,
             "\
-# dhcpd.conf (ISC): RFC 3442 classless static routes for the workload VLAN. A client that receives
+# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
 # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
 # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
-option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
-option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 0, 192, 168, 20, 1;
+subnet 192.168.20.0 netmask 255.255.255.0 {
+\toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
+\toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 0, 192, 168, 20, 1;
+}
 "
         );
+    }
+
+    /// Two rows never collide inside one dhcpd.conf: each gets its own `subnet … { … }`
+    /// definition line, keyed on its own VLAN, not the shared aggregate.
+    #[test]
+    fn two_rows_get_two_distinct_subnet_definition_lines() {
+        let agg = [Ipv4Prefix::parse("10.99.0.0/16").unwrap()];
+        let a = dhcp_option_121(
+            Ipv4Prefix::parse("192.168.20.0/24").unwrap(),
+            &agg,
+            "192.168.20.254".parse().unwrap(),
+            "192.168.20.1".parse().unwrap(),
+        );
+        let b = dhcp_option_121(
+            Ipv4Prefix::parse("192.168.30.0/24").unwrap(),
+            &agg,
+            "192.168.30.254".parse().unwrap(),
+            "192.168.30.1".parse().unwrap(),
+        );
+        assert!(a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {"), "{a}");
+        assert!(b.contains("subnet 192.168.30.0 netmask 255.255.255.0 {"), "{b}");
+        assert_ne!(a, b);
     }
 }
 

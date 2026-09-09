@@ -74,7 +74,7 @@ fn render(member: &str) -> String {
         "dhcp",
         f.workloads
             .iter()
-            .map(|w| workload::dhcp_option_121(&f.aggregate(), w.gw, w.router))
+            .map(|w| workload::dhcp_option_121(w.prefix, &f.aggregate(), w.gw, w.router))
             .collect::<String>(),
     );
     out
