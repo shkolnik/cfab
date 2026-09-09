@@ -330,7 +330,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // (Debian `Recommends`): probed once, and its absence writes an empty record with a
     // warning rather than failing the bringup — a leaf without ethtool used to fail here
     // ungracefully with no precondition to explain why; it no longer does.
-    let have_ethtool = have_tool(sys, "ethtool")?;
+    // `?` would let a plain exec failure (never observed off `/usr/bin/env` itself, but not
+    // provably impossible) fail the whole bringup over a diagnostic dependency it doesn't have
+    // — `unwrap_or(false)` folds it into the ordinary "not on PATH" answer instead.
+    let have_ethtool = have_tool(sys, "ethtool").unwrap_or(false);
     if !have_ethtool {
         warnings.push("WARNING: ethtool not installed: wire drivers unrecorded".to_string());
     }
@@ -342,8 +345,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             .iter()
             .filter(|w| !absent.contains(w.name.as_str()))
         {
-            if let Some(drv) = wire_drivers::driver_of(sys, &w.name) {
-                drivers.push((w.name.clone(), drv));
+            match wire_drivers::driver_of(sys, &w.name) {
+                Some(drv) => drivers.push((w.name.clone(), drv)),
+                // ethtool is on PATH but this device refused the read (a device-specific
+                // nonzero exit, e.g. "Operation not supported") — named per wire rather than
+                // silently skipped, so the watchdog's later "different driver" report isn't the
+                // first anyone hears of it.
+                None => warnings.push(format!(
+                    "WARNING: ethtool -i {}: driver unrecorded",
+                    w.name
+                )),
             }
         }
     }
@@ -2051,6 +2062,32 @@ pub(crate) mod tests {
         );
         assert!(calls_for(&sys, "ethtool -K").is_empty(), "{:?}", sys.calls);
         assert!(calls_for(&sys, "ethtool -k").is_empty(), "{:?}", sys.calls);
+    }
+
+    /// ethtool is on PATH, but one present wire refuses the read (a device-specific nonzero
+    /// exit, e.g. "Operation not supported"): that wire is silently left out of the driver
+    /// record — same as before — but now names itself in a per-wire warning rather than
+    /// vanishing without a trace. The other wires still record normally.
+    #[test]
+    fn a_device_specific_ethtool_failure_warns_by_name_and_still_records_the_rest() {
+        let (mut sys, view) = up_sys_and_view();
+        sys = sys
+            .on_fail(&["ethtool", "-i", "eth9"], 1, "Operation not supported")
+            .on_stdout(&["ethtool", "-i", "eth1"], "driver: igb\n")
+            .on_stdout(&["ethtool", "-i", "eth0"], "driver: igb\n");
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert_eq!(
+            sys.writes_to("/run/cfab/wire-drivers"),
+            Some("eth1 igb\neth0 igb\n")
+        );
+        assert!(
+            warnings.contains(&"WARNING: ethtool -i eth9: driver unrecorded".to_string()),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("not installed")),
+            "a device's own refusal must not read as ethtool being uninstalled: {warnings:?}"
+        );
     }
 
     /// An absent wire is not probed and not recorded — same rule the rest of `up` follows.
