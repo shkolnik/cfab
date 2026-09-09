@@ -69,21 +69,26 @@ scatter-gather on) gets a udev rule on the host, fired on the netdev-add event; 
 reports the driver and the speed it finds. `ethtool` is a Debian `Recommends`, not a `Depends`:
 it is a read-only diagnostic, and its absence degrades gracefully — `up` still applies, the
 driver record is empty, and `status` says `driver ?` and names the gap once, rather than
-refusing anything. The retired `driver_features` and `usb` wire keys are refused at load,
-naming this.
+refusing anything. If ethtool is present but one device refuses `ethtool -i`, `up` warns
+`WARNING: ethtool -i <wire>: driver unrecorded` for that wire alone — it gets no driver record,
+and the forwarding watchdog skips its different-driver check for it. The retired
+`driver_features` and `usb` wire keys are refused at load, naming this.
 
 An example udev rule for an adapter that needs an offload turned off (matched here by USB
-vendor/product ID, not by netdev name, since a re-enumerated NIC can pick up a new one):
+vendor/product ID, not by netdev name, since a re-enumerated NIC can pick up a new one). The
+first rule pins the USB configuration (vendor mode) so the vendor driver binds before any
+interface driver probes; the second applies the offload change on every netdev add:
 
 ```
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8157", ATTR{bConfigurationValue}="1"
 SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="8157", RUN+="/usr/local/sbin/nic-offload"
 ```
 
-with `/usr/local/sbin/nic-offload` doing the actual work on the interface udev hands it in
-`$INTERFACE`:
+with `/usr/local/sbin/nic-offload` (`chmod 755`) doing the actual work on the interface udev
+hands it in `$INTERFACE`:
 
 ```
+#!/bin/sh
 ethtool -K "$INTERFACE" tx off rx off sg off tso off gso off
 ```
 

@@ -3,50 +3,14 @@
 //! is the honest proof: the thing asserted is the ABSENCE of a mechanism, and the argv literal
 //! `"-K"` (`ethtool -K <nic> ...`) is the one needle every past call site used.
 //!
-//! Production code only: each source is truncated at its first `#[cfg(test)]` line before the
-//! grep, exactly like `no_second_path.rs`, so a test naming the retired call to prove the
-//! production side never emits it is not itself a false positive.
+//! Production code only, via `tests/support/mod.rs`'s `#[cfg(test)]`-mod stripper (shared with
+//! `no_second_path.rs`): a test naming the retired call to prove the production side never
+//! emits it is not itself a false positive.
 
-use std::path::Path;
+#[path = "support/mod.rs"]
+mod support;
 
-fn rust_sources() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).unwrap();
-                out.push((display(&path), production_only(&text)));
-            }
-        }
-    }
-    out
-}
-
-fn display(path: &Path) -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Everything up to (not including) the first line that contains `#[cfg(test)]`.
-fn production_only(text: &str) -> String {
-    let mut kept = String::new();
-    for line in text.lines() {
-        if line.contains("#[cfg(test)]") {
-            break;
-        }
-        kept.push_str(line);
-        kept.push('\n');
-    }
-    kept
-}
+use support::rust_sources;
 
 #[test]
 fn no_production_code_path_builds_an_ethtool_dash_capital_k_argv() {
@@ -83,5 +47,32 @@ fn no_production_line_names_ethtool_and_dash_capital_k_together() {
     assert!(
         hits.is_empty(),
         "ethtool -K survivors (NIC features are the host's business now): {hits:?}"
+    );
+}
+
+/// Teeth for the stripper itself: a truncate-at-first-`#[cfg(test)]` implementation blinds this
+/// whole guard to any production code that follows a tests module. Both files below have real
+/// production items after theirs, so their presence in the scanned text is the proof the
+/// stripper is skipping only the gated module and not swallowing what comes after it.
+#[test]
+fn the_stripper_keeps_production_code_that_follows_a_tests_module() {
+    let sources = rust_sources();
+    let workload = sources
+        .iter()
+        .find(|(p, _)| p == "src/emit/workload.rs")
+        .map(|(_, t)| t.as_str())
+        .expect("src/emit/workload.rs is scanned");
+    assert!(
+        workload.contains("fn bridge_table"),
+        "bridge_table follows workload.rs's tests module and must stay in the scanned text"
+    );
+    let decl = sources
+        .iter()
+        .find(|(p, _)| p == "src/decl.rs")
+        .map(|(_, t)| t.as_str())
+        .expect("src/decl.rs is scanned");
+    assert!(
+        decl.contains("mod fixtures"),
+        "fixtures follows decl.rs's tests module and must stay in the scanned text"
     );
 }

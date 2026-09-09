@@ -347,10 +347,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         {
             match wire_drivers::driver_of(sys, &w.name) {
                 Some(drv) => drivers.push((w.name.clone(), drv)),
-                // ethtool is on PATH but this device refused the read (a device-specific
-                // nonzero exit, e.g. "Operation not supported") — named per wire rather than
-                // silently skipped, so the watchdog's later "different driver" report isn't the
-                // first anyone hears of it.
+                // `driver_of` returns None both for a device-specific refusal (a nonzero exit,
+                // e.g. "Operation not supported") and for an exec failure (ethtool removed
+                // between the `have_tool` probe above and this call) — either way this wire
+                // gets no driver record, named per wire rather than silently skipped, so the
+                // watchdog's later "different driver" report isn't the first anyone hears of it.
                 None => warnings.push(format!("WARNING: ethtool -i {}: driver unrecorded", w.name)),
             }
         }

@@ -70,7 +70,14 @@ warning, and
 .B status
 reports
 .B "driver ?"
-and names the gap once instead of refusing anything.
+and names the gap once instead of refusing anything. If ethtool is present
+but one device refuses
+.BR "ethtool \-i" ,
+.B up
+warns
+.B "WARNING: ethtool \-i <wire>: driver unrecorded"
+for that wire alone; it gets no driver record, and the forwarding watchdog
+skips its different\-driver check for it.
 .PP
 Most subcommands require root. The generators
 .RB ( "cfab gen" ,

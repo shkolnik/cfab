@@ -2454,6 +2454,15 @@ mod tests {
         link_speeds(&mut sys, &view, &mut c, &BTreeSet::new()).unwrap();
         let lines: Vec<String> = c.reasons.iter().map(|(_, m)| m.clone()).collect();
         assert_eq!(lines, ["ethtool not installed: driver changes unchecked"]);
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.as_str() == "/usr/bin/env sh -c command -v ethtool")
+                .count(),
+            1,
+            "one `command -v ethtool` probe per gather: {:?}",
+            sys.calls
+        );
     }
 
     /// The combined case: a speed mismatch AND ethtool truly absent — one `driver ?` line for
@@ -2480,6 +2489,15 @@ mod tests {
                 .count(),
             1,
             "one line per gather, not per wire: {lines:?}"
+        );
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.as_str() == "/usr/bin/env sh -c command -v ethtool")
+                .count(),
+            1,
+            "one `command -v ethtool` probe per gather: {:?}",
+            sys.calls
         );
     }
 
