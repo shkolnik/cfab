@@ -380,7 +380,12 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         } else {
             w.uplinks.join(", ")
         };
-        let trigger = w.trigger.as_deref().unwrap_or("-");
+        // `Some("")` (the announcer entry exists but its trigger has not been set yet) reads
+        // the same as `None` here — one dash, not an empty word in the middle of the line.
+        let trigger = match w.trigger.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => "-",
+        };
         let _ = writeln!(
             out,
             "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
@@ -3029,6 +3034,39 @@ mod tests {
             1,
             "the line, and no reason lines: {text}"
         );
+    }
+
+    /// An announcer entry that exists but has not published a trigger yet (`""`, the zero value
+    /// before its first tick) renders the same dash a missing entry would, not an empty word
+    /// sitting in the middle of the line.
+    #[test]
+    fn an_empty_trigger_renders_the_same_dash_as_no_entry() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let blank_trigger = serde_json::json!({
+            "supervisor": {"pid": 1234, "uptime_s": 3601, "applying": false, "applies": 1,
+                "last_apply_error": null},
+            "components": [
+                {"name": "engine", "state": "running", "pid": 1240, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "shape-daemon", "state": "running", "pid": 1250, "uptime_s": 3600,
+                 "restarts": 0, "last_exit": null},
+                {"name": "conf-sync", "state": "stopped", "pid": null, "uptime_s": null,
+                 "restarts": 0, "last_exit": null, "why": "not clustered"}
+            ],
+            "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
+            "workloads": [
+                {"name": "vms", "ifname": "primary.3", "trigger": "", "announces": 0, "bursts": 0}
+            ]
+        })
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &blank_trigger);
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].trigger.as_deref(), Some(""));
+        assert!(m.workloads[0].up, "an empty trigger is not itself a fault");
+        let text = render_text(&m, false, true).output;
+        assert!(text.contains("announce trigger -\n"), "{text}");
     }
 
     /// Each workload fault earns exactly one reason line and takes the row down — never more

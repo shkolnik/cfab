@@ -97,7 +97,7 @@ cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="absent"} 0
 # HELP cfab_bgp_neighbor_prefixes_sent Prefixes this member has sent the gateway router.
 # TYPE cfab_bgp_neighbor_prefixes_sent gauge
 cfab_bgp_neighbor_prefixes_sent{zone="mgmt",neighbor="192.168.249.254"} 3
-# HELP cfab_workload_up 1 when the workload interface, gw, guard and return path are all in place.
+# HELP cfab_workload_up 1 when the workload row is installed (table present, address, sibling, route-get) and its announcer is running.
 # TYPE cfab_workload_up gauge
 cfab_workload_up{name="vms"} 1
 # HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.

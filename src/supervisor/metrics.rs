@@ -550,7 +550,8 @@ impl FabricCollector {
         family(
             enc,
             "cfab_workload_up",
-            "1 when the workload interface, gw, guard and return path are all in place.",
+            "1 when the workload row is installed (table present, address, sibling, \
+             route-get) and its announcer is running.",
             &up,
         )
     }

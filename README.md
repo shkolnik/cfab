@@ -142,8 +142,9 @@ the bind keeps failing, and retries every 60 s. The fabric is unaffected: a bind
 never fatal and never delays the apply.
 
 A member carrying at least one `[[workload]]` row also serves `cfab_workload_up{name}` (1 when
-the row's interface, addresses, ARP guard and return path are all in place); a member with no
-row carries no series at all.
+the row's table is present, its addresses and sibling return-path rule are installed, the
+route-get proof succeeds, and its announcer is running); a member with no row carries no series
+at all.
 
 ```
 curl -s http://10.249.0.1:23232/metrics | grep -E 'cfab_fabric_state|cfab_links_up'
