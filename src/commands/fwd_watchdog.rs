@@ -22,6 +22,7 @@ use crate::commands::common::{link_exists, link_kind_is};
 use crate::commands::{apply, engine_ctl};
 use crate::derive::{Port, View};
 use crate::driver_features;
+use crate::emit;
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
@@ -398,8 +399,9 @@ fn install_deferred_workloads(
     }
     let original_len = pending.len();
     let mut still_pending: Vec<String> = Vec::new();
-    for name in pending {
-        let Some(row) = rows.iter().find(|r| r.wl.name == name) else {
+    let mut ready_names: Vec<String> = Vec::new();
+    for name in &pending {
+        let Some(row) = rows.iter().find(|r| r.wl.name == *name) else {
             continue; // the declaration dropped this row; nothing left to install for it
         };
         let ready = match uplink::identify(sys, &row.wl.ifname) {
@@ -409,23 +411,65 @@ fn install_deferred_workloads(
                 .all(|port| matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _)))),
             Err(_) => false,
         };
-        if !ready {
-            still_pending.push(name.to_string());
-            continue;
+        if ready {
+            ready_names.push((*name).to_string());
+        } else {
+            still_pending.push((*name).to_string());
         }
-        match run_ok(
-            sys,
-            &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", &row.wl.ifname],
-        ) {
-            Ok(_) => restored.push(format!("installed workload {name}")),
+    }
+    if !ready_names.is_empty() {
+        // CRITICAL (re-review): a row `apply` could never identify has no entry at all in the
+        // guard table apply wrote (apply's pass 2 only adds a row it COULD identify) — install
+        // its gw address without first re-loading the guard over its now-identified uplink and
+        // the member answers ARP for the shared gw to a foreign VM over that very uplink;
+        // arp_ignore does not help here, since the gw address is on the RECEIVING interface, not
+        // the uplink. Re-derive the guard set fresh from every row this member declares (not just
+        // the ones installing this tick — a still-not-forwarding-but-identified row's guard
+        // entry is as harmless here as it is in apply's own pass 1) and reload the table with the
+        // same producer apply uses, BEFORE any address goes live.
+        let guards: Vec<(std::net::Ipv4Addr, uplink::Uplink)> = rows
+            .iter()
+            .filter_map(|row| uplink::identify(sys, &row.wl.ifname).ok().map(|up| (row.wl.gw, up)))
+            .collect();
+        let bridge_path = format!("{}/workload-bridge.nft", view.fabric.run_dir);
+        let bridge_nft = emit::workload::bridge_table(&guards);
+        let loaded = match sys.write(&bridge_path, &bridge_nft) {
+            Ok(()) => run_ok(sys, &["nft", "-f", &bridge_path]),
+            Err(e) => Err(e),
+        };
+        match loaded {
+            Ok(_) => {
+                for name in &ready_names {
+                    let row = rows.iter().find(|r| &r.wl.name == name).expect("checked above");
+                    match run_ok(
+                        sys,
+                        &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", &row.wl.ifname],
+                    ) {
+                        Ok(_) => restored.push(format!("installed workload {name}")),
+                        Err(e) => {
+                            unrestored.push(format!("unrestored workload {name}: {e}"));
+                            still_pending.push(name.clone());
+                        }
+                    }
+                }
+            }
             Err(e) => {
-                unrestored.push(format!("unrestored workload {name}: {e}"));
-                still_pending.push(name.to_string());
+                // The guard did not load: not one row installs this tick, all stay deferred.
+                for name in &ready_names {
+                    unrestored.push(format!("unrestored workload {name}: guard not loaded: {e}"));
+                    still_pending.push(name.clone());
+                }
             }
         }
     }
     if still_pending.len() != original_len {
-        sys.write(&path, &still_pending.join("\n"))?;
+        match sys.write(&path, &still_pending.join("\n")) {
+            Ok(()) => {}
+            Err(e) => unrestored.push(format!(
+                "unrestored workload-deferred bookkeeping: {path} not written ({e}) — a row \
+                 already installed may be re-probed again next tick"
+            )),
+        }
     }
     Ok(())
 }
@@ -1077,6 +1121,80 @@ pub(crate) mod tests {
             sys.writes_of("/run/cfab/workload-deferred").is_empty(),
             "still pending: unchanged, no rewrite"
         );
+    }
+
+    // CRITICAL (re-review): a row whose uplink was never identified at apply time has no entry
+    // in workload-bridge.nft — apply's pass 2 only ever adds an entry for a row it COULD
+    // identify. Installing that row's gw address without first re-loading the guard over its
+    // now-identified uplink leaves the member answering ARP for the shared gw to foreign VMs
+    // over that uplink (arp_ignore does not help: the gw is on the RECEIVING interface).
+    #[test]
+    fn the_watchdog_loads_the_bridge_guard_before_installing_a_row_never_identified_at_apply() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        let pos = |needle: &str| {
+            sys.calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not run: {:#?}", sys.calls))
+        };
+        assert!(
+            pos("write /run/cfab/workload-bridge.nft")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+            "the guard must be reloaded before the address goes live"
+        );
+        assert!(
+            pos("nft -f /run/cfab/workload-bridge.nft")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3")
+        );
+        let written = sys.writes_of("/run/cfab/workload-bridge.nft");
+        assert!(
+            written.last().is_some_and(|t| t.contains("eth0")),
+            "{written:#?}"
+        );
+        assert!(report.restored.contains(&"installed workload vms".to_string()));
+    }
+
+    #[test]
+    fn a_failed_guard_reload_installs_no_address_and_leaves_the_row_deferred() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            )
+            .on_fail(
+                &["nft", "-f", "/run/cfab/workload-bridge.nft"],
+                1,
+                "Error: syntax error",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(
+            report
+                .unrestored
+                .iter()
+                .any(|l| l == "unrestored workload vms: guard not loaded: nft -f \
+                     /run/cfab/workload-bridge.nft: exit 1 — Error: syntax error"),
+            "{:#?}",
+            report.unrestored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), Vec::<&str>::new());
     }
 
     #[test]
