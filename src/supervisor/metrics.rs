@@ -565,7 +565,12 @@ impl FabricCollector {
         let ws = &self.snap.model.workloads;
         let up: Vec<(Labels, i64)> = ws
             .iter()
-            .map(|w| (lbl(&[("name", w.name.as_str())]), i64::from(w.up)))
+            .map(|w| {
+                (
+                    lbl(&[("name", w.name.as_str())]),
+                    i64::from(w.state.is_up()),
+                )
+            })
             .collect();
         family(
             enc,
@@ -1417,7 +1422,10 @@ mod tests {
     #[test]
     fn a_down_workload_reports_zero_and_a_model_without_workloads_emits_no_family() {
         let mut s = fixture_up();
+        // `cfab_workload_up` renders `w.state.is_up()` (review M5), so `state` must move with
+        // `up` here exactly as production always constructs the pair.
         s.model.workloads[0].up = false;
+        s.model.workloads[0].state = WorkloadState::Broken;
         let text = render(&s);
         assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
 
@@ -1436,20 +1444,60 @@ mod tests {
         s.model.workloads[0].vms_seen = None;
         s.model.workloads[0].guard_drops = None;
         s.model.workloads[0].bytes = None;
+        // A deferred row has no rendered announcer either (Task 1: `apply` never gave it a gw
+        // address), so `Components.workloads` carries no entry for it — realistic, not just
+        // "faithful to a fixture that happens to omit it" (review M2).
+        s.model.components.as_mut().unwrap().workloads.clear();
         let text = render(&s);
         assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
+        // Exactly one of the four `state` series is 1 (review M3): pinning all four, not just
+        // the two that changed, so a bug that also flips `broken` or `announcer_not_started`
+        // cannot hide behind an assertion that only checks `deferred` and `up`.
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"up\"} 0"),
+            "{text}"
+        );
         assert!(
             text.contains("cfab_workload_state{name=\"vms\",state=\"deferred\"} 1"),
             "{text}"
         );
         assert!(
-            text.contains("cfab_workload_state{name=\"vms\",state=\"up\"} 0"),
+            text.contains("cfab_workload_state{name=\"vms\",state=\"announcer_not_started\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"broken\"} 0"),
             "{text}"
         );
         assert!(!text.contains("cfab_workload_vms_seen"), "{text}");
         assert!(!text.contains("cfab_workload_guard_drops"), "{text}");
         assert!(!text.contains("cfab_workload_rx_bytes"), "{text}");
         assert!(!text.contains("cfab_workload_tx_bytes"), "{text}");
+        assert!(!text.contains("cfab_workload_announces"), "{text}");
+        assert!(!text.contains("cfab_workload_bursts"), "{text}");
+    }
+
+    /// The `AnnouncerNotStarted` arm specifically (review M2): a supervisor is answering, but
+    /// `Components.workloads` carries no entry for this row's name — the row's own announcer
+    /// never started. `announces`/`bursts` must stay absent, never fall back to a stale or
+    /// fabricated value, even though `components` itself is `Some`.
+    #[test]
+    fn an_unstarted_announcer_drops_announces_and_bursts_even_with_a_supervisor_answering() {
+        let mut s = fixture_up();
+        s.model.workloads[0].up = false;
+        s.model.workloads[0].state = WorkloadState::AnnouncerNotStarted;
+        s.model.workloads[0].vms_seen = None;
+        s.model.workloads[0].guard_drops = None;
+        s.model.workloads[0].bytes = None;
+        s.model.components.as_mut().unwrap().workloads.clear();
+        let text = render(&s);
+        assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
+        assert!(
+            text.contains("cfab_workload_state{name=\"vms\",state=\"announcer_not_started\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("cfab_workload_announces"), "{text}");
+        assert!(!text.contains("cfab_workload_bursts"), "{text}");
     }
 
     /// No supervisor answering drops `announces`/`bursts` (their only source), but the other
