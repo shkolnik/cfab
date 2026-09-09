@@ -49,8 +49,8 @@ depends = "nftables, iproute2"
 # Only a leaf on a kernel without nf_tables uses iptables-legacy; a host never does, so its
 # absence must not block the install (James 2026-09-06). ethtool is a read-only diagnostic
 # dependency (2026-09-09): cfab records the driver of each wire and cross-checks link speed
-# with it, but sets no NIC feature any more (a host-side udev rule does; BACKLOG item 17) and
-# degrades gracefully to its absence. apt installs Recommends by default.
+# with it, but sets no NIC feature any more — NIC feature quirks are set by a host-side udev
+# rule, not by cfab — and degrades gracefully to its absence. apt installs Recommends by default.
 recommends = "iptables, ethtool"
 assets = [
     ["target/release/cfab", "usr/bin/", "755"],
