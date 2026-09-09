@@ -67,6 +67,7 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+        out.push_str(crate::emit::workload::DHCP_OPTION_121_DEFINITION);
         for wl in &fabric.workloads {
             out.push_str(&crate::emit::workload::dhcp_option_121(
                 wl.prefix, &aggregate, wl.gw, wl.router,
@@ -104,6 +105,9 @@ mod tests {
              allow storage; carried by pve1-tb, pve2-tb\n\
              fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, \
              10.249.0.0/16\n\
+             # dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition \
+             inside a subnet block.\n\
+             option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
              # dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A \
              client that receives\n\
              # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) \
@@ -111,7 +115,6 @@ mod tests {
              # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, \
              10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1\n\
              subnet 192.168.20.0 netmask 255.255.255.0 {\n\
-             \toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
              \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, \
              199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n\
              }\n"

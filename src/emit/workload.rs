@@ -44,15 +44,23 @@ pub fn aggregate(zone_ids: &[u8]) -> Vec<Ipv4Prefix> {
 const HEADER: &str =
     "# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client \
      that receives\n";
+/// The one global option definition every workload's subnet block relies on; print it once,
+/// above the blocks, never inside one.
+pub const DHCP_OPTION_121_DEFINITION: &str =
+    "# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a \
+     subnet block.\n\
+     option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n";
 /// The RFC 3442 classless-static-routes (option 121) dhcpd.conf snippet for one workload's
 /// gateway: every aggregate prefix routed via `gw`, plus the default route via `router` (RULED,
 /// spec §4 and §10 call 14: `router` is a declared key, refused outside `prefix`, printed only
 /// here). A client that receives option 121 ignores option 3 entirely, so the default route
 /// must be inside 121 or a client loses its existing default when it picks up this VLAN's lease.
-/// The options sit inside a `subnet <net> netmask <mask> { … }` definition keyed on `prefix` (the
+/// The value sits inside a `subnet <net> netmask <mask> { … }` block keyed on `prefix` (the
 /// workload's own VLAN, not the aggregate): with more than one `[[workload]]` row, each row's
 /// values differ, so without a subnet block to scope them, dhcpd would take only the last row's
-/// `option` statements as a global default and silently drop the others.
+/// `option` statement as a global default and silently drop the others. The option DEFINITION is
+/// [`DHCP_OPTION_121_DEFINITION`], printed once and globally by the caller: isc-dhcpd 4.4.3
+/// refuses a scoped one (`option definitions may not be scoped`, pve3-tb 2026-09-09).
 pub fn dhcp_option_121(
     prefix: Ipv4Prefix,
     aggregate: &[Ipv4Prefix],
@@ -91,7 +99,6 @@ pub fn dhcp_option_121(
          INSIDE 121 (last entry).\n\
          # {routes}\n\
          subnet {} netmask {} {{\n\
-         \toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
          \toption rfc3442-classless-static-routes {items}, 0, {r};\n\
          }}\n",
         prefix.net,
@@ -137,7 +144,6 @@ mod tests {
 # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
 # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
 subnet 192.168.20.0 netmask 255.255.255.0 {
-\toption rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
 \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 0, 192, 168, 20, 1;
 }
 "
@@ -164,6 +170,9 @@ subnet 192.168.20.0 netmask 255.255.255.0 {
         assert!(a.contains("subnet 192.168.20.0 netmask 255.255.255.0 {"), "{a}");
         assert!(b.contains("subnet 192.168.30.0 netmask 255.255.255.0 {"), "{b}");
         assert_ne!(a, b);
+        // dhcpd: `option definitions may not be scoped` — the definition never appears in a block.
+        assert!(!a.contains("code 121"), "{a}");
+        assert!(DHCP_OPTION_121_DEFINITION.contains("code 121 = array of unsigned integer 8;"));
     }
 }
 
