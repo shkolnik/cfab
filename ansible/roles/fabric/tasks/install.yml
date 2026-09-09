@@ -67,10 +67,9 @@
 
 - name: Install and configure cfab
   block:
-    # The declaration goes down FIRST: a package whose `cfab check` refuses it (a retired key,
-    # e.g. `driver_features` — 2026-09-09) is more useful to diagnose against the declaration
-    # already on disk than against one that is not there yet. No upgrade semantics needed here
-    # (James: no existing installs), but there is no reason to prefer the other order either.
+    # Declaration before package, by ruling — this role runs no `cfab check` itself, so nothing
+    # here depends on the order. No upgrade semantics either way (no existing installs to
+    # disturb): apt only ever moves a host onto a version it did not already have.
     - name: /etc/cfab
       ansible.builtin.file:
         path: /etc/cfab
