@@ -1799,8 +1799,10 @@ fn workload_posture(
         // A row `apply` did not defer, but whose announcer the supervisor never started (Task
         // 8b's own journal says why) has no entry here — that is its own fault, not "healthy
         // with nothing to show for the trigger": one settling line, and the row counts down.
+        // With no supervisor answering the announcer's state is unknown, and that fault already
+        // has its own line: only an answering supervisor with no entry means "not started".
         let announce = comps.and_then(|k| k.workloads.iter().find(|w| w.name == name));
-        if announce.is_none() {
+        if comps.is_some() && announce.is_none() {
             c.settling(format!("workload {name}: announcer not started"));
             up = false;
         }
@@ -3206,6 +3208,23 @@ mod tests {
             .unwrap_or_else(|| panic!("{:#?}", m.conditions));
         assert_eq!(hit.class, Class::Settling);
         assert!(!m.workloads[0].up);
+        assert_eq!(m.workloads[0].trigger, None);
+    }
+
+    /// No supervisor answering is one fault with its own line; the announcer's state is then
+    /// unknown, not "not started", so the row does not earn a second reason for the same cause.
+    #[test]
+    fn no_supervisor_does_not_also_read_as_announcer_not_started() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", "");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !m.conditions.iter().any(|c| c.text == "workload vms: announcer not started"),
+            "{:#?}",
+            m.conditions
+        );
         assert_eq!(m.workloads[0].trigger, None);
     }
 
