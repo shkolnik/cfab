@@ -22,11 +22,13 @@ use crate::commands::common::{link_exists, link_kind_is};
 use crate::commands::{apply, engine_ctl};
 use crate::derive::{Port, View};
 use crate::driver_features;
+use crate::emit;
 use crate::emit::engine::TransitCost;
 use crate::error::Result;
 use crate::model::MemberKind;
 use crate::prober::HeldPrimaries;
-use crate::sys::{Sys, run_ignore};
+use crate::sys::{Sys, run_ignore, run_ok};
+use crate::workload::uplink;
 
 pub struct WatchdogReport {
     /// None = healthy; Some(reason) = failed closed.
@@ -135,6 +137,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
     restore_bond_membership(sys, view, &mut restored, &mut downed)?;
     restore_rules(sys, view, &mut restored, &mut downed)?;
     restore_gw_return_defaults(sys, view, &mut restored)?;
+    restore_workloads(sys, view, &mut restored, &mut unrestored)?;
     for line in restored
         .iter()
         .chain(rebuilt.iter())
@@ -308,6 +311,196 @@ fn restore_gw_return_defaults(
                 "re-added return-path default table {} via {}",
                 d.table, d.via
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The workload bridge ARP guard table and the shared `arp_ignore` sysctl `up` set for a member
+/// that carries at least one `[[workload]]` row (spec §5.1, ruling 11). Both are member-wide,
+/// not one of `fabric_legs`'s netdevs, so — like the rules above — the whole set is re-checked
+/// once per tick rather than keyed to a leg. No-op on a member with no workload row: `up` never
+/// touched either object there, so there is nothing to watch.
+fn restore_workloads(
+    sys: &mut dyn Sys,
+    view: &View,
+    restored: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
+    let rows = view.workload_rows();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let names = rows
+        .iter()
+        .map(|r| r.wl.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A failed check or a failed restore here is named and left for the next tick (fail loud,
+    // never abort the tick): an `nft` that cannot answer, or a re-apply that itself fails, must
+    // not swallow whatever `restore_rules` etc. already found upstream, or skip the arp_ignore
+    // check and the deferred-row install below.
+    let bridge_present = match sys.run(&["nft", "list", "table", "bridge", "cfab"]) {
+        Ok(out) => out.ok(),
+        Err(e) => {
+            unrestored.push(format!("unrestored workload {names}: {e}"));
+            true // unknown: do not also try to restore a table we could not even ask about
+        }
+    };
+    if !bridge_present {
+        let path = format!("{}/workload-bridge.nft", view.fabric.run_dir);
+        match sys.read(&path) {
+            Ok(_) => match run_ok(sys, &["nft", "-f", &path]) {
+                Ok(_) => restored.push(format!("restored bridge table cfab (workload {names})")),
+                Err(e) => unrestored.push(format!("unrestored workload {names}: {e}")),
+            },
+            Err(_) => unrestored.push(format!(
+                "unrestored workload {names}: bridge table cfab missing and {path} missing \
+                 (run cfab up)"
+            )),
+        }
+    }
+    let arp_path = "/proc/sys/net/ipv4/conf/all/arp_ignore";
+    let v = sys
+        .read(arp_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if v != "1" {
+        match sys.write(arp_path, "1") {
+            Ok(()) => restored.push(format!(
+                "restored net.ipv4.conf.all.arp_ignore=1 (workload {names})"
+            )),
+            Err(e) => unrestored.push(format!("unrestored workload {names}: {e}")),
+        }
+    }
+    if let Err(e) = install_deferred_workloads(sys, view, &rows, restored, unrestored) {
+        unrestored.push(format!("unrestored workload {names}: {e}"));
+    }
+    Ok(())
+}
+
+/// A row `apply` deferred (spec §5.1 pass 1, James's ruling 2026-09-09) because its uplink was
+/// not yet identified or not yet STP-forwarding: re-probe it every tick, and once it is ready,
+/// apply the gw address it never got and journal it once. `restore_workloads`'s own arp_ignore
+/// check above already covers "and arp_ignore" — that sysctl is member-wide, not per-row, and is
+/// re-asserted whenever ANY workload row exists at all. No `workload-deferred` file (never
+/// written, or every row already installed) means nothing pending: zero reads beyond the one
+/// missing-file check, zero writes.
+fn install_deferred_workloads(
+    sys: &mut dyn Sys,
+    view: &View,
+    rows: &[crate::derive::WorkloadRow],
+    restored: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) -> Result<()> {
+    let path = format!("{}/workload-deferred", view.fabric.run_dir);
+    let Ok(content) = sys.read(&path) else {
+        return Ok(());
+    };
+    let pending: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let original_len = pending.len();
+    let mut still_pending: Vec<String> = Vec::new();
+    let mut ready_names: Vec<String> = Vec::new();
+    for name in &pending {
+        let Some(row) = rows.iter().find(|r| r.wl.name == *name) else {
+            continue; // the declaration dropped this row; nothing left to install for it
+        };
+        let ready = match uplink::identify(sys, &row.wl.ifname) {
+            Ok(up) => up
+                .ports
+                .iter()
+                .all(|port| matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _)))),
+            Err(_) => false,
+        };
+        if ready {
+            ready_names.push((*name).to_string());
+        } else {
+            still_pending.push((*name).to_string());
+        }
+    }
+    if !ready_names.is_empty() {
+        // CRITICAL (re-review): a row `apply` could never identify has no entry at all in the
+        // guard table apply wrote (apply's pass 2 only adds a row it COULD identify) — install
+        // its gw address without first re-loading the guard over its now-identified uplink and
+        // the member answers ARP for the shared gw to a foreign VM over that very uplink;
+        // arp_ignore does not help here, since the gw address is on the RECEIVING interface, not
+        // the uplink. Re-derive the guard set fresh from every row this member declares (not just
+        // the ones installing this tick — a still-not-forwarding-but-identified row's guard
+        // entry is as harmless here as it is in apply's own pass 1) and reload the table with the
+        // same producer apply uses, BEFORE any address goes live.
+        //
+        // IMPORTANT (round 2 re-check): a row already live keeps its address across ticks, but
+        // its guard entry only exists in this freshly rebuilt table — so if ANY declared row's
+        // uplink fails to identify this tick (transient or not), the naive rebuild silently
+        // drops that row from the guard set even when it is not the row being installed. That
+        // shrinks live protection below "every row that currently owns a gw address", which is
+        // strictly worse than doing nothing this tick. So: identify every row first: any failure
+        // aborts the whole reload (no write, no `nft -f`) and keeps every ready row deferred —
+        // never partially rebuild the guard set. And never let a failed `nft -f` corrupt the
+        // canonical file `restore_workloads` will read on a future tick: write the candidate
+        // ruleset to a temp name and `rename` it over the canonical name only once `nft -f` has
+        // actually loaded it, so a failed load leaves the previous, still-correct file in place.
+        let mut identify_failure: Option<(String, String)> = None;
+        let mut guards: Vec<(std::net::Ipv4Addr, uplink::Uplink)> = Vec::new();
+        for row in rows {
+            match uplink::identify(sys, &row.wl.ifname) {
+                Ok(up) => guards.push((row.wl.gw, up)),
+                Err(e) => {
+                    identify_failure = Some((row.wl.name.clone(), e));
+                    break;
+                }
+            }
+        }
+        if let Some((name, reason)) = identify_failure {
+            unrestored.push(format!(
+                "unrestored workload {name}: uplink not identified: {reason}; deferred rows kept"
+            ));
+            still_pending.extend(ready_names.iter().cloned());
+        } else {
+            let bridge_path = format!("{}/workload-bridge.nft", view.fabric.run_dir);
+            let tmp_path = format!("{bridge_path}.new");
+            let bridge_nft = emit::workload::bridge_table(&guards);
+            let loaded = match sys.write(&tmp_path, &bridge_nft) {
+                Ok(()) => run_ok(sys, &["nft", "-f", &tmp_path])
+                    .and_then(|out| sys.rename(&tmp_path, &bridge_path).map(|()| out)),
+                Err(e) => Err(e),
+            };
+            match loaded {
+                Ok(_) => {
+                    for name in &ready_names {
+                        let row = rows.iter().find(|r| &r.wl.name == name).expect("checked above");
+                        match run_ok(
+                            sys,
+                            &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", &row.wl.ifname],
+                        ) {
+                            Ok(_) => restored.push(format!("installed workload {name}")),
+                            Err(e) => {
+                                unrestored.push(format!("unrestored workload {name}: {e}"));
+                                still_pending.push(name.clone());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The guard did not load: not one row installs this tick, all stay deferred.
+                    for name in &ready_names {
+                        unrestored.push(format!("unrestored workload {name}: guard not loaded: {e}"));
+                        still_pending.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if still_pending.len() != original_len {
+        match sys.write(&path, &still_pending.join("\n")) {
+            Ok(()) => {}
+            Err(e) => unrestored.push(format!(
+                "unrestored workload-deferred bookkeeping: {path} not written ({e}) — a row \
+                 already installed may be re-probed again next tick"
+            )),
         }
     }
     Ok(())
@@ -718,6 +911,23 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// pve1-tb with TWO workload rows on the same "primary" bridge/eth0 uplink: "vms" on
+    /// primary.3 and "vms2" on primary.4 — for the guard-rebuild-on-install-tick tests, where
+    /// one row's `identify()` failing this tick must never cost a DIFFERENT row its guard entry
+    /// or its progress out of `workload-deferred`.
+    fn two_row_wl_fabric() -> Fabric {
+        let t = crate::decl::fixtures::with_prefs(
+            &crate::decl::fixtures::example(),
+            "pve1-tb",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
+        );
+        let blocks = format!(
+            "{}\n[[workload]]\nname = \"vms2\"\nifname = \"primary.4\"\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            crate::decl::fixtures::WORKLOAD_BLOCK
+        );
+        Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
+    }
+
     /// `nft -j list chains` with only cfab's own tables. `extra` appends a foreign chain.
     fn chains_json(extra: &str) -> String {
         format!(
@@ -784,6 +994,348 @@ pub(crate) mod tests {
             );
         }
         legs_present(rules_present(sys, view), view)
+    }
+
+    /// `healthy_sys` plus the workload facts in their healthy state.
+    fn wl_healthy_sys(view: &View) -> MockSys {
+        healthy_sys(view)
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
+            .file("/run/cfab/workload-bridge.nft", "table bridge cfab\n")
+            .on_stdout(
+                &["nft", "list", "table", "bridge", "cfab"],
+                "table bridge cfab {\n}\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            )
+    }
+
+    #[test]
+    fn the_watchdog_restores_the_bridge_guard_and_arp_ignore_and_the_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
+        );
+        assert!(sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        let log = report.restored.join("\n");
+        assert!(
+            log.contains("restored bridge table cfab (workload vms)"),
+            "{log}"
+        );
+        assert!(
+            log.contains("restored net.ipv4.conf.all.arp_ignore=1 (workload vms)"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_failed_arp_ignore_write_is_recorded_and_the_tick_still_journals_the_sibling_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .write_fail("/proc/sys/net/ipv4/conf/all/arp_ignore")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(
+            report
+                .unrestored
+                .iter()
+                .any(|l| l.starts_with("unrestored workload vms: FATAL: cannot write")),
+            "{:#?}",
+            report.unrestored
+        );
+        // The tick did not abort: the sibling rule after it in the same function still ran.
+        assert!(sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+    }
+
+    #[test]
+    fn a_healthy_workload_costs_the_watchdog_no_writes() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view);
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_failing_bridge_restore_is_recorded_and_the_tick_still_journals_the_rest() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .on_fail(
+                &["nft", "-f", "/run/cfab/workload-bridge.nft"],
+                1,
+                "Error: syntax error",
+            )
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        let unrestored = report.unrestored.join("\n");
+        assert!(
+            unrestored.contains("unrestored workload vms: nft -f /run/cfab/workload-bridge.nft"),
+            "{unrestored}"
+        );
+        // The tick did not abort: the arp_ignore restore and the sibling rule after it still ran.
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
+        );
+        assert!(sys.ran("ip rule add pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
+        // Every unrestored/restored line got journaled, the failed one included.
+        assert!(
+            sys.calls
+                .iter()
+                .any(|c| c.contains("logger") && c.contains("unrestored workload vms")),
+            "{:#?}",
+            sys.calls
+        );
+    }
+
+    #[test]
+    fn a_missing_bridge_file_is_named_as_unrestored() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // `healthy_sys`, not `wl_healthy_sys`: the latter stubs the bridge .nft file into
+        // existence, which is exactly the fact this test needs absent.
+        let mut sys = healthy_sys(&view)
+            .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
+            .on_fail(
+                &["nft", "list", "table", "bridge", "cfab"],
+                1,
+                "Error: No such file or directory",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2000"],
+                "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
+                 2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert_eq!(
+            report.unrestored,
+            vec![
+                "unrestored workload vms: bridge table cfab missing and /run/cfab/workload-bridge.nft missing (run cfab up)"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_watchdog_installs_a_deferred_row_once_its_uplink_starts_forwarding() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert_eq!(
+            report.restored.iter().filter(|l| *l == "installed workload vms").count(),
+            1,
+            "{:?}",
+            report.restored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
+    }
+
+    #[test]
+    fn the_watchdog_leaves_a_still_unready_deferred_row_alone() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "1\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(
+            sys.writes_of("/run/cfab/workload-deferred").is_empty(),
+            "still pending: unchanged, no rewrite"
+        );
+    }
+
+    // CRITICAL (re-review): a row whose uplink was never identified at apply time has no entry
+    // in workload-bridge.nft — apply's pass 2 only ever adds an entry for a row it COULD
+    // identify. Installing that row's gw address without first re-loading the guard over its
+    // now-identified uplink leaves the member answering ARP for the shared gw to foreign VMs
+    // over that uplink (arp_ignore does not help: the gw is on the RECEIVING interface). The
+    // reload goes through a temp name (round 2 re-check): a failed `nft -f` must never corrupt
+    // the canonical file a future tick's `restore_workloads` would otherwise load in its place.
+    #[test]
+    fn the_watchdog_loads_the_bridge_guard_before_installing_a_row_never_identified_at_apply() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        let pos = |needle: &str| {
+            sys.calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not run: {:#?}", sys.calls))
+        };
+        assert!(
+            pos("write /run/cfab/workload-bridge.nft.new")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+            "the guard must be reloaded before the address goes live"
+        );
+        assert!(
+            pos("nft -f /run/cfab/workload-bridge.nft.new")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3")
+        );
+        assert!(
+            pos("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft")
+                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+            "only a successfully loaded table is promoted to the canonical name"
+        );
+        let written = sys.writes_of("/run/cfab/workload-bridge.nft.new");
+        assert!(
+            written.last().is_some_and(|t| t.contains("eth0")),
+            "{written:#?}"
+        );
+        assert_eq!(
+            sys.writes_to("/run/cfab/workload-bridge.nft"),
+            written.last().copied(),
+            "the rename left the canonical file holding the newly loaded content"
+        );
+        assert!(report.restored.contains(&"installed workload vms".to_string()));
+    }
+
+    #[test]
+    fn a_failed_guard_reload_installs_no_address_and_leaves_the_row_deferred() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            )
+            .on_fail(
+                &["nft", "-f", "/run/cfab/workload-bridge.nft.new"],
+                1,
+                "Error: syntax error",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft"));
+        assert!(
+            report
+                .unrestored
+                .iter()
+                .any(|l| l == "unrestored workload vms: guard not loaded: nft -f \
+                     /run/cfab/workload-bridge.nft.new: exit 1 — Error: syntax error"),
+            "{:#?}",
+            report.unrestored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), Vec::<&str>::new());
+        // Round 3: the canonical file a future tick's `restore_workloads` would read is exactly
+        // what it was before this failed reload — untouched by the temp file's content.
+        assert_eq!(
+            sys.writes_to("/run/cfab/workload-bridge.nft"),
+            Some("table bridge cfab\n"),
+            "a failed nft -f must never corrupt the canonical guard file"
+        );
+    }
+
+    // IMPORTANT (round 2 re-check): the guard-rebuild loop reads EVERY declared row (not just
+    // the ones installing this tick) to keep every live row's guard entry in the fresh table.
+    // If a row not being installed this tick fails `identify()` (a transient sysfs read glitch,
+    // a NIC mid-re-enumeration), the naive fix silently drops that row from the rebuilt guard
+    // set — even though its gw address is already live — which is worse than doing nothing.
+    // Invariant: the loaded guard set never shrinks below the set of rows that currently own a
+    // gw address. So: any declared row failing `identify()` aborts the WHOLE reload this tick
+    // (no write, no `nft -f`), and every row that was ready to install stays deferred.
+    #[test]
+    fn an_unrelated_rows_identify_failure_aborts_the_whole_reload_and_keeps_the_ready_row_deferred()
+    {
+        let f = two_row_wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // "vms" (primary.3) is NOT in workload-deferred — it is already live from an earlier
+        // tick — but it has no `lower_primary` link this tick: a transient identify() failure.
+        // "vms2" (primary.4) IS in workload-deferred and is ready to install this tick.
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms2")
+            .link("/sys/class/net/primary.4/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.4",
+                "primary.4  VID: 4\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("write /run/cfab/workload-bridge.nft.new"));
+        assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft.new"));
+        assert!(!sys.ran("ip addr replace 192.168.30.254/24 dev primary.4"));
+        assert!(
+            sys.writes_of("/run/cfab/workload-deferred").is_empty(),
+            "vms2 stays deferred; nothing changed, so no rewrite of an unchanged pending set"
+        );
+        let expected = "unrestored workload vms: uplink not identified: workload interface primary.3 is not a VLAN sub-interface of a bridge (no lower link in /sys/class/net/primary.3); deferred rows kept";
+        assert!(
+            report.unrestored.iter().any(|l| l == expected),
+            "expected {expected:?} in {:#?}",
+            report.unrestored
+        );
+    }
+
+    #[test]
+    fn fabric_legs_never_include_the_workload_interface() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(!fabric_legs(&v).contains(&"primary.3".to_string()));
     }
 
     /// Every declared leg of every declared wire present and of the kind cfab created it with —

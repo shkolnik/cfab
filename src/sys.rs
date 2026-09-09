@@ -286,6 +286,9 @@ pub mod mock {
         /// write to — and a poll loop that waits for something to appear (a run dir written by
         /// a restarting supervisor) has no other way to be tested.
         pub appear_after: Vec<(usize, String, String)>,
+        /// Every (path, content) written, in order — a refused write included, so a test can see
+        /// a write was attempted even where `write_fails` blocked it from landing in `files`.
+        pub writes: Vec<(String, String)>,
         /// port netdev -> what `bond_port_state` answers for it. A port that is not in the map
         /// does not exist: the read fails with `ENODEV`, which is how a real kernel reports a
         /// netdev that has gone away.
@@ -411,6 +414,15 @@ pub mod mock {
         pub fn writes_to(&self, path: &str) -> Option<&str> {
             self.files.get(path).map(String::as_str)
         }
+
+        /// Every content written to `path`, in order (a refused write included).
+        pub fn writes_of(&self, path: &str) -> Vec<&str> {
+            self.writes
+                .iter()
+                .filter(|(p, _)| p == path)
+                .map(|(_, c)| c.as_str())
+                .collect()
+        }
     }
 
     impl Sys for MockSys {
@@ -495,6 +507,7 @@ pub mod mock {
 
         fn write(&mut self, path: &str, content: &str) -> Result<()> {
             self.calls.push(format!("write {path}"));
+            self.writes.push((path.to_string(), content.to_string()));
             if self.write_fails.iter().any(|p| p == path) {
                 return Err(Error::fatal(format!(
                     "cannot write {path}: permission denied"
@@ -698,6 +711,18 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(reply, "got state\n");
+    }
+
+    #[test]
+    fn the_mock_records_every_write_in_order_with_its_content() {
+        let mut sys = MockSys::default();
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "1").unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/eth0/forwarding", "0").unwrap();
+        sys.write("/proc/sys/net/ipv4/conf/all/arp_ignore", "0").unwrap();
+        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"), vec!["1", "0"]);
+        assert_eq!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/forwarding"), vec!["0"]);
+        assert!(sys.writes_of("/proc/sys/net/ipv4/conf/eth0/rp_filter").is_empty());
+        assert_eq!(sys.writes_to("/proc/sys/net/ipv4/conf/all/arp_ignore"), Some("0"), "writes_to keeps its last-value meaning");
     }
 
     #[test]
