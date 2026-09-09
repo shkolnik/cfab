@@ -4079,14 +4079,16 @@ table bridge cfab {
     fn neighbors_seen_excludes_members_gw_router_and_out_of_prefix() {
         let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
         let exclude: Vec<std::net::Ipv4Addr> = vec![
-            "192.168.20.2".parse().unwrap(), // this member
-            "192.168.20.3".parse().unwrap(), // a peer member
-            "192.168.20.1".parse().unwrap(), // router
+            "192.168.20.2".parse().unwrap(),   // this member
+            "192.168.20.3".parse().unwrap(),   // a peer member
+            "192.168.20.1".parse().unwrap(),   // router
+            "192.168.20.254".parse().unwrap(), // gw
         ];
         let neigh_json = serde_json::json!([
             {"dst": "192.168.20.2", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
             {"dst": "192.168.20.3", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
             {"dst": "192.168.20.1", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:06", "state": ["REACHABLE"]},
             {"dst": "192.168.20.50", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
             {"dst": "192.168.21.5", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
         ])
@@ -4137,13 +4139,20 @@ table bridge cfab {
 
     /// A healthy row carries all three new fields, read from the fixture: the guard sum over the
     /// row's one uplink port, the sysfs byte counters, and `vms_seen` from the neighbor read
-    /// (one VM plus this member's own address, which is excluded, leaving 1).
+    /// (one VM, this member's own address, the gw and the router — all three of the latter
+    /// excluded by `workload_posture` itself, not a hand-built slice — leaving 1). This is the
+    /// end-to-end proof that `exclude.push(wl.gw)` / `exclude.push(wl.router)` in
+    /// `workload_posture` do something: deleting either push turns this red (`vms_seen` would go
+    /// to `Some(2)`), which `neighbors_seen_excludes_members_gw_router_and_out_of_prefix` alone
+    /// cannot show since it hands `neighbors_seen` a hand-built `exclude` slice.
     #[test]
     fn a_healthy_row_carries_guard_drops_bytes_and_vms_seen_from_the_fixture() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([
             {"dst": "192.168.20.2", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.1", "dev": "primary.3", "state": ["REACHABLE"]},
             {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
         ])
         .to_string();
