@@ -647,7 +647,13 @@ refuses a
 .B router
 or member address outside
 .BR prefix ;
-any of them on the prefix's network or broadcast address; a member address
+any of them on the prefix's network or broadcast address; a
+.B gw
+or
+.B router
+that is not a bare IPv4 address (no mask \(em
+.BR prefix 's
+mask is applied to both); a member address
 without the prefix's mask or equal to
 .B gw
 or
@@ -672,7 +678,15 @@ vocabulary); a workload
 overlapping a zone's own
 .B 10.<id>.0.0/16
 block; a workload row no member carries; a member declaring the same
-workload row twice; a member workload naming an unknown row; and a leaf
+workload row twice; a member workload naming an unknown row;
+.B "span = \(dqhost\(dq"
+(phase 2, not built yet \(em omit
+.B span
+or write
+.BR \(dqswitch\(dq );
+an unrecognized
+.B span
+value; and a leaf
 carrying one (a leaf never transits); with rows declared it also prints the
 fabric aggregate (the smallest set of prefixes covering every declared zone
 block) and the DHCP option 121 snippet. Names share the zone vocabulary, so
@@ -739,7 +753,14 @@ option: a client that receives option 121 ignores option 3, so a 121 lease
 with no default route inside it leaves the VM with none at all. A VM without
 option 121 still reaches fabric identities via the declared
 .BR router ,
-degraded, not broken.
+degraded, not broken. The aggregate is fabric\-wide: it covers every declared
+zone block regardless of this row's own
+.BR allow ,
+so a zone the row does not reach still routes through
+.B gw
+rather than falling to the default route \(em traffic this workload is not
+allowed into is dropped at the host, not carried off toward
+.BR router .
 .SH SEE ALSO
 .BR ip (8),
 .BR nft (8),

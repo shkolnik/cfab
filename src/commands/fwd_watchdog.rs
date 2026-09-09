@@ -28,7 +28,7 @@ use crate::error::Result;
 use crate::model::MemberKind;
 use crate::prober::HeldPrimaries;
 use crate::sys::{Sys, run_ignore, run_ok};
-use crate::workload::uplink;
+use crate::workload::{deferred_names, uplink};
 
 pub struct WatchdogReport {
     /// None = healthy; Some(reason) = failed closed.
@@ -478,16 +478,26 @@ fn reconcile_workload_guard(
     unrestored: &mut Vec<String>,
 ) -> Result<()> {
     let path = format!("{}/workload-deferred", view.fabric.run_dir);
-    let pending: Vec<String> = sys
-        .read(&path)
-        .map(|c| c.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
-        .unwrap_or_default();
+    // M3 (whole-branch review): the one shared parser (`status` and the supervisor already read
+    // it this way) — a second hand-rolled split here could silently drift from it (e.g. one
+    // trims blank lines, the other does not) and read a different pending set than `status`
+    // reports.
+    let pending = deferred_names(sys, view);
     let original_len = pending.len();
     let mut still_pending: Vec<String> = Vec::new();
     let mut ready_names: Vec<String> = Vec::new();
     for name in &pending {
         let Some(row) = rows.iter().find(|r| &r.wl.name == name) else {
-            continue; // the declaration dropped this row; nothing left to install for it
+            // The declaration dropped this row (or the file is stale/corrupt): nothing left to
+            // install for it, but it must not just vanish from the bookkeeping — journal it
+            // once this tick and keep it in the file so an operator can see and fix it, rather
+            // than the file quietly losing an entry it never installed.
+            unrestored.push(format!(
+                "unrestored workload-deferred bookkeeping: {name} names no declared \
+                 [[workload]] row"
+            ));
+            still_pending.push(name.clone());
+            continue;
         };
         let ready = match uplink::identify(sys, &row.wl.ifname) {
             Ok(up) => up
@@ -1386,6 +1396,41 @@ pub(crate) mod tests {
             report.restored
         );
         assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
+    }
+
+    // M3 (whole-branch review): a name in `workload-deferred` with no matching declared row
+    // (the declaration dropped it, or the file is stale) used to just `continue`, which vanished
+    // from `still_pending` and so from the rewritten file too — the bookkeeping silently lost
+    // it. It must be journaled (once, this tick) and kept in the file, never dropped.
+    #[test]
+    fn a_deferred_name_with_no_declared_row_is_journaled_and_kept_not_dropped() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms\nretired")
+            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file(
+                "/proc/net/vlan/primary.3",
+                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(
+            report.unrestored.iter().any(|l| l.contains("retired")),
+            "an unmatched deferred name must be journaled, not silently dropped: {:?}",
+            report.unrestored
+        );
+        let final_write = sys
+            .writes_of("/run/cfab/workload-deferred")
+            .last()
+            .copied()
+            .unwrap();
+        assert_eq!(
+            final_write, "retired",
+            "an unmatched name must stay in the file, never disappear"
+        );
     }
 
     // C1 (whole-branch review): a row `apply` deferred because its own interface was

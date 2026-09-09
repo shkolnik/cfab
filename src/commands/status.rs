@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::commands::common::{
-    FabricRule, conf_interfaces, foreign_forward_remedy, unresolved_forward_drops,
+    FabricRule, conf_interfaces, foreign_forward_remedy, has_ip_addr, unresolved_forward_drops,
     workload_return_rules,
 };
 use crate::commands::engine_ctl;
@@ -27,7 +27,7 @@ use crate::error::Result;
 use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
-use crate::sys::{Output, Sys, run_optional};
+use crate::sys::{Output, Sys, have_tool, run_optional};
 
 /// The re-read cadence of `--wait`.
 const POLL_SECS: u64 = 2;
@@ -1717,7 +1717,11 @@ fn workload_posture(
         .read("/proc/sys/net/ipv4/conf/all/arp_ignore")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unreadable".to_string());
-    let bridge_ok = sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
+    // M2 (whole-branch review): `have_tool`-guarded like teardown.rs's mark removal — a host
+    // with no `nft` binary must report this as a condition on the row, never propagate the exec
+    // error and abort the whole `status` gather before any other line renders.
+    let bridge_ok =
+        have_tool(sys, "nft")? && sys.run(&["nft", "list", "table", "bridge", "cfab"])?.ok();
 
     for row in rows {
         let wl = row.wl;
@@ -1757,14 +1761,14 @@ fn workload_posture(
             let addr = sys
                 .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
                 .stdout;
-            if !addr.contains(&format!(" {}", row.address)) {
+            if !has_ip_addr(&addr, &row.address) {
                 c.settling(format!(
                     "workload {name}: address {} missing on {}",
                     row.address, wl.ifname
                 ));
                 up = false;
             }
-            if !addr.contains(&format!(" {gw_cidr}")) {
+            if !has_ip_addr(&addr, &gw_cidr) {
                 c.settling(format!(
                     "workload {name}: gw {gw_cidr} missing on {}",
                     wl.ifname
@@ -2163,6 +2167,10 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "systemctl is-enabled ",
         "tc class show dev ",
         "ethtool -i ",
+        // M2 (whole-branch review): `have_tool`'s `command -v` probe, added so `bridge_ok` can
+        // check for `nft` without a bare `sys.run` that aborts the whole gather when it is
+        // absent (see `workload_posture`) — a query, never a write.
+        "/usr/bin/env sh -c command -v ",
     ];
     if let Some(rest) = call.strip_prefix("unix_request ") {
         // `<path> <verb> [args]`: the engine's `state`, and the supervisor's read-only
@@ -3044,6 +3052,51 @@ mod tests {
             1,
             "the line, and no reason lines: {text}"
         );
+    }
+
+    // M1 (whole-branch review): the address/gw reads used `.contains(" <cidr>")`, a substring
+    // match, while apply/teardown were hardened to the whitespace-token-exact `has_ip_addr`
+    // (gate C). `192.168.20.2/2400` (an implausible mask, but the mock can say it) contains
+    // ` 192.168.20.2/24` as a literal substring — a token-exact reader must not be fooled.
+    #[test]
+    fn a_workload_address_reading_is_token_exact_not_substring() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
+            "primary.3 UP 192.168.20.2/2400 192.168.20.254/2400\n",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !m.workloads[0].up,
+            "a mangled token must never satisfy a substring match"
+        );
+    }
+
+    // M2 (whole-branch review): a host with no `nft` binary made `bridge_ok`'s bare `sys.run`
+    // propagate an exec error (`RealSys::run` maps a missing binary to `Err`), aborting the
+    // WHOLE `status` gather before any other line rendered — the same class of bug fixed in
+    // teardown.rs's mark removal. `have_tool`-guard it: a missing `nft` is a condition this row
+    // reports (the same settling line the "table missing" case already uses), never a hard stop.
+    #[test]
+    fn a_missing_nft_binary_is_reported_not_an_error() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view)
+            .on_fail(&["/usr/bin/env", "sh", "-c", "command -v nft"], 1, "");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert!(
+            !sys.ran("nft list table bridge cfab"),
+            "have_tool must short-circuit the nft call, exactly like teardown.rs"
+        );
+        assert!(
+            m.conditions
+                .iter()
+                .any(|c| c.text == "workload vms: bridge table cfab missing (uplink ARP guard down)"),
+        );
+        assert!(!m.workloads[0].up);
     }
 
     /// An announcer entry that exists but has not published a trigger yet (`""`, the zero value
