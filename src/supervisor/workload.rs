@@ -167,12 +167,47 @@ impl Workloads {
         now: Instant,
     ) {
         self.start_pending(sys, view, io, now);
+        self.refresh_uplinks(sys, view);
         if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
             return;
         }
         for r in &mut self.rows {
             if neigh::fdb_poll_changed(sys, &r.up, &mut r.seen) {
                 r.announcer.on_event(now);
+            }
+        }
+    }
+
+    /// Re-read every running row's uplink.
+    ///
+    /// A bridge port added since the last tick — a second NIC, a bond member, a VLAN trunk —
+    /// is an uplink from then on. Without this it would still be classified as a VM port, so
+    /// every peer MAC learned on it would read as this host's ownership changing and burst,
+    /// which is exactly the amplification the uplink filter exists to prevent.
+    ///
+    /// Cheap: one `brif/` listing plus a `device` probe per port, the same reads `apply` does.
+    /// A read that FAILS keeps the last known uplink rather than blanking it (a blank uplink
+    /// set would make every port a VM port); the forwarding watchdog owns that alarm and
+    /// already reports an unidentifiable uplink on its own tick, so this one does not
+    /// double-report it.
+    fn refresh_uplinks(&mut self, sys: &mut dyn Sys, view: &View) {
+        for row in view.workload_rows() {
+            let Ok(up) = uplink::identify(sys, &row.wl.ifname) else {
+                continue;
+            };
+            let Some(r) = self.rows.iter_mut().find(|r| r.name == row.wl.name) else {
+                continue;
+            };
+            if r.up == up {
+                continue;
+            }
+            let (name, old, new) = (r.name.clone(), r.up.ports.join(","), up.ports.join(","));
+            r.up = up;
+            if old != new {
+                journal(
+                    &self.trace,
+                    format!("cfab: workload {name}: uplink ports {old} -> {new}"),
+                );
             }
         }
     }
@@ -713,6 +748,84 @@ mod tests {
         assert_eq!(w.rows_for_status()[0].bursts, 0);
         w.on_neigh(&mut sys, &add(10, false), t0); // a VM starts talking
         assert_eq!(w.rows_for_status()[0].bursts, 1);
+    }
+
+    /// A port added to the bridge after the announcer started is classified from the tick that
+    /// sees it: a second uplink NIC must never be read as a VM port, or every peer MAC learned
+    /// on it would burst.
+    #[test]
+    fn a_new_uplink_port_is_reclassified_on_the_next_tick() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            None,
+            opens,
+            t0,
+        );
+        let add = |ifindex| {
+            NeighSignal::Add(NeighEvent {
+                ifindex,
+                mac: [2, 0xcf, 0xab, 0, 0, 1],
+                permanent: false,
+            })
+        };
+        // A second physical NIC joins the bridge (ifindex 3), and a VM tap beside it (10).
+        sys.files
+            .insert("/sys/class/net/primary/brif/eth1/state".into(), "3\n".into());
+        sys.files
+            .insert("/sys/class/net/eth1/ifindex".into(), "3\n".into());
+        sys.links
+            .insert("/sys/class/net/eth1/device".into(), "../../../0000:02:00.0".into());
+
+        let trace = rec();
+        w.trace = Some(trace.clone());
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0);
+        assert_eq!(
+            said(&trace),
+            vec!["cfab: workload vms: uplink ports eth0 -> eth0,eth1"]
+        );
+        w.on_neigh(&mut sys, &add(3), t0);
+        assert_eq!(
+            w.rows_for_status()[0].bursts,
+            0,
+            "a MAC on the new uplink is a peer's, not a VM starting here"
+        );
+        w.on_neigh(&mut sys, &add(10), t0);
+        assert_eq!(w.rows_for_status()[0].bursts, 1, "the tap still bursts");
+    }
+
+    /// An uplink that momentarily cannot be identified keeps its last known ports: a blank
+    /// uplink set would make every port a VM port, which is worse than a stale one. (The
+    /// forwarding watchdog is what shouts about an unidentifiable uplink.)
+    #[test]
+    fn a_failed_uplink_read_keeps_the_last_known_ports() {
+        let (mut sys, view) = wl(None);
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), t0);
+        w.on_neigh(
+            &mut sys,
+            &NeighSignal::Add(NeighEvent {
+                ifindex: 2, // eth0, still the uplink as far as we last knew
+                mac: [2, 0xcf, 0xab, 0, 0, 1],
+                permanent: false,
+            }),
+            t0,
+        );
+        assert_eq!(w.rows_for_status()[0].bursts, 0);
+        assert_eq!(said(&trace).len(), 1, "only the start line: no second alarm");
     }
 
     /// ENOBUFS: the kernel dropped events we will never see, so the gap itself is the signal.
