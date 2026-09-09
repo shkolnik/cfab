@@ -537,6 +537,24 @@ impl FabricCollector {
         )
     }
 
+    /// One series per `[[workload]]` row this member carries (spec §5.1 item 10); an absent
+    /// family on a member with none, including every leaf.
+    fn workloads(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
+        let up: Vec<(Labels, i64)> = self
+            .snap
+            .model
+            .workloads
+            .iter()
+            .map(|w| (lbl(&[("name", w.name.as_str())]), i64::from(w.up)))
+            .collect();
+        family(
+            enc,
+            "cfab_workload_up",
+            "1 when the workload interface, gw, guard and return path are all in place.",
+            &up,
+        )
+    }
+
     fn components(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
         let Some(c) = &self.snap.model.components else {
             return Ok(());
@@ -704,6 +722,7 @@ impl Collector for FabricCollector {
         self.probe_ports(&mut enc)?;
         self.conditions(&mut enc)?;
         self.ingress(&mut enc)?;
+        self.workloads(&mut enc)?;
         self.components(&mut enc)?;
         self.telemetry(&mut enc)
     }
@@ -919,7 +938,7 @@ mod tests {
     }
 
     use crate::commands::status::model::{
-        Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach,
+        Adjacency, Bonding, Headline, LegPort, MemberInfo, Reach, WorkloadStatus,
     };
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
@@ -1126,6 +1145,20 @@ mod tests {
             } else {
                 Vec::new()
             },
+            workloads: if full {
+                vec![WorkloadStatus {
+                    name: "vms".to_string(),
+                    ifname: "primary.3".to_string(),
+                    address: "192.168.20.2/24".to_string(),
+                    gw: "192.168.20.254/24".to_string(),
+                    up: true,
+                    zones: vec!["storage".to_string()],
+                    uplinks: vec!["eth0".to_string()],
+                    trigger: Some("neigh events".to_string()),
+                }]
+            } else {
+                Vec::new()
+            },
             conditions: if full {
                 vec![
                     Condition {
@@ -1188,6 +1221,9 @@ mod tests {
         };
         let mut m = model(State::UpDegraded, Some(h), true);
         m.adjacencies[1].up = false;
+        // No workload row on the degraded fixture: `full` otherwise controls every OTHER
+        // family, and this one has its own dedicated golden coverage on `fixture_up` alone.
+        m.workloads.clear();
         snapshot(m, probe_rows())
     }
 
@@ -1225,6 +1261,20 @@ mod tests {
     #[test]
     fn golden_up() {
         assert_eq!(render(&fixture_up()), include_str!("metrics_golden_up.txt"));
+    }
+
+    /// A down row reports 0, never an absent series — the family exists once any row does — and
+    /// a model with no workload rows at all (every other fixture) emits no family, per the
+    /// absence rule every labeled family here follows.
+    #[test]
+    fn a_down_workload_reports_zero_and_a_model_without_workloads_emits_no_family() {
+        let mut s = fixture_up();
+        s.model.workloads[0].up = false;
+        let text = render(&s);
+        assert!(text.contains("cfab_workload_up{name=\"vms\"} 0"), "{text}");
+
+        let text = render(&fixture_down());
+        assert!(!text.contains("cfab_workload_up"), "{text}");
     }
 
     #[test]
@@ -1271,6 +1321,7 @@ mod tests {
             "cfab_ingress_reachable",
             "cfab_bgp_neighbor_state",
             "cfab_bgp_neighbor_prefixes_sent",
+            "cfab_workload_up",
             "cfab_wire_present",
             "cfab_bond_home_carrier",
             "cfab_component_state",

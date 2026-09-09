@@ -613,7 +613,12 @@ the port and the errno, shows the standing
 .B "cfab status"
 line
 .BR "metrics endpoint not listening on :23232 (...)" ,
-and retries every 60\ s \(em the fabric is unaffected.
+and retries every 60\ s \(em the fabric is unaffected. A member carrying at least one
+.B [[workload]]
+row also serves
+.BR "cfab_workload_up{name}" ,
+1 when that row's interface, addresses, ARP guard and return path are all in place; a member
+with no row carries no series at all.
 .SH WORKLOADS
 A
 .B [[workload]]
