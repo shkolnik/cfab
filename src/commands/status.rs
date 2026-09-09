@@ -16,7 +16,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::commands::common::{
-    conf_interfaces, foreign_forward_remedy, unresolved_forward_drops, workload_return_rules,
+    FabricRule, conf_interfaces, foreign_forward_remedy, unresolved_forward_drops,
+    workload_return_rules,
 };
 use crate::commands::engine_ctl;
 use crate::derive::{Port, View, segments_of};
@@ -1495,6 +1496,26 @@ fn reachability(
     Ok(())
 }
 
+/// The workload's own pref-2000 sibling, sourced from `siblings` (`common::workload_return_rules`'s
+/// own output, filtered the same `starts_with` way `return_path_rules` splices it — never a
+/// second reformat of the needle) rather than an `.expect()`: `status` only ever reads, so a
+/// sibling that should always exist by construction (both call sites filter the same (zone,
+/// workload) pairs from the same `view.fabric`) and somehow does not — a future refactor that
+/// ever lets the two filters drift — is reported as the same "return path missing" fact an
+/// installed-but-dropped sibling gets, never a panic.
+fn sibling_return_reason(siblings: &[FabricRule], blk: &str, prefix: &str, r2000: &str) -> Option<String> {
+    let needle = format!("from {blk} to {prefix} lookup main");
+    let installed = siblings
+        .iter()
+        .filter(|r| r.needle.starts_with(&format!("from {blk} to ")))
+        .any(|r| r.needle == needle && r2000.contains(&r.needle));
+    if installed {
+        None
+    } else {
+        Some(format!("return path missing: pref 2000 {needle}"))
+    }
+}
+
 /// Return-path rules per zone; a gw zone's table must hold the engine's default, its leg must carry
 /// the address, and the router must be peering.
 #[allow(clippy::too_many_arguments)]
@@ -1527,17 +1548,13 @@ fn return_path_and_ingress(
         // The pref-2000 siblings for this zone: one per workload this zone is in the `allow`
         // list of, on every member AND every leaf (spec §5.1 item 5) — the leaf has no
         // `[[workload]]` row of its own, but still needs the sibling to answer `ip route get
-        // <vm> from <identity>`. The workload's own prefix picks its sibling out of `siblings`
-        // (built once above), so the reported needle is always `common::workload_return_rules`'s
-        // text, never reformatted here.
+        // <vm> from <identity>`. `sibling_return_reason` matches the workload's prefix against
+        // `siblings` (built once above) the same `starts_with` way `return_path_rules` splices
+        // it, never a panic if the two filters ever drift.
         for w in f.workloads.iter().filter(|w| w.allow.iter().any(|a| a == &z.name)) {
-            let needle = format!("from {blk} to {} lookup main", w.prefix);
-            let rule = siblings
-                .iter()
-                .find(|r| r.needle == needle)
-                .expect("workload_return_rules emits exactly this needle for every allowed zone");
-            if !r2000.contains(&rule.needle) {
-                c.settling(format!("return path missing: pref 2000 {}", rule.needle));
+            let prefix = w.prefix.to_string();
+            if let Some(reason) = sibling_return_reason(&siblings, &blk, &prefix, &r2000) {
+                c.settling(reason);
                 c.broken_workloads.insert(w.name.clone());
             }
             // The route-get proof (R4): fabric-sourced traffic from this member's OWN identity
@@ -3267,6 +3284,33 @@ mod tests {
             .unwrap_or_else(|| panic!("{want}: {:#?}", m.conditions));
         assert_eq!(hit.class, Class::Standing);
         assert!(!m.workloads[0].up);
+    }
+
+    /// `sibling_return_reason` never panics: an empty (or non-matching) `siblings` list is
+    /// reported as the same "return path missing" fact an installed-but-dropped sibling gets,
+    /// from the needle the function derives itself when there is nothing to source it from.
+    #[test]
+    fn a_missing_sibling_reports_the_reason_never_panics() {
+        let want = "return path missing: pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main";
+        assert_eq!(
+            sibling_return_reason(&[], "10.99.0.0/16", "192.168.20.0/24", ""),
+            Some(want.to_string())
+        );
+        // A sibling list that has rules, just not this one (a different zone's block).
+        let other = workload_return_rules(&View::new(&wl_fabric(), "pve1-tb").unwrap());
+        assert_eq!(other.len(), 1, "{other:#?}");
+        assert_eq!(
+            sibling_return_reason(&other, "10.100.0.0/16", "192.168.20.0/24", ""),
+            Some(
+                "return path missing: pref 2000 from 10.100.0.0/16 to 192.168.20.0/24 lookup main"
+                    .to_string()
+            )
+        );
+        // And the healthy case: present in `siblings` and already installed in `r2000`.
+        assert_eq!(
+            sibling_return_reason(&other, "10.99.0.0/16", "192.168.20.0/24", &other[0].needle),
+            None
+        );
     }
 
     /// The `status` never-writes invariant holds over the workload checks too: every new call
