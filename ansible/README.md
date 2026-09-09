@@ -3,7 +3,10 @@
 One role, `shkolnik.cfab.fabric`: installs the `cfab` package from its apt repository on a host and
 drives a gated rollout, one operation per run, selected by tag. It carries nothing about any
 particular site: the declaration (`fabric.toml`) is the operator's and comes in through
-`cfab_declaration`. Collection version = cfab package version, for now.
+`cfab_declaration`. The collection is versioned on its own (`galaxy.yml`), separately from the cfab
+package: a release is the git tag `ansible/v<version>` on this repository (interim, until the
+collection is published to Ansible Galaxy from CI). The role works with cfab package 0.5.1 or newer
+(it needs the packaged unit's `EnvironmentFile=/etc/default/cfab`); pin the package with `cfab_version`.
 
 ## Use from your own repository
 
@@ -13,7 +16,7 @@ particular site: the declaration (`fabric.toml`) is the operator's and comes in 
 collections:
   - name: https://github.com/shkolnik/cfab.git#/ansible/
     type: git
-    version: v0.5.1
+    version: ansible/v0.6.0
 ```
 
 ```
@@ -70,7 +73,7 @@ is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansi
 | `CFAB_HOST=<cfab_host>` (the packaged unit's `EnvironmentFile`) | `/etc/default/cfab` |
 
 The unit is the package's own, `/lib/systemd/system/cfab.service`, installed disabled; the role ships
-no unit of its own. Collection versions before 0.5.2 templated a copy of the unit to
+no unit of its own. Collection versions before 0.6.0 templated a copy of the unit to
 `/etc/systemd/system/cfab.service`; install removes that copy (and only that copy) so the packaged
 unit takes over, and apply refuses to run while anything else overrides it there.
 

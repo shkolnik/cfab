@@ -106,7 +106,7 @@
         dest: /etc/default/cfab
         mode: "0644"
 
-    # Collection versions before 0.5.2 templated their own copy of the unit to
+    # Collection versions before 0.6.0 templated their own copy of the unit to
     # /etc/systemd/system/cfab.service, which overrides the packaged one and went stale. Remove
     # it only when it is that copy (its Description is unique to the old template); anything
     # else at that path is the operator's and the apply task refuses to run under it.
