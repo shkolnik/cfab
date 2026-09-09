@@ -18,10 +18,8 @@ cfab_keyring_path: /usr/share/keyrings/jshkol-archive-keyring.gpg
 # so this only bites on a first install). Set to e.g. "0.1.0-1" to pin.
 cfab_version: ""
 
-cfab_conf_path: /etc/cfab/fabric.toml
-
-# The [[member]] this host runs as. Written into the unit's environment, so the row name and
-# the inventory name are one thing (rename the row, not this).
+# The [[member]] this host runs as. Written to /etc/default/cfab (the packaged unit's
+# EnvironmentFile), so the row name and the inventory name are one thing (rename the row, not this).
 cfab_host: "{{ inventory_hostname }}"
 
 # --tags apply arms a timed revert BEFORE bringup: unless `--tags disarm` runs within this many

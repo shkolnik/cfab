@@ -1,10 +1,23 @@
 # Apply = arm the timed revert, then bringup (start, or re-apply in place if already active), then
 # verify and print. The host disarms itself only via `--tags disarm`; otherwise cfab-revert fires.
-- name: The unit must be installed first
-  stat:
-    path: /etc/systemd/system/cfab.service
+- name: Which unit file does systemd run for cfab.service?
+  command: systemctl show -p FragmentPath --value cfab.service
   register: cfab_unit
-  failed_when: not cfab_unit.stat.exists
+  changed_when: false
+
+- name: The packaged unit must be the one systemd runs
+  assert:
+    that:
+      - cfab_unit.stdout | length > 0
+      - cfab_unit.stdout is not match('/etc/systemd/')
+    fail_msg: >-
+      cfab.service is {{ 'not installed (run the install first)' if cfab_unit.stdout | length == 0
+      else 'overridden by ' ~ cfab_unit.stdout ~ ', which this role did not write; remove it (or move it to a drop-in under cfab.service.d/) so the packaged unit runs' }}
+    quiet: true
+
+- name: CFAB_HOST must be set for this host (install first)
+  command: grep -qx 'CFAB_HOST={{ cfab_host }}' /etc/default/cfab
+  changed_when: false
 
 - name: Drop a previous revert timer (re-apply inside the window restarts the clock)
   command: systemctl stop cfab-revert.timer cfab-revert.service
@@ -44,7 +57,7 @@
   when: cfab_start.rc != 0
 
 - name: Status (wait up to {{ cfab_status_wait }} s for UP)
-  command: /usr/bin/cfab -c {{ cfab_conf_path }} status --wait {{ cfab_status_wait }}
+  command: /usr/bin/cfab status --wait {{ cfab_status_wait }}
   environment:
     CFAB_HOST: "{{ cfab_host }}"
   register: cfab_status

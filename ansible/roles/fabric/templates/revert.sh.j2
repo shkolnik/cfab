@@ -7,4 +7,4 @@
 export CFAB_HOST={{ cfab_host }}
 logger -t cfab-revert "revert ($1): disabling cfab and tearing down"
 systemctl disable --now cfab.service
-/usr/bin/cfab -c {{ cfab_conf_path }} down
+/usr/bin/cfab down

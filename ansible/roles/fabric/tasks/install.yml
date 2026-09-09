@@ -1,5 +1,7 @@
-# Install = the apt repository, then the cfab package plus its declaration and the
-# interim boot unit. Nothing is enabled or started: the network is untouched until `--tags apply`.
+# Install = the apt repository, then the cfab package plus its declaration and /etc/default/cfab.
+# The unit is the package's own (/lib/systemd/system/cfab.service); the role ships none, so there
+# is exactly one unit definition and it moves with the package. Nothing is enabled or started: the
+# network is untouched until `--tags apply`.
 # Idempotent; re-run to ship a declaration change (it takes effect on the next apply/boot, never
 # by itself — see the report at the end).
 #
@@ -78,14 +80,14 @@
 
     - name: /etc/cfab
       ansible.builtin.file:
-        path: "{{ cfab_conf_path | dirname }}"
+        path: /etc/cfab
         state: directory
         mode: "0755"
 
     - name: Declaration ({{ cfab_declaration }})
       ansible.builtin.copy:
         src: "{{ cfab_declaration }}"
-        dest: "{{ cfab_conf_path }}"
+        dest: /etc/cfab/fabric.toml
         mode: "0644"
       register: cfab_conf
 
@@ -95,14 +97,37 @@
         dest: "{{ cfab_revert_script }}"
         mode: "0755"
 
-    # The deb (0.3.0+) ships its own cfab.service (packaging/deb/cfab.service, disabled/unstarted).
-    # This role's copy pins the same unit at /etc/systemd/system/cfab.service so cfab_host and
-    # cfab_conf_path are baked in without editing /etc/default/cfab separately.
-    - name: cfab.service (installed disabled)
+    # The packaged unit reads /etc/default/cfab (EnvironmentFile=); CFAB_HOST is the one thing the
+    # role has to say. The deb ships the file as a conffile with CFAB_HOST commented out; this
+    # overwrites it, and dpkg keeps the local copy on later upgrades.
+    - name: /etc/default/cfab (CFAB_HOST={{ cfab_host }})
       ansible.builtin.template:
-        src: cfab.service.j2
-        dest: /etc/systemd/system/cfab.service
+        src: cfab.default.j2
+        dest: /etc/default/cfab
         mode: "0644"
+
+    # Collection versions before 0.5.2 templated their own copy of the unit to
+    # /etc/systemd/system/cfab.service, which overrides the packaged one and went stale. Remove
+    # it only when it is that copy (its Description is unique to the old template); anything
+    # else at that path is the operator's and the apply task refuses to run under it.
+    - name: Is there a unit at /etc/systemd/system/cfab.service?
+      ansible.builtin.stat:
+        path: /etc/systemd/system/cfab.service
+      register: cfab_override
+
+    - name: Read it
+      ansible.builtin.slurp:
+        src: /etc/systemd/system/cfab.service
+      register: cfab_override_body
+      when: cfab_override.stat.exists
+
+    - name: Remove the old role-templated unit (the packaged unit takes over)
+      ansible.builtin.file:
+        path: /etc/systemd/system/cfab.service
+        state: absent
+      when: cfab_override.stat.exists
+            and 'Description=cluster-network-fabric member (' in (cfab_override_body.content | b64decode)
+      register: cfab_override_removed
       notify: systemd daemon-reload
 
     - name: Flush handlers
@@ -123,8 +148,11 @@
       ansible.builtin.debug:
         msg: >-
           {{ cfab_host }}: cfab {{ cfab_dpkg.stdout }} from {{ cfab_apt_uri }},
-          declaration {{ cfab_conf_path }}; unit cfab is
+          declaration /etc/cfab/fabric.toml; unit cfab is
           {{ 'ACTIVE' if cfab_active.stdout == 'active' else 'not running' }}
           {{ '— declaration changed: run --tags apply to re-run bringup in place'
              if (cfab_conf.changed and cfab_active.stdout == 'active') else '' }}
+          {{ '— the old role-templated unit was removed, but the running supervisor keeps the settings it
+             started under (watchdog, stop timeout) until `systemctl restart cfab` (apply only reloads)'
+             if (cfab_override_removed is changed and cfab_active.stdout == 'active') else '' }}
           {{ '— next: --tags probe (read-only), then --tags apply' if cfab_active.stdout != 'active' else '' }}

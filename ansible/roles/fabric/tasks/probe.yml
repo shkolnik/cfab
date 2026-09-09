@@ -5,7 +5,7 @@
   args:
     executable: /bin/bash
   environment:
-    CFAB_CONF: "{{ cfab_conf_path }}"
+    CFAB_CONF: /etc/cfab/fabric.toml
     CFAB_NICS: "{{ cfab_nics }}"
     CFAB_KEYRING: "{{ cfab_keyring_path }}"
   register: cfab_probe

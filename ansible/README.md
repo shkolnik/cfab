@@ -35,14 +35,14 @@ Run, always `-l` one host at a time:
 
 ```
 ansible-playbook cfab.yml -l pve2 --tags probe      # read-only inventory of the host; paste it back
-ansible-playbook cfab.yml -l pve2                   # install: apt repo, package, declaration, unit (DISABLED). No network change.
+ansible-playbook cfab.yml -l pve2                   # install: apt repo, package, declaration, /etc/default/cfab. No network change.
 ansible-playbook cfab.yml -l pve2 --tags apply      # arm a 10-min revert, enable+start, verify, print
 ansible-playbook cfab.yml -l pve2 --tags disarm     # keep it: stop the revert timer
 ansible-playbook cfab.yml -l pve2 --tags rollback   # undo now: disable + cfab down (package stays)
 ```
 
 Inventory names **are** the `[[member]]` names (`cfab_host` defaults to `inventory_hostname` and
-is written into the unit's environment). Requires ansible-core >= 2.15 on the control node
+is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansible-core >= 2.15 on the control node
 (`deb822_repository`) and `python3-debian` on the host (the role installs it).
 
 ## Variables
@@ -53,7 +53,6 @@ is written into the unit's environment). Requires ansible-core >= 2.15 on the co
 | `cfab_nics` | the `nic = "…"` names in the declaration | wires the probe inspects |
 | `cfab_version` | `""` = newest in the repository | pin, e.g. `0.5.1-1`; equal version = apt no-op |
 | `cfab_apt_uri` / `cfab_apt_suite` / `cfab_apt_component` | `https://pkg.jshkol.com` `stable` `main` | where the package comes from |
-| `cfab_conf_path` | `/etc/cfab/fabric.toml` | where the declaration lands |
 | `cfab_host` | `inventory_hostname` | the `[[member]]` row this host runs as |
 | `cfab_revert_minutes` | `10` | apply arms a timed revert; `--tags disarm` within this window keeps the fabric |
 | `cfab_status_wait` | `90` | seconds `cfab status --wait` waits for UP after bringup |
@@ -68,7 +67,12 @@ is written into the unit's environment). Requires ansible-core >= 2.15 on the co
 | `cfab` package (pulls `nftables iproute2 ethtool libpcre2-8-0`) | `/usr/bin/cfab` |
 | the declaration | `/etc/cfab/fabric.toml` |
 | `cfab-revert`, generated: what the timer and `--tags rollback` run | `/usr/local/sbin/cfab-revert` |
-| `cfab.service` with `cfab_host`/`cfab_conf_path` baked in, **installed disabled** | `/etc/systemd/system/cfab.service` |
+| `CFAB_HOST=<cfab_host>` (the packaged unit's `EnvironmentFile`) | `/etc/default/cfab` |
+
+The unit is the package's own, `/lib/systemd/system/cfab.service`, installed disabled; the role ships
+no unit of its own. Collection versions before 0.5.2 templated a copy of the unit to
+`/etc/systemd/system/cfab.service`; install removes that copy (and only that copy) so the packaged
+unit takes over, and apply refuses to run while anything else overrides it there.
 
 Install never changes the network. `apt` will not replace a package at an equal version string,
 even if the bytes differ: bump the version or `dpkg -i` to move a host onto another build.
@@ -102,7 +106,7 @@ Removing the install:
 ```sh
 ansible-playbook cfab.yml -l pve2 --tags rollback   # first, if the fabric is up
 apt-get purge cfab
-rm -f /etc/systemd/system/cfab.service /usr/local/sbin/cfab-revert && systemctl daemon-reload
+rm -f /usr/local/sbin/cfab-revert
 rm -rf /etc/cfab
 rm -f /etc/apt/sources.list.d/jshkol.sources /usr/share/keyrings/jshkol-archive-keyring.{asc,gpg}
 ```
