@@ -7,6 +7,7 @@
 //! the socket is reopened and the caller is told, so it can treat the gap as "something changed"
 //! and burst once rather than miss a workload that started talking during the overflow.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 
@@ -34,6 +35,15 @@ pub struct NeighEvent {
     /// does NOT mean "programmed by somebody" (measured on pve3-tb 2026-09-08: static = NOARP,
     /// permanent/own MAC = PERMANENT, learned = REACHABLE).
     pub permanent: bool,
+}
+
+/// What the watch task hands the supervisor: one decoded FDB add, or the gap an `ENOBUFS`
+/// overflow left behind. The gap is a signal in its own right — the kernel dropped events we
+/// will never see, so the honest reading is "something changed", and the caller bursts once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeighSignal {
+    Add(NeighEvent),
+    Overflow,
 }
 
 /// The subscription. Held open across ticks; dropped and reopened on overflow.
@@ -100,6 +110,46 @@ pub fn decode(buf: &[u8]) -> Vec<NeighEvent> {
     out
 }
 
+/// The fallback trigger (ruling 12), taken ONLY when the subscription cannot be opened: has any
+/// MAC appeared on a non-uplink port of `up`'s bridge since the last poll?
+///
+/// `seen` is the caller's memory of `(port, mac)` pairs, so the first poll of a bridge that
+/// already has VMs on it reports a change once and then goes quiet. Two lines are never a
+/// change: an entry on one of `up.ports` (the uplink carries every peer's MAC, and a peer's MAC
+/// is not our ownership changing) and a ` permanent` entry (the bridge's own address on the
+/// port, or one an admin pinned) — neither is a VM starting to talk here.
+///
+/// A poll that cannot run at all (`bridge` absent, a netlink refusal) reports NO change rather
+/// than a false one: the beacon is the correctness floor and a failed poll costs one period.
+pub fn fdb_poll_changed(
+    sys: &mut dyn crate::sys::Sys,
+    up: &crate::workload::uplink::Uplink,
+    seen: &mut BTreeSet<(String, String)>,
+) -> bool {
+    let Ok(out) = sys.run(&["bridge", "fdb", "show", "br", &up.bridge]) else {
+        return false;
+    };
+    if !out.ok() {
+        return false;
+    }
+    let mut changed = false;
+    for line in out.stdout.lines() {
+        if line.contains(" permanent") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(mac), Some("dev"), Some(port)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if up.ports.iter().any(|p| p == port) {
+            continue;
+        }
+        changed |= seen.insert((port.to_string(), mac.to_string()));
+    }
+    changed
+}
+
 // The match below is over the netlink crate's own `#[non_exhaustive]` enum, which no exhaustive
 // match can cover: a `_` arm is the only legal spelling. cfab's own enums are still matched
 // exhaustively.
@@ -124,6 +174,7 @@ fn bridge_event(n: &NeighbourMessage) -> Option<NeighEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::mock::MockSys;
     use netlink_packet_core::NetlinkHeader;
     use netlink_packet_route::neighbour::NeighbourHeader;
 
@@ -193,6 +244,66 @@ mod tests {
             decode(&two).iter().map(|e| e.ifindex).collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    /// The fallback (ruling 12): what `bridge fdb show` says, minus the uplink's own ports and
+    /// minus the permanent entries, is the set of MACs living on this host's VM ports. A change
+    /// to that set is an ownership change.
+    #[test]
+    fn fdb_poll_reports_new_macs_on_non_uplink_ports_only() {
+        let mut sys = MockSys::default().on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev cnfvm1-h vlan 3 master primary\n\
+             00:aa:bb:cc:dd:ee dev eth0 vlan 3 master primary\n\
+             02:cf:ab:00:00:01 dev cnfvm1-h master primary permanent\n",
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let up = crate::workload::uplink::Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        assert!(
+            fdb_poll_changed(&mut sys, &up, &mut seen),
+            "the first poll learns the VM MAC on cnfvm1-h"
+        );
+        assert_eq!(
+            seen,
+            [("cnfvm1-h".to_string(), "02:cf:ab:00:00:01".to_string())]
+                .into_iter()
+                .collect(),
+            "eth0 is the uplink and the permanent line is the bridge's own: neither counts"
+        );
+        assert!(
+            !fdb_poll_changed(&mut sys, &up, &mut seen),
+            "nothing new on the second poll"
+        );
+    }
+
+    /// The same MAC on a DIFFERENT port is a different fact (a VM's tap was recreated), and a
+    /// second VM is a second fact. A poll that cannot run at all reports no change rather than
+    /// a false one — the beacon is the floor.
+    #[test]
+    fn a_mac_that_moves_port_is_new_and_a_failed_poll_is_no_change() {
+        let up = crate::workload::uplink::Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sys = MockSys::default().on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev cnfvm1-h vlan 3 master primary\n",
+        );
+        assert!(fdb_poll_changed(&mut sys, &up, &mut seen));
+        let mut moved = MockSys::default().on_stdout(
+            &["bridge", "fdb", "show", "br", "primary"],
+            "02:cf:ab:00:00:01 dev cnfvm2-h vlan 3 master primary\n",
+        );
+        assert!(fdb_poll_changed(&mut moved, &up, &mut seen), "new port");
+        let mut broken =
+            MockSys::default().on_fail(&["bridge", "fdb", "show"], 1, "Cannot open netlink");
+        assert!(!fdb_poll_changed(&mut broken, &up, &mut seen));
     }
 
     /// THE PROBE (ruling 12). Root, a bridge, and a MAC that starts talking on a non-uplink port.

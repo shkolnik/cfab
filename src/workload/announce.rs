@@ -18,17 +18,29 @@ pub const BURST_GAP: Duration = Duration::from_secs(1);
 /// One burst per interface per PERIOD: at most BURST_LEN + 1 frames per PERIOD under MAC churn.
 pub const BURST_MIN_GAP: Duration = PERIOD;
 
-/// The send seam. The announcer never reads: it puts one frame on one interface and that is the
-/// whole of its I/O. In production this is the prober's `AF_PACKET` socket (`PacketIo`, which
-/// opens and binds the netdev on first use); in tests it is a recorder.
+/// The announcer's whole I/O: one frame out of one interface, and that interface's own MAC.
+/// In production both are the prober's `AF_PACKET` layer (`PacketIo`, which opens and binds the
+/// netdev on first use and reads MACs with `getifaddrs`); in tests it is a recorder. The
+/// announcer never reads the WIRE — nothing here can receive.
 pub trait AnnounceIo {
     /// Put `frame` on `ifname` exactly as given — the sub-interface adds the VLAN tag.
     fn send(&mut self, ifname: &str, frame: &[u8]) -> Result<()>;
+
+    /// `ifname`'s current MAC. Read at every beacon rather than cached at start: a VLAN
+    /// sub-interface's MAC follows its parent, and a Linux bridge adopts the lowest MAC among
+    /// its ports — so adding a tap can change it under a running supervisor. Announcing a MAC
+    /// that no longer answers is a silent black hole for every VM in the VLAN, which is exactly
+    /// the failure this whole feature exists to prevent.
+    fn mac(&mut self, ifname: &str) -> Result<[u8; 6]>;
 }
 
 impl AnnounceIo for crate::prober::io::PacketIo {
     fn send(&mut self, ifname: &str, frame: &[u8]) -> Result<()> {
         crate::prober::io::ProbeIo::send(self, ifname, frame)
+    }
+
+    fn mac(&mut self, ifname: &str) -> Result<[u8; 6]> {
+        crate::prober::io::link_mac(ifname)
     }
 }
 
@@ -176,12 +188,27 @@ pub mod mock {
 
     use super::{AnnounceIo, Result};
 
-    #[derive(Default)]
+    /// The MAC a fresh recorder answers with, so a test that does not care about MACs still
+    /// gets a plausible one.
+    pub const MOCK_MAC: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+
     pub struct RecordingIo {
         /// `(ifname, frame)` per successful send.
         pub sent: Vec<(String, Vec<u8>)>,
         /// When set, every send fails with this text and records nothing.
         pub fail: Option<String>,
+        /// What `mac()` answers; `None` makes the read itself fail, as an absent netdev does.
+        pub mac: Option<[u8; 6]>,
+    }
+
+    impl Default for RecordingIo {
+        fn default() -> Self {
+            RecordingIo {
+                sent: Vec::new(),
+                fail: None,
+                mac: Some(MOCK_MAC),
+            }
+        }
     }
 
     impl AnnounceIo for RecordingIo {
@@ -191,6 +218,40 @@ pub mod mock {
             }
             self.sent.push((ifname.to_string(), frame.to_vec()));
             Ok(())
+        }
+
+        fn mac(&mut self, ifname: &str) -> Result<[u8; 6]> {
+            self.mac.ok_or_else(|| {
+                crate::error::Error::fatal(format!("{ifname}: no link-layer address (no netdev?)"))
+            })
+        }
+    }
+
+    /// The same recorder behind a handle, so a test can hand one copy to the code under test
+    /// (the supervisor's `Hooks` take an owned `Box<dyn AnnounceIo>`) and keep another to read
+    /// what reached the wire.
+    #[derive(Clone, Default)]
+    pub struct SharedIo(pub std::sync::Arc<std::sync::Mutex<RecordingIo>>);
+
+    impl SharedIo {
+        /// The frames recorded so far, `(ifname, frame)` in order.
+        pub fn sent(&self) -> Vec<(String, Vec<u8>)> {
+            self.0.lock().unwrap().sent.clone()
+        }
+
+        /// Change the MAC the interface answers with, mid-run.
+        pub fn set_mac(&self, mac: [u8; 6]) {
+            self.0.lock().unwrap().mac = Some(mac);
+        }
+    }
+
+    impl AnnounceIo for SharedIo {
+        fn send(&mut self, ifname: &str, frame: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().send(ifname, frame)
+        }
+
+        fn mac(&mut self, ifname: &str) -> Result<[u8; 6]> {
+            self.0.lock().unwrap().mac(ifname)
         }
     }
 }

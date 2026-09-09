@@ -81,17 +81,7 @@ impl PacketIo {
 
     fn open(port: &str) -> Result<std::os::fd::OwnedFd> {
         use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, bind, socket};
-        // `getifaddrs` is the one safe way to obtain a bound link-layer address for a netdev:
-        // it hands back the kernel's own `sockaddr_ll` for the interface, ifindex filled in.
-        // The address's `sll_protocol` is 0, and `packet_bind` reads that as "keep the protocol
-        // the socket was created with", which is the ETH_P_ALL below.
-        let addr = nix::ifaddrs::getifaddrs()
-            .map_err(|e| crate::error::Error::fatal(format!("cannot list interfaces: {e}")))?
-            .filter(|ia| ia.interface_name == port)
-            .find_map(|ia| ia.address.as_ref().and_then(|a| a.as_link_addr().copied()))
-            .ok_or_else(|| {
-                crate::error::Error::fatal(format!("{port}: no link-layer address (no netdev?)"))
-            })?;
+        let addr = link_addr(port)?;
         let fd = socket(
             AddressFamily::Packet,
             SockType::Raw,
@@ -109,6 +99,30 @@ impl PacketIo {
             .map_err(|e| crate::error::Error::fatal(format!("{port}: cannot bind socket: {e}")))?;
         Ok(fd)
     }
+}
+
+/// The kernel's own `sockaddr_ll` for a netdev.
+///
+/// `getifaddrs` is the one safe way to obtain a bound link-layer address: it hands back the
+/// kernel's structure with the ifindex filled in. The address's `sll_protocol` is 0, and
+/// `packet_bind` reads that as "keep the protocol the socket was created with" (ETH_P_ALL).
+fn link_addr(port: &str) -> Result<nix::sys::socket::LinkAddr> {
+    nix::ifaddrs::getifaddrs()
+        .map_err(|e| crate::error::Error::fatal(format!("cannot list interfaces: {e}")))?
+        .filter(|ia| ia.interface_name == port)
+        .find_map(|ia| ia.address.as_ref().and_then(|a| a.as_link_addr().copied()))
+        .ok_or_else(|| {
+            crate::error::Error::fatal(format!("{port}: no link-layer address (no netdev?)"))
+        })
+}
+
+/// A netdev's MAC, from the same lookup `open` binds with — so a frame's sender MAC and the
+/// socket's netdev can never disagree, and a netdev that has been re-created answers with what
+/// it is NOW, never with what it was when something cached it.
+pub fn link_mac(port: &str) -> Result<[u8; 6]> {
+    link_addr(port)?
+        .addr()
+        .ok_or_else(|| crate::error::Error::fatal(format!("{port}: link-layer address has no MAC")))
 }
 
 impl ProbeIo for PacketIo {

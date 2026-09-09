@@ -981,6 +981,7 @@ mod tests {
             },
             ingress: Vec::new(),
             fallback: Vec::new(),
+            workloads: Vec::new(),
             metrics_error: None,
         }
     }
