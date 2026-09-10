@@ -603,21 +603,34 @@ impl HostRoutes {
                 return;
             }
         };
-        let mut sent_ok = false;
+        // One aggregate condition for the whole cycle, never one per address: the fault is per
+        // INTERFACE (every send here targets the same leg), so N failing VMs must cost one
+        // line, not N distinct strings `say_once` cannot dedup and that all reprint every
+        // cycle. `recovered` fires only when EVERY send this cycle succeeded — a mix of one
+        // failure and one success is still a standing fault, never a same-tick "recovered"
+        // contradicting the failure line it was meant to clear.
+        let total = live.len();
+        let mut failed = 0usize;
+        let mut last_err = None;
         for (&addr, &mac) in live {
             let frame = unicast_probe(src_mac, mac, wl.gw, addr);
-            match io.send(&leg, &frame) {
-                Ok(()) => sent_ok = true,
-                Err(e) => self.fail_costing(
-                    &name,
-                    Cond::Probe,
-                    format!("idle-VM probe to {addr} on {leg} failed: {e}"),
-                    "retried next cycle",
-                    out,
-                ),
+            if let Err(e) = io.send(&leg, &frame) {
+                failed += 1;
+                last_err = Some(format!("{addr}: {e}"));
             }
         }
-        if sent_ok {
+        if failed > 0 {
+            self.fail_costing(
+                &name,
+                Cond::Probe,
+                format!(
+                    "{failed} of {total} idle-VM probes on {leg} failed: {}",
+                    last_err.unwrap_or_default()
+                ),
+                "retried next cycle",
+                out,
+            );
+        } else {
             self.rows
                 .entry(name.clone())
                 .or_default()
@@ -1459,6 +1472,75 @@ mod tests {
             shared.sent().len(),
             2,
             "due again a third of the 300 s ageing_time later"
+        );
+    }
+
+    /// S2: a probe fan-out failure is ONE aggregate line per cycle, never one per address, and
+    /// `recovered` never fires in the same cycle a send failed. Before this fix, one failing
+    /// send inserted a standing fault line and the loop's own later success then IMMEDIATELY
+    /// cleared it and printed "… recovered" in the very same tick — a live contradiction that
+    /// would repeat forever on any host with more than one VM where exactly one send keeps
+    /// failing (the fault is per-INTERFACE, so that is the common case, not a corner case).
+    #[test]
+    fn a_partial_probe_failure_is_one_aggregate_line_never_a_same_tick_recovered() {
+        use crate::error::{Error, Result};
+        use crate::workload::announce::AnnounceIo;
+        use crate::workload::announce::mock::MOCK_MAC;
+
+        /// Fails the send addressed to one specific destination MAC and succeeds every other —
+        /// the shape a real partial fan-out failure takes (one VM's tap gone mid-cycle, the
+        /// rest fine). `RecordingIo`'s `fail` is all-or-nothing and cannot exercise this.
+        struct PartialFailIo {
+            fail_dst: [u8; 6],
+        }
+        impl AnnounceIo for PartialFailIo {
+            fn send(&mut self, _ifname: &str, frame: &[u8]) -> Result<()> {
+                if frame[0..6].to_vec() == self.fail_dst.to_vec() {
+                    return Err(Error::fatal("send failed (test)"));
+                }
+                Ok(())
+            }
+            fn mac(&mut self, _ifname: &str) -> Result<[u8; 6]> {
+                Ok(MOCK_MAC)
+            }
+        }
+
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        // Two local VMs this time (the default fixture has only one): .103 (mac …01, sends
+        // fine) and .150 (mac …0b, whose send `PartialFailIo` fails).
+        let neigh = r#"[
+          {"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]},
+          {"dst":"192.168.20.150","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:0b","state":["REACHABLE"]}
+        ]"#;
+        let fdb = r#"[
+          {"mac":"02:cf:ab:00:00:01","ifname":"tap100i0","vlan":3,"master":"primary","state":""},
+          {"mac":"02:cf:ab:00:00:0b","ifname":"tap150i0","vlan":3,"master":"primary","state":""}
+        ]"#;
+        let mut sys = tick_sys("")
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], neigh)
+            .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb);
+        let mut hr = HostRoutes::new();
+        let mut fail_io = PartialFailIo {
+            fail_dst: [0x02, 0xcf, 0xab, 0x00, 0x00, 0x0b],
+        };
+        let t0 = Instant::now();
+
+        let said = hr.tick(&mut sys, &v, &mut fail_io, t0);
+        let probe_lines: Vec<&String> =
+            said.iter().filter(|l| l.contains("idle-VM probe")).collect();
+        assert_eq!(
+            probe_lines.len(),
+            1,
+            "one aggregate line for the whole cycle, not one per failing address: {said:?}"
+        );
+        assert!(
+            probe_lines[0].contains("1 of 2 idle-VM probes on cfab-work-vms failed"),
+            "{probe_lines:?}"
+        );
+        assert!(
+            !said.iter().any(|l| l.contains("recovered")),
+            "a fault that stood this very cycle must never be reported recovered in it: {said:?}"
         );
     }
 
