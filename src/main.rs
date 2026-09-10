@@ -322,6 +322,17 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         commands::check::run_cli(&mut sys, &fabric, &member, &mut std::io::stdout())?;
         return Ok(ExitCode::SUCCESS);
     }
+    // `gen prefs` renders EVERY member's wire order (`derive::render_prefs` takes no member and
+    // never asks who is running), so the identity gate below refused it for a reason unrelated to
+    // anything it does. The other `gen` artifacts render this member's own configuration and keep
+    // the gate.
+    if let Command::Gen {
+        artifact: GenArtifact::Prefs,
+    } = cli.command
+    {
+        print!("{}", cfab::derive::render_prefs(&fabric));
+        return Ok(ExitCode::SUCCESS);
+    }
     // The name came from the kernel hostname, so the remedy is about the HOST — there is no
     // argument to have mistyped. `Fabric::member`'s own message is the generic lookup failure,
     // correct for the library's other callers (a test harness resolves literal names); this adds
@@ -364,7 +375,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                         print!("{}", emit::ceiling_ipt::generate(&view)?)
                     }
                 },
-                GenArtifact::Prefs => print!("{}", cfab::derive::render_prefs(&fabric)),
+                GenArtifact::Prefs => unreachable!("handled above"),
                 GenArtifact::Engine => {
                     print!("{}", commands::render::engine_json(&view)?)
                 }

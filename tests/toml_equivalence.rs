@@ -300,6 +300,24 @@ fn check_reports_the_whole_file_on_a_box_that_is_no_member() {
     );
     // The verdict, and every member's row — not just some member's.
     assert!(stdout.starts_with("fabric.toml OK: "), "{stdout}");
+    // `gen prefs` is the other artifact that names no member: it renders every member's wire
+    // order and never asks who is running, so it too must work here.
+    let prefs = Command::new(env!("CARGO_BIN_EXE_cfab"))
+        .arg("--config")
+        .arg(&path)
+        .args(["gen", "prefs"])
+        .output()
+        .expect("the cfab binary runs");
+    assert!(
+        prefs.status.success(),
+        "gen prefs must succeed on a valid file whoever runs it: exit {:?}\n{}",
+        prefs.status.code(),
+        String::from_utf8_lossy(&prefs.stderr)
+    );
+    let prefs_out = String::from_utf8(prefs.stdout).expect("utf-8 stdout");
+    for m in MEMBERS {
+        assert!(prefs_out.contains(&format!("{m} storage: ")), "{prefs_out}");
+    }
     for m in MEMBERS {
         assert!(stdout.contains(&format!("\nmember {m} (")), "{stdout}");
     }
