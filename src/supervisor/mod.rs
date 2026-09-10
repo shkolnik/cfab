@@ -626,7 +626,7 @@ pub(crate) async fn run_with(
     let _ = engine_ctl::sweep_routes(sys);
     launch(
         "engine",
-        engine_ctl_argv(exe, config, &view.member.name, "engine"),
+        engine_ctl_argv(exe, config, "engine"),
         pid,
         true,
         spawner,
@@ -677,7 +677,7 @@ pub(crate) async fn run_with(
     if view.kind() == MemberKind::Host {
         launch(
             "shape-daemon",
-            engine_ctl_argv(exe, config, &view.member.name, "shape-daemon"),
+            engine_ctl_argv(exe, config, "shape-daemon"),
             pid,
             false,
             spawner,
@@ -699,7 +699,7 @@ pub(crate) async fn run_with(
     if clustered {
         launch(
             "conf-sync",
-            engine_ctl_argv(exe, config, &view.member.name, "conf-sync"),
+            engine_ctl_argv(exe, config, "conf-sync"),
             pid,
             false,
             spawner,
@@ -885,7 +885,7 @@ pub(crate) async fn run_with(
                 for name in due {
                     launch(
                         name,
-                        engine_ctl_argv(exe, config, &view.member.name, name),
+                        engine_ctl_argv(exe, config, name),
                         pid,
                         name == "engine",
                         spawner,
@@ -1114,15 +1114,14 @@ pub(crate) async fn run_with(
     if reload { EXIT_RELOAD } else { EXIT_OK }
 }
 
-/// Argv for a supervised child: exactly today's `<exe> --config <config> --host <member>
-/// <verb>` (spec §3).
-fn engine_ctl_argv(exe: &str, config: &str, member: &str, verb: &str) -> Vec<String> {
+/// Argv for a supervised child: `<exe> --config <config> <verb>` (spec §3). The child is NOT
+/// told who it is — it reads the kernel hostname exactly as this parent did, on the same box,
+/// so there is no way for the two to disagree about their own identity.
+fn engine_ctl_argv(exe: &str, config: &str, verb: &str) -> Vec<String> {
     vec![
         exe.to_string(),
         "--config".to_string(),
         config.to_string(),
-        "--host".to_string(),
-        member.to_string(),
         verb.to_string(),
     ]
 }
@@ -1296,7 +1295,7 @@ async fn do_reapply(
     // reapply. Bounded by the same `Applying` tolerance, so a hung reapply still trips WatchdogSec.
     feed_during_reapply(feed, apply_started);
     restart_child(
-        "engine", true, view, shared, spawner, exe, config, pid, exit_tx, exit_rx, pending,
+        "engine", true, shared, spawner, exe, config, pid, exit_tx, exit_rx, pending,
     )
     .await;
     feed_during_reapply(feed, apply_started);
@@ -1304,7 +1303,6 @@ async fn do_reapply(
         restart_child(
             "shape-daemon",
             false,
-            view,
             shared,
             spawner,
             exe,
@@ -1334,7 +1332,6 @@ async fn do_reapply(
 async fn restart_child(
     name: &'static str,
     needs_readiness: bool,
-    view: &View<'_>,
     shared: &Arc<Mutex<Shared>>,
     spawner: &mut dyn Spawner,
     exe: &str,
@@ -1389,7 +1386,7 @@ async fn restart_child(
     pending.retain(|(n, _)| *n != name);
     launch(
         name,
-        engine_ctl_argv(exe, config, &view.member.name, name),
+        engine_ctl_argv(exe, config, name),
         pid,
         needs_readiness,
         spawner,

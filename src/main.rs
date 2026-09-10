@@ -20,10 +20,6 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// The `[[member]]` row to run as (default: $CFAB_HOST, else this kernel's hostname)
-    #[arg(long, global = true)]
-    host: Option<String>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -201,15 +197,13 @@ fn no_config_line(cli_config: &Option<PathBuf>, resolved: &std::path::Path) -> S
     format!("DOWN (no {})", named.display())
 }
 
-fn member_name(cli_host: &Option<String>) -> Result<String, Error> {
-    if let Some(h) = cli_host {
-        return Ok(h.clone());
-    }
-    if let Ok(h) = std::env::var("CFAB_HOST")
-        && !h.is_empty()
-    {
-        return Ok(h);
-    }
+/// This member's identity: the kernel hostname, and nothing else. There is deliberately no
+/// override — a flag or an environment variable naming a different row let `cfab status` read
+/// the RUNNING supervisor and print its live health under another member's heading (measured
+/// 2026-09-10). The declaration is installed whole on every host, so the hostname is the index
+/// into it; a host that cannot answer "who am I" the same way twice has no honest status to
+/// report.
+fn member_name() -> Result<String, Error> {
     Ok(std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map_err(|e| Error::fatal(format!("cannot read hostname: {e}")))?
         .trim()
@@ -320,7 +314,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Some(f) => (f, String::new()),
         None => load_fabric_text(&path)?,
     };
-    let member = member_name(&cli.host)?;
+    let member = member_name()?;
     let view = View::new(&fabric, &member)?;
 
     match cli.command {
@@ -503,10 +497,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
-/// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
-/// `[runtime] run_dir` cap files with the cluster-published cap as the absent-local fallback, and
-/// CFAB_UP_IFS as the authoritative up-set, else sysfs carrier, else assume up (never demote
-/// on missing information).
+/// The manual `gen shape` path: `[runtime] run_dir` cap files with the cluster-published cap as
+/// the absent-local fallback, and CFAB_UP_IFS as the authoritative up-set, else sysfs carrier,
+/// else assume up (never demote on missing information).
 fn shape_for<'a>(
     view: &View<'a>,
     fabric: &cfab::model::Fabric,
