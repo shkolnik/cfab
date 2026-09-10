@@ -24,6 +24,7 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -211,12 +212,16 @@ pub enum DropReason {
     /// A server-facing `BOOTREPLY` whose `giaddr` is not this row's own leg address — not a
     /// reply to a request this relay made.
     ForeignReplyGiaddr(Ipv4Addr),
-    /// A trusted reply's `ciaddr` is outside the row's own `prefix` (S3, defense in depth): the
-    /// server-facing socket is not device-bound, so anything routable can reach it, and
-    /// `rp_filter = 2` (loose) admits a spoofed source. Bounded blast radius even so —
+    /// A trusted reply's `ciaddr` OR `yiaddr` is outside the row's own `prefix` (S3, defense in
+    /// depth): the server-facing socket is not device-bound, so anything routable can reach it,
+    /// and `rp_filter = 2` (loose) admits a spoofed source. Bounded blast radius even so —
     /// `hostroutes::local_vms` already filters to `prefix`, excludes `fabric_addresses`, and
     /// requires the MAC on a non-uplink FDB port — but this also catches a misconfigured dhcpd
-    /// serving the wrong subnet, so it is worth the three lines.
+    /// serving the wrong subnet, so it is worth the lines. `yiaddr` matters as much as `ciaddr`
+    /// (gate C fix round 2, should-fix 5): a SELECTING-state OFFER/ACK carries `ciaddr = 0` and
+    /// the offered lease only in `yiaddr`, so checking `ciaddr` alone let a wrong-subnet dhcpd's
+    /// reply THROUGH to the VM even though `ack_discovery` already refused to register it —
+    /// forwarded but never routable, a silent failure rather than a refused one.
     OutOfPrefix(Ipv4Addr),
 }
 
@@ -250,10 +255,14 @@ pub fn forward_client(pkt: &[u8], leg: Ipv4Addr, dhcp_server: Ipv4Addr) -> Actio
 /// The server→client half (spec §5.4): trust only a `BOOTREPLY` whose UDP source is
 /// `dhcp_server` and whose `giaddr` is this row's own leg address; then `ciaddr != 0` unicasts
 /// to it, else broadcasts to the leg (a unicast to `yiaddr` cannot work before the client owns
-/// the address — finding 9). A nonzero `ciaddr` outside `prefix` is refused (S3): the
-/// server-facing socket is not device-bound and cfab sets `rp_filter = 2` (loose), so a spoofed
-/// `BOOTREPLY` that otherwise passes the two trust checks above must not teach the host a
-/// neighbor entry for an address this row has no business claiming.
+/// the address — finding 9). A nonzero `ciaddr` OR `yiaddr` outside `prefix` is refused (S3, gate
+/// C fix round 2 should-fix 5): the server-facing socket is not device-bound and cfab sets
+/// `rp_filter = 2` (loose), so a spoofed `BOOTREPLY` — or, the case this actually guards against
+/// in practice, a dhcpd misconfigured for the wrong subnet — that otherwise passes the two trust
+/// checks above must not teach the host a neighbor entry for an address this row has no business
+/// claiming, NOR reach the VM at all: forwarding an address the host will never route to is a
+/// silent failure, not a refused one. `yiaddr` is checked whether or not `ciaddr` was (a
+/// SELECTING-state OFFER/ACK carries `ciaddr = 0` and the offered lease only in `yiaddr`).
 pub fn forward_server(
     pkt: &[u8],
     src: Ipv4Addr,
@@ -277,6 +286,10 @@ pub fn forward_server(
     let ciaddr = p.ciaddr();
     if !ciaddr.is_unspecified() && !prefix.contains(ciaddr) {
         return Action::Drop(DropReason::OutOfPrefix(ciaddr));
+    }
+    let yiaddr = p.yiaddr();
+    if !yiaddr.is_unspecified() && !prefix.contains(yiaddr) {
+        return Action::Drop(DropReason::OutOfPrefix(yiaddr));
     }
     let dest = if ciaddr.is_unspecified() {
         Ipv4Addr::BROADCAST
@@ -368,28 +381,106 @@ fn bind_pair(row: &RelayRow) -> io::Result<(UdpSocket, UdpSocket)> {
 /// makes a larger UDP payload vanishingly rare on this wire (fold-in, opus review).
 const BUF_LEN: usize = 1500;
 
-/// Whether a bind failure's journal line should print (S1): only when the error text differs
-/// from what `Shared` already holds for this row. A deferred row, or a leg the watchdog has not
-/// built yet, hits the same failure on every retry until its precondition clears — this is what
-/// keeps that from restating the same line once per `BIND_RETRY` forever (relay.rs's own doc
-/// comment above names this hazard for drops; a bind failure was the one place it went
-/// unthrottled).
-fn should_log_bind_failure(previous: Option<&str>, msg: &str) -> bool {
+/// Whether a repeating condition's journal line should print (S1; gate C fix round 2 renamed
+/// this from `should_log_bind_failure` — should-fix 2 — once it grew a second and third caller
+/// below that are not bind failures): only when the text differs from the previous streak's.
+/// A deferred row, or a leg the watchdog has not built yet, hits the same bind failure on every
+/// retry until its precondition clears; a wrong-subnet dhcpd or an unreachable one drops the
+/// same way on every packet. Either would restate the same line forever without this (relay.rs's
+/// own doc comment on `DropReason` names the hazard).
+fn should_log_once(previous: Option<&str>, msg: &str) -> bool {
     previous != Some(msg)
+}
+
+/// How `serve`'s presence watch (B1) and the bind-failure wait (should-fix 8, folded in for
+/// free) read a device's current ifindex: real relay tasks read `/sys/class/net/<dev>/ifindex`;
+/// tests inject a closure so the leg-rebuild race is reproducible without CAP_NET_ADMIN. Boxed
+/// behind `Arc<dyn Fn>` rather than a type parameter: `run` is `tokio::spawn`ed
+/// (`supervisor/mod.rs`), so whatever reads the ifindex must be `Send + Sync + 'static`
+/// regardless, and a trait object keeps `run`/`serve`'s signatures from growing a generic that
+/// only tests exercise.
+pub(crate) type IfindexReader = Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>;
+
+/// `None` when `dev` does not exist — never an error, since "the leg is not there yet" is the
+/// everyday case this exists to detect (a deferred row, a watchdog rebuild in flight).
+fn sysfs_ifindex(dev: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{dev}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn default_ifindex_reader() -> IfindexReader {
+    Arc::new(sysfs_ifindex)
+}
+
+/// How often `serve`'s presence watch re-reads the leg's ifindex (B1): a plain `stat`-class
+/// read, cheap enough that "2-5 s" costs nothing measurable, and short enough that a leg rebuild
+/// is caught well inside one DHCP client retransmit interval.
+const IFINDEX_POLL: Duration = Duration::from_secs(3);
+
+/// What `serve`'s presence watch needs to notice the leg it is bound to has been deleted and
+/// rebuilt under it (B1, VERIFIED on real hardware — pve2: after `fwd_watchdog` deletes and
+/// recreates a leg, the OLD ifindex's device-bound client socket goes deaf, but a fresh
+/// `if_nametoindex`-equivalent read of the same NAME returns the NEW ifindex at once). A plain
+/// struct rather than three loose parameters to `serve`, so a caller cannot swap the baseline
+/// and the poll interval by accident.
+struct LegWatch {
+    /// The leg's ifindex read right after `bind_pair` succeeded. `None` only if that very first
+    /// read raced the device's own creation (bind succeeded, sysfs had not caught up yet) — rare
+    /// enough, and self-limiting enough (the next poll almost certainly reads `Some`), that it
+    /// is treated as "unknown baseline" rather than an error: the watch simply arms itself off
+    /// whatever the first poll observes instead of firing a false rebuild on tick one.
+    baseline: Option<u32>,
+    reader: IfindexReader,
+    poll: Duration,
+}
+
+/// How often the bind-failure wait polls for the leg's appearance instead of sleeping the whole
+/// `BIND_RETRY` blind (should-fix 8, folded in for free by B1's ifindex reader): a deferred row,
+/// or a leg the watchdog has not built yet, normally clears in 2-3 s at boot, not `BIND_RETRY`'s
+/// full 60 s. `BACKOFF`'s own cadence, reused rather than inventing a second constant for the
+/// same "check again soon" idea.
+const LEG_POLL: Duration = BACKOFF;
+
+/// Sleep up to `retry`, but wake as soon as `leg` exists (should-fix 8): a `bind_pair` failure is
+/// usually exactly this — the leg is not there yet — so re-attempting the instant it appears
+/// turns a bind failure at boot into a 2-3 s gap instead of up to 60 s of DHCP blackout. A leg
+/// that genuinely never appears still only re-tries the bind every `LEG_POLL`, cheap enough
+/// (one sysfs read) that the shorter cadence costs nothing over the plain sleep it replaces.
+async fn wait_for_leg(leg: &str, reader: &IfindexReader, poll: Duration, retry: Duration) {
+    let deadline = tokio::time::Instant::now() + retry;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline || reader(leg).is_some() {
+            return;
+        }
+        tokio::time::sleep(poll.min(deadline - now)).await;
+    }
 }
 
 /// The relay task (spec §5.4): bind, serve until a socket errors, then retry. A task death (a
 /// live relay whose socket later failed) retries on the same `BACKOFF` a supervised child
 /// restarts on; a bind failure (the leg does not exist yet, or the address is not local) is a
 /// standing condition rather than a transient hiccup, so it retries every `BIND_RETRY` instead
-/// and is loud only when the reason changes (S1). Neither is ever fatal to the member — a leg
-/// that does not exist yet (a deferred row, a watchdog rebuild in progress) is indistinguishable
-/// in kind from a port transiently held by something else: both clear themselves the moment the
-/// precondition does.
+/// (woken early the moment the leg appears — should-fix 8) and is loud only when the reason
+/// changes (S1). Neither is ever fatal to the member — a leg that does not exist yet (a deferred
+/// row, a watchdog rebuild in progress) is indistinguishable in kind from a port transiently held
+/// by something else: both clear themselves the moment the precondition does.
 pub(crate) async fn run(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+) {
+    run_with_reader(row, shared, cmd_tx, default_ifindex_reader()).await
+}
+
+async fn run_with_reader(
+    row: RelayRow,
+    shared: Arc<Mutex<Shared>>,
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    reader: IfindexReader,
 ) {
     loop {
         // S1: which cadence retries this pass, and whether the journal line prints, depend on
@@ -397,9 +488,9 @@ pub(crate) async fn run(
         // ended it) keeps the spec's own 2 s `BACKOFF` and always logs once, exactly as before.
         // A bind failure (the `Err` arm) is the one a deferred row, or a leg the watchdog has
         // not built yet, hits every pass until its precondition clears — that follows
-        // `metrics::BIND_RETRY`'s 60 s cadence instead, and logs only when the standing error
-        // actually changes.
-        let retry = match bind_pair(&row) {
+        // `metrics::BIND_RETRY`'s 60 s cadence instead (woken early by `wait_for_leg`), and logs
+        // only when the standing error actually changes.
+        let bound = match bind_pair(&row) {
             Ok((client, server)) => {
                 shared
                     .lock()
@@ -409,7 +500,17 @@ pub(crate) async fn run(
                     "cfab: workload {}: dhcp relay bound on {}, forwarding to {}",
                     row.name, row.leg, row.dhcp_server
                 );
-                let why = serve(&client, &server, &row, &shared, &cmd_tx).await;
+                // B1: the baseline this serve() call watches for a rebuild against. A `None`
+                // read right after a successful bind is the rare race noted on `LegWatch`, not
+                // a reason to skip the watch — `serve` treats it as "adopt whatever the first
+                // poll sees" rather than a false trigger.
+                let baseline = reader(&row.leg);
+                let watch = LegWatch {
+                    baseline,
+                    reader: reader.clone(),
+                    poll: IFINDEX_POLL,
+                };
+                let why = serve(&client, &server, &row, &shared, &cmd_tx, &watch).await;
                 eprintln!(
                     "cfab: workload {}: dhcp relay socket lost ({why}); retrying in {}s",
                     row.name,
@@ -418,14 +519,14 @@ pub(crate) async fn run(
                 shared.lock().unwrap().relay_event(
                     &row.name,
                     row.dhcp_server,
-                    RelayEvent::BindError(why),
+                    RelayEvent::SocketError(why),
                 );
-                BACKOFF
+                true
             }
             Err(e) => {
                 let msg = format!("cannot bind: {e}");
                 let previous = shared.lock().unwrap().relay_last_error(&row.name);
-                let is_new = should_log_bind_failure(previous.as_deref(), &msg);
+                let is_new = should_log_once(previous.as_deref(), &msg);
                 shared.lock().unwrap().relay_event(
                     &row.name,
                     row.dhcp_server,
@@ -438,36 +539,74 @@ pub(crate) async fn run(
                         BIND_RETRY.as_secs()
                     );
                 }
-                BIND_RETRY
+                false
             }
         };
-        tokio::time::sleep(retry).await;
+        if bound {
+            tokio::time::sleep(BACKOFF).await;
+        } else {
+            wait_for_leg(&row.leg, &reader, LEG_POLL, BIND_RETRY).await;
+        }
     }
 }
 
-/// Serve both sockets until something goes wrong; returns why. A `recv_from` error and a
-/// `send_to` error end this loop alike, and both are recorded before returning (the same
-/// `RelayEvent::BindError`/`last_error` path a bind failure uses, so `status`/metrics show
-/// whichever failed last). This is load-bearing, not symmetry for its own sake (B1, VERIFIED on
-/// real hardware — pve2, an isolated dummy device deleted and recreated under the same name):
-/// the forwarding watchdog really does delete and rebuild a leg under a running supervisor
-/// (`src/commands/fwd_watchdog.rs` "The whole leg is gone: rebuild it"), and a socket bound to a
-/// device that vanishes this way does NOT fail its `recv_from` — it just goes deaf forever —
-/// while its `send_to` fails immediately with `ENODEV`. Ending the loop on a send failure is
-/// what lets `run`'s retry rebind within the backoff and self-heal; a healthy-looking relay that
-/// silently drops every packet would otherwise stand until the process restarts, and DHCP is
-/// phase 2's only discovery mechanism.
+/// Serve both sockets until something goes wrong; returns why. A `recv_from` error on either
+/// socket, a `client.send_to` error (the device-bound socket), or `watch` catching the leg's
+/// ifindex change all end this loop and are recorded the same way (`RelayEvent::SocketError` /
+/// `last_error`, so `status`/metrics show whichever failed last). A `server.send_to` error does
+/// NOT end the loop (gate C fix round 2, should-fix 1: see below).
+///
+/// `watch` is the load-bearing fix, not `client.send_to`'s failure (B1, VERIFIED on real
+/// hardware — pve2, an isolated dummy device deleted and recreated under the same name): the
+/// forwarding watchdog really does delete and rebuild a leg under a running supervisor
+/// (`src/commands/fwd_watchdog.rs` "The whole leg is gone: rebuild it"), and the device-bound
+/// CLIENT socket goes deaf on `recv_from` when that happens — it never errors, it just stops
+/// delivering. `client.send_to` WOULD fail with `ENODEV`, but reaching it requires a fresh
+/// request from a VM to arrive first via that same deaf `client.recv_from`, which cannot happen
+/// post-rebuild — so that send is unreachable as a detection signal in exactly the scenario B1
+/// exists for. `watch` polls the leg's ifindex by NAME instead (a fresh read is unaffected by
+/// which old ifindex a socket is bound to) and ends the loop the moment it moves, closing the
+/// deaf window without depending on any packet ever arriving.
 async fn serve(
     client: &UdpSocket,
     server: &UdpSocket,
     row: &RelayRow,
     shared: &Arc<Mutex<Shared>>,
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
+    watch: &LegWatch,
 ) -> String {
     let mut cbuf = [0u8; BUF_LEN];
     let mut sbuf = [0u8; BUF_LEN];
+    let mut baseline = watch.baseline;
+    let mut poll = tokio::time::interval_at(
+        tokio::time::Instant::now() + watch.poll,
+        watch.poll.max(Duration::from_millis(1)),
+    );
+    // Throttled per streak (S1's own pattern), local to this one serve() call: a rebind starts
+    // both streaks fresh, which is correct — the previous socket's drop history says nothing
+    // about the new one's.
+    let mut last_send_drop: Option<String> = None;
+    let mut last_prefix_drop: Option<String> = None;
     loop {
         tokio::select! {
+            _ = poll.tick() => {
+                let now = (watch.reader)(&row.leg);
+                match (baseline, now) {
+                    // Adopt the first real reading rather than compare against "unknown"
+                    // (`LegWatch::baseline`'s own doc: a bind-time race, not a rebuild).
+                    (None, _) => baseline = now,
+                    (Some(b), Some(n)) if b == n => {}
+                    _ => {
+                        let msg = format!(
+                            "leg {} rebuilt (ifindex {baseline:?} -> {now:?})", row.leg
+                        );
+                        shared.lock().unwrap().relay_event(
+                            &row.name, row.dhcp_server, RelayEvent::SocketError(msg.clone()),
+                        );
+                        return msg;
+                    }
+                }
+            }
             r = client.recv_from(&mut cbuf) => {
                 match r {
                     Ok((n, _from)) => {
@@ -481,11 +620,25 @@ async fn serve(
                                     );
                                 }
                                 Err(e) => {
+                                    // Should-fix 1: the server socket is NOT device-bound, so
+                                    // this is a routing fact (dhcp_server unreachable), never a
+                                    // device-vanish signal — counted, and the loop keeps
+                                    // serving, exactly like `hostroutes`'s own stray-forward
+                                    // drop ("counted, NOT dropped" as a task-ending event).
+                                    // Ending the loop here (the previous round's fix) tore down
+                                    // BOTH sockets on every retransmit of an unreachable-server
+                                    // DISCOVER — a self-inflicted DoS on top of the outage.
                                     let msg = format!("server-facing send: {e}");
+                                    if should_log_once(last_send_drop.as_deref(), &msg) {
+                                        eprintln!(
+                                            "cfab: workload {}: dhcp request dropped ({msg})",
+                                            row.name
+                                        );
+                                    }
+                                    last_send_drop = Some(msg);
                                     shared.lock().unwrap().relay_event(
-                                        &row.name, row.dhcp_server, RelayEvent::BindError(msg.clone()),
+                                        &row.name, row.dhcp_server, RelayEvent::Dropped,
                                     );
-                                    return msg;
                                 }
                             }
                         }
@@ -499,34 +652,55 @@ async fn serve(
                         let std::net::IpAddr::V4(src) = from.ip() else {
                             continue; // this relay never binds a v6 socket; not ours
                         };
-                        if let Action::Forward { to, bytes } =
-                            forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server, row.prefix)
-                        {
-                            if let Some((yiaddr, chaddr)) = ack_discovery(&sbuf[..n], row.prefix) {
-                                shared.lock().unwrap().relay_event(
-                                    &row.name, row.dhcp_server, RelayEvent::Discovered,
+                        match forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server, row.prefix) {
+                            Action::Forward { to, bytes } => {
+                                if let Some((yiaddr, chaddr)) = ack_discovery(&sbuf[..n], row.prefix) {
+                                    shared.lock().unwrap().relay_event(
+                                        &row.name, row.dhcp_server, RelayEvent::Discovered,
+                                    );
+                                    let _ = cmd_tx.send(Cmd::DhcpAck {
+                                        name: row.name.clone(),
+                                        leg: row.leg.clone(),
+                                        yiaddr,
+                                        chaddr,
+                                    });
+                                }
+                                match client.send_to(&bytes, to).await {
+                                    Ok(_) => {
+                                        shared.lock().unwrap().relay_event(
+                                            &row.name, row.dhcp_server, RelayEvent::Reply,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let msg = format!("client-facing send: {e}");
+                                        shared.lock().unwrap().relay_event(
+                                            &row.name, row.dhcp_server,
+                                            RelayEvent::SocketError(msg.clone()),
+                                        );
+                                        return msg;
+                                    }
+                                }
+                            }
+                            // Should-fix 5: a wrong-subnet dhcpd (S3's own doc comment names the
+                            // case) must not just fail silently to register — the reply is
+                            // refused outright, counted, and throttled the same way a send
+                            // drop is. Every other `Drop` reason stays silent by design
+                            // (`DropReason`'s own doc: a stray broadcast or a probing scanner
+                            // must not become a self-inflicted journal DoS).
+                            Action::Drop(DropReason::OutOfPrefix(addr)) => {
+                                let msg = format!(
+                                    "dhcp reply from {} claims {addr}, outside {}'s prefix; refused",
+                                    row.dhcp_server, row.name
                                 );
-                                let _ = cmd_tx.send(Cmd::DhcpAck {
-                                    name: row.name.clone(),
-                                    leg: row.leg.clone(),
-                                    yiaddr,
-                                    chaddr,
-                                });
-                            }
-                            match client.send_to(&bytes, to).await {
-                                Ok(_) => {
-                                    shared.lock().unwrap().relay_event(
-                                        &row.name, row.dhcp_server, RelayEvent::Reply,
-                                    );
+                                if should_log_once(last_prefix_drop.as_deref(), &msg) {
+                                    eprintln!("cfab: workload {}: {msg}", row.name);
                                 }
-                                Err(e) => {
-                                    let msg = format!("client-facing send: {e}");
-                                    shared.lock().unwrap().relay_event(
-                                        &row.name, row.dhcp_server, RelayEvent::BindError(msg.clone()),
-                                    );
-                                    return msg;
-                                }
+                                last_prefix_drop = Some(msg);
+                                shared.lock().unwrap().relay_event(
+                                    &row.name, row.dhcp_server, RelayEvent::Dropped,
+                                );
                             }
+                            Action::Drop(_) => {}
                         }
                     }
                     Err(e) => return format!("server socket: {e}"),
@@ -563,6 +737,17 @@ mod tests {
         net: Ipv4Addr::new(192, 168, 22, 0),
         len: 24,
     };
+
+    /// A `LegWatch` that never fires: the reader always answers `None` and the poll interval is
+    /// long enough to never tick inside a test's timeout. For tests exercising a path other than
+    /// the presence watch itself.
+    fn no_watch() -> LegWatch {
+        LegWatch {
+            baseline: None,
+            reader: Arc::new(|_dev: &str| None),
+            poll: Duration::from_secs(3600),
+        }
+    }
 
     // ---- Bootp parse, over the real captured packets --------------------------------------
 
@@ -748,6 +933,27 @@ mod tests {
         }
     }
 
+    /// Teeth (S3, gate C fix round 2 should-fix 5): the SELECTING-state shape — `ciaddr = 0`
+    /// (the raw OFFER capture's own value), the offered lease only in `yiaddr` — is exactly the
+    /// gap `ciaddr`-only checking left open: a wrong-subnet dhcpd's OFFER passed the ciaddr
+    /// check (0.0.0.0 is unspecified, never out of prefix) and was forwarded to the VM even
+    /// though `ack_discovery` already refused to register the same address. The fix must
+    /// refuse the forward itself, not merely the registration.
+    #[test]
+    fn a_reply_with_a_yiaddr_outside_the_prefix_is_dropped_even_with_no_ciaddr() {
+        let mut p = Bootp::parse(OFFER).unwrap();
+        p.set_giaddr(LEG);
+        assert!(p.ciaddr().is_unspecified(), "the raw capture's own ciaddr");
+        let outsider = Ipv4Addr::new(10, 0, 0, 9);
+        p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&outsider.octets());
+        match forward_server(p.as_bytes(), SERVER, LEG, SERVER, PREFIX) {
+            Action::Drop(DropReason::OutOfPrefix(a)) => assert_eq!(a, outsider),
+            other @ (Action::Forward { .. } | Action::Drop(_)) => {
+                panic!("expected OutOfPrefix, got {other:?}")
+            }
+        }
+    }
+
     /// Teeth: the server-facing socket must ignore a `BOOTREQUEST` — a VM unicasting straight
     /// to the leg address on port 67, or our own request looping back some other way.
     #[test]
@@ -895,16 +1101,16 @@ mod tests {
         assert_eq!(relayed.hops(), 1);
     }
 
-    // ---- serve: a send failure ends the loop and is recorded (B1) -------------------------
+    // ---- serve: a client-facing send failure still ends the loop, when it fires -----------
 
-    /// B1, VERIFIED on real hardware (pve2): a leg rebuild under a running supervisor leaves
-    /// `recv_from` silently deaf while `send_to` fails immediately with `ENODEV`. This test
-    /// cannot reproduce `ENODEV` itself (no CAP_NET_ADMIN in this sandbox), but it reproduces
-    /// the shape that matters — `send_to` failing on a live relay — deterministically and
-    /// root-free: `bind_client` always sets `SO_BROADCAST`; a client-facing socket built by hand
-    /// WITHOUT it fails a broadcast send with `EACCES` (a kernel-enforced socket-option check,
-    /// not a privilege one). A crafted DHCPOFFER with no `ciaddr` yet makes `forward_server`
-    /// broadcast the reply, driving exactly the `client.send_to` call B1 fixes.
+    /// The RARE case where `client.send_to`'s `ENODEV` path IS reachable (a reply already in
+    /// flight when the leg is rebuilt) still ends the loop the same way it always did — this is
+    /// not B1's fix (that is the presence watch below), just proof the pre-existing path was not
+    /// regressed while restructuring `serve` around should-fixes 1/5. Reproduced root-free:
+    /// `bind_client` always sets `SO_BROADCAST`; a client-facing socket built by hand WITHOUT it
+    /// fails a broadcast send with `EACCES` (a kernel-enforced socket-option check, not a
+    /// privilege one). A crafted DHCPOFFER with no `ciaddr` yet makes `forward_server` broadcast
+    /// the reply, driving exactly that `client.send_to` call.
     #[tokio::test]
     async fn a_send_failure_ends_serve_and_is_recorded_in_shared() {
         let leg = Ipv4Addr::new(127, 88, 0, 3);
@@ -943,7 +1149,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            serve(&client, &server, &row, &shared, &cmd_tx),
+            serve(&client, &server, &row, &shared, &cmd_tx, &no_watch()),
         )
         .await
         .expect("serve must return on a send failure, not hang forever");
@@ -960,23 +1166,307 @@ mod tests {
         );
     }
 
-    // ---- should_log_bind_failure: a bind-failure line prints once per streak (S1) ----------
+    // ---- serve: the presence watch ends the loop on a leg rebuild (B1) --------------------
+
+    /// B1's actual fix, proven directly: `watch` ends `serve` the moment the leg's ifindex
+    /// changes, with NO packet ever arriving — closing exactly the window the module doc names
+    /// (the device-bound client socket goes deaf on `recv_from`, so nothing downstream of a
+    /// packet can ever fire again). The reader is a fake — no CAP_NET_ADMIN in this sandbox to
+    /// actually delete and recreate a device — but `serve` cannot tell it apart from a real one:
+    /// the injection point named on `IfindexReader`'s own doc comment IS the mechanism.
+    #[tokio::test]
+    async fn a_leg_rebuild_ends_serve_via_the_presence_watch_with_no_packet_at_all() {
+        let leg_addr = Ipv4Addr::new(127, 88, 0, 21);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 22);
+        // Neither socket ever receives anything: proof the watch fires on its own.
+        let client = UdpSocket::from_std(bind_server(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+        let server = UdpSocket::from_std(bind_server(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let reader: IfindexReader = Arc::new(move |_dev: &str| {
+            // The first two polls still see the baseline ifindex (5); from the third on, the
+            // leg has been rebuilt under a new one (6) — "same name, different device", exactly
+            // what a real `fwd_watchdog` delete-and-recreate produces.
+            let n = calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(if n < 2 { 5 } else { 6 })
+        });
+        let watch = LegWatch {
+            baseline: Some(5),
+            reader,
+            poll: Duration::from_millis(5),
+        };
+
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "test-leg".to_string(),
+            leg_addr,
+            dhcp_server,
+            prefix: PREFIX,
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve(&client, &server, &row, &shared, &cmd_tx, &watch),
+        )
+        .await
+        .expect(
+            "serve must return once the presence watch catches the rebuild, not hang forever \
+             waiting on a packet a dead client socket can never deliver",
+        );
+
+        assert!(
+            result.contains("rebuilt"),
+            "expected a rebuild message: {result}"
+        );
+        assert!(result.contains("test-leg"), "{result}");
+        let recorded = shared.lock().unwrap().relay_last_error(&row.name);
+        assert_eq!(
+            recorded.as_deref(),
+            Some(result.as_str()),
+            "a leg rebuild is a socket death: it belongs in last_error, same as any other"
+        );
+    }
+
+    /// The baseline race `LegWatch::baseline`'s doc names: the very first poll answers `None`
+    /// (the bind-time read raced the device showing up in sysfs). It must be adopted as the new
+    /// baseline, not treated as an instant "the leg is gone" false rebuild.
+    #[tokio::test]
+    async fn an_unknown_baseline_is_adopted_not_treated_as_a_rebuild() {
+        let client = UdpSocket::from_std(bind_server(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+        let server = UdpSocket::from_std(bind_server(Ipv4Addr::LOCALHOST, 0).unwrap()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let reader: IfindexReader = Arc::new(move |_dev: &str| {
+            let n = calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Poll 0: still unknown (the race). Poll 1 on: settles on 7 and stays there — must
+            // NOT be read as a rebuild relative to the adopted baseline.
+            if n == 0 { None } else { Some(7) }
+        });
+        let watch = LegWatch {
+            baseline: None,
+            reader,
+            poll: Duration::from_millis(5),
+        };
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "test-leg".to_string(),
+            leg_addr: Ipv4Addr::new(127, 88, 0, 23),
+            dhcp_server: Ipv4Addr::new(127, 88, 0, 24),
+            prefix: PREFIX,
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        // 30 ms is 6 polls at 5 ms each; if the unknown-baseline race were mishandled, `serve`
+        // would have returned long before this deadline.
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            serve(&client, &server, &row, &shared, &cmd_tx, &watch),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "serve must still be running: an adopted baseline is not a rebuild, got: {result:?}"
+        );
+    }
+
+    // ---- serve: a server-facing send failure is counted, not fatal (should-fix 1) ---------
+
+    /// Should-fix 1: the previous round ended BOTH sockets on a server-facing send failure —
+    /// the server socket is not device-bound, so this is a routing fact (dhcp_server
+    /// unreachable), never a device-vanish signal. It must be counted and the loop must keep
+    /// serving, not cost the relay a rebind (and a self-inflicted DoS on the journal) on every
+    /// retransmitted DISCOVER.
+    #[tokio::test]
+    async fn a_server_facing_send_failure_is_counted_and_the_loop_keeps_serving() {
+        let leg = Ipv4Addr::new(127, 88, 0, 31);
+        // A test-only trick, never a real configuration: `bind_server` never sets
+        // `SO_BROADCAST` (only `bind_client` does), so sending to the broadcast address from
+        // the server socket fails with `EACCES` — a kernel-refused send, deterministic and
+        // root-free, standing in for the `ENETUNREACH` an unreachable real dhcp_server gives.
+        let dhcp_server = Ipv4Addr::BROADCAST;
+
+        let client = UdpSocket::from_std(bind_client(0, None).unwrap()).unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let server = UdpSocket::from_std(bind_server(leg, 0).unwrap()).unwrap();
+
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "lo".to_string(),
+            leg_addr: leg,
+            dhcp_server,
+            prefix: PREFIX,
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let shared_task = shared.clone();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(async move {
+            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+        });
+
+        // The client socket is already bound, so the kernel buffers this regardless of whether
+        // `serve` has started polling yet: a real BOOTREQUEST (unmodified giaddr, so
+        // `forward_client` accepts and forwards it) delivered straight to the relay's own
+        // client-facing port.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(DISCOVER, (Ipv4Addr::LOCALHOST, client_port))
+            .unwrap();
+
+        // Give the task a moment to process the one packet, then prove both halves: it counted
+        // the drop, AND it is still alive to serve the next one — the two facts should-fix 1
+        // exists to establish together.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            shared.lock().unwrap().relay_drops("test-row"),
+            1,
+            "a server-facing send failure must be counted"
+        );
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .relay_last_error("test-row")
+                .is_none(),
+            "a counted drop is not a socket death and must not touch last_error (should-fix 2)"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the loop must still be serving after a server-facing send failure"
+        );
+        handle.abort();
+    }
+
+    // ---- serve: an out-of-prefix reply is refused and counted, not fatal (should-fix 5) ----
+
+    /// Should-fix 5: a reply whose `yiaddr`/`ciaddr` falls outside the row's own prefix (a
+    /// misconfigured, wrong-subnet dhcpd) must be refused rather than forwarded to the VM, and
+    /// must not end the task either — it is a configuration fact about the SERVER, not this
+    /// relay's own socket health.
+    #[tokio::test]
+    async fn an_out_of_prefix_reply_is_refused_counted_and_the_loop_keeps_serving() {
+        let leg = Ipv4Addr::new(127, 88, 0, 41);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 42);
+
+        let client = UdpSocket::from_std(bind_client(0, None).unwrap()).unwrap();
+        let server = UdpSocket::from_std(bind_server(leg, 0).unwrap()).unwrap();
+        let server_port = server.local_addr().unwrap().port();
+
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "lo".to_string(),
+            leg_addr: leg,
+            dhcp_server,
+            prefix: PREFIX,
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let shared_task = shared.clone();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(async move {
+            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+        });
+
+        // A DHCPOFFER from the real, trusted server, with the right giaddr, but a yiaddr this
+        // row's prefix does not own — the wrong-subnet-dhcpd shape should-fix 5 exists for.
+        let mut p = Bootp::parse(OFFER).unwrap();
+        p.set_giaddr(leg);
+        let outsider = Ipv4Addr::new(10, 0, 0, 9);
+        p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&outsider.octets());
+        let sender = std::net::UdpSocket::bind((dhcp_server, 0)).unwrap();
+        sender.send_to(p.as_bytes(), (leg, server_port)).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            shared.lock().unwrap().relay_drops("test-row"),
+            1,
+            "an out-of-prefix reply must be counted"
+        );
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .relay_last_error("test-row")
+                .is_none(),
+            "a refused reply is not a socket death and must not touch last_error"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the loop must still be serving after refusing an out-of-prefix reply"
+        );
+        handle.abort();
+    }
+
+    // ---- wait_for_leg: the bind-failure wait wakes early (should-fix 8, folded in free) ----
+
+    /// Should-fix 8, closed as a side effect of B1's reader: a bind failure whose cause is "the
+    /// leg is not there yet" must not sit out the full `BIND_RETRY` — it wakes the moment the
+    /// reader reports the leg present, not after any fixed sleep.
+    #[tokio::test]
+    async fn wait_for_leg_wakes_as_soon_as_the_leg_appears() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = calls.clone();
+        // Absent for the first three polls, present from the fourth — well inside a 60 s
+        // `BIND_RETRY` this test never actually waits out.
+        let reader: IfindexReader = Arc::new(move |_dev: &str| {
+            let n = calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 3 { None } else { Some(1) }
+        });
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_leg("test-leg", &reader, Duration::from_millis(5), BIND_RETRY),
+        )
+        .await
+        .expect("wait_for_leg must return once the leg appears, not sit out the full BIND_RETRY");
+        assert!(
+            start.elapsed() < BIND_RETRY,
+            "must wake well before the full retry window elapses"
+        );
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 4);
+    }
+
+    /// A leg that never appears still only waits the bounded `retry`, never longer — the poll
+    /// is a WAKE-UP mechanism, not a way to wait past the caller's own deadline.
+    #[tokio::test]
+    async fn wait_for_leg_gives_up_at_the_deadline_when_the_leg_never_appears() {
+        let reader: IfindexReader = Arc::new(|_dev: &str| None);
+        let start = tokio::time::Instant::now();
+        let bound = Duration::from_millis(30);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_leg("test-leg", &reader, Duration::from_millis(5), bound),
+        )
+        .await
+        .expect("wait_for_leg must still return at the deadline");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= bound && elapsed < bound * 3,
+            "expected roughly {bound:?}, got {elapsed:?}"
+        );
+    }
+
+    // ---- should_log_once: a repeating condition's line prints once per streak (S1) ---------
 
     #[test]
     fn a_bind_failure_line_prints_once_per_streak_not_once_per_retry() {
         assert!(
-            should_log_bind_failure(None, "cannot bind: address not available"),
+            should_log_once(None, "cannot bind: address not available"),
             "the first failure in a streak must print"
         );
         assert!(
-            !should_log_bind_failure(
+            !should_log_once(
                 Some("cannot bind: address not available"),
                 "cannot bind: address not available"
             ),
             "the same standing error must not print again"
         );
         assert!(
-            should_log_bind_failure(
+            should_log_once(
                 Some("cannot bind: address not available"),
                 "cannot bind: address in use"
             ),

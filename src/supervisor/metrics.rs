@@ -743,34 +743,42 @@ impl FabricCollector {
             &bursts,
         )?;
 
-        // The DHCP relay (spec §5.4/§6): sourced from `components.relays`, keyed by name, the
-        // same join `announces`/`bursts` use above — a row this member does not carry gets no
-        // series, and a row that carries one but declares no `dhcp_server` gets none either,
-        // since it has no entry in `components.relays` at all.
+        // The DHCP relay (spec §5.4/§6): sourced from `components.relays`, joined against `ws`
+        // by name exactly the way `announces`/`bursts` above are — a row this member does not
+        // carry (not in `ws`) gets no series, and a row that carries one but declares no
+        // `dhcp_server` gets none either, since it then has no entry in `components.relays` at
+        // all. Gate C fix round 2, should-fix 3: the previous version iterated `c.relays`
+        // directly instead of joining through `ws`, so its claim of using "the same join" was
+        // false (harmless today only because every relay row is also a workload row).
         let mut relayed: Vec<(Labels, u64)> = Vec::new();
         let mut discovered: Vec<(Labels, u64)> = Vec::new();
+        let mut dropped: Vec<(Labels, u64)> = Vec::new();
         if let Some(c) = &self.snap.model.components {
-            for r in &c.relays {
+            for w in ws {
+                let Some(r) = c.relays.iter().find(|r| r.name == w.name) else {
+                    continue;
+                };
                 relayed.push((
-                    lbl(&[("name", r.name.as_str()), ("direction", "request")]),
+                    lbl(&[("name", w.name.as_str()), ("direction", "request")]),
                     r.requests,
                 ));
                 relayed.push((
-                    lbl(&[("name", r.name.as_str()), ("direction", "reply")]),
+                    lbl(&[("name", w.name.as_str()), ("direction", "reply")]),
                     r.replies,
                 ));
                 discovered.push((
-                    lbl(&[("name", r.name.as_str()), ("source", "dhcp")]),
+                    lbl(&[("name", w.name.as_str()), ("source", "dhcp")]),
                     r.discovered,
                 ));
+                dropped.push((lbl(&[("name", w.name.as_str())]), r.drops));
             }
         }
         counter_family(
             enc,
             "cfab_workload_dhcp_relayed",
-            "DHCP packets this row's relay has forwarded since it last bound (spec §5.4): \
-             `direction=\"request\"` toward dhcp_server, `direction=\"reply\"` back to the leg; \
-             absent when the row declares no dhcp_server or no supervisor answered.",
+            "DHCP packets this row's relay has forwarded since the supervisor started (spec \
+             §5.4): `direction=\"request\"` toward dhcp_server, `direction=\"reply\"` back to \
+             the leg; absent when the row declares no dhcp_server or no supervisor answered.",
             &relayed,
         )?;
         counter_family(
@@ -781,6 +789,15 @@ impl FabricCollector {
              non-DHCP first packet (source=\"neigh\") is a later gate's. Absent under the same \
              condition as cfab_workload_dhcp_relayed.",
             &discovered,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_dhcp_relay_drops",
+            "DHCP packets this row's relay declined to forward since the supervisor started, \
+             without ending the relay task (gate C fix round 2): a server-facing send that \
+             failed because dhcp_server is unreachable, or a reply whose address fell outside \
+             the row's prefix. Absent under the same condition as cfab_workload_dhcp_relayed.",
+            &dropped,
         )
     }
 
@@ -1463,12 +1480,12 @@ mod tests {
         snapshot(model(State::Up, Some(h), true), probe_rows())
     }
 
-    /// `fixture_up` plus one DHCP relay row on `vms` (S4): requests, replies and discovered all
-    /// nonzero, so a rendering bug that silently drops a family cannot hide behind absence. Not
-    /// folded into `components()` itself: `fixture_down`/`fixture_degraded` share that fixture
-    /// through `model()` regardless of `full`, and a "down" member's `components` document
-    /// carrying a relay row that has no matching entry in `model.workloads` is not a state any
-    /// real supervisor publishes (a row's relay only spawns once the row applies).
+    /// `fixture_up` plus one DHCP relay row on `vms` (S4): requests, replies, discovered and
+    /// drops all nonzero, so a rendering bug that silently drops a family cannot hide behind
+    /// absence. Not folded into `components()` itself: `fixture_down`/`fixture_degraded` share
+    /// that fixture through `model()` regardless of `full`, and a "down" member's `components`
+    /// document carrying a relay row that has no matching entry in `model.workloads` is not a
+    /// state any real supervisor publishes (a row's relay only spawns once the row applies).
     fn fixture_up_with_relay() -> Snapshot {
         let mut s = fixture_up();
         s.model.components.as_mut().unwrap().relays = vec![RelayInfo {
@@ -1477,6 +1494,7 @@ mod tests {
             requests: 7,
             replies: 5,
             discovered: 3,
+            drops: 2,
             last_error: None,
         }];
         s
@@ -1760,6 +1778,7 @@ mod tests {
         assert!(
             base.contains("cfab_workload_vms_discovered_total{name=\"vms\",source=\"dhcp\"} 3")
         );
+        assert!(base.contains("cfab_workload_dhcp_relay_drops_total{name=\"vms\"} 2"));
 
         let mut s = fixture_up_with_relay();
         s.model.workloads[0].vms_seen = Some(9);
@@ -1806,6 +1825,13 @@ mod tests {
         assert_eq!(
             changed_lines(&base, &render(&s)),
             vec!["cfab_workload_vms_discovered_total{name=\"vms\",source=\"dhcp\"} 4"]
+        );
+
+        let mut s = fixture_up_with_relay();
+        s.model.components.as_mut().unwrap().relays[0].drops = 9;
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_dhcp_relay_drops_total{name=\"vms\"} 9"]
         );
 
         // `state` and `up` are structurally coupled (`WorkloadState::is_up`), so mutating state
@@ -1877,6 +1903,7 @@ mod tests {
             "cfab_workload_bursts_total",
             "cfab_workload_dhcp_relayed_total",
             "cfab_workload_vms_discovered_total",
+            "cfab_workload_dhcp_relay_drops_total",
             "cfab_wire_present",
             "cfab_bond_home_carrier",
             "cfab_component_state",

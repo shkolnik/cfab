@@ -481,8 +481,8 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         if let Some(r) = &w.relay {
             let _ = write!(
                 line,
-                ", relay to {} ({} requests, {} replies",
-                r.server, r.requests, r.replies
+                ", relay to {} ({} requests, {} replies, {} dropped",
+                r.server, r.requests, r.replies, r.drops
             );
             if let Some(e) = &r.last_error {
                 let _ = write!(line, ", last error: {e}");
@@ -1814,12 +1814,14 @@ fn relay_status(wl: &crate::model::Workload, comps: Option<&Components>) -> Opti
                 server,
                 requests: r.requests,
                 replies: r.replies,
+                drops: r.drops,
                 last_error: r.last_error.clone(),
             },
             None => RelayStatus {
                 server,
                 requests: 0,
                 replies: 0,
+                drops: 0,
                 last_error: None,
             },
         }
@@ -3612,7 +3614,7 @@ mod tests {
         ]);
         let relays = serde_json::json!([
             {"name": "vms", "server": "192.168.10.11", "requests": 7, "replies": 5,
-             "discovered": 3, "last_error": null}
+             "discovered": 3, "drops": 2, "last_error": null}
         ]);
         let mut sys = wl_status_sys(&f, &view).socket(
             "/run/cfab/cfab.sock",
@@ -3622,7 +3624,7 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         let text = render_text(&m, false, true).output;
         assert!(
-            text.contains(", relay to 192.168.10.11 (7 requests, 5 replies)"),
+            text.contains(", relay to 192.168.10.11 (7 requests, 5 replies, 2 dropped)"),
             "{text}"
         );
     }
@@ -3639,7 +3641,7 @@ mod tests {
         ]);
         let relays = serde_json::json!([
             {"name": "vms", "server": "192.168.10.11", "requests": 0, "replies": 0,
-             "discovered": 0, "last_error": "cannot bind: address not available"}
+             "discovered": 0, "drops": 0, "last_error": "cannot bind: address not available"}
         ]);
         let mut sys = wl_status_sys(&f, &view).socket(
             "/run/cfab/cfab.sock",
@@ -3650,8 +3652,8 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                ", relay to 192.168.10.11 (0 requests, 0 replies, last error: cannot bind: \
-                 address not available)"
+                ", relay to 192.168.10.11 (0 requests, 0 replies, 0 dropped, last error: cannot \
+                 bind: address not available)"
             ),
             "{text}"
         );
@@ -3665,7 +3667,7 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let relays = serde_json::json!([
             {"name": "vms", "server": "192.168.10.11", "requests": 0, "replies": 0,
-             "discovered": 0, "last_error": "cannot bind: address not available"}
+             "discovered": 0, "drops": 0, "last_error": "cannot bind: address not available"}
         ]);
         let mut sys = wl_status_sys(&f, &view)
             .file(&format!("{}/workload-deferred", f.run_dir), "vms\n")
@@ -3685,8 +3687,8 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                ", relay to 192.168.10.11 (0 requests, 0 replies, last error: cannot bind: \
-                 address not available)"
+                ", relay to 192.168.10.11 (0 requests, 0 replies, 0 dropped, last error: cannot \
+                 bind: address not available)"
             ),
             "{text}"
         );

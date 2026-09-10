@@ -47,12 +47,22 @@ pub struct RelayInfo {
     pub name: String,
     /// The `dhcp_server` this row's relay forwards to.
     pub server: std::net::Ipv4Addr,
-    /// Client→server packets forwarded since the task last bound.
+    /// Client→server packets forwarded since the supervisor started: monotonic for its life
+    /// (`Shared::relay_event` never resets it; a rebind clears only `last_error`), which is the
+    /// correct shape for a Prometheus counter (gate C fix round 2, should-fix 4 — the earlier
+    /// wording "since the task last bound" claimed a reset that never happens).
     pub requests: u64,
-    /// Server→client packets forwarded since the task last bound.
+    /// Server→client packets forwarded since the supervisor started; same monotonic shape as
+    /// `requests`.
     pub replies: u64,
     /// Relayed `DHCPACK`s that earned a neighbor write (spec §5.4, call 5 caveat).
     pub discovered: u64,
+    /// Packets this relay declined to forward without ending the task, since the supervisor
+    /// started (gate C fix round 2, should-fixes 1/5): a server-facing send that failed because
+    /// `dhcp_server` is unreachable, or a reply whose `ciaddr`/`yiaddr` fell outside the row's
+    /// `prefix`. `#[serde(default)]` so an older supervisor's document still parses.
+    #[serde(default)]
+    pub drops: u64,
     /// The relay's last bind or socket error, for as long as it stands; `None` while healthy.
     pub last_error: Option<String>,
 }

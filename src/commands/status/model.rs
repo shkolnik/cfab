@@ -381,6 +381,11 @@ pub struct RelayStatus {
     pub server: Ipv4Addr,
     pub requests: u64,
     pub replies: u64,
+    /// Packets this relay declined to forward without ending the task (gate C fix round 2,
+    /// should-fixes 1/5): a server-facing send that failed because `dhcp_server` is
+    /// unreachable, or a reply whose address fell outside the row's `prefix`. Zero, not a
+    /// degraded row on its own — a wrong-subnet dhcpd is a config fact, not a member fault.
+    pub drops: u64,
     /// The relay's last bind or socket error, for as long as it stands; `None` while healthy or
     /// before the task has reported anything (no supervisor answering, or the task's first tick
     /// has not run yet) — never a health condition of the row (spec §3.1, availability first).

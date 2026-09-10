@@ -178,6 +178,13 @@ struct RelayReport {
     requests: u64,
     replies: u64,
     discovered: u64,
+    /// Packets this relay declined to forward without ending the task (gate C fix round 2,
+    /// should-fixes 1 and 5): a server-facing send that failed because `dhcp_server` is
+    /// unreachable, or a reply whose `ciaddr`/`yiaddr` claims an address outside the row's own
+    /// `prefix`. Both are routing/configuration facts, not socket death, so they are counted
+    /// here rather than costing the relay a rebind (should-fix 1) or a silent forward
+    /// (should-fix 5); `relay.rs`'s own journal line explains which, throttled per streak.
+    drops: u64,
     last_error: Option<String>,
 }
 
@@ -188,6 +195,7 @@ impl RelayReport {
             requests: 0,
             replies: 0,
             discovered: 0,
+            drops: 0,
             last_error: None,
         }
     }
@@ -195,12 +203,19 @@ impl RelayReport {
 
 /// A fact the relay task reports about one row (spec §5.4). Kept as an enum rather than letting
 /// the task poke `Shared`'s fields directly: `relay.rs` never needs to know the report's shape,
-/// only that these five things can happen.
+/// only that these facts can happen.
 pub(crate) enum RelayEvent {
     /// The two sockets bound: clears any standing bind error.
     Bound,
-    /// A bind, or later a socket read, failed. Carries the message `status`/`/metrics` show.
+    /// `run`'s own bind attempt failed (the leg or its address is not there yet). Carries the
+    /// message `status`/`/metrics` show as the row's standing error.
     BindError(String),
+    /// A live relay's socket died (a `recv`/`send` on a device-bound socket failed, or `serve`'s
+    /// presence watch caught the leg being deleted and rebuilt — gate C fix round 2, B1): the
+    /// task is about to retry from scratch. Distinct from `BindError` so the name matches what
+    /// happened — this relay WAS bound and something after that killed it, not that binding
+    /// itself failed (should-fix 2). Carries the message `status`/`/metrics` show.
+    SocketError(String),
     /// A client→server packet was forwarded.
     Request,
     /// A server→client packet was forwarded.
@@ -208,6 +223,12 @@ pub(crate) enum RelayEvent {
     /// A relayed `DHCPACK` earned a neighbor write (posted separately as `Cmd::DhcpAck`; this is
     /// the counter half, credited when the task decides to register, not when the write lands).
     Discovered,
+    /// One packet the relay declined to forward WITHOUT ending the task (should-fixes 1 and 5):
+    /// a server-facing send that failed because `dhcp_server` is unreachable, or a reply whose
+    /// `ciaddr`/`yiaddr` falls outside the row's `prefix`. Never touches `last_error` — that
+    /// field means "the socket is unhealthy," and neither of these does (the socket is fine;
+    /// the packet was refused on its own facts).
+    Dropped,
 }
 
 impl Shared {
@@ -248,9 +269,11 @@ impl Shared {
         match ev {
             RelayEvent::Bound => r.last_error = None,
             RelayEvent::BindError(e) => r.last_error = Some(e),
+            RelayEvent::SocketError(e) => r.last_error = Some(e),
             RelayEvent::Request => r.requests += 1,
             RelayEvent::Reply => r.replies += 1,
             RelayEvent::Discovered => r.discovered += 1,
+            RelayEvent::Dropped => r.drops += 1,
         }
     }
 
@@ -263,6 +286,17 @@ impl Shared {
         self.relays.get(name).and_then(|r| r.last_error.clone())
     }
 
+    /// One row's dropped-without-ending-the-task count (gate C fix round 2, should-fixes 1/5):
+    /// the same sibling relationship `relay_last_error` documents — `workload::relay`'s own test
+    /// module reads this back to prove a send failure or an out-of-prefix reply is counted
+    /// without stopping the task. `0` for a row with no entry yet, same as a fresh `RelayReport`.
+    /// `#[cfg(test)]`, unlike `relay_last_error`: nothing in production reads this back today
+    /// (`status`/metrics read the published `RelayInfo.drops` instead), only the test module.
+    #[cfg(test)]
+    pub(crate) fn relay_drops(&self, name: &str) -> u64 {
+        self.relays.get(name).map_or(0, |r| r.drops)
+    }
+
     /// The `components` document's relay rows (spec §6), in name order (`BTreeMap` iteration).
     fn relay_infos(&self) -> Vec<report::RelayInfo> {
         self.relays
@@ -273,6 +307,7 @@ impl Shared {
                 requests: r.requests,
                 replies: r.replies,
                 discovered: r.discovered,
+                drops: r.drops,
                 last_error: r.last_error.clone(),
             })
             .collect()
