@@ -328,7 +328,20 @@ impl HostRoutes {
                 let r = self.rows.entry(wl.name.clone()).or_default();
                 r.holddown.observe(&live, now)
             };
-            self.ask_engine(sys, view, wl, ifindex, &wanted, &mut out);
+            // The engine's set is the VMs PLUS this member's own leg address as a /32 (spec
+            // fact 5): a relayed DHCP reply is unicast to `giaddr` = the leg address, and with
+            // the workload /24 originated by nobody, nothing routes to it unless the host that
+            // owns it says so. It rides the same request, so it is redistributed into the
+            // allowed zones' OSPF as a type-5 (which is the only origination a leaf can hear)
+            // and originated into BGP beside the VM /32s. It goes no further: the nft
+            // `<leg>-local` set below is VM addresses, and a host proxy-ARPing for its own
+            // address or claiming it as a VM is exactly what `fabric_addresses` excludes.
+            // A deferred row has no leg to reach it by, so it withdraws with the leg.
+            let mut engine_set = wanted.clone();
+            if installed {
+                engine_set.insert(row.addr);
+            }
+            self.ask_engine(sys, view, wl, ifindex, &engine_set, &mut out);
             self.sync_set(sys, wl, &wanted, &mut out);
         }
         out
@@ -867,7 +880,7 @@ mod tests {
         assert!(
             sys.ran(
                 "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
-                 192.168.20.103/32"
+                 192.168.20.2/32 192.168.20.103/32"
             ),
             "{:?}",
             sys.calls
@@ -880,6 +893,34 @@ mod tests {
         assert!(
             !sys.calls.iter().any(|c| c.contains("nft delete element")),
             "nothing to delete: {:?}",
+            sys.calls
+        );
+    }
+
+    /// Spec fact 5 and its one hazard, in one place: this member's own leg address is a /32 in
+    /// the set handed to the ENGINE (so a relayed DHCP reply addressed to `giaddr` has a route
+    /// home, over OSPF for a leaf and over BGP for the router) and is NOT in the nft
+    /// `<leg>-local` set, which is VM addresses and decides what the host answers for. The two
+    /// sets are built one line apart and it would cost nothing to conflate them.
+    #[test]
+    fn the_leg_slash_32_is_originated_and_never_joins_the_local_vm_set() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        assert!(
+            sys.ran(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.2/32 192.168.20.103/32"
+            ),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c.contains("element") && c.contains("192.168.20.2")),
+            "the leg address must not reach the local set: {:?}",
             sys.calls
         );
     }
@@ -942,7 +983,7 @@ mod tests {
         assert!(
             sys.ran(
                 "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 0 \
-                 192.168.20.103/32"
+                 192.168.20.2/32 192.168.20.103/32"
             ),
             "{:?}",
             sys.calls
@@ -1007,7 +1048,7 @@ mod tests {
             HostRoutes::new().tick(&mut sys, &v, Instant::now()),
             vec![
                 "cfab: workload vms: engine refused workload-routes cfab-work-vms 42 \
-                 192.168.20.103/32: {\"error\":\"no such leg\"}; host routes unchanged"
+                 192.168.20.2/32 192.168.20.103/32: {\"error\":\"no such leg\"}; host routes unchanged"
                     .to_string(),
                 "cfab: workload vms: cannot read the nft set inet cfab-fwd \
                  cfab-work-vms-local; the local set is unchanged"
