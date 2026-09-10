@@ -210,6 +210,123 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
     })
 }
 
+/// Whether the additive host default belongs in table 250 right now (spec §6): the ingress
+/// prober's router-reachability fact for the gw zone's leg, and nothing else. Pure, so the
+/// decision is one testable function and the two callers cannot drift.
+///
+/// `true` when any wire under the leg has heard the router, and `true` when there is no row to
+/// ask (conflict 8): the prober does not exist yet when `apply` runs, its own hysteresis starts
+/// reachable, and "no opinion" must never read as "the router is dark" — that would withdraw a
+/// working default on every startup.
+///
+/// A published `reachable` already folds carrier in (`Prober::report`), so a gw leg whose every
+/// wire is unplugged answers `false` here without any probe having to miss.
+pub fn default_wanted(probed: &crate::prober::ProbeRows, view: &View) -> bool {
+    let Some(zone) = view.gw_rows().into_iter().next().map(|r| r.zone) else {
+        return true;
+    };
+    match probed.ingress.iter().find(|l| l.zone == zone) {
+        Some(leg) => leg.ports.iter().any(|p| p.reachable),
+        None => true,
+    }
+}
+
+/// The additive host default's reconcile state (spec §6): what was last wanted, and the
+/// standing failure line, so a fault that lasts costs one journal line and not one a tick.
+///
+/// One function, two callers, like every other restore in this file: the supervisor's watchdog
+/// tick runs it at LEVEL (3 s), and its prober tick runs it on the EDGE alone (500 ms), where a
+/// level check would cost four subprocesses every half-second for nothing.
+#[derive(Debug, Default)]
+pub struct HostDefaultState {
+    wanted: Option<bool>,
+    standing: Option<String>,
+}
+
+impl HostDefaultState {
+    /// Has `wanted` moved since the last pass? A member with no opinion yet answers yes, so the
+    /// first prober tick reconciles once and then only on a flip.
+    pub fn changed(&self, wanted: bool) -> bool {
+        self.wanted != Some(wanted)
+    }
+
+    /// One reconcile pass. Returns the journal lines to say, in order; the caller owns stderr.
+    pub fn reconcile(&mut self, sys: &mut dyn Sys, view: &View, wanted: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(hd) = common::host_default(view) else {
+            return out; // no gw zone: `up` installed nothing and there is nothing to keep level
+        };
+        match self.pass(sys, view, &hd, wanted, &mut out) {
+            Ok(()) => {
+                if self.standing.take().is_some() {
+                    out.push("cfab: host default: reconcile recovered".to_string());
+                }
+            }
+            Err(e) => {
+                // Clearing `standing` on recovery is the load-bearing half: a standing line
+                // never cleared swallows the SECOND occurrence of the same fault forever.
+                let line = format!("cfab: host default: {e}");
+                if self.standing.as_deref() != Some(line.as_str()) {
+                    self.standing = Some(line.clone());
+                    out.push(line);
+                }
+            }
+        }
+        self.wanted = Some(wanted);
+        out
+    }
+
+    fn pass(
+        &mut self,
+        sys: &mut dyn Sys,
+        view: &View,
+        hd: &common::HostDefault,
+        wanted: bool,
+        out: &mut Vec<String>,
+    ) -> Result<()> {
+        // The pins track the floor device's addresses whether or not the fabric default is in
+        // force: they keep admin-sourced traffic on main either way.
+        let addrs = match common::floor_default(sys)? {
+            Some(floor) => common::floor_addresses(sys, &floor.dev)?,
+            None => Vec::new(),
+        };
+        for line in common::sync_floor_rules(sys, &addrs)? {
+            out.push(format!("cfab: host default: {line}"));
+        }
+        // `&[]`: the pref-2099 pins are the line above; this is 2100 and 2101.
+        for r in common::host_default_rules(view, &[]) {
+            if common::fabric_rule_present(sys, &r)? {
+                continue;
+            }
+            common::ensure_fabric_rule(sys, &r)?;
+            out.push(format!(
+                "cfab: host default: re-added ip rule pref {} {}",
+                r.pref, r.needle
+            ));
+        }
+        match (wanted, hd.present(sys)?) {
+            (true, false) => {
+                hd.install(sys)?;
+                out.push(format!(
+                    "cfab: host default: installed via {} dev {} (table {})",
+                    hd.via, hd.dev, hd.table
+                ));
+            }
+            (false, true) => {
+                hd.withdraw(sys)?;
+                // The rules stay: with table 250 empty every lookup falls through to the
+                // kernel's own final `32766 from all lookup main`, which is the floor.
+                out.push(format!(
+                    "cfab: host default: withdrawn (router {} unreachable over every wire of {})",
+                    hd.via, hd.dev
+                ));
+            }
+            (true, true) | (false, false) => {}
+        }
+        Ok(())
+    }
+}
+
 /// The L3 netdevs cfab owns: class segments and the fallback bonds. Their ports are L2 only.
 fn fabric_legs(view: &View) -> Vec<String> {
     view.class_rows()
@@ -1112,7 +1229,7 @@ pub(crate) mod tests {
       {"chain":{"family":"ip","table":"filter","name":"FORWARD",
                 "hook":"forward","prio":0,"policy":"drop"}}"#;
 
-    fn healthy_sys(view: &View) -> MockSys {
+    pub(crate) fn healthy_sys(view: &View) -> MockSys {
         let mut sys = MockSys::default()
             .socket(
                 &engine_ctl::sock_path(view.fabric),
@@ -2949,5 +3066,246 @@ pub(crate) mod tests {
         let mut sys = healthy_sys(&view);
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(report.blocked.is_empty(), "{:?}", report.blocked);
+    }
+
+    // ---- the additive host default (spec §6, Task 4) ---------------------------------------
+
+    use crate::prober::ProbeRows;
+    use crate::supervisor::report::{ProbedLeg, ProbedPort};
+
+    fn probed_port(wire: &str, reachable: bool) -> ProbedPort {
+        ProbedPort {
+            wire: wire.to_string(),
+            island: "a".to_string(),
+            reachable,
+            suspect: !reachable,
+            last_reply_ms: reachable.then_some(12),
+        }
+    }
+
+    fn ingress_rows(ports: Vec<ProbedPort>) -> ProbeRows {
+        ProbeRows {
+            fallback: Vec::new(),
+            ingress: vec![ProbedLeg {
+                zone: "mgmt".to_string(),
+                bond: "cfab-gw249".to_string(),
+                active: Some("cfab-gw249-a".to_string()),
+                quiet: false,
+                ports,
+                moves: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_default_is_wanted_while_any_wire_of_the_gw_leg_reaches_the_router() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(default_wanted(
+            &ingress_rows(vec![probed_port("eth1", false), probed_port("eth9", true)]),
+            &view
+        ));
+    }
+
+    #[test]
+    fn the_default_is_not_wanted_when_every_wire_of_the_gw_leg_is_dark() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(!default_wanted(
+            &ingress_rows(vec![probed_port("eth1", false), probed_port("eth9", false)]),
+            &view
+        ));
+    }
+
+    /// Conflict 8: no prober row yet (the first ticks, or a supervisor that has not published)
+    /// is not evidence the router is dark — the install is optimistic and the reconcile
+    /// withdraws it once the prober does have an opinion.
+    #[test]
+    fn with_no_prober_row_at_all_the_default_is_wanted() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(default_wanted(&ProbeRows::default(), &view));
+        // ...and on a member with no gw zone there is nothing to gate on either.
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        assert!(default_wanted(&ProbeRows::default(), &leaf));
+    }
+
+    /// A member's state starts with no opinion, so the first observation is always an edge —
+    /// which is what makes the prober's 500 ms tick reconcile once at startup and then only on
+    /// a flip.
+    #[test]
+    fn only_a_flip_is_an_edge_for_the_prober_tick() {
+        let mut st = HostDefaultState::default();
+        assert!(st.changed(true), "no opinion yet is an edge");
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys();
+        st.reconcile(&mut sys, &view, true);
+        assert!(!st.changed(true));
+        assert!(st.changed(false));
+    }
+
+    /// The kernel as it is right after `up`: the floor, its address, the three rules in place
+    /// and the 250 default absent.
+    fn host_default_sys() -> MockSys {
+        MockSys::default()
+            .on_stdout(
+                &["ip", "route", "show", "table", "main", "default"],
+                "default via 192.168.10.254 dev eth0 onlink\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
+                "eth0 UP 192.168.10.1/24\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.1 iif lo lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2100"],
+                "2100:\tfrom all iif lo lookup main suppress_prefixlength 0\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2101"],
+                "2101:\tfrom all iif lo lookup cfab-default\n",
+            )
+    }
+
+    #[test]
+    fn the_reconcile_installs_the_wanted_default_and_says_so_once() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys();
+        let mut st = HostDefaultState::default();
+        assert_eq!(
+            st.reconcile(&mut sys, &view, true),
+            ["cfab: host default: installed via 192.168.249.254 dev cfab-gw249 (table 250)"]
+        );
+        assert!(sys.ran(
+            "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+             table 250 proto 206"
+        ));
+        // Now it is there: the level check says nothing at all.
+        let mut sys = host_default_sys().on_stdout(
+            &["ip", "route", "show", "table", "250", "default"],
+            "default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 proto cfab-default\n",
+        );
+        assert!(st.reconcile(&mut sys, &view, true).is_empty());
+    }
+
+    #[test]
+    fn the_reconcile_withdraws_by_exact_key_when_the_router_is_unreachable() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys().on_stdout(
+            &["ip", "route", "show", "table", "250", "default"],
+            "default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 proto cfab-default\n",
+        );
+        let lines = HostDefaultState::default().reconcile(&mut sys, &view, false);
+        assert_eq!(
+            lines,
+            [
+                "cfab: host default: withdrawn (router 192.168.249.254 unreachable over every \
+              wire of cfab-gw249)"
+            ]
+        );
+        assert!(sys.ran(
+            "ip route del default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+             table 250 proto 206"
+        ));
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip rule del")),
+            "the rules stay: table 250 empty falls through to the kernel's own 32766 rule"
+        );
+    }
+
+    /// The pins follow the floor device on every pass, whether or not the fabric default is in
+    /// force: an address added to the admin bridge gets one, an address removed loses one.
+    #[test]
+    fn the_reconcile_refreshes_pref_2099_from_the_floor_devices_addresses() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys().on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
+            "eth0 UP 192.168.10.1/24 192.168.10.60/24\n",
+        );
+        let lines = HostDefaultState::default().reconcile(&mut sys, &view, false);
+        assert!(
+            lines.contains(
+                &"cfab: host default: added ip rule pref 2099 from 192.168.10.60 iif lo lookup \
+                   main"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(sys.ran("ip rule add pref 2099 from 192.168.10.60 iif lo lookup main"));
+    }
+
+    /// The rules are restored like every other object cfab owns: the operator who flushed them
+    /// gets them back on the next tick, with a line saying so.
+    #[test]
+    fn the_reconcile_restores_a_rule_that_was_flushed() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys().on_stdout(&["ip", "rule", "show", "pref", "2101"], "");
+        let lines = HostDefaultState::default().reconcile(&mut sys, &view, true);
+        assert!(
+            lines.contains(
+                &"cfab: host default: re-added ip rule pref 2101 from all iif lo".to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(sys.ran("ip rule add pref 2101 from all iif lo lookup 250"));
+    }
+
+    #[test]
+    fn a_member_with_no_gw_zone_reconciles_nothing_at_all() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = host_default_sys();
+        assert!(
+            HostDefaultState::default()
+                .reconcile(&mut sys, &view, true)
+                .is_empty()
+        );
+        assert!(sys.calls.is_empty(), "{:?}", sys.calls);
+    }
+
+    /// A fault that lasts costs one journal line, not one every three seconds — and the
+    /// recovery is said once too, so the SECOND occurrence is never swallowed.
+    #[test]
+    fn a_standing_reconcile_failure_is_said_once_and_its_recovery_too() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut st = HostDefaultState::default();
+        let mut broken = host_default_sys().on_fail(
+            &["ip", "route", "show", "table", "main", "default"],
+            2,
+            "Cannot open netlink socket",
+        );
+        let first = st.reconcile(&mut broken, &view, true);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(
+            first[0].contains("cannot read this host's own default route"),
+            "{first:?}"
+        );
+        assert!(
+            st.reconcile(&mut broken, &view, true).is_empty(),
+            "said once"
+        );
+        let mut fixed = host_default_sys();
+        let after = st.reconcile(&mut fixed, &view, true);
+        assert_eq!(
+            after,
+            [
+                "cfab: host default: installed via 192.168.249.254 dev cfab-gw249 (table 250)",
+                "cfab: host default: reconcile recovered",
+            ],
+            "the pass says what it did, then that the standing fault is over"
+        );
+        // ...and the recovery is said once too, so a SECOND occurrence is never swallowed.
+        let second = st.reconcile(&mut broken, &view, true);
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(second[0].contains("cannot read this host's own default route"));
     }
 }
