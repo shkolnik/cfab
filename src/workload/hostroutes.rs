@@ -273,9 +273,12 @@ struct Row {
     /// broad scan, which is what makes the `neigh del` below provably ours.
     last_wanted: BTreeSet<Ipv4Addr>,
     /// Whether this row has ever completed a membership reconcile. The FIRST one is a baseline
-    /// (whatever is already there when cfab starts watching, or when a deferred row installs),
-    /// never a set of changes: without this, every VM already on the wire at startup would log
-    /// a "joined" line for a join that never happened.
+    /// (whatever is already there when cfab starts watching), never a set of changes: without
+    /// this, every VM already on the wire at startup would log a "joined" line for a join that
+    /// never happened. This does NOT reset when a row is deferred and later reinstalled — only
+    /// `last_wanted` does (below) — so a row returning from deferral is NOT read as a fresh
+    /// baseline: every VM already on the wire when it reinstalls logs a "joined" line, which is
+    /// the desired behavior (the row was genuinely absent from the fabric while deferred).
     seen_before: bool,
     /// When the idle-VM probe (spec §5.2 (a)) is next due. `None` until this row's first
     /// installed tick.
