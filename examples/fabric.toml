@@ -148,12 +148,14 @@ run_dir = "/run/cfab"
 
 # ---- Optional: VM workload VLANs (phase 1) -----------------------------------------------
 # A [[workload]] row reaches a VM VLAN into the fabric: an anycast gw every host answers, a
-# passive OSPF advertisement into the allowed zones, and a symmetric forward policy. ifname is
-# preconfigured (baseline-owned); cfab never creates or deletes it. Each carrying member adds
-# its own address on ifname under workloads = [...] in its [[member]] block.
+# passive OSPF advertisement into the allowed zones, and a symmetric forward policy. uplink is
+# the host's vlan-aware bridge carrying the VMs and vid the VLAN they are on; cfab creates the
+# leg cfab-work-<name> on it (and gives the bridge that vid), and removes both on down. Each
+# carrying member adds its own address on the leg under workloads = [...] in its [[member]] block.
 #[[workload]]
 #name   = "vms"
-#ifname = "primary.3"
+#uplink = "primary"
+#vid    = 3
 #prefix = "192.168.20.0/24"
 #gw     = "192.168.20.254"
 #router = "192.168.20.1"

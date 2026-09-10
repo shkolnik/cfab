@@ -644,8 +644,7 @@ with exactly one series 1;
 .BR "cfab_workload_vms_seen" ,
 IPv4 neighbor entries inside the row's
 .B prefix ,
-on its
-.I ifname ,
+on its leg,
 in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared
 member address,
 .BR gw
@@ -664,8 +663,7 @@ drop counters summed over the row's uplink ports, reset to 0 when
 re\-renders the table or the watchdog restores it;
 .BR "cfab_workload_rx_bytes_total" ,
 .BR "cfab_workload_tx_bytes_total" ,
-the gateway's own forwarding on the row's
-.I ifname
+the gateway's own forwarding on the row's leg
 (not cross\-host VM\-to\-VM traffic, which stays on the physical switch); and
 .BR "cfab_workload_announces_total" ,
 .BR "cfab_workload_bursts_total" ,
@@ -680,7 +678,8 @@ row declares a VM VLAN cfab reaches into the fabric:
 .RS
 [[workload]]
 name   = "vms"
-ifname = "primary.3"          # host\-side interface on the workload VLAN; preconfigured, required
+uplink = "primary"            # the host's vlan\-aware bridge carrying the VMs
+vid    = 3                    # the VLAN the VMs are on; cfab's leg is cfab\-work\-vms
 prefix = "192.168.20.0/24"
 gw     = "192.168.20.254"     # the anycast gateway every host answers
 router = "192.168.20.1"       # the VLAN's existing default router, printed inside DHCP option 121
@@ -688,7 +687,7 @@ allow  = ["storage"]          # zones this workload may reach; default deny, cou
 
 [[member]]
 name = "pve1"
-workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on ifname
+workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on the leg
 .RE
 .fi
 .PP
@@ -716,13 +715,13 @@ two members declaring the same address on one workload row; an empty
 .BR allow ;
 an
 .B allow
-naming an unknown zone; an
-.B ifname
-colliding with a declared wire, a declared segment, or a cfab\-generated
-bond/identity interface; two
+naming an unknown zone; a
+.B vid
+outside 2\-4094 (1 is the bridge's untagged default; 0 and 4095 are reserved);
+a derived leg name colliding with a declared wire, a declared segment, or a
+cfab\-generated bond/identity interface; two
 .B [[workload]]
-rows sharing a name or an
-.BR ifname ;
+rows sharing a name, or whose names cut to the same 15\-byte leg;
 a workload name that is also a zone name (workload and zone names share one
 vocabulary); a workload
 .B prefix
@@ -752,34 +751,42 @@ row at all: reaching a zone requires forwarding, so no
 .B allow
 value is ever valid once it is off.
 .PP
+.B cfab check
+and
 .B cfab up
-refuses if
-.I ifname
-does not exist, lacks the member's declared address, or is administratively
-down (or in an unparsable state) \(em a stanza problem needing a fix and a
-re\-apply. A lower\-layer carrier fault
-.RB ( LOWERLAYERDOWN )
-is not a declaration fault, and neither is an uplink that cannot yet be
-identified or is not yet STP\-forwarding: each defers that one row to the
-watchdog (a warning names the reason, no gw address goes live) and applies
-everything else, and the watchdog installs the row once the condition
-clears.
+refuse an
+.B uplink
+bridge that is not vlan\-aware
+.RB ( "bridge\-vlan\-aware yes"
+in
+.IR /etc/network/interfaces ):
+a tagged leg on it would receive nothing. Everything else is a wait, not a
+refusal: a bridge that is not on the host yet, an uplink that cannot be
+identified, and an uplink that is not yet STP\-forwarding each defer that one
+row to the watchdog (a warning names the reason, no leg is built and no gw
+address goes live) and let the rest of the member apply; the watchdog installs
+the row once the condition clears.
 .PP
-The VLAN interface itself is baseline\-owned (Proxmox, systemd\-networkd,
-whatever already brought it up); cfab only points at it, and never creates or
-deletes it.
+The bridge is the host's (Proxmox, systemd\-networkd, whatever brought it up)
+and cfab never creates or deletes it. The leg on it is cfab's:
 .B up
-adds IPv4 forwarding on
-.IR ifname ;
-a passive OSPF entry for
-.I ifname
+adds
+.BR cfab\-work\-<name> ,
+an 802.1Q vlan of
+.B vid
+on
+.BR uplink ,
+carrying this member's declared address, plus
+.B vid
+on the bridge itself (without it the leg receives nothing); IPv4 forwarding on
+the leg;
+a passive OSPF entry for the leg
 in every allowed zone's instance; a pref\-2000 sibling return\-path rule per
 (zone, workload prefix) on every member and leaf; a symmetric stateless
 accept pair in the forward policy; a forward\-hook DSCP overwrite; the
 anycast
 .B gw
-as a second address on
-.I ifname
+as a second address on the leg,
 answered with the host's own MAC, with
 .B net.ipv4.conf.all.arp_ignore=1
 set; an nft bridge rule dropping ARP for
@@ -789,9 +796,11 @@ migrated VM's fabric\-side neighbor entries onto its new host.
 .B down
 removes everything
 .B up
-added on this member, never
-.I ifname
-itself. The watchdog restores anything of it found missing or wrong.
+added on this member, the leg included, and \(em only if cfab is the one that
+added it \(em the vid on the bridge; never the
+.B uplink
+bridge itself, and never a vid the host already had. The watchdog restores
+anything of it found missing or wrong, the leg and the bridge's vid included.
 .PP
 A VM's DHCP lease should carry option 121 (RFC 3442) with the fabric
 aggregate routed via
