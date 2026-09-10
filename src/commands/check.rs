@@ -1,6 +1,8 @@
 //! `cfab check`: validate the declaration and report the fabric as declared, what THIS member
 //! gets, and (with `[[workload]]` rows) each row and the fabric aggregate.
 
+use std::collections::BTreeSet;
+
 use crate::derive::View;
 use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
@@ -96,6 +98,28 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 carried_by
             ));
         }
+        // Conflict 11 (holo `b01dab56`): the `redistribution` entry cfab writes on a zone's
+        // OSPF instance subscribes to ALL static routes in the RIB, not to the ones belonging
+        // to the row that zone allows. With one row that is moot; with two whose `allow` sets
+        // differ, each zone advertises both rows' /32s. Said once, naming the rows, because an
+        // operator would otherwise read `allow` as a route filter — it is a forward-policy
+        // filter, which is what actually decides reach.
+        let allow_sets: BTreeSet<&Vec<String>> =
+            fabric.workloads.iter().map(|w| &w.allow).collect();
+        if allow_sets.len() > 1 {
+            out.push_str(&format!(
+                "warning: workload rows {} declare different allow sets; every allowed zone's \
+                 OSPF instance advertises the per-VM routes of ALL rows (holo redistributes \
+                 static routes per instance, not per route) — reach is decided by the forward \
+                 policy, not by which routes exist\n",
+                fabric
+                    .workloads
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let aggregate = fabric.aggregate();
         out.push_str(&format!(
             "fabric aggregate (for DHCP option 121): {}\n",
@@ -173,6 +197,38 @@ mod tests {
         // ...and a member with no workload row reads nothing at all.
         let leaf = View::new(&f, "pve3-tb").unwrap();
         host_preflight(&MockSys::default(), &leaf).expect("no rows, no host facts");
+    }
+
+    /// Conflict 11: holo's `redistribution` list is per-INSTANCE, not per-route, so an entry
+    /// for `ietf-routing:static` on a zone's OSPF instance advertises every static route cfab
+    /// installs — including the /32s of a workload row that zone is not in the `allow` list of.
+    /// `check` says so once, naming the rows, rather than letting an operator read the `allow`
+    /// lists as route filters.
+    #[test]
+    fn check_warns_when_two_workload_rows_declare_different_allow_sets() {
+        let two = format!(
+            "{}\n[[workload]]\nname = \"dmz\"\nuplink = \"primary\"\nvid = 4\n\
+             prefix = \"192.168.21.0/24\"\ngw = \"192.168.21.254\"\n\
+             router = \"192.168.21.1\"\nallow = [\"storage\", \"mgmt\"]\n",
+            crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
+                 { name = \"dmz\", address = \"192.168.21.2/24\" }]",
+            )
+        );
+        let f = Fabric::from_decl(&Declaration::parse(&two).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let want = "warning: workload rows vms, dmz declare different allow sets; every allowed \
+                    zone's OSPF instance advertises the per-VM routes of ALL rows (holo \
+                    redistributes static routes per instance, not per route) — reach is decided \
+                    by the forward policy, not by which routes exist\n";
+        assert!(report(&f, &view).contains(want), "{}", report(&f, &view));
+        // One row, or two that agree: nothing to warn about, and the line is absent.
+        let one = wl_fabric();
+        assert!(!report(&one, &View::new(&one, "pve1-tb").unwrap()).contains("warning:"));
+        let agree = two.replace("allow = [\"storage\", \"mgmt\"]", "allow = [\"storage\"]");
+        let f2 = Fabric::from_decl(&Declaration::parse(&agree).unwrap()).unwrap();
+        assert!(!report(&f2, &View::new(&f2, "pve1-tb").unwrap()).contains("warning:"));
     }
 
     #[test]
