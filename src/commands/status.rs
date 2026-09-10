@@ -3601,6 +3601,62 @@ mod tests {
         );
     }
 
+    /// S5: a row with a healthy relay appends its counters to the workload line.
+    #[test]
+    fn a_relay_appends_its_status_to_the_workload_line() {
+        let f = wl_fabric_with_relay("192.168.10.11");
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let workloads = serde_json::json!([
+            {"name": "vms", "ifname": "cfab-work-vms", "trigger": "neigh events",
+             "announces": 12, "bursts": 1}
+        ]);
+        let relays = serde_json::json!([
+            {"name": "vms", "server": "192.168.10.11", "requests": 7, "replies": 5,
+             "discovered": 3, "last_error": null}
+        ]);
+        let mut sys = wl_status_sys(&f, &view).socket(
+            "/run/cfab/cfab.sock",
+            &components_doc_with_relays(true, workloads, relays),
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(", relay to 192.168.10.11 (7 requests, 5 replies)"),
+            "{text}"
+        );
+    }
+
+    /// S5: a bind or socket error rides on the same line, per spec §6 — a relay is a degraded
+    /// row, never a member fault, but never a silent one either.
+    #[test]
+    fn a_relay_bind_error_appends_last_error_to_the_workload_line() {
+        let f = wl_fabric_with_relay("192.168.10.11");
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let workloads = serde_json::json!([
+            {"name": "vms", "ifname": "cfab-work-vms", "trigger": "neigh events",
+             "announces": 12, "bursts": 1}
+        ]);
+        let relays = serde_json::json!([
+            {"name": "vms", "server": "192.168.10.11", "requests": 0, "replies": 0,
+             "discovered": 0, "last_error": "cannot bind: address not available"}
+        ]);
+        let mut sys = wl_status_sys(&f, &view).socket(
+            "/run/cfab/cfab.sock",
+            &components_doc_with_relays(true, workloads, relays),
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                ", relay to 192.168.10.11 (0 requests, 0 replies, last error: cannot bind: \
+                 address not available)"
+            ),
+            "{text}"
+        );
+    }
+
     /// S2: the one row a bind failure is GUARANTEED on (the leg does not exist yet) must not be
     /// the one row that hides it. A deferred row still reports its relay's standing error.
     #[test]
