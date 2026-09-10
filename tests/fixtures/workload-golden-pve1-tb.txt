@@ -1,15 +1,7 @@
 == check ==
 fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members
 this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 1 ingress leg(s)
-workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 router 192.168.20.1 allow storage; carried by pve1-tb, pve2-tb
-fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, 10.249.0.0/16
-# dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition inside a subnet block.
-option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;
-# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
-# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
-# 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
-# paste the next line inside the existing 'subnet 192.168.20.0 netmask 255.255.255.0 { ... }' block of this VLAN (do not add a second subnet block: dhcpd loads overlapping subnets with a warning and the lease picks one)
-	option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;
+workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 host-local, no dhcp_server (no relay), allow storage; carried by pve1-tb, pve2-tb
 
 == rules ==
 pref 2000 from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0
@@ -581,11 +573,4 @@ table bridge cfab {
         iifname "eth0" vlan id 3 vlan type arp arp daddr ip 192.168.20.254 counter drop comment "gw-request-from-uplink"
     }
 }
-
-== dhcp ==
-# dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A client that receives
-# option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) is INSIDE 121 (last entry).
-# 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, 10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1
-# paste the next line inside the existing 'subnet 192.168.20.0 netmask 255.255.255.0 { ... }' block of this VLAN (do not add a second subnet block: dhcpd loads overlapping subnets with a warning and the lease picks one)
-	option rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, 199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;
 

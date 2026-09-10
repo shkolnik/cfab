@@ -139,8 +139,8 @@ pub fn local_vms(
 }
 
 /// Every address on this workload the fabric itself owns: each declared member's address on the
-/// row (fabric-wide, not just this member — `View::workload_rows` is this-member-only), the
-/// anycast `gw` and the VLAN's `router`. Without it a peer's own resolution of the gateway
+/// row (fabric-wide, not just this member — `View::workload_rows` is this-member-only) and the
+/// anycast `gw`. Without it a peer's own resolution of the gateway
 /// would read as a VM, and this member would originate a /32 for an address every member holds.
 fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
     let mut out: BTreeSet<Ipv4Addr> = view
@@ -152,7 +152,6 @@ fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
         .map(|mw| mw.address)
         .collect();
     out.insert(wl.gw);
-    out.insert(wl.router);
     out
 }
 
@@ -600,9 +599,10 @@ mod tests {
         .unwrap()
     }
 
-    /// The fixture the plan names: one VM on a tap, this member and its peer, the router, one
-    /// out-of-prefix neighbor, and one VLAN-3 address whose MAC lives on the uplink (a VM on
-    /// another host). Only the first is local.
+    /// The fixture the plan names: one VM on a tap, this member and its peer, one out-of-prefix
+    /// neighbor, and two VLAN-3 addresses whose MACs live on the uplink (VMs on another host).
+    /// Only the first is local. (.1 is an ordinary address here: with `router` retired the VLAN
+    /// has no gateway but cfab's own `gw`, so nothing about .1 is special any more.)
     const NEIGH: &str = r#"[
       {"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]},
       {"dst":"192.168.20.2","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:02","state":["PERMANENT"]},
@@ -636,14 +636,14 @@ mod tests {
         assert_eq!(
             local_vms(NEIGH, FDB, &v, wl, &["eth0".to_string()]).unwrap(),
             set(&["192.168.20.103"]),
-            "the peers' addresses, the router, the out-of-prefix entry and the VM whose MAC is \
-             on the uplink are all excluded"
+            "the peers' addresses, the out-of-prefix entry and the VMs whose MACs are on the \
+             uplink are all excluded"
         );
-        // The teeth: with the uplink not named, the VM on the OTHER host stops being excluded
-        // and this member would originate a /32 for a VM it cannot reach.
+        // The teeth: with the uplink not named, the VMs on the OTHER host stop being excluded
+        // and this member would originate /32s for VMs it cannot reach.
         assert_eq!(
             local_vms(NEIGH, FDB, &v, wl, &[]).unwrap(),
-            set(&["192.168.20.103", "192.168.20.104"])
+            set(&["192.168.20.1", "192.168.20.103", "192.168.20.104"])
         );
     }
 
@@ -765,18 +765,13 @@ mod tests {
     /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
     /// workload must never read as a VM here (a 3-host testbed would otherwise count peers).
     #[test]
-    fn the_exclusion_set_covers_every_member_the_gw_and_the_router() {
+    fn the_exclusion_set_covers_every_member_and_the_gw() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
             fabric_addresses(&v, &f.workloads[0]),
-            set(&[
-                "192.168.20.1",
-                "192.168.20.2",
-                "192.168.20.3",
-                "192.168.20.254"
-            ]),
-            "pve1-tb and pve2-tb carry the row; .1 is the router and .254 the anycast gw"
+            set(&["192.168.20.2", "192.168.20.3", "192.168.20.254"]),
+            "pve1-tb and pve2-tb carry the row; .254 is the anycast gw"
         );
     }
 

@@ -1,5 +1,5 @@
 //! `cfab check`: validate the declaration and report the fabric as declared, what THIS member
-//! gets, and (with `[[workload]]` rows) each row and the fabric aggregate.
+//! gets, and (with `[[workload]]` rows) each row.
 
 use std::collections::BTreeSet;
 
@@ -39,18 +39,37 @@ pub fn host_preflight(sys: &dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
+/// Can this row's relay plausibly route to `server`? Two ways, and no third: the address sits
+/// inside a zone this row is allowed into (its own `10.<id>.0.0/16` block or that zone's
+/// ingress /24), or some zone declares a `gw`, which gives the member a default route that
+/// reaches anything off-fabric. Neither means the relay's traffic is FORWARDED — the relay
+/// speaks from the host itself, so `allow` does not gate it — only that a route can exist. A
+/// declaration failing both is a warning, never a refusal: cfab cannot see the host's own
+/// routing table from here, and an operator may have one.
+fn reaches(fabric: &Fabric, wl: &crate::model::Workload, server: std::net::Ipv4Addr) -> bool {
+    if fabric.zones.iter().any(|z| z.gw.is_some()) {
+        return true;
+    }
+    let o = server.octets();
+    fabric
+        .zones
+        .iter()
+        .filter(|z| wl.allow.iter().any(|a| a == &z.name))
+        .any(|z| {
+            z.block() == format!("{}.{}", o[0], o[1])
+                || z.gw
+                    .as_ref()
+                    .is_some_and(|g| g.subnet_prefix() == format!("{}.{}.{}", o[0], o[1], o[2]))
+        })
+}
+
 /// The lines `cfab check` prints. The per-member line is the last thing an operator sees before
 /// `up` creates the netdevs, so it names every leg `up` will build — the fallback legs included:
 /// their ports fan out per wire, so their count is member-dependent and not derivable from the
 /// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, uplink,
-/// vid, the leg cfab creates, prefix, gw, router, allow, and the members that carry it), then
-/// the fabric aggregate — the
-/// smallest set of prefixes covering every declared zone block — followed by one RFC 3442
-/// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw`, `router`,
-/// and the row's own `prefix` differ per row): each snippet is a comment naming the EXISTING
-/// subnet block (of that row's own VLAN) the `option` line pastes into, never a `subnet { … }`
-/// block of its own — a second declaration of an existing subnet loads with only a warning and
-/// the lease silently picks one (I3, whole-branch review, VERIFIED pve3-tb isc-dhcpd 4.4.3-P1).
+/// vid, the leg cfab creates, prefix, gw, the relay's server if the row declares one, allow, and
+/// the members that carry it). The VLAN is host-local, so there is no aggregate and no DHCP
+/// option-121 snippet to paste: a VM's default route is `gw`, which is option 3.
 pub fn report(fabric: &Fabric, view: &View) -> String {
     let kind = match view.kind() {
         MemberKind::Host => "host",
@@ -85,18 +104,33 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 .map(|m| m.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let relay = match wl.dhcp_server {
+                Some(s) => format!("dhcp_server {s}"),
+                None => "no dhcp_server (no relay)".to_string(),
+            };
             out.push_str(&format!(
-                "workload {}: {} vid {} ({}) {} gw {} router {} allow {}; carried by {}\n",
+                "workload {}: {} vid {} ({}) {} gw {} host-local, {relay}, allow {}; carried by \
+                 {}\n",
                 wl.name,
                 wl.uplink,
                 wl.vid,
                 wl.leg_ifname(),
                 wl.prefix,
                 wl.gw,
-                wl.router,
                 wl.allow.join(", "),
                 carried_by
             ));
+            if let Some(server) = wl.dhcp_server {
+                if !reaches(fabric, wl, server) {
+                    out.push_str(&format!(
+                        "warning: workload {}: dhcp_server {server} is in no zone this row is \
+                         allowed into ({}) and no zone declares a gw, so the relay has no route \
+                         to it\n",
+                        wl.name,
+                        wl.allow.join(", ")
+                    ));
+                }
+            }
         }
         // Conflict 11 (holo `b01dab56`): the `redistribution` entry cfab writes on a zone's
         // OSPF instance subscribes to ALL static routes in the RIB, not to the ones belonging
@@ -123,21 +157,6 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                     .map(|w| w.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            ));
-        }
-        let aggregate = fabric.aggregate();
-        out.push_str(&format!(
-            "fabric aggregate (for DHCP option 121): {}\n",
-            aggregate
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        out.push_str(crate::emit::workload::DHCP_OPTION_121_DEFINITION);
-        for wl in &fabric.workloads {
-            out.push_str(&crate::emit::workload::dhcp_option_121(
-                wl.prefix, &aggregate, wl.gw, wl.router,
             ));
         }
     }
@@ -214,7 +233,7 @@ mod tests {
         let two = format!(
             "{}\n[[workload]]\nname = \"dmz\"\nuplink = \"primary\"\nvid = 4\n\
              prefix = \"192.168.21.0/24\"\ngw = \"192.168.21.254\"\n\
-             router = \"192.168.21.1\"\nallow = [\"storage\", \"mgmt\"]\n",
+             allow = [\"storage\", \"mgmt\"]\n",
             crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
                 "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
                 "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
@@ -247,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn report_lists_workloads_and_the_aggregate() {
+    fn report_lists_workloads() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
@@ -256,24 +275,61 @@ mod tests {
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n\
              workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 \
-             router 192.168.20.1 \
-             allow storage; carried by pve1-tb, pve2-tb\n\
-             fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, \
-             10.249.0.0/16\n\
-             # dhcpd.conf (ISC): option 121 is defined ONCE, globally; dhcpd refuses a definition \
-             inside a subnet block.\n\
-             option rfc3442-classless-static-routes code 121 = array of unsigned integer 8;\n\
-             # dhcpd.conf (ISC): RFC 3442 classless static routes for this workload's subnet. A \
-             client that receives\n\
-             # option 121 IGNORES option 3, so the default route (0.0.0.0/0 via 192.168.20.1) \
-             is INSIDE 121 (last entry).\n\
-             # 10.99.0.0/16 via 192.168.20.254, 10.199.0.0/16 via 192.168.20.254, \
-             10.249.0.0/16 via 192.168.20.254, 0.0.0.0/0 via 192.168.20.1\n\
-             # paste the next line inside the existing 'subnet 192.168.20.0 netmask \
-             255.255.255.0 { ... }' block of this VLAN (do not add a second subnet block: \
-             dhcpd loads overlapping subnets with a warning and the lease picks one)\n\
-             \toption rfc3442-classless-static-routes 16, 10, 99, 192, 168, 20, 254, 16, 10, \
-             199, 192, 168, 20, 254, 16, 10, 249, 192, 168, 20, 254, 0, 192, 168, 20, 1;\n"
+             host-local, no dhcp_server (no relay), allow storage; carried by pve1-tb, pve2-tb\n"
+        );
+    }
+
+    /// A declared `dhcp_server` is named on the row's line, and — since this fabric has a gw
+    /// zone, i.e. a default route off-fabric — draws no warning.
+    #[test]
+    fn report_names_a_declared_dhcp_server_and_does_not_warn_when_a_gw_zone_exists() {
+        let text = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
+            "gw = \"192.168.20.254\"",
+            "gw = \"192.168.20.254\"\ndhcp_server = \"192.168.10.11\"",
+        );
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let out = report(&f, &view);
+        assert!(
+            out.contains("host-local, dhcp_server 192.168.10.11, allow storage;"),
+            "{out}"
+        );
+        assert!(!out.contains("has no route to it"), "{out}");
+    }
+
+    /// ...and with no gw zone anywhere and the server outside every allowed zone's block, the
+    /// relay would have nothing to route over: a WARNING, never a refusal (cfab cannot see the
+    /// host's own routing table, and an operator may have a route of their own).
+    #[test]
+    fn report_warns_when_no_zone_can_reach_the_declared_dhcp_server() {
+        let text = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example())
+            .replace(
+                "gw = \"192.168.20.254\"",
+                "gw = \"192.168.20.254\"\ndhcp_server = \"192.168.10.11\"",
+            )
+            .lines()
+            .filter(|l| !l.starts_with("gw = { domain"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        assert!(
+            report(&f, &view).contains(
+                "warning: workload vms: dhcp_server 192.168.10.11 is in no zone this row is \
+                 allowed into (storage) and no zone declares a gw, so the relay has no route to \
+                 it\n"
+            ),
+            "{}",
+            report(&f, &view)
+        );
+        // A server INSIDE an allowed zone's own block needs no gw zone and draws no warning.
+        let inside = text.replace("192.168.10.11", "10.99.5.11");
+        let f2 = Fabric::from_decl(&Declaration::parse(&inside).unwrap()).unwrap();
+        let v2 = View::new(&f2, "pve1-tb").unwrap();
+        assert!(
+            !report(&f2, &v2).contains("has no route to it"),
+            "{}",
+            report(&f2, &v2)
         );
     }
 }

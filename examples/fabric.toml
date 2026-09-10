@@ -146,20 +146,24 @@ connect_s = 3         # FRR's default 120 s makes a returned wire re-peer slowly
 [runtime]
 run_dir = "/run/cfab"
 
-# ---- Optional: VM workload VLANs (phase 1) -----------------------------------------------
-# A [[workload]] row reaches a VM VLAN into the fabric: an anycast gw every host answers, a
-# passive OSPF advertisement into the allowed zones, and a symmetric forward policy. uplink is
-# the host's vlan-aware bridge carrying the VMs and vid the VLAN they are on; cfab creates the
-# leg cfab-work-<name> on it (and gives the bridge that vid), and removes both on down. Each
-# carrying member adds its own address on the leg under workloads = [...] in its [[member]] block.
+# ---- Optional: VM workload VLANs ---------------------------------------------------------
+# A [[workload]] row reaches a VM VLAN into the fabric: an anycast gw every host answers and
+# every VM defaults to, a per-VM /32 into the allowed zones, and a symmetric forward policy.
+# The VLAN is HOST-LOCAL: it must not be carried between hosts by the switch, so the uplink
+# bridge port must not carry vid (bridge-vids on the host's own stanza), or the row defers.
+# uplink is the host's vlan-aware bridge carrying the VMs and vid the VLAN they are on; cfab
+# creates the leg cfab-work-<name> on it (and gives the bridge that vid), and removes both on
+# down. Each carrying member adds its own address on the leg under workloads = [...] in its
+# [[member]] block. dhcp_server is optional: with it, cfab relays the VLAN's DHCP to that
+# server; without it the row has no relay.
 #[[workload]]
-#name   = "vms"
-#uplink = "primary"
-#vid    = 3
-#prefix = "192.168.20.0/24"
-#gw     = "192.168.20.254"
-#router = "192.168.20.1"
-#allow  = ["storage"]
+#name        = "vms"
+#uplink      = "primary"
+#vid         = 3
+#prefix      = "192.168.20.0/24"
+#gw          = "192.168.20.254"
+#dhcp_server = "192.168.10.11"
+#allow       = ["storage"]
 #
 # ...and in the carrying member's [[member]] block:
 #workloads = [{ name = "vms", address = "192.168.20.2/24" }]

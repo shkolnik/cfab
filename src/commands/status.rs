@@ -4558,8 +4558,8 @@ table bridge cfab {
 
     /// A healthy row carries every observability field, read from the fixture: the guard sum
     /// over the row's one uplink port, the sysfs byte counters, `vms_seen` from the
-    /// neighbor/FDB join (one VM; this member's own address, the gw and the router are all
-    /// excluded by `workload::hostroutes::local_vms`, the same derivation the /32 set uses),
+    /// neighbor/FDB join (one VM; this member's own address and the gw are excluded by
+    /// `workload::hostroutes::local_vms`, the same derivation the /32 set uses),
     /// and the stray-forward counter off the forward chain.
     #[test]
     fn a_healthy_row_carries_guard_drops_bytes_vms_seen_and_stray_forwards() {
@@ -4568,7 +4568,6 @@ table bridge cfab {
         let neigh_json = serde_json::json!([
             {"dst": "192.168.20.2", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:02", "state": ["REACHABLE"]},
             {"dst": "192.168.20.254", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:51", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.1", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:51", "state": ["REACHABLE"]},
             {"dst": "192.168.20.50", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:50", "state": ["REACHABLE"]},
         ])
         .to_string();

@@ -1415,7 +1415,7 @@ pub(crate) mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
         );
         let blocks = format!(
-            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nallow = [\"storage\"]\n",
             crate::decl::fixtures::WORKLOAD_BLOCK
         );
         Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()

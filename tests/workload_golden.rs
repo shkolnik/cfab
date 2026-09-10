@@ -1,8 +1,8 @@
 //! Gate B acceptance: one golden per member with every workload-related rendering.
 //!
 //! Six emitters answer for the `with_workload` fixture in one artifact — `check`, the return-path
-//! rules, the forward policy, the mark table, the engine config, the bridge ARP guard and the
-//! DHCP option 121 snippet — rendered verbatim for a host that carries the workload (`pve1-tb`)
+//! rules, the forward policy, the mark table, the engine config and the bridge ARP guard —
+//! rendered verbatim for a host that carries the workload (`pve1-tb`)
 //! and for the leaf that does not (`pve3-tb`). A change to any one of them shows up here as a
 //! diff to read, which is the point: the fixture files are the reviewed record of what phase 1
 //! puts on a member.
@@ -68,13 +68,6 @@ fn render_text(decl_text: &str, member: &str) -> String {
         } else {
             workload::bridge_table(&guards)
         },
-    );
-    section(
-        "dhcp",
-        f.workloads
-            .iter()
-            .map(|w| workload::dhcp_option_121(w.prefix, &f.aggregate(), w.gw, w.router))
-            .collect::<String>(),
     );
     out
 }
