@@ -120,6 +120,26 @@ fn bgp_listen_policy(_fabric: &Fabric) -> BgpListenPolicy {
     BgpListenPolicy::NoListener
 }
 
+/// Which half of a request that takes two commits a tree is. Only an ifindex move has a
+/// `Withdraw` in front of it (see `apply`); every other request is one `Install`. It exists
+/// for the journal: both commits of a move carry the same `request=` summary, so without this
+/// the record of a move is two identical lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Withdraw,
+    Install,
+}
+
+impl Step {
+    /// One spelling per step, everywhere.
+    fn as_str(self) -> &'static str {
+        match self {
+            Step::Withdraw => "withdraw",
+            Step::Install => "install",
+        }
+    }
+}
+
 /// Everything a re-commit rebuilds the configuration tree from, so that no request can undo
 /// another's effect: before this, `transit-cost` regenerated from the `View` alone and would
 /// have withdrawn every workload route as a side effect of a forward-policy flap.
@@ -154,20 +174,20 @@ impl EngineState {
             .collect()
     }
 
-    /// Every tree `req` must commit, IN ORDER, each with THE STATE THAT STEP LEAVES BEHIND —
-    /// per step, not per request, so the caller can adopt each state the moment that step is
-    /// in force and never claim more than the engine has (`commit_steps`). Pure: the ordering
-    /// is the whole point (see the ifindex comment below), and it is tested without a live
-    /// engine. Every tree is generated before any is committed, so a request the generator
-    /// refuses leaves the caller's state untouched.
-    fn apply(&self, view: &View, req: &sock::Request) -> Result<Vec<(Value, EngineState)>> {
-        let mut steps: Vec<EngineState> = Vec::new();
+    /// Every tree `req` must commit, IN ORDER, each with its label and THE STATE THAT STEP
+    /// LEAVES BEHIND — per step, not per request, so the caller can adopt each state the
+    /// moment that step is in force and never claim more than the engine has (`commit_steps`).
+    /// Pure: the ordering is the whole point (see the ifindex comment below), and it is tested
+    /// without a live engine. Every tree is generated before any is committed, so a request
+    /// the generator refuses leaves the caller's state untouched.
+    fn apply(&self, view: &View, req: &sock::Request) -> Result<Vec<(Step, Value, EngineState)>> {
+        let mut steps: Vec<(Step, EngineState)> = Vec::new();
         match req {
             sock::Request::State => {}
             sock::Request::TransitCost(at) => {
                 let mut next = self.clone();
                 next.transit = *at;
-                steps.push(next);
+                steps.push((Step::Install, next));
             }
             sock::Request::WorkloadRoutes {
                 leg,
@@ -190,18 +210,18 @@ impl EngineState {
                     withdraw
                         .routes
                         .insert(leg.clone(), (*ifindex, BTreeSet::new()));
-                    steps.push(withdraw);
+                    steps.push((Step::Withdraw, withdraw));
                 }
-                let mut next = steps.last().unwrap_or(self).clone();
+                let mut next = steps.last().map_or(self, |(_, s)| s).clone();
                 next.routes.insert(leg.clone(), (*ifindex, cidrs.clone()));
-                steps.push(next);
+                steps.push((Step::Install, next));
             }
         }
         steps
             .into_iter()
-            .map(|s| {
+            .map(|(step, s)| {
                 let tree = generate_with(view, s.transit, &s.wanted())?;
-                Ok((tree, s))
+                Ok((step, tree, s))
             })
             .collect()
     }
@@ -216,8 +236,8 @@ impl EngineState {
         let steps = self.apply(view, req)?;
         let last = steps
             .last()
-            .map_or_else(|| self.clone(), |(_, s)| s.clone());
-        Ok((steps.into_iter().map(|(t, _)| t).collect(), last))
+            .map_or_else(|| self.clone(), |(_, _, s)| s.clone());
+        Ok((steps.into_iter().map(|(_, t, _)| t).collect(), last))
     }
 }
 
@@ -234,18 +254,22 @@ impl EngineState {
 async fn commit_steps<E>(
     state: &mut EngineState,
     req: &sock::Request,
-    steps: Vec<(Value, EngineState)>,
+    steps: Vec<(Step, Value, EngineState)>,
     mut commit_one: E,
 ) -> Result<()>
 where
     E: AsyncFnMut(Value) -> Result<bool>,
 {
-    for (tree, next) in steps {
+    for (step, tree, next) in steps {
         // Only a step that actually moved something is worth a log line, or the record of the
         // change drowns in the record of no change. A step that changed nothing is still in
         // force, so the state advances either way.
         if commit_one(tree).await? {
-            info!(request = %req.summary(), "engine configuration re-committed");
+            info!(
+                request = %req.summary(),
+                step = step.as_str(),
+                "engine configuration re-committed"
+            );
         }
         *state = next;
     }
@@ -658,6 +682,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.wanted()["primary.3"].len(), 1);
+    }
+
+    /// The two commits of an ifindex move are one journal line each and must be told apart:
+    /// they carry the same `request=` summary, so the step is what distinguishes them. One
+    /// spelling for each, and every single-commit request is an `install`.
+    #[test]
+    fn every_step_is_labeled_and_an_ifindex_move_is_withdraw_then_install() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let labels = |steps: &[(Step, serde_json::Value, EngineState)]| {
+            steps.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>()
+        };
+
+        let (state, one) = {
+            let s = EngineState::new();
+            let steps = s
+                .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+                .unwrap();
+            (steps.last().unwrap().2.clone(), labels(&steps))
+        };
+        assert_eq!(one, ["install"]);
+
+        let moved = state
+            .apply(&v, &routes_req("primary.3", 43, &["192.168.20.103/32"]))
+            .unwrap();
+        assert_eq!(labels(&moved), ["withdraw", "install"]);
+
+        let withdrawn = state.apply(&v, &routes_req("primary.3", 42, &[])).unwrap();
+        assert_eq!(labels(&withdrawn), ["install"]);
+
+        let cost = state
+            .apply(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .unwrap();
+        assert_eq!(labels(&cost), ["install"]);
+    }
+
+    /// The journal line for a request never carries the whole route set.
+    #[test]
+    fn a_request_summary_is_one_short_line() {
+        assert_eq!(sock::Request::State.summary(), "state");
+        assert_eq!(
+            sock::Request::TransitCost(TransitCost::LeafOffset).summary(),
+            "transit-cost leaf"
+        );
+        assert_eq!(
+            routes_req("primary.3", 42, &["192.168.20.103/32", "192.168.20.104/32"]).summary(),
+            "workload-routes primary.3 42 (2 routes)"
+        );
     }
 
     #[test]
