@@ -315,7 +315,17 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         None => load_fabric_text(&path)?,
     };
     let member = member_name()?;
-    let view = View::new(&fabric, &member)?;
+    // The name came from the kernel hostname, so the remedy is about the HOST — there is no
+    // argument to have mistyped. `Fabric::member`'s own message is the generic lookup failure,
+    // correct for the library's other callers (a test harness resolves literal names); this adds
+    // the sentence that is true only when the name is an identity.
+    let view = View::new(&fabric, &member).map_err(|e| {
+        Error::config(format!(
+            "{e}\ncfab identifies this host by its kernel hostname ({member}), and there is no \
+             flag or environment variable to say otherwise. Rename the host to match its \
+             [[member]] row, or rename the row to match the host."
+        ))
+    })?;
 
     match cli.command {
         Command::Schema | Command::Cluster { .. } | Command::PdeathSelftest { .. } => {

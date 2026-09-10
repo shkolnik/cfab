@@ -1116,7 +1116,15 @@ pub(crate) async fn run_with(
 
 /// Argv for a supervised child: `<exe> --config <config> <verb>` (spec §3). The child is NOT
 /// told who it is — it reads the kernel hostname exactly as this parent did, on the same box,
-/// so there is no way for the two to disagree about their own identity.
+/// by the same rule.
+///
+/// The one way the two can still differ: the kernel hostname is read at each process's own
+/// start, so a rename while the supervisor is running (`hostnamectl set-hostname`) leaves the
+/// parent on its startup identity and gives a LATER respawn a different one — either another
+/// member's row or a fatal "not a declared member". Pinning the name in argv would hide that
+/// instead of fixing it: the two halves would then disagree with the box. A rename under a
+/// running fabric is a re-identification of the host and wants a restart, not a papered-over
+/// child.
 fn engine_ctl_argv(exe: &str, config: &str, verb: &str) -> Vec<String> {
     vec![
         exe.to_string(),
