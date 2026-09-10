@@ -61,8 +61,10 @@ const RESOLVED: &[&str] = &["REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"]
 /// A MAC with no FDB entry at all is NOT local: the bridge has no record of it being here, and
 /// the conservative reading (do not claim it) is the one ruling 6 narrows toward.
 ///
-/// `None` when either document does not parse as a JSON array — a failed read is never a fact
-/// about VMs, and every caller treats it as "unchanged", never as "they are all gone".
+/// `None` when either document does not parse as a JSON array, or is a non-empty array none of
+/// whose entries carry the keys we read (an iproute2 that spells them otherwise) — a failed read
+/// is never a fact about VMs, and every caller treats it as "unchanged", never as "they are all
+/// gone". An EMPTY array is a real answer in both documents.
 pub fn local_vms(
     neigh_json: &str,
     fdb_json: &str,
@@ -98,20 +100,27 @@ pub fn local_vms(
 
     let exclude = fabric_addresses(view, wl);
     let mut out = BTreeSet::new();
+    let mut understood = 0usize;
     for e in neigh {
-        let Some(dst) = e["dst"].as_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else {
+        // The shape test, and why it is `dst` + `state` and not the address parsing: an entry
+        // for an IPv6 neighbor (every leg has fe80::) carries both keys and is simply not ours
+        // to route, and an entry with no `lladdr` is a real unresolved neighbor. Only an
+        // iproute2 that spells these two otherwise leaves us with nothing to read.
+        let (Some(dst), Some(state)) = (e["dst"].as_str(), e["state"].as_array()) else {
+            continue;
+        };
+        understood += 1;
+        let Some(dst) = dst.parse::<Ipv4Addr>().ok() else {
             continue;
         };
         if !wl.prefix.contains(dst) || exclude.contains(&dst) {
             continue;
         }
-        let resolved = e["state"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        if !state
+            .iter()
             .filter_map(|s| s.as_str())
-            .any(|s| RESOLVED.contains(&s));
-        if !resolved {
+            .any(|s| RESOLVED.contains(&s))
+        {
             continue;
         }
         let Some(mac) = e["lladdr"].as_str() else {
@@ -120,6 +129,11 @@ pub fn local_vms(
         if local_macs.contains(&mac.to_ascii_lowercase()) {
             out.insert(dst);
         }
+    }
+    // Same reading as the FDB above: a non-empty document none of whose entries we could read
+    // is a refusal, never "this leg has no neighbors" — the latter withdraws every /32.
+    if understood == 0 && !neigh.is_empty() {
+        return None;
     }
     Some(out)
 }
@@ -598,6 +612,32 @@ mod tests {
         );
         // An EMPTY document is a real answer: a bridge that has learned nothing yet.
         assert!(local_vms(NEIGH, "[]", &v, wl, &[]).unwrap().is_empty());
+        // And the same on the neighbor side: an iproute2 that spells `dst`/`state` otherwise
+        // must refuse, not read as "this leg has no neighbors" and withdraw every /32.
+        assert_eq!(
+            local_vms(
+                r#"[{"address":"192.168.20.103","lladdr":"02:cf:ab:00:00:01","nud":["REACHABLE"]}]"#,
+                fdb,
+                &v,
+                wl,
+                &[]
+            ),
+            None
+        );
+        // An empty neighbor table is a real answer, and so is one holding only IPv6 (which we
+        // do not route here): both are "no VMs", neither is a refusal.
+        assert!(local_vms("[]", fdb, &v, wl, &[]).unwrap().is_empty());
+        assert!(
+            local_vms(
+                r#"[{"dst":"fe80::1","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:09","state":["REACHABLE"]}]"#,
+                fdb,
+                &v,
+                wl,
+                &[]
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
