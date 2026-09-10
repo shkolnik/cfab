@@ -528,7 +528,12 @@ pub fn sync_floor_rules(sys: &mut dyn Sys, wanted: &[String]) -> Result<Vec<Stri
     let mut out = Vec::new();
     for a in wanted.iter().filter(|a| !installed.contains(a)) {
         let r = floor_rule(a);
-        ensure_fabric_rule(sys, &r)?;
+        // A bare add, not `ensure_fabric_rule`: `installed` IS this pref's readback one line
+        // above, so the ensure would re-run `ip rule show pref 2099` per address to learn what
+        // the filter just decided. Same argv, same idempotence, one read per pass.
+        let mut argv = vec!["ip", "rule", "add", "pref", r.pref.as_str()];
+        argv.extend(r.add.iter().map(String::as_str));
+        run_ok(sys, &argv)?;
         out.push(format!("added ip rule pref {} {}", r.pref, r.needle));
     }
     let stale: Vec<&String> = installed.iter().filter(|a| !wanted.contains(a)).collect();
