@@ -418,9 +418,18 @@ pub(crate) async fn run(
     }
 }
 
-/// Serve both sockets until one of them errors on `recv_from`; returns why. A `send_to` failure
-/// is not fatal to the loop — one lost frame is cheaper than tearing down a relay that is
-/// otherwise working, and the RFC's own client/server retransmits cover it.
+/// Serve both sockets until something goes wrong; returns why. A `recv_from` error and a
+/// `send_to` error end this loop alike, and both are recorded before returning (the same
+/// `RelayEvent::BindError`/`last_error` path a bind failure uses, so `status`/metrics show
+/// whichever failed last). This is load-bearing, not symmetry for its own sake (B1, VERIFIED on
+/// real hardware — pve2, an isolated dummy device deleted and recreated under the same name):
+/// the forwarding watchdog really does delete and rebuild a leg under a running supervisor
+/// (`src/commands/fwd_watchdog.rs` "The whole leg is gone: rebuild it"), and a socket bound to a
+/// device that vanishes this way does NOT fail its `recv_from` — it just goes deaf forever —
+/// while its `send_to` fails immediately with `ENODEV`. Ending the loop on a send failure is
+/// what lets `run`'s retry rebind within the backoff and self-heal; a healthy-looking relay that
+/// silently drops every packet would otherwise stand until the process restarts, and DHCP is
+/// phase 2's only discovery mechanism.
 async fn serve(
     client: &UdpSocket,
     server: &UdpSocket,
@@ -437,11 +446,21 @@ async fn serve(
                     Ok((n, _from)) => {
                         if let Action::Forward { to, bytes } =
                             forward_client(&cbuf[..n], row.leg_addr, row.dhcp_server)
-                            && server.send_to(&bytes, to).await.is_ok()
                         {
-                            shared.lock().unwrap().relay_event(
-                                &row.name, row.dhcp_server, RelayEvent::Request,
-                            );
+                            match server.send_to(&bytes, to).await {
+                                Ok(_) => {
+                                    shared.lock().unwrap().relay_event(
+                                        &row.name, row.dhcp_server, RelayEvent::Request,
+                                    );
+                                }
+                                Err(e) => {
+                                    let msg = format!("server-facing send: {e}");
+                                    shared.lock().unwrap().relay_event(
+                                        &row.name, row.dhcp_server, RelayEvent::BindError(msg.clone()),
+                                    );
+                                    return msg;
+                                }
+                            }
                         }
                     }
                     Err(e) => return format!("client socket: {e}"),
@@ -467,10 +486,19 @@ async fn serve(
                                     chaddr,
                                 });
                             }
-                            if client.send_to(&bytes, to).await.is_ok() {
-                                shared.lock().unwrap().relay_event(
-                                    &row.name, row.dhcp_server, RelayEvent::Reply,
-                                );
+                            match client.send_to(&bytes, to).await {
+                                Ok(_) => {
+                                    shared.lock().unwrap().relay_event(
+                                        &row.name, row.dhcp_server, RelayEvent::Reply,
+                                    );
+                                }
+                                Err(e) => {
+                                    let msg = format!("client-facing send: {e}");
+                                    shared.lock().unwrap().relay_event(
+                                        &row.name, row.dhcp_server, RelayEvent::BindError(msg.clone()),
+                                    );
+                                    return msg;
+                                }
                             }
                         }
                     }
@@ -838,6 +866,71 @@ mod tests {
         let relayed = Bootp::parse(&buf[..n]).unwrap();
         assert_eq!(relayed.giaddr(), leg);
         assert_eq!(relayed.hops(), 1);
+    }
+
+    // ---- serve: a send failure ends the loop and is recorded (B1) -------------------------
+
+    /// B1, VERIFIED on real hardware (pve2): a leg rebuild under a running supervisor leaves
+    /// `recv_from` silently deaf while `send_to` fails immediately with `ENODEV`. This test
+    /// cannot reproduce `ENODEV` itself (no CAP_NET_ADMIN in this sandbox), but it reproduces
+    /// the shape that matters — `send_to` failing on a live relay — deterministically and
+    /// root-free: `bind_client` always sets `SO_BROADCAST`; a client-facing socket built by hand
+    /// WITHOUT it fails a broadcast send with `EACCES` (a kernel-enforced socket-option check,
+    /// not a privilege one). A crafted DHCPOFFER with no `ciaddr` yet makes `forward_server`
+    /// broadcast the reply, driving exactly the `client.send_to` call B1 fixes.
+    #[tokio::test]
+    async fn a_send_failure_ends_serve_and_is_recorded_in_shared() {
+        let leg = Ipv4Addr::new(127, 88, 0, 3);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 4);
+
+        let raw = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        raw.set_reuse_address(true).unwrap();
+        raw.bind(&SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).into())
+            .unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let client = UdpSocket::from_std(raw.into()).unwrap();
+
+        let server = UdpSocket::from_std(bind_server(leg, 0).unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Craft a DHCPOFFER forward_server will accept and broadcast: real dhcp_server as
+        // source, this row's own leg as giaddr, ciaddr left unspecified (as captured).
+        let mut offer = OFFER.to_vec();
+        {
+            let mut p = Bootp::parse(&offer).unwrap();
+            p.set_giaddr(leg);
+            offer = p.into_bytes();
+        }
+        let sender = UdpSocket::from_std(bind_server(dhcp_server, 0).unwrap()).unwrap();
+        sender.send_to(&offer, server_addr).await.unwrap();
+
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "lo".to_string(),
+            leg_addr: leg,
+            dhcp_server,
+            prefix: PREFIX,
+        };
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve(&client, &server, &row, &shared, &cmd_tx),
+        )
+        .await
+        .expect("serve must return on a send failure, not hang forever");
+
+        assert!(
+            result.contains("client-facing send"),
+            "expected a client-facing send failure, got: {result}"
+        );
+        let recorded = shared.lock().unwrap().relay_last_error(&row.name);
+        assert_eq!(
+            recorded.as_deref(),
+            Some(result.as_str()),
+            "the same failure must land in Shared's last_error (S1/status/metrics read it back)"
+        );
     }
 
     // ---- mac_str -----------------------------------------------------------------------
