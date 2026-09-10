@@ -238,8 +238,12 @@ impl HostRoutes {
     /// the caller owns stderr and the test trace.
     pub fn tick(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) -> Vec<String> {
         let mut out = Vec::new();
+        let rows = view.workload_rows();
+        if rows.is_empty() {
+            return out; // a member with no `[[workload]]` row reads nothing at all
+        }
         let deferred = deferred_names(sys, view);
-        for row in view.workload_rows() {
+        for row in rows {
             let wl = row.wl;
             self.rows.entry(wl.name.clone()).or_default();
             let installed = !deferred.contains(&wl.name);
@@ -274,13 +278,14 @@ impl HostRoutes {
     ) -> Option<BTreeSet<Ipv4Addr>> {
         let leg = wl.leg_ifname();
         let name = wl.name.clone();
-        let ports = match uplink::identify_declared(&*sys, &wl.uplink, wl.vid) {
-            Ok(up) => up.ports,
-            Err(why) => {
-                self.fail(&name, Cond::Read, why, out);
-                return None;
-            }
+        // An uplink that cannot be identified is skipped in silence, deliberately: the
+        // forwarding watchdog and `status` each already report that exact condition in their
+        // own words, and a third reporter would turn one fault into three lines a tick. The
+        // cost of the skip is one tick's routes, unchanged — never withdrawn.
+        let Ok(up) = uplink::identify_declared(&*sys, &wl.uplink, wl.vid) else {
+            return None;
         };
+        let ports = up.ports;
         let neigh = sys.run(&["ip", "-j", "neigh", "show", "dev", &leg]).ok()?;
         if !neigh.ok() {
             self.fail(

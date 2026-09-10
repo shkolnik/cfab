@@ -20,6 +20,7 @@ use std::time::Instant;
 use crate::derive::View;
 use crate::sys::Sys;
 use crate::workload::announce::{AnnounceIo, Announcer};
+use crate::workload::hostroutes::HostRoutes;
 use crate::workload::neigh::{self, NeighSignal};
 use crate::workload::uplink::{self, Uplink};
 use crate::workload::{Trigger, deferred_names};
@@ -149,6 +150,10 @@ pub(crate) struct Workloads {
     /// Rows already reported as deferred, so the 3 s tick says it once rather than 20 times a
     /// minute for as long as an uplink takes to forward.
     deferred_said: BTreeSet<String>,
+    /// The per-VM host routes (spec §5.2): the same rows, reconciled on the same tick, so the
+    /// set an announcer bursts for and the set this member originates /32s for are read from
+    /// one place at one moment.
+    hostroutes: HostRoutes,
     trace: Trace,
 }
 
@@ -168,6 +173,7 @@ impl Workloads {
             trigger: None,
             rows: Vec::new(),
             deferred_said: BTreeSet::new(),
+            hostroutes: HostRoutes::new(),
             trace,
         };
         if view.workload_rows().is_empty() {
@@ -194,6 +200,13 @@ impl Workloads {
     ) {
         self.start_pending(sys, view, io, now);
         self.refresh_uplinks(sys, view);
+        // The host-route reconcile (spec §5.2, ruling 6). Level triggered and independent of
+        // the announcers: it runs for every declared row, including one still deferred (whose
+        // wanted set is empty), and it owns its own standing-line dedup, so what arrives here
+        // is only what has not been said yet.
+        for line in self.hostroutes.tick(sys, view, now) {
+            journal(&self.trace, line);
+        }
         if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
             return;
         }
@@ -455,9 +468,28 @@ mod tests {
     /// pve1-tb carrying the "vms" row: `apply`'s own workload fixture (bridge `primary`, uplink
     /// eth0 forwarding at ifindex 2, one VM tap `tap100i0` at ifindex 10), plus the watchdog's
     /// deferred-row list where a test wants one. The MAC comes from the io seam, not from sysfs.
+    ///
+    /// It also answers everything the host-route reconcile reads on a HEALTHY member — the leg's
+    /// ifindex, one VM neighbor whose MAC is on the tap, an empty nft set, an engine that takes
+    /// the request — so a test about the announcers sees a quiet reconcile beside them, and a
+    /// test about the reconcile breaks exactly one of those reads and asserts what it says.
     fn wl(deferred: Option<&str>) -> (MockSys, View<'static>) {
         let (sys, view) = crate::commands::apply::tests::wl_sys_and_view("pve1-tb");
-        let mut sys = sys;
+        let mut sys = sys
+            .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                r#"[{"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "fdb", "show", "br", "primary"],
+                r#"[{"mac":"02:cf:ab:00:00:01","ifname":"tap100i0","master":"primary"}]"#,
+            )
+            .on_stdout(
+                &["nft", "-j", "list", "set", "inet", "cfab-fwd"],
+                r#"{"nftables":[{"set":{"name":"cfab-work-vms-local","type":"ipv4_addr"}}]}"#,
+            )
+            .socket("/run/cfab/engine.sock", "{\"workload_routes\":{}}\n");
         if let Some(names) = deferred {
             sys = sys.file(&deferred_path(&view), names);
         }
@@ -549,6 +581,108 @@ mod tests {
         );
         assert_eq!(said(&trace).len(), 2, "started once, said once");
         assert_eq!(w.rows_for_status().len(), 1);
+    }
+
+    /// Task 3: the host-route reconcile rides the announcers' own 3 s tick and the same row
+    /// set, so a member with no `[[workload]]` row never runs it at all and a member with one
+    /// originates the /32 and fills the nft set the stray drop reads.
+    #[test]
+    fn the_tick_reconciles_the_host_routes_beside_the_announcers() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(rec()),
+            opens,
+            t0,
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("workload-routes")),
+            "the reconcile is the tick's, not start's: {:?}",
+            sys.calls
+        );
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
+        assert!(
+            sys.ran(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.103/32"
+            ),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            sys.ran("nft add element inet cfab-fwd cfab-work-vms-local { 192.168.20.103 }"),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// The reconcile's own journal is the supervisor's journal: a fault it names is said on
+    /// stderr and to the trace, exactly once, like every other repeating condition here.
+    #[test]
+    fn what_the_host_route_reconcile_says_reaches_the_journal_once() {
+        let (sys, view) = wl(None);
+        let mut sys = sys.on_fail(
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            1,
+            "Cannot talk to rtnetlink",
+        );
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        for n in [3, 6] {
+            w.tick(
+                &mut sys,
+                &view,
+                &mut RecordingIo::default(),
+                t0 + Duration::from_secs(n),
+            );
+        }
+        assert_eq!(
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("host routes unchanged"))
+                .collect::<Vec<_>>(),
+            vec![
+                "cfab: workload vms: cannot read the neighbors of cfab-work-vms; host routes \
+                 unchanged"
+            ]
+        );
+    }
+
+    /// A member with no `[[workload]]` row pays nothing: no reconcile, no reads, no request.
+    #[test]
+    fn a_member_without_workload_rows_runs_no_reconcile() {
+        let f = crate::model::Fabric::from_decl(
+            &crate::decl::Declaration::parse(&crate::decl::fixtures::example()).unwrap(),
+        )
+        .unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(rec()),
+            opens,
+            Instant::now(),
+        );
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), Instant::now());
+        assert!(sys.calls.is_empty(), "{:?}", sys.calls);
     }
 
     /// An uplink that cannot be identified after a successful apply (the bridge's last
