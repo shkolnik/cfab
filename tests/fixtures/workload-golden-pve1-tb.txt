@@ -71,6 +71,7 @@ table inet cfab {
   chain forward {
     type filter hook forward priority mangle; policy accept;
     iifname "cfab-work-vms" oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-vms-storage"
+    iifname "cfab-work-vms" oifname "cfab-gw249" ip dscp set cs2 comment "dscp-vms-gw249"
   }
 }
 
