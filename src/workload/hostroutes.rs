@@ -757,7 +757,9 @@ impl HostRoutes {
             Cond::Engine => unreachable!("Cond::Engine's cost is per-refusal; see ask_engine"),
             Cond::Probe => unreachable!("Cond::Probe's cost is per-fault; see maybe_probe"),
             Cond::AgeingTime => {
-                unreachable!("Cond::AgeingTime's cost is fixed at its one call site; see maybe_probe")
+                unreachable!(
+                    "Cond::AgeingTime's cost is fixed at its one call site; see maybe_probe"
+                )
             }
         };
         self.fail_costing(name, cond, why, cost, out);
@@ -1518,7 +1520,10 @@ mod tests {
           {"mac":"02:cf:ab:00:00:0b","ifname":"tap150i0","vlan":3,"master":"primary","state":""}
         ]"#;
         let mut sys = tick_sys("")
-            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], neigh)
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                neigh,
+            )
             .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb);
         let mut hr = HostRoutes::new();
         let mut fail_io = PartialFailIo {
@@ -1527,8 +1532,10 @@ mod tests {
         let t0 = Instant::now();
 
         let said = hr.tick(&mut sys, &v, &mut fail_io, t0);
-        let probe_lines: Vec<&String> =
-            said.iter().filter(|l| l.contains("idle-VM probe")).collect();
+        let probe_lines: Vec<&String> = said
+            .iter()
+            .filter(|l| l.contains("idle-VM probe"))
+            .collect();
         assert_eq!(
             probe_lines.len(),
             1,
@@ -1679,7 +1686,11 @@ mod tests {
         );
 
         hr.tick(&mut sys, &v, &mut io, t0 + PERIOD);
-        assert_eq!(shared.sent().len(), 2, "due at exactly PERIOD (5s), the floor");
+        assert_eq!(
+            shared.sent().len(),
+            2,
+            "due at exactly PERIOD (5s), the floor"
+        );
     }
 
     /// A deferred row has no leg: the wanted set is empty, the engine is told so with ifindex
