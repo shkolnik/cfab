@@ -57,16 +57,15 @@ pub fn host_warnings(sys: &mut dyn Sys, view: &View) -> Vec<String> {
             continue;
         };
         match uplink::ports_carrying_vid(sys, &up) {
-            Ok(ports) => {
-                for port in ports {
-                    out.push(format!(
-                        "warning: workload {}: uplink {port} carries vid {} (host stanza \
-                         bridge-vids?): the VLAN is host-local and must not reach the switch; \
-                         `up` defers this row until the vid is gone",
-                        row.wl.name, row.wl.vid
-                    ));
-                }
-            }
+            Ok(ports) if !ports.is_empty() => out.push(format!(
+                "warning: workload {}: vid {} is on uplink {} (host stanza bridge-vids?): the \
+                 VLAN is host-local and must not reach the switch; `up` defers this row until \
+                 the vid is gone",
+                row.wl.name,
+                row.wl.vid,
+                ports.join(", ")
+            )),
+            Ok(_) => {}
             Err(e) => out.push(format!(
                 "warning: workload {}: uplink port vid probe failed: {e}",
                 row.wl.name
@@ -275,9 +274,32 @@ mod tests {
         assert_eq!(
             host_warnings(&mut carrying, &view),
             vec![
-                "warning: workload vms: uplink eth0 carries vid 3 (host stanza bridge-vids?): \
+                "warning: workload vms: vid 3 is on uplink eth0 (host stanza bridge-vids?): \
                  the VLAN is host-local and must not reach the switch; `up` defers this row \
                  until the vid is gone"
+            ]
+        );
+        // Every carrying port in ONE line, and the same spelling `up` uses: two NICs in one
+        // bridge is this project's own additive-connectivity thesis, and an operator who reads
+        // only the first port removes only half the fault.
+        let mut both = base()
+            .link("/sys/class/net/eth1/device", "../../../0000:01:00.1")
+            .file("/sys/class/net/primary/brif/eth1/state", "3\n")
+            .file("/sys/class/net/eth1/ifindex", "3\n")
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":3}]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth1"],
+                r#"[{"ifname":"eth1","vlans":[{"vlan":3}]}]"#,
+            );
+        assert_eq!(
+            host_warnings(&mut both, &view),
+            vec![
+                "warning: workload vms: vid 3 is on uplink eth0, eth1 (host stanza \
+                 bridge-vids?): the VLAN is host-local and must not reach the switch; `up` \
+                 defers this row until the vid is gone"
             ]
         );
         // A clean port warns about nothing.

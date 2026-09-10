@@ -508,11 +508,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 continue;
             }
         };
-        if let Some(port) = carrying.first() {
+        if !carrying.is_empty() {
             warnings.push(format!(
-                "workload {name}: uplink {port} carries vid {} (host stanza bridge-vids?): \
-                 remove it; row deferred to the watchdog",
-                row.wl.vid
+                "workload {name}: vid {} is on uplink {} (host stanza bridge-vids?): remove \
+                 it; row deferred to the watchdog",
+                row.wl.vid,
+                carrying.join(", ")
             ));
             deferred_names.push(name.clone());
             workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
@@ -1896,7 +1897,7 @@ pub(crate) mod tests {
         let warnings = run(&mut carrying, &view, &opts()).unwrap();
         assert!(
             warnings.iter().any(|w| w
-                == "workload vms: uplink eth0 carries vid 3 (host stanza bridge-vids?): remove \
+                == "workload vms: vid 3 is on uplink eth0 (host stanza bridge-vids?): remove \
                     it; row deferred to the watchdog"),
             "{warnings:#?}"
         );
@@ -1928,7 +1929,7 @@ pub(crate) mod tests {
         let warnings = run(&mut carrying, &view, &opts()).unwrap();
         assert!(
             warnings.iter().any(|w| w
-                == "workload vms: uplink eth1 carries vid 3 (host stanza bridge-vids?): remove \
+                == "workload vms: vid 3 is on uplink eth1 (host stanza bridge-vids?): remove \
                     it; row deferred to the watchdog"),
             "{warnings:#?}"
         );
