@@ -20,7 +20,7 @@ COPY ${CFAB_DEB} /tmp/cfab.deb
 # without nf_tables — a real Synology, DSM 7.3.2 / 4.4) would silently be missing from the
 # image; without ethtool the image would run in the degraded no-ethtool mode by design (no
 # driver record, no link-speed cross-check) rather than by an accident of this install line.
-# Which backend is used is decided at `cfab up` against the host's kernel, not at build time.
+# Which backend is used is decided at apply time against the host's kernel, not at build time.
 # Add diagnostic tools (tcpdump, iputils-ping, ...) in a derived image if a deployment wants
 # them — they are not part of the generic contract.
 RUN apt-get update -qq \

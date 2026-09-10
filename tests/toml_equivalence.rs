@@ -102,7 +102,7 @@ fn render(fabric: &Fabric, view: &View<'_>, argv: &[String]) -> (String, String)
     let a: Vec<&str> = argv.iter().map(String::as_str).collect();
     let plain = |s: String| (s, String::new());
     match a.as_slice() {
-        ["check"] => plain(cfab::commands::check::report(fabric, view)),
+        ["check"] => plain(cfab::commands::check::report(fabric)),
         ["gen", "policy"] => plain(cfab::emit::policy::generate(view).expect("gen policy")),
         ["gen", "mark"] => plain(cfab::emit::mark::generate(view).expect("gen mark")),
         ["gen", "mark", "--backend", "iptables-legacy"] => {
@@ -189,6 +189,33 @@ fn with_gw_ports(file: &str, fixture: &str) -> String {
     )
 }
 
+/// Enumerated transform 4: `check`'s member lines. The shell era printed exactly one, for the
+/// member the run was scoped to:
+///
+/// ```text
+/// this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [...], ...
+/// ```
+///
+/// The TOML era scopes `check` to nothing — it reports every declared member, so its output is
+/// the same on every host and a diff across the cluster proves they hold the same file. The DATA
+/// in the line is unchanged, which is what equivalence is about, so this takes the new report
+/// back down to the old shape: keep the line for the member under capture, drop the other
+/// members', restore the old label. A no-op on every other artifact.
+fn one_member_line(file: &str, member: &str, rendered: &str) -> String {
+    if file != "check.txt" {
+        return rendered.to_string();
+    }
+    let mine = format!("member {member} (");
+    rendered
+        .lines()
+        .filter(|l| !l.starts_with("member ") || l.starts_with(&mine))
+        .map(|l| match l.strip_prefix("member ") {
+            Some(rest) => format!("this member: {}\n", rest.replacen("): ", "); ", 1)),
+            None => format!("{l}\n"),
+        })
+        .collect()
+}
+
 fn diff(label: &str, want: &str, got: &str) -> Option<String> {
     if want == got {
         return None;
@@ -217,7 +244,7 @@ fn every_artifact_matches_the_shell_format_capture() {
             if let Some(d) = diff(
                 &format!("{member} {file} (stdout)"),
                 &with_gw_ports(&file, &renamed(&fixture(member, &file))),
-                &without_leaf_filter(&file, &stdout),
+                &one_member_line(&file, member, &without_leaf_filter(&file, &stdout)),
             ) {
                 panic!("{d}");
             }
@@ -235,6 +262,56 @@ fn every_artifact_matches_the_shell_format_capture() {
 /// What `run` above stopped covering when it left the binary behind: argv parsing, the `Gen`
 /// dispatch arms, and the exact bytes `print!`/`eprintln!` put on each stream.
 ///
+/// `check` is the whole file's verdict, and a box that is no member of the fabric still gets it.
+///
+/// Before this, `check` loaded the declaration, ran the whole validation gate, PASSED it, and
+/// then exited nonzero anyway because the kernel hostname matched no `[[member]]` row — an exit
+/// status about the operator, dressed as a statement about the file. A laptop, a CI runner or a
+/// host renamed out of its row could not read a verdict on a file it holds.
+///
+/// This runs the real binary against the UNMODIFIED example, whose three rows are `pveN-tb`. It
+/// therefore only means anything on a box that is not one of them, which is every box that is
+/// not the testbed — so it asserts the premise first rather than passing vacuously.
+#[test]
+fn check_reports_the_whole_file_on_a_box_that_is_no_member() {
+    let me = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .expect("a kernel hostname")
+        .trim()
+        .to_string();
+    if MEMBERS.contains(&me.as_str()) {
+        return; // on the testbed itself the premise does not hold; the sibling test covers it
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fabric.toml");
+    std::fs::write(&path, example()).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cfab"))
+        .arg("--config")
+        .arg(&path)
+        .arg("check")
+        .output()
+        .expect("the cfab binary runs");
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(
+        out.status.success(),
+        "check must succeed on a valid file whoever runs it: exit {:?}\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The verdict, and every member's row — not just some member's.
+    assert!(stdout.starts_with("fabric.toml OK: "), "{stdout}");
+    for m in MEMBERS {
+        assert!(stdout.contains(&format!("\nmember {m} (")), "{stdout}");
+    }
+    // ...and it says what it could not do, rather than reading as a clean bill of health.
+    assert!(
+        stdout.contains(&format!(
+            "this host: {me} is not a declared member of this fabric; host checks skipped\n"
+        )),
+        "{stdout}"
+    );
+}
+
 /// Identity is the kernel hostname now, so this does not name a member — it hands the binary a
 /// declaration in which THIS box IS a member, by copying the example and renaming one row (the
 /// name appears exactly once in the file). Then it asserts the binary's two streams equal what
@@ -274,13 +351,21 @@ fn cfab_prints_exactly_what_the_library_renders() {
             String::from_utf8_lossy(&out.stderr)
         );
         let (want, want_err) = run(&path, &me, &argv);
-        // `check` is the one artifact whose CLI form prints live host facts before the report,
-        // so compare only the tail the library owns; every other artifact is compared whole.
+        // `check` is the one artifact whose CLI form prints more than the library call: the
+        // file's report FIRST, then this host's own line and whatever the live host checks say.
+        // So the library's render is a prefix here, and only here; every other artifact is
+        // compared whole. (Prefix, not suffix: the host section moved below the report so a
+        // host that cannot carry a row can no longer suppress the file's verdict.)
         let got = String::from_utf8(out.stdout).expect("utf-8 stdout");
         if file == "check.txt" {
             assert!(
-                got.ends_with(&want),
-                "{file}: the binary's report tail differs from the library's\n--- want tail ---\n{want}\n--- got ---\n{got}"
+                got.starts_with(&want),
+                "{file}: the binary's report head differs from the library's\n--- want head ---\n{want}\n--- got ---\n{got}"
+            );
+            // and the host line the library does NOT render is there, naming this box
+            assert!(
+                got[want.len()..].starts_with(&format!("this host: {me}\n")),
+                "{file}: the host line is missing or does not name this box\n--- got ---\n{got}"
             );
         } else if let Some(d) = diff(&format!("{file} (binary vs library)"), &want, &got) {
             panic!("{d}");
