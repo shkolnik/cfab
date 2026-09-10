@@ -538,7 +538,7 @@ fn restore_workload_legs(
         if !uplink::bridge_present(sys, bridge) {
             continue;
         }
-        match leg::present(sys, &leg, vid) {
+        match leg::present(sys, &leg, bridge, vid) {
             Ok(true) => match leg::ensure_self_vid(sys, &view.fabric.run_dir, bridge, vid) {
                 Ok(true) => restored.push(format!(
                     "re-added vid {vid} on bridge {bridge} itself (workload {name})"
@@ -573,10 +573,13 @@ fn build_workload_row(
     leg::install(
         sys,
         &f.run_dir,
-        &leg,
-        &row.wl.uplink,
-        row.wl.vid,
-        &row.address,
+        &leg::LegSpec {
+            leg: &leg,
+            uplink: &row.wl.uplink,
+            vid: row.wl.vid,
+            address: &row.address,
+            gw_cidr: &row.wl.gw_cidr(),
+        },
         &qos,
     )?;
     run_ok(
@@ -982,7 +985,7 @@ fn leg_absent(
     if !link_exists(sys, ifname)? {
         return Ok(true);
     }
-    if !link_kind_is(sys, ifname, &apply::vlan_marker(vid))? {
+    if !apply::vlan_identity_is(sys, ifname, lower, vid)? {
         unrestored.push(apply::not_our_vlan(ifname, lower, vid));
     }
     Ok(false)
@@ -1315,7 +1318,11 @@ pub(crate) mod tests {
             sys = sys
                 .on_stdout(
                     &["ip", "-d", "link", "show", &leg],
-                    &format!("9: {leg}: <UP> {} \n", apply::vlan_marker(r.wl.vid)),
+                    &format!(
+                        "9: {leg}@{}: <UP> {} \n",
+                        r.wl.uplink,
+                        apply::vlan_marker(r.wl.vid)
+                    ),
                 )
                 .on_stdout(
                     &["bridge", "-j", "vlan", "show", "dev", &r.wl.uplink],
@@ -2029,27 +2036,29 @@ pub(crate) mod tests {
     /// in. Wires answer `ip link show`; each class leg, gw leg and bond port answers `ip -d link
     /// show` with its vlan marker, each bond with " bond ".
     pub(crate) fn legs_present(mut sys: MockSys, view: &View) -> MockSys {
-        let mut vlans: Vec<(String, u16)> = view
+        // `<name>@<parent>`, as the kernel prints it: the identity check reads the parent out
+        // of this same line, so a fixture without it is a leg on the wrong bridge.
+        let mut vlans: Vec<(String, String, u16)> = view
             .class_rows()
             .into_iter()
-            .map(|r| (r.ifname, r.vid))
+            .map(|r| (r.ifname, r.wire, r.vid))
             .collect();
         for r in view.gw_rows() {
             if r.migrates() {
                 sys = bond_kind(sys, &r.ifname);
-                vlans.extend(r.ports.into_iter().map(|s| (s.ifname, r.vid)));
+                vlans.extend(r.ports.into_iter().map(|s| (s.ifname, s.wire, r.vid)));
             } else {
-                vlans.push((r.ifname, r.vid));
+                vlans.push((r.ifname, r.home, r.vid));
             }
         }
         for r in view.fallback_rows() {
             sys = bond_kind(sys, &r.ifname);
-            vlans.extend(r.ports.into_iter().map(|s| (s.ifname, r.vid)));
+            vlans.extend(r.ports.into_iter().map(|s| (s.ifname, s.wire, r.vid)));
         }
-        for (ifname, vid) in vlans {
+        for (ifname, lower, vid) in vlans {
             sys = sys.on_stdout(
                 &["ip", "-d", "link", "show", &ifname],
-                &format!("9: {ifname}: <UP> {} \n", apply::vlan_marker(vid)),
+                &format!("9: {ifname}@{lower}: <UP> {} \n", apply::vlan_marker(vid)),
             );
         }
         sys

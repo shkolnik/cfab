@@ -135,8 +135,11 @@ re\-reads the declaration and acts on it (see
 below), while
 .B SIGTERM
 runs the stop sequence: forwarding off first, then each child is signalled and
-given 10 s before SIGKILL, then the fabric is torn down. Only one supervisor
-runs at a time, guarded by a lock on the run dir.
+given 10 s before SIGKILL, then the fabric is torn down \(em everything
+.B down
+removes except the workload leg netdev, which a stop keeps (see
+.BR WORKLOADS ).
+Only one supervisor runs at a time, guarded by a lock on the run dir.
 .TP
 .B down
 Remove everything cfab applied and restore FRR to its pre-fabric state. Never
@@ -847,7 +850,19 @@ removes everything
 added on this member, the leg included, and \(em only if cfab is the one that
 added it \(em the vid on the bridge; never the
 .B uplink
-bridge itself, and never a vid the host already had. The watchdog restores
+bridge itself, and never a vid the host already had. Stopping the service
+(a restart or a package upgrade included) removes the same things
+.I except
+the leg netdev, which stays with this member's address: deleting it would flush
+the kernel neighbor entries that record which VMs live here, and an idle VM
+would go unannounced until it next sent traffic. Neighbor entries live on the
+netdev, so the bridge's vid is not part of that: it goes back under the same
+ownership test, and
+.B up
+re\-adds it. The anycast
+.B gw
+address still comes off, so a stopped member stops answering for the gateway.
+The watchdog restores
 anything of it found missing or wrong, the leg and the bridge's vid included.
 .PP
 A VM's DHCP lease should carry option 121 (RFC 3442) with the fabric

@@ -218,7 +218,10 @@ A `[[workload]]` row declares a VM VLAN cfab reaches into the fabric — an anyc
 member answers, a passive OSPF advertisement into the zones it may reach, and a symmetric
 forward policy. `uplink` is the host's own vlan-aware bridge carrying the VMs and `vid` is the
 VLAN they are on; cfab creates its own leg `cfab-work-<name>` on that bridge (and gives the
-bridge that vid on itself), and removes both again on `down`.
+bridge that vid on itself), and removes both again on `down`. A `systemctl stop`/`restart` (a
+package upgrade included) keeps the leg itself and gives the vid back: deleting the leg would
+flush the kernel neighbor entries that are this member's record of which VMs live here, and an
+idle VM would go unannounced until it next sent something.
 
 ```toml
 [[workload]]
@@ -281,6 +284,12 @@ the condition clears.
   rules, the forward accepts, the DSCP hook, the second address, the bridge guard, the leg
   itself, and — only if cfab is the one that added it — the vid on the bridge. It stops the
   announcer, and it never touches the `uplink` bridge or a vid the host already had.
+- **Stopping the service removes** the same things with one exception: the leg netdev stays,
+  with this member's own address, so a restart keeps its neighbor entries and the VMs on it stay
+  announced. The bridge's vid is not part of that (neighbor entries live on the netdev), so it
+  goes back under the same ownership test `down` uses and `up` re-adds it. The anycast `gw`
+  address still goes, so a stopped member stops answering for the gateway and VMs re-resolve it
+  to a live one.
 - **The watchdog restores** anything of the above it finds missing or wrong, the leg and the
   bridge's vid included, the same way it restores every other cfab-owned interface, rule, or
   sysctl.

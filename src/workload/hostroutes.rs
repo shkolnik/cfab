@@ -674,6 +674,29 @@ mod tests {
         );
     }
 
+    /// The restart case: the leg now outlives a `systemctl restart cfab`, so its neighbor
+    /// entries do too — and an entry nothing has touched for 30 s is STALE, not REACHABLE. An
+    /// idle VM must still be a VM on the first tick after the restart, with no new traffic from
+    /// it. `read_local_vms` re-reads the whole table every tick (there is no event-only path to
+    /// miss it), so this pins the one thing that could silence it: the state list.
+    #[test]
+    fn a_stale_neighbor_entry_is_a_vm_so_an_idle_one_survives_a_restart() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        let fdb = r#"[{"mac":"02:cf:ab:00:00:0a","ifname":"tap100i0","master":"primary"}]"#;
+        for state in ["REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"] {
+            let neigh = format!(
+                r#"[{{"dst":"192.168.20.107","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:0a","state":["{state}"]}}]"#
+            );
+            assert_eq!(
+                local_vms(&neigh, fdb, &v, wl, &["eth0".to_string()]).unwrap(),
+                set(&["192.168.20.107"]),
+                "{state} is a resolved VM"
+            );
+        }
+    }
+
     /// An unresolved neighbor is not a VM, and a document that does not parse is not an empty
     /// set: `None` is what stops a failed read from withdrawing every route.
     #[test]

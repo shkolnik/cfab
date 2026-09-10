@@ -70,7 +70,7 @@ mod workload_lifecycle {
                 &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
                 "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             );
-        teardown::run(&mut sys, &view).unwrap();
+        teardown::run(&mut sys, &view, teardown::Teardown::Down).unwrap();
 
         let calls = &sys.calls;
         let count = |s: &str| calls.iter().filter(|c| c.contains(s)).count();
