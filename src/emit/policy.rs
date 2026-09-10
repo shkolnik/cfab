@@ -155,31 +155,65 @@ pub fn generate_seeded(
 /// one producer against itself, so the two forms never have to normalize to each other.
 pub fn without_local_elements(text: &str) -> String {
     let mut out = String::new();
-    let mut skip_to_depth: Option<i32> = None;
+    // The depth OUTSIDE the `-local` set block we are inside, when we are inside one.
+    let mut in_local: Option<i32> = None;
+    // The unbalanced braces of an element list still being skipped: nft wraps a long one over
+    // several lines. Skipped lines never move `depth` — the clause is balanced as a whole.
+    let mut skip = 0i32;
     let mut depth = 0i32;
     for line in text.lines() {
         let t = line.trim();
-        let before = depth;
-        depth += balance(t);
-        if let Some(d) = skip_to_depth {
-            if depth <= d {
-                skip_to_depth = None;
-            }
+        let bal = balance(t);
+        if skip > 0 {
+            skip = (skip + bal).max(0);
             continue;
         }
-        if is_local_set_open(t) {
-            let indent = &line[..line.len() - line.trim_start().len()];
-            let name = t.split_whitespace().nth(1).unwrap_or_default();
-            out.push_str(&format!("{indent}set {name} {{ }}\n"));
-            if depth > before {
-                skip_to_depth = Some(before); // a block: drop it through its closing brace
-            }
+        if in_local.is_some() && t.starts_with("elements = {") {
+            skip = bal.max(0);
             continue;
+        }
+        let outside = depth;
+        depth += bal;
+        if in_local.is_some_and(|d| depth <= d) {
+            in_local = None; // this line closed the block, and is kept
+        } else if is_local_set_open(t) {
+            if bal > 0 {
+                in_local = Some(outside); // a block; its `elements` lines go above
+            } else {
+                // This emitter's one-line set: the clause is cut out of the line in place,
+                // leaving the type and everything else exactly as written.
+                out.push_str(&without_elements_clause(line));
+                out.push('\n');
+                continue;
+            }
         }
         out.push_str(line);
         out.push('\n');
     }
     out
+}
+
+/// One line with its ` elements = { … }` clause removed, braces matched so a nested one cannot
+/// cut the line short. A line without the clause comes back unchanged.
+fn without_elements_clause(line: &str) -> String {
+    let Some(at) = line.find(" elements = {") else {
+        return line.to_string();
+    };
+    let open = at + line[at..].find('{').expect("the clause carries its brace");
+    let mut depth = 0i32;
+    for (i, c) in line[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return format!("{}{}", &line[..at], &line[open + i + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    line.to_string()
 }
 
 /// The opening of a set whose name is a workload row's local set (`Workload::local_set`).
@@ -447,6 +481,23 @@ mod tests {
         assert_ne!(
             without_local_elements(empty),
             without_local_elements("table inet cfab-fwd {\n}\n")
+        );
+        // Only the ELEMENTS are excused. The rest of the set's body is generated state like
+        // any other, so a changed type is drift `up` does repair, in both renderings.
+        assert_ne!(
+            without_local_elements(filled),
+            without_local_elements(&filled.replace("ipv4_addr", "ipv6_addr")),
+            "a one-line set's type must survive the normalizer"
+        );
+        assert_ne!(
+            without_local_elements(nft_filled),
+            without_local_elements(&nft_filled.replace("ipv4_addr", "ipv6_addr")),
+            "a set block's type must survive the normalizer"
+        );
+        assert!(
+            without_local_elements(nft_filled).contains("type ipv4_addr"),
+            "{}",
+            without_local_elements(nft_filled)
         );
     }
 
