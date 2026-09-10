@@ -74,6 +74,47 @@ fn parse_self_vids(json: &str, bridge: &str) -> BTreeSet<u16> {
     out
 }
 
+/// The netdev, if any, that already holds `vid` on `uplink` and is not our own `leg`.
+///
+/// The kernel allows exactly ONE 802.1Q device per (parent, vid): a host stanza that declares
+/// `<bridge>.<vid>` (the pre-0.5.3 shape) takes the pair, and `ip link add … type vlan id <vid>`
+/// then fails with `8021q: VLAN device already exists`. That failure used to take the whole
+/// member down (apply errors, the supervisor exits 3, `RestartPreventExitStatus=3` keeps it
+/// down), so the caller defers the row instead — which needs the holder's NAME, to say what to
+/// remove. VERIFIED shape (pve1-tb, iproute2 6.15.0, 2026-09-10):
+/// `[{"ifindex":661,"link":"eth9","ifname":"cfab-st",…,"linkinfo":{"info_kind":"vlan",
+/// "info_data":{"protocol":"802.1Q","id":100,…}}}]`.
+pub fn foreign_holder(
+    sys: &mut dyn Sys,
+    uplink: &str,
+    vid: u16,
+    leg: &str,
+) -> Result<Option<String>> {
+    let out = run_ok(sys, &["ip", "-d", "-j", "link", "show", "type", "vlan"])?;
+    Ok(parse_foreign_holder(&out.stdout, uplink, vid, leg))
+}
+
+/// The `ifname` of the first entry whose parent is `uplink` and whose vlan id is `vid`, other
+/// than `leg` itself. Anything unparsable — not JSON, a missing `link`/`ifname`/`id` — is simply
+/// not a holder we can name, the same tolerance `parse_self_vids` takes: a false "no holder"
+/// leaves the kernel to refuse the add as it did before, while a false holder would defer a row
+/// that could have come up.
+fn parse_foreign_holder(json: &str, uplink: &str, vid: u16, leg: &str) -> Option<String> {
+    let doc = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    doc.as_array()?.iter().find_map(|entry| {
+        let ifname = entry.get("ifname")?.as_str()?;
+        if ifname == leg || entry.get("link")?.as_str()? != uplink {
+            return None;
+        }
+        let id = entry
+            .get("linkinfo")?
+            .get("info_data")?
+            .get("id")?
+            .as_u64()?;
+        (u16::try_from(id).ok()? == vid).then(|| ifname.to_string())
+    })
+}
+
 /// Create (or repair) the leg and give the bridge the vid if it lacks it.
 ///
 /// `mk_vlan` is the same builder every other cfab leg uses, so a netdev of this name that is
@@ -213,6 +254,74 @@ mod tests {
             parse_self_vids("Cannot find device", "primary"),
             BTreeSet::new()
         );
+    }
+
+    /// The VERIFIED output shape of `ip -d -j link show type vlan` (pve1-tb, iproute2 6.15),
+    /// trimmed to the fields the walk reads: a foreign holder of vid 3 on `primary`, cfab's
+    /// own storage leg on another parent, and cfab's own workload leg.
+    const VLAN_SHOW: &str = r#"[{"ifindex":661,"link":"eth9","ifname":"cfab-st","linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":100}}},{"ifindex":662,"link":"primary","ifname":"primary.3","linkinfo":{"info_kind":"vlan","info_data":{"protocol":"802.1Q","id":3}}}]"#;
+
+    #[test]
+    fn a_foreign_vlan_device_holding_the_uplinks_vid_is_named() {
+        assert_eq!(
+            parse_foreign_holder(VLAN_SHOW, "primary", 3, "cfab-work-vms"),
+            Some("primary.3".to_string())
+        );
+    }
+
+    #[test]
+    fn cfabs_own_leg_is_not_a_foreign_holder_of_its_own_vid() {
+        let own = r#"[{"link":"primary","ifname":"cfab-work-vms","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#;
+        assert_eq!(
+            parse_foreign_holder(own, "primary", 3, "cfab-work-vms"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_same_vid_device_on_a_different_parent_is_not_a_holder() {
+        // vid 3 is only ever taken per (parent, vid): `primary2.3` does not block `primary`.
+        let elsewhere = r#"[{"link":"primary2","ifname":"primary2.3","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#;
+        assert_eq!(
+            parse_foreign_holder(elsewhere, "primary", 3, "cfab-work-vms"),
+            None
+        );
+        // And a different vid on the right parent is not one either.
+        assert_eq!(
+            parse_foreign_holder(VLAN_SHOW, "primary", 4, "cfab-work-vms"),
+            None
+        );
+    }
+
+    #[test]
+    fn unparsable_vlan_json_or_a_missing_field_claims_no_holder() {
+        assert_eq!(
+            parse_foreign_holder("Cannot find device", "primary", 3, "cfab-work-vms"),
+            None
+        );
+        assert_eq!(
+            parse_foreign_holder("[]", "primary", 3, "cfab-work-vms"),
+            None
+        );
+        // Present but shapeless: no `link`, no `id`, no `ifname` — never a holder.
+        let partial = r#"[{"ifname":"primary.3","linkinfo":{"info_kind":"vlan"}},{"link":"primary","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#;
+        assert_eq!(
+            parse_foreign_holder(partial, "primary", 3, "cfab-work-vms"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_holder_probe_asks_the_kernel_for_vlan_devices() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+            VLAN_SHOW,
+        );
+        assert_eq!(
+            foreign_holder(&mut sys, "primary", 3, "cfab-work-vms").unwrap(),
+            Some("primary.3".to_string())
+        );
+        assert!(sys.ran("ip -d -j link show type vlan"));
     }
 
     #[test]

@@ -1830,13 +1830,15 @@ fn workload_posture(
         let gw_cidr = wl.gw_cidr();
 
         if deferred.contains(name) {
-            // Two deferral causes, two spellings: an absent bridge is the operator's to create
-            // (or to rename back), and naming it is the whole point of the line; anything else
-            // is the uplink's own readiness, which clears on its own.
+            // An absent bridge is the one cause status can see for itself, and it is the
+            // operator's to fix, so it is named. Every other cause is only in
+            // `workload-deferred`, which carries names and no reasons: the line points at the
+            // apply warning instead of guessing (rack, 2026-09-10 — a row deferred because a
+            // host stanza held its vid was reported as "uplink not forwarding yet").
             if crate::workload::uplink::bridge_present(&*sys, &wl.uplink) {
                 c.settling(format!(
-                    "workload {name}: deferred (uplink not forwarding yet; the watchdog installs \
-                     it once it is)"
+                    "workload {name}: deferred (the apply warning in the journal names why; the \
+                     watchdog installs it when that clears)"
                 ));
             } else {
                 c.settling(format!(
@@ -3795,7 +3797,8 @@ mod tests {
 
     /// A row deferred because its declared bridge is not on the host yet says exactly that, and
     /// says it once (spec §5.1, James's availability ruling): the bridge is the operator's, and
-    /// "uplink not forwarding yet" would name the wrong thing to go look at.
+    /// the generic "the apply warning names why" would send the reader to the journal for the
+    /// one cause status can see for itself.
     #[test]
     fn a_row_deferred_for_a_missing_bridge_names_the_bridge() {
         let f = wl_fabric();
@@ -3844,10 +3847,13 @@ mod tests {
             1,
             "one line, not a pile of live-check faults: {deferred:?}"
         );
+        // The status path reads only `workload-deferred`, which carries names and no causes:
+        // it must point at the apply warning rather than guess one (rack, 2026-09-10 — a row
+        // deferred because a host stanza held its vid was reported as "not forwarding yet").
         assert_eq!(
             deferred[0].text,
-            "workload vms: deferred (uplink not forwarding yet; the watchdog installs it once \
-             it is)"
+            "workload vms: deferred (the apply warning in the journal names why; the watchdog \
+             installs it when that clears)"
         );
         assert_eq!(deferred[0].class, Class::Settling);
     }

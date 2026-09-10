@@ -455,6 +455,37 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
             continue;
         }
+        // The kernel allows one 802.1Q device per (parent, vid). A host stanza that already
+        // declares `<bridge>.<vid>`, or any other tool that took the pair, owns it — building
+        // the leg would fail with `8021q: VLAN device already exists`, which used to take the
+        // WHOLE member down (VERIFIED on the rack 2026-09-10). Fourth deferral under James's
+        // availability ruling of 2026-09-09, with the holder and the remedy named.
+        //
+        // A probe that cannot RUN (no `ip`, an iproute2 too old for `-j`/`type vlan`) defers the
+        // row too, exactly as the identify/STP probes above do with their own failures: turning
+        // an unanswerable question into a fatal would reintroduce the dark member this branch
+        // exists to prevent.
+        let holder = match leg::foreign_holder(sys, bridge, row.wl.vid, &leg) {
+            Ok(holder) => holder,
+            Err(e) => {
+                warnings.push(format!(
+                    "workload {name}: vid holder probe failed: {e}; row deferred to the watchdog"
+                ));
+                deferred_names.push(name.clone());
+                workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
+                continue;
+            }
+        };
+        if let Some(dev) = holder {
+            warnings.push(format!(
+                "workload {name}: vid {} on {bridge} is held by {dev} (a host stanza?): remove \
+                 it; row deferred to the watchdog",
+                row.wl.vid
+            ));
+            deferred_names.push(name.clone());
+            workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
+            continue;
+        }
         workload_descs.push(format!(
             "{name} on {leg} ({} {})",
             uplink_word(&up.ports),
@@ -1714,6 +1745,101 @@ pub(crate) mod tests {
         );
         // Everything else still applies: the policy loaded, forwarding still went on.
         assert!(listening.ran("nft -f /run/cfab/policy.nft"));
+    }
+
+    // VERIFIED on the rack 2026-09-10 12:10 UTC: a host stanza that already declares
+    // `primary.3` owns the (parent, vid) pair the leg needs, `ip link add … type vlan id 3`
+    // fails with `8021q: VLAN device already exists`, and apply used to return that error —
+    // supervisor exit 3, RestartPreventExitStatus, the whole member dark. James's ruling: defer
+    // the one row, name the remedy, let the watchdog install it when the device is gone.
+    #[test]
+    fn up_defers_a_row_whose_vid_is_held_by_a_foreign_vlan_device() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut held = sys.on_stdout(
+            &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+            r#"[{"ifname":"primary.3","link":"primary","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#,
+        );
+        let warnings = run(&mut held, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "workload vms: vid 3 on primary is held by primary.3 (a host stanza?): \
+                    remove it; row deferred to the watchdog"),
+            "{warnings:#?}"
+        );
+        assert!(!held.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!held.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            held.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // The member still comes up whole: policy loaded, the bridge guard rendered over the
+        // identified uplink (harmless before the leg exists), arp_ignore set.
+        assert!(held.ran("nft -f /run/cfab/policy.nft"));
+        assert!(held.ran("nft -f /run/cfab/workload-bridge.nft"));
+        assert_eq!(
+            held.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
+            vec!["1"]
+        );
+    }
+
+    // The probe is a command, and a command can fail to run at all (no `ip`, an iproute2 too
+    // old for `-j`/`type vlan`, a transient exec error). Propagating that out of `run` would
+    // exit 3 and take the member dark — the exact class this whole fix removes — so a failed
+    // probe defers the row like every other workload precondition.
+    //
+    // Driven by a nonzero exit rather than `MockSys::fail_exec`: `fail_exec` matches its needle
+    // against each argv ELEMENT, so the full command line never matches, and the only elements
+    // that would (`ip`, `vlan`) also poison every class leg later in the same apply.
+    #[test]
+    fn up_defers_a_row_when_the_vid_holder_probe_fails() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut broken = sys.on_fail(
+            &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+            255,
+            "Command \"vlan\" is unknown, try \"ip link help\".",
+        );
+        let warnings = run(&mut broken, &view, &opts()).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.starts_with("workload vms: vid holder probe failed: "))
+            .unwrap_or_else(|| panic!("{warnings:#?}"));
+        assert!(
+            warning.ends_with("; row deferred to the watchdog"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("ip -d -j link show type vlan: exit 255"),
+            "the failure names the command that failed: {warning}"
+        );
+        assert!(!broken.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!broken.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            broken.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        assert!(broken.ran("nft -f /run/cfab/policy.nft"));
+    }
+
+    #[test]
+    fn up_is_idempotent_over_its_own_leg_holding_the_vid() {
+        // The only vlan device on (primary, 3) is the leg cfab itself built on a previous run:
+        // that is not a foreign holder, and the row applies as normal.
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut ours = sys.on_stdout(
+            &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+            r#"[{"ifname":"cfab-work-vms","link":"primary","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#,
+        );
+        let warnings = run(&mut ours, &view, &opts()).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("is held by")),
+            "{warnings:#?}"
+        );
+        assert!(ours.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            ours.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec![""],
+            "rows declared, none deferred: the file is written empty"
+        );
     }
 
     #[test]
