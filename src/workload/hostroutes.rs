@@ -853,14 +853,22 @@ mod tests {
     /// pve1-tb with the leg up, one VM on a tap, and an empty nft set: the tick must originate
     /// the /32 at the engine and add the element.
     fn tick_sys(elements: &str) -> MockSys {
+        tick_sys_with(NEIGH, FDB, elements)
+    }
+
+    /// `tick_sys` with the neigh/FDB documents parameterized, so a test can drive `HostRoutes`
+    /// across several ticks with a different live-VM picture each time (gate C fix round 2,
+    /// reviewer note 6: the ACK-vs-FDB ordering race needs exactly this — the same row, several
+    /// ticks, a different `local_vms` answer at each one).
+    fn tick_sys_with(neigh: &str, fdb: &str, elements: &str) -> MockSys {
         MockSys::default()
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
-            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], NEIGH)
-            .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], FDB)
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], neigh)
+            .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb)
             .on_stdout(
                 &["nft", "-j", "list", "set", "inet", "cfab-fwd"],
                 &format!(
@@ -923,6 +931,95 @@ mod tests {
             "the leg address must not reach the local set: {:?}",
             sys.calls
         );
+    }
+
+    /// The ordering hazard between a relayed DHCPACK's `Cmd::DhcpAck` neighbor write and this
+    /// tick's own FDB-gated `local_vms` read (gate C fix round 2, reviewer note 6). The ACK
+    /// write is `ip neigh replace` (`supervisor/mod.rs`'s `Cmd::DhcpAck` handler): it lands the
+    /// instant the ACK is relayed. `local_vms` requires MORE than a resolved neighbor, though —
+    /// the same MAC must also appear in the bridge FDB on a non-uplink port
+    /// (`the_gw_and_a_mac_with_no_fdb_entry_are_never_local`), which only happens once the VM
+    /// has sent a bridge-visible frame. If a tick lands in that gap AND this address's
+    /// hold-down had already fully expired (a VM that went fully quiet and is now getting a
+    /// fresh lease for the SAME address), `local_vms` reports it absent exactly as if it were
+    /// still gone, and the level-triggered reconcile withdraws it — the very address the ACK
+    /// just earned a neighbor entry for. It self-heals the next tick once the FDB catches up;
+    /// this pins that shape happens and recovers, so a future change cannot silently drop the
+    /// self-heal half.
+    #[test]
+    fn an_ack_that_beats_the_fdb_is_withdrawn_once_then_self_heals() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        let vm = "192.168.20.150";
+        let mac = "02:cf:ab:00:00:aa";
+        let resolved = format!(
+            r#"[{{"dst":"{vm}","dev":"cfab-work-vms","lladdr":"{mac}","state":["REACHABLE"]}}]"#
+        );
+        let on_tap = format!(r#"[{{"mac":"{mac}","ifname":"tap100i0","master":"primary"}}]"#);
+
+        // Tick 1 (t0): live, MAC on the tap. Wanted; the hold-down entry is armed with no
+        // deadline yet (still live).
+        let mut up = tick_sys_with(&resolved, &on_tap, "");
+        hr.tick(&mut up, &v, t0);
+        assert!(
+            up.ran(&format!(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.2/32 {vm}/32"
+            )),
+            "{:?}",
+            up.calls
+        );
+
+        // Tick 2 (t0 + 1s): the VM has gone fully quiet — absent from both documents. This is
+        // the FIRST tick that observes it missing, so the hold-down deadline is armed from HERE
+        // (`t0 + 1s + HOLDDOWN`), not from t0 — held for now.
+        let quiet_at = t0 + Duration::from_secs(1);
+        let mut quiet = tick_sys_with("[]", "[]", &format!(r#","elem":["{vm}"]"#));
+        hr.tick(&mut quiet, &v, quiet_at);
+        assert!(
+            !quiet.calls.iter().any(|c| c.contains("nft delete")),
+            "still inside the hold-down window: {:?}",
+            quiet.calls
+        );
+
+        // Tick 3, AT the deadline (`quiet_at + HOLDDOWN`): a fresh DHCPACK for the SAME address
+        // has just been relayed — `ip -j neigh show` reports it resolved again (the write this
+        // test stands in for is `Cmd::DhcpAck`'s `ip neigh replace`) — but the bridge has not
+        // yet learned the MAC on a port, so `local_vms` still reads it as absent. The hold-down
+        // was already due: withdrawn, on the very tick the ACK landed.
+        let deadline = quiet_at + HOLDDOWN;
+        let mut race = tick_sys_with(&resolved, "[]", &format!(r#","elem":["{vm}"]"#));
+        hr.tick(&mut race, &v, deadline);
+        assert!(
+            race.ran(&format!(
+                "nft delete element inet cfab-fwd cfab-work-vms-local {{ {vm} }}"
+            )),
+            "the ACK's neighbor write is not enough on its own; withdrawn: {:?}",
+            race.calls
+        );
+        assert!(
+            race.ran("unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 192.168.20.2/32"),
+            "the /32 must not still be asked for: {:?}",
+            race.calls
+        );
+
+        // Tick 4: the FDB catches up (the VM's first bridge-visible frame lands). Self-heals —
+        // re-originated with no further DHCP traffic needed.
+        let mut healed = tick_sys_with(&resolved, &on_tap, "");
+        hr.tick(&mut healed, &v, deadline + Duration::from_secs(1));
+        assert!(
+            healed.ran(&format!(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.2/32 {vm}/32"
+            )),
+            "self-heal: {:?}",
+            healed.calls
+        );
+        assert!(healed.ran(&format!(
+            "nft add element inet cfab-fwd cfab-work-vms-local {{ {vm} }}"
+        )));
     }
 
     /// Level-triggered both ways: an element nft holds that we no longer want is deleted, and
