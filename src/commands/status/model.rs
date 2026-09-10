@@ -361,7 +361,67 @@ pub struct WorkloadStatus {
     pub stray_forwards: Option<u64>,
 }
 
-/// Which member this gather describes.
+/// Which default route this member's own traffic takes right now (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultPath {
+    /// cfab's additive default in table 250, through the fabric gateway.
+    Fabric { via: String, dev: String },
+    /// The host's own default in main — the floor cfab adds to and never removes.
+    Floor { via: String, dev: String },
+    /// Neither table holds one: this member has no default route at all.
+    None,
+}
+
+/// Why this member's own traffic is not taking the fabric gateway. Typed, not prose, so the
+/// metric can tell "this host has no gw zone at all" from "its router went dark" without
+/// matching on the text of a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultReason {
+    /// The ingress prober says no wire of the gw leg reaches the router.
+    RouterUnreachable,
+    /// This member declares no `gw` zone, so cfab never had a default to add (every leaf).
+    NoGwZone,
+    /// Table 250 is empty and nothing says the router is dark: cfab is down, `down` ran, or the
+    /// install failed.
+    Withdrawn,
+}
+
+impl DefaultReason {
+    /// The one spelling of each, in status prose.
+    pub fn word(self) -> &'static str {
+        match self {
+            DefaultReason::RouterUnreachable => "router unreachable",
+            DefaultReason::NoGwZone => "no gw zone",
+            DefaultReason::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// The host default as `status` read it: which path locally originated traffic takes, and why
+/// it is not the fabric one when it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDefault {
+    pub path: DefaultPath,
+    /// `None` while the fabric default is in force.
+    pub reason: Option<DefaultReason>,
+}
+
+impl HostDefault {
+    /// The line `status` prints after `default: `.
+    pub fn render(&self) -> String {
+        let head = match &self.path {
+            DefaultPath::Fabric { via, dev } => format!("via fabric gw {via} ({dev})"),
+            DefaultPath::Floor { via, dev } => format!("via floor {via} ({dev})"),
+            DefaultPath::None => "none".to_string(),
+        };
+        match self.reason {
+            Some(r) => format!("{head}, {}", r.word()),
+            None => head,
+        }
+    }
+}
+
+/// Which member this gather describes./// Which member this gather describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberInfo {
     pub name: String,
@@ -410,4 +470,7 @@ pub struct StatusModel {
     pub prefs: Vec<HostZonePref>,
     /// The run dir, which every "no supervisor answering" line names.
     pub run_dir: String,
+    /// Which default route this member's own traffic takes (spec §6). `None` on a leaf and on
+    /// a member with no fabric applied — neither has one of cfab's to describe.
+    pub host_default: Option<HostDefault>,
 }

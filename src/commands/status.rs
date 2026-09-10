@@ -42,8 +42,9 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 pub mod model;
 
 pub use model::{
-    Adjacency, BondLeg, Bonding, Class, Condition, GuardDrops, Headline, HomeCarrier, Ingress,
-    LegKind, LegPort, MemberInfo, Reach, State, StatusModel, WorkloadState, WorkloadStatus,
+    Adjacency, BondLeg, Bonding, Class, Condition, DefaultPath, DefaultReason, GuardDrops,
+    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, State,
+    StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -230,6 +231,12 @@ fn gather_with(
         ));
     }
     let conditions = c.conditions();
+    // Read before the model takes ownership of `components`.
+    let host_default = if applied {
+        Some(read_host_default(sys, view, components.as_ref())?)
+    } else {
+        None
+    };
     Ok(StatusModel {
         member: MemberInfo {
             name: view.member.name.clone(),
@@ -246,6 +253,56 @@ fn gather_with(
         components,
         prefs: view.prefs(),
         run_dir: f.run_dir.clone(),
+        // Nothing applied means no cfab default to describe: the host's own routing is its own
+        // business and cfab has not touched it.
+        host_default,
+    })
+}
+
+/// Which default route this member's own traffic takes right now (spec §6): table 250 if cfab's
+/// is in force, else the floor in main, with the reason it is not the fabric one.
+///
+/// Two `ip route show table …` reads and the prober rows already in the `components` document —
+/// no new argv prefix, and no second opinion about reachability: `default_wanted` is the same
+/// function the supervisor's reconcile decides with.
+fn read_host_default(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<&Components>,
+) -> Result<HostDefault> {
+    let ours = crate::commands::common::host_default(view);
+    if let Some(hd) = &ours
+        && hd.present(sys)?
+    {
+        return Ok(HostDefault {
+            path: DefaultPath::Fabric {
+                via: hd.via.clone(),
+                dev: hd.dev.clone(),
+            },
+            reason: None,
+        });
+    }
+    let reason = match &ours {
+        None => DefaultReason::NoGwZone,
+        Some(_) => {
+            let ingress = comps.map(|c| c.ingress.as_slice()).unwrap_or_default();
+            if crate::commands::fwd_watchdog::default_wanted(ingress, view) {
+                DefaultReason::Withdrawn
+            } else {
+                DefaultReason::RouterUnreachable
+            }
+        }
+    };
+    let path = match crate::commands::common::floor_default(sys)? {
+        Some(floor) => DefaultPath::Floor {
+            via: floor.via,
+            dev: floor.dev,
+        },
+        None => DefaultPath::None,
+    };
+    Ok(HostDefault {
+        path,
+        reason: Some(reason),
     })
 }
 
@@ -411,6 +468,11 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             let _ = write!(line, ", {n} stray forwards");
         }
         let _ = writeln!(out, "{line}");
+    }
+    // Which default this member's own traffic takes (spec §6), and why it is not the fabric one
+    // when it is not. Absent on a member with no fabric applied.
+    if let Some(d) = &m.host_default {
+        let _ = writeln!(out, "  default: {}", d.render());
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
@@ -2735,6 +2797,10 @@ mod tests {
             // default) — reading it would fail, and status must never read it on a leaf
             .on_fail(&["ip", "route", "show", "table", "249"], 2,
                 "Error: ipv4: FIB table does not exist.")
+            // No gw zone means no table 250 to read, but the host's own floor default is
+            // still there and `status` names it.
+            .on_stdout(&["ip", "route", "show", "table", "main", "default"],
+                "default via 192.168.10.1 dev primary onlink\n")
     }
 
     /// Every expected BFD session, up.
@@ -3021,7 +3087,13 @@ mod tests {
         .on_stdout(&["ip", "rule", "show", "pref", "2002"],
             "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
         .on_stdout(&["ip", "route", "show", "table", "249"],
-            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+        // The additive host default (spec §6) in force: cfab's own route in table 250, with
+        // the floor still sitting in main under it.
+        .on_stdout(&["ip", "route", "show", "table", "250", "default"],
+            "default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 proto cfab-default\n")
+        .on_stdout(&["ip", "route", "show", "table", "main", "default"],
+            "default via 192.168.10.1 dev primary onlink\n");
         shaped(sys, view)
     }
 
@@ -4024,6 +4096,7 @@ mod tests {
              prefs storage: eth9 eth1 eth0 (derived)\n  \
              prefs cluster: eth1 eth9 eth0 (derived)\n  \
              prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             default: via fabric gw 192.168.249.254 (cfab-gw249)\n  \
              components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
              (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
         );
@@ -4115,6 +4188,7 @@ mod tests {
              prefs storage: eth9 eth1 eth0 (derived)\n  \
              prefs cluster: eth1 eth9 eth0 (derived)\n  \
              prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             default: via fabric gw 192.168.249.254 (cfab-gw249)\n  \
              components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
              (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
         );
@@ -4678,7 +4752,8 @@ table bridge cfab {
             "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  mark: nft\n\
              \x20 prefs storage: eth9 eth1 eth0 (derived)\n\
              \x20 prefs cluster: eth1 eth9 eth0 (derived)\n\
-             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n  components: engine running 1h00m \
+             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n\
+             \x20 default: via floor 192.168.10.1 (primary), no gw zone\n  components: engine running 1h00m \
              (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
              | watchdog ok 2s ago\n",
             "{}",
@@ -4877,8 +4952,16 @@ table bridge cfab {
         let mut sys = healthy_leaf(&view);
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        // The `default:` line says "no gw zone" on a leaf, which is the opposite of reporting
+        // a gw return path — every other line is what this guards.
+        let lines: String = report
+            .output
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("default:"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !report.output.contains("gw ") && !report.output.contains("table 249"),
+            !lines.contains("gw ") && !lines.contains("table 249"),
             "a leaf must not report the gw return path: {}",
             report.output
         );
@@ -7533,5 +7616,138 @@ table bridge cfab {
             )],
             "the record of a daemon that is not running is not an expectation"
         );
+    }
+
+    /// Spec §6: the additive host default in force is the one line an operator reads to know
+    /// which way this member's own traffic leaves.
+    #[test]
+    fn the_host_default_line_names_the_fabric_gateway_when_table_250_carries_it() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via fabric gw 192.168.249.254 (cfab-gw249)\n"),
+            "{}",
+            report.output
+        );
+        let mut sys = healthy_host(&f, &view);
+        let m = gather(
+            &mut sys,
+            &view,
+            &expected_links(&view).unwrap(),
+            &Ctx::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            m.host_default.as_ref().map(|h| h.path.clone()),
+            Some(DefaultPath::Fabric {
+                via: "192.168.249.254".to_string(),
+                dev: GW_BOND.to_string(),
+            })
+        );
+        assert!(m.host_default.unwrap().reason.is_none());
+    }
+
+    /// The prober says no wire of the ingress leg reaches the router, so the reconcile has
+    /// withdrawn the route on purpose: the line names the floor that is carrying traffic AND
+    /// the reason, which is the half that tells an operator where to look.
+    #[test]
+    fn a_withdrawn_default_over_a_dark_router_names_the_floor_and_the_router() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_ingress(&view, &["eth9", "eth1", "eth0"]),
+            );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), router unreachable\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Table 250 empty while the router is answering is not a deliberate withdrawal: nothing
+    /// installed it (yet). The word is `withdrawn` either way, but the path is still the floor.
+    #[test]
+    fn an_empty_table_250_with_a_live_router_reads_withdrawn() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), withdrawn\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// A member with no gw zone has no fabric default to offer and never reads table 250: the
+    /// reason says so rather than reading as a fault.
+    #[test]
+    fn a_member_with_no_gw_zone_says_no_gw_zone_and_never_reads_table_250() {
+        let f = fabric();
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&leaf);
+        let report = run(&mut sys, &leaf, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), no gw zone\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !sys.ran("ip route show table 250 default"),
+            "a member with no gw zone has no table 250 to read"
+        );
+    }
+
+    /// No default route anywhere — cfab's withdrawn and the host's own gone too. `none` is a
+    /// fact worth printing: this member currently reaches nothing off its declared subnets.
+    #[test]
+    fn no_default_route_at_all_reads_none() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "")
+            .on_stdout(&["ip", "route", "show", "table", "main", "default"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains("  default: none, withdrawn\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Nothing applied means cfab has not touched this host's routing: no line, and no read of
+    /// either table — the host's own default is its own business.
+    #[test]
+    fn an_unapplied_member_has_no_host_default_and_reads_neither_table() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        let m = gather(
+            &mut sys,
+            &view,
+            &expected_links(&view).unwrap(),
+            &Ctx::default(),
+        )
+        .unwrap();
+        assert!(m.host_default.is_none());
+        let report = render_text(&m, false, false);
+        assert!(!report.output.contains("default:"), "{}", report.output);
+        assert!(!sys.ran("ip route show table 250 default"));
+        assert!(!sys.ran("ip route show table main default"));
     }
 }

@@ -212,7 +212,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
 
 /// Whether the additive host default belongs in table 250 right now (spec §6): the ingress
 /// prober's router-reachability fact for the gw zone's leg, and nothing else. Pure, so the
-/// decision is one testable function and the two callers cannot drift.
+/// decision is one testable function and its three callers — the two supervisor ticks and
+/// `status`, which reads the same rows out of the `components` document — cannot drift.
 ///
 /// `true` when any wire under the leg has heard the router, and `true` when there is no row to
 /// ask (conflict 8): the prober does not exist yet when `apply` runs, its own hysteresis starts
@@ -221,11 +222,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, held: &HeldPrimaries) -> Result<Watch
 ///
 /// A published `reachable` already folds carrier in (`Prober::report`), so a gw leg whose every
 /// wire is unplugged answers `false` here without any probe having to miss.
-pub fn default_wanted(probed: &crate::prober::ProbeRows, view: &View) -> bool {
+pub fn default_wanted(ingress: &[crate::supervisor::report::ProbedLeg], view: &View) -> bool {
     let Some(zone) = view.gw_rows().into_iter().next().map(|r| r.zone) else {
         return true;
     };
-    match probed.ingress.iter().find(|l| l.zone == zone) {
+    match ingress.iter().find(|l| l.zone == zone) {
         Some(leg) => leg.ports.iter().any(|p| p.reachable),
         None => true,
     }
@@ -3070,7 +3071,6 @@ pub(crate) mod tests {
 
     // ---- the additive host default (spec §6, Task 4) ---------------------------------------
 
-    use crate::prober::ProbeRows;
     use crate::supervisor::report::{ProbedLeg, ProbedPort};
 
     fn probed_port(wire: &str, reachable: bool) -> ProbedPort {
@@ -3083,18 +3083,15 @@ pub(crate) mod tests {
         }
     }
 
-    fn ingress_rows(ports: Vec<ProbedPort>) -> ProbeRows {
-        ProbeRows {
-            fallback: Vec::new(),
-            ingress: vec![ProbedLeg {
-                zone: "mgmt".to_string(),
-                bond: "cfab-gw249".to_string(),
-                active: Some("cfab-gw249-a".to_string()),
-                quiet: false,
-                ports,
-                moves: 0,
-            }],
-        }
+    fn ingress_rows(ports: Vec<ProbedPort>) -> Vec<ProbedLeg> {
+        vec![ProbedLeg {
+            zone: "mgmt".to_string(),
+            bond: "cfab-gw249".to_string(),
+            active: Some("cfab-gw249-a".to_string()),
+            quiet: false,
+            ports,
+            moves: 0,
+        }]
     }
 
     #[test]
@@ -3124,10 +3121,10 @@ pub(crate) mod tests {
     fn with_no_prober_row_at_all_the_default_is_wanted() {
         let f = view_fixture();
         let view = View::new(&f, "pve1-tb").unwrap();
-        assert!(default_wanted(&ProbeRows::default(), &view));
+        assert!(default_wanted(&[], &view));
         // ...and on a member with no gw zone there is nothing to gate on either.
         let leaf = View::new(&f, "pve3-tb").unwrap();
-        assert!(default_wanted(&ProbeRows::default(), &leaf));
+        assert!(default_wanted(&[], &leaf));
     }
 
     /// A member's state starts with no opinion, so the first observation is always an edge —

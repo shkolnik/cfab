@@ -1483,7 +1483,7 @@ fn prober_tick(
         eprintln!("{line}");
     }
     let held = prober.held_primaries();
-    let wanted = fwd_watchdog::default_wanted(&rows, view);
+    let wanted = fwd_watchdog::default_wanted(&rows.ingress, view);
     {
         let mut st = shared.lock().unwrap();
         st.probed = rows;
@@ -1576,7 +1576,7 @@ fn watchdog_tick(
     // The host default's LEVEL check (spec §6), the same shape every other restore in the
     // watchdog has: what the prober believes, re-asserted against what the kernel holds, and
     // pref 2099 refreshed from the floor device's current addresses.
-    let wanted = fwd_watchdog::default_wanted(&probed, view);
+    let wanted = fwd_watchdog::default_wanted(&probed.ingress, view);
     for line in tokio::task::block_in_place(|| host_default.reconcile(sys, view, wanted)) {
         eprintln!("{line}");
     }

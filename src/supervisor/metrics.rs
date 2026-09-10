@@ -17,7 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
 use crate::commands::status::model::{
-    BondLeg, Class, Condition, HomeCarrier, Ingress, LegKind, State, StatusModel, WorkloadState,
+    BondLeg, Class, Condition, DefaultPath, DefaultReason, HomeCarrier, Ingress, LegKind, State,
+    StatusModel, WorkloadState,
 };
 use crate::prober::ProbeRows;
 use crate::supervisor::child::State as ChildState;
@@ -561,6 +562,33 @@ impl FabricCollector {
     /// (2026-09-09) adds five more series from the same rows; each is absent (not zero) for a
     /// row whose source field is `None` — a deferred or unread row reports nothing rather than
     /// a fabricated observation.
+    /// Which default this member's own traffic takes (spec §6). Absent — never a zero — on a
+    /// member with no gw zone (every leaf: cfab never had a default to add there, so "on the
+    /// floor" is not a condition to alert on) and on one with no default route at all.
+    fn host_default(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
+        let Some(d) = &self.snap.model.host_default else {
+            return Ok(());
+        };
+        if d.reason == Some(DefaultReason::NoGwZone) {
+            return Ok(());
+        }
+        let v = match d.path {
+            DefaultPath::Fabric { .. } => 0i64,
+            DefaultPath::Floor { .. } => 1,
+            DefaultPath::None => return Ok(()),
+        };
+        scalar(
+            enc,
+            "cfab_host_default_path",
+            "0 while this member's locally originated traffic takes cfab's additive default \
+             through the fabric gateway (table 250), 1 while it takes the host's own floor \
+             default in main — because the ingress prober reports the router unreachable, \
+             because the default was withdrawn, or because cfab is not running. Absent on a \
+             member with no gw zone and on one with no default route at all.",
+            v,
+        )
+    }
+
     fn workloads(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
         let ws = &self.snap.model.workloads;
         let up: Vec<(Labels, i64)> = ws
@@ -881,6 +909,7 @@ impl Collector for FabricCollector {
         self.probe_ports(&mut enc)?;
         self.conditions(&mut enc)?;
         self.ingress(&mut enc)?;
+        self.host_default(&mut enc)?;
         self.workloads(&mut enc)?;
         self.components(&mut enc)?;
         self.telemetry(&mut enc)
@@ -1097,8 +1126,8 @@ mod tests {
     }
 
     use crate::commands::status::model::{
-        Adjacency, Bonding, GuardDrops, Headline, LegPort, MemberInfo, Reach, WorkloadState,
-        WorkloadStatus,
+        Adjacency, Bonding, GuardDrops, Headline, HostDefault, LegPort, MemberInfo, Reach,
+        WorkloadState, WorkloadStatus,
     };
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
@@ -1356,6 +1385,13 @@ mod tests {
             components: Some(components()),
             prefs: Vec::new(),
             run_dir: "/run/cfab".to_string(),
+            host_default: full.then(|| HostDefault {
+                path: DefaultPath::Fabric {
+                    via: "192.168.249.254".to_string(),
+                    dev: "cfab-gw249".to_string(),
+                },
+                reason: None,
+            }),
         }
     }
 
@@ -1432,6 +1468,48 @@ mod tests {
     #[test]
     fn output_ends_with_the_openmetrics_terminator() {
         assert!(render(&fixture_up()).ends_with("# EOF\n"));
+    }
+
+    /// Spec §6: the series is the one number an alert can hang off — 1 says this member is
+    /// leaving over its own floor, whatever the reason.
+    #[test]
+    fn the_host_default_series_is_one_while_the_floor_carries_the_traffic() {
+        let mut snap = fixture_up();
+        snap.model.host_default = Some(HostDefault {
+            path: DefaultPath::Floor {
+                via: "192.168.10.1".to_string(),
+                dev: "primary".to_string(),
+            },
+            reason: Some(DefaultReason::RouterUnreachable),
+        });
+        assert!(render(&snap).contains("\ncfab_host_default_path 1\n"));
+    }
+
+    /// Absence, not zero, in the two cases where neither value would be true: a member with no
+    /// gw zone was never offered a fabric default, and a member with no default route at all is
+    /// not on the floor either.
+    #[test]
+    fn the_host_default_series_is_absent_with_no_gw_zone_and_with_no_default_at_all() {
+        for hd in [
+            HostDefault {
+                path: DefaultPath::Floor {
+                    via: "192.168.10.1".to_string(),
+                    dev: "primary".to_string(),
+                },
+                reason: Some(DefaultReason::NoGwZone),
+            },
+            HostDefault {
+                path: DefaultPath::None,
+                reason: Some(DefaultReason::Withdrawn),
+            },
+        ] {
+            let mut snap = fixture_up();
+            snap.model.host_default = Some(hd);
+            assert!(
+                !render(&snap).contains("cfab_host_default_path"),
+                "the series must be absent, not zero"
+            );
+        }
     }
 
     #[test]
