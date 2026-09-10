@@ -88,6 +88,11 @@ pub fn install(
     qos_map: &[&str],
 ) -> Result<()> {
     mk_vlan(sys, leg, uplink, vid, Some(address), true, qos_map)?;
+    // Address-then-vid on purpose, and momentarily: until the bridge carries the vid the leg
+    // receives nothing, so the window is one where no traffic can arrive at the address anyway
+    // (unlike the anycast `gw`, which apply/the watchdog deliberately install only after the
+    // bridge ARP guard). Both steps are idempotent, so a failure here is repaired by the next
+    // `install` rather than leaving a half-built leg that has to be unwound.
     ensure_self_vid(sys, run_dir, uplink, vid)?;
     Ok(())
 }
