@@ -249,9 +249,12 @@ and reaching a zone requires forwarding, so there is no valid `allow` once forwa
 `cfab check` and `cfab up` refuse a `uplink` bridge that is not vlan-aware (`bridge-vlan-aware
 yes` in `/etc/network/interfaces`) — a tagged leg on it would receive nothing. Everything else is
 a wait, not a refusal: a bridge that is not on the host yet, an uplink that cannot be identified,
-and an uplink that is not yet STP-forwarding each defer that one row to the watchdog (a warning
-names the reason, no leg is built and no gw address goes live) and let the rest of the member
-apply; the watchdog installs the row once the condition clears.
+an uplink that is not yet STP-forwarding, and another vlan device already holding the row's `vid`
+on the `uplink` (a `<bridge>.<vid>` host stanza from before 0.5.3 — the kernel allows one 802.1Q
+device per parent and vid, so the leg cannot be built until it is removed) each defer that one row
+to the watchdog (a warning names the reason and, for a holder, the device to remove; no leg is
+built and no gw address goes live) and let the rest of the member apply; the watchdog installs the
+row once the condition clears.
 
 - **`up` adds:** the leg `cfab-work-<name>` as vlan `vid` on `uplink`, carrying this member's
   declared address, plus `vid` on the bridge itself (without it the leg receives nothing);
