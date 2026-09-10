@@ -37,6 +37,8 @@ table inet cfab-fwd {
     iifname @mgmt oifname @mgmt counter accept comment "allow-mgmt-mgmt"
     iifname "cfab-work-vms" oifname @storage counter accept comment "allow-vms-storage"
     iifname @storage oifname "cfab-work-vms" counter accept comment "allow-storage-vms"
+    iifname "cfab-work-vms" oifname "cfab-gw249" counter accept comment "allow-vms-gw249"
+    iifname "cfab-gw249" oifname "cfab-work-vms" counter accept comment "allow-gw249-vms"
     counter comment "default-deny"
   }
 }
@@ -175,6 +177,19 @@ table inet cfab {
                 }
               ]
             }
+          },
+          {
+            "name": "cfab-mgmt-wl-vms",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "192.168.20.0/24",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
           }
         ]
       }
@@ -233,6 +248,20 @@ table inet cfab {
                 "conditions": {
                   "match-prefix-set": {
                     "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-next-hop": "self"
+                  }
+                }
+              },
+              {
+                "name": "wl-vms",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-wl-vms"
                   }
                 },
                 "actions": {
