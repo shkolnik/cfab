@@ -1310,6 +1310,7 @@ mod tests {
                         request: 7,
                     }),
                     bytes: Some((10_000, 20_000)),
+                    stray_forwards: Some(4),
                 }]
             } else {
                 Vec::new()

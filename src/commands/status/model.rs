@@ -353,6 +353,12 @@ pub struct WorkloadStatus {
     /// `(rx_bytes, tx_bytes)` from `/sys/class/net/<ifname>/statistics/`; `None` on a read
     /// failure.
     pub bytes: Option<(u64, u64)>,
+    /// The forward chain's `stray-<name>` drop counter, summed over the row's one rule per
+    /// allowed zone (spec §5.2, ruling 6): fabric packets this member refused to put on its
+    /// leg for a VM it does not know. `None` when the chain carries no such rule at all —
+    /// an absent rule and a rule that has dropped nothing are different facts. The counter
+    /// resets whenever `apply` re-renders `inet cfab-fwd`.
+    pub stray_forwards: Option<u64>,
 }
 
 /// Which member this gather describes.

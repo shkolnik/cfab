@@ -576,6 +576,24 @@ mod tests {
         assert_eq!(local_vms("{}", "{}", &v, wl, &[]), None);
     }
 
+    /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
+    /// workload must never read as a VM here (a 3-host testbed would otherwise count peers).
+    #[test]
+    fn the_exclusion_set_covers_every_member_the_gw_and_the_router() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            fabric_addresses(&v, &f.workloads[0]),
+            set(&[
+                "192.168.20.1",
+                "192.168.20.2",
+                "192.168.20.3",
+                "192.168.20.254"
+            ]),
+            "pve1-tb and pve2-tb carry the row; .1 is the router and .254 the anycast gw"
+        );
+    }
+
     #[test]
     fn a_vm_is_wanted_at_once_and_a_departure_is_held_for_one_announce_period() {
         let mut h = Holddown::default();
