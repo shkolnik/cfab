@@ -273,6 +273,8 @@ ip rule show pref 2001
 ip rule add pref 2001 from 10.249.0.0/16 lookup 249
 ip rule show pref 2002
 ip rule add pref 2002 from 10.249.0.0/16 unreachable
+ip -j neigh show dev cfab-work-vms
+bridge -j fdb show br primary
 write /run/cfab/policy.nft
 nft -f /run/cfab/policy.nft
 nft list chain inet cfab-fwd forward

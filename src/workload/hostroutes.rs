@@ -246,6 +246,50 @@ impl Row {
     }
 }
 
+/// The two reads and the join for one row, with no reporting: the live local VMs, or `None`
+/// when a read could not be made or a document could not be read. `HostRoutes::observe` does
+/// the same reads with a spelling per failure, which is what a supervisor tick owes the
+/// journal; the callers here (`apply`'s seed, `status`'s count) have their own reporting.
+pub fn read_local_vms(sys: &mut dyn Sys, view: &View, wl: &Workload) -> Option<BTreeSet<Ipv4Addr>> {
+    let ports = uplink::identify_declared(&*sys, &wl.uplink, wl.vid)
+        .ok()?
+        .ports;
+    let neigh = sys
+        .run(&["ip", "-j", "neigh", "show", "dev", &wl.leg_ifname()])
+        .ok()?;
+    let fdb = sys
+        .run(&["bridge", "-j", "fdb", "show", "br", &wl.uplink])
+        .ok()?;
+    if !neigh.ok() || !fdb.ok() {
+        return None;
+    }
+    local_vms(&neigh.stdout, &fdb.stdout, view, wl, &ports)
+}
+
+/// What `apply` seeds `emit::policy::generate_seeded` from: set name -> the VMs on that leg.
+///
+/// Every declared row gets an entry, empty when the row is deferred (no leg to read) or when a
+/// read failed — `apply` seeding empty is exactly what it did before this existed, and the
+/// reconcile fills it on the next tick either way. Best effort by design: a seed that cannot
+/// be read must never stop `up` from loading the policy.
+pub fn seed_locals(sys: &mut dyn Sys, view: &View) -> BTreeMap<String, BTreeSet<Ipv4Addr>> {
+    let rows = view.workload_rows();
+    if rows.is_empty() {
+        return BTreeMap::new();
+    }
+    let deferred = deferred_names(sys, view);
+    rows.into_iter()
+        .map(|row| {
+            let vms = if deferred.contains(&row.wl.name) {
+                BTreeSet::new()
+            } else {
+                read_local_vms(sys, view, row.wl).unwrap_or_default()
+            };
+            (row.wl.local_set(), vms)
+        })
+        .collect()
+}
+
 /// Every workload row's host-route reconcile, driven from the supervisor's workload tick.
 #[derive(Debug, Default)]
 pub struct HostRoutes {
@@ -970,6 +1014,26 @@ mod tests {
             "cfab: workload vms: engine withdrew the routes of cfab-work-vms and refused the \
              reinstall: the provider refused the install; retried next tick"
         );
+    }
+
+    /// What `apply` seeds the nft sets from: the same join, keyed by set name, so the emitter
+    /// and the reconcile can never disagree about what belongs in one. A deferred row has no
+    /// leg to read and seeds empty, and so does a row whose reads fail.
+    #[test]
+    fn the_apply_seed_is_the_same_join_and_a_deferred_row_seeds_nothing() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        assert_eq!(
+            seed_locals(&mut sys, &v),
+            [("cfab-work-vms-local".to_string(), set(&["192.168.20.103"]))]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        );
+        let mut deferred = tick_sys("").file("/run/cfab/workload-deferred", "vms\n");
+        assert!(seed_locals(&mut deferred, &v)["cfab-work-vms-local"].is_empty());
+        let mut blind = tick_sys("").on_fail(&["ip", "-j", "neigh"], 1, "no such device");
+        assert!(seed_locals(&mut blind, &v)["cfab-work-vms-local"].is_empty());
     }
 
     #[test]

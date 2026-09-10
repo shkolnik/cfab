@@ -660,8 +660,7 @@ impl FabricCollector {
             "Fabric packets this member refused to put on this row's leg because their \
              destination is not a VM it currently knows (spec 5.2, ruling 6), summed over the \
              row's one drop rule per allowed zone; reset to 0 when apply re-renders inet \
-             cfab-fwd or the row's VM set is empty for a moment after it; absent when the \
-             forward chain carries no such rule.",
+             cfab-fwd; absent when the forward chain carries no such rule.",
             &stray,
         )?;
 

@@ -6,8 +6,27 @@
 
 use crate::derive::View;
 use crate::error::Result;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
+/// The forward policy with every `<leg>-local` set declared empty. What `cfab gen` prints and
+/// what `status` compares against: neither knows this member's live VMs, and neither should
+/// guess at them.
 pub fn generate(view: &View) -> Result<String> {
+    generate_seeded(view, &BTreeMap::new())
+}
+
+/// The same, with the local sets seeded from `locals` (set name -> the VMs on that leg).
+///
+/// `nft -f` replaces the table atomically, so a set declared empty is an empty set the instant
+/// the policy loads — and the stray-forward drop is live beside it. Loading the VMs `apply`
+/// can already see, in the same transaction, is what keeps a live re-apply from black-holing
+/// every VM on the member until the reconcile's next tick. A row `apply` could not read seeds
+/// empty, exactly as before.
+pub fn generate_seeded(
+    view: &View,
+    locals: &BTreeMap<String, BTreeSet<Ipv4Addr>>,
+) -> Result<String> {
     let f = view.fabric;
     let mut out = String::new();
     out.push_str("table inet cfab-fwd\n");
@@ -53,14 +72,22 @@ pub fn generate(view: &View) -> Result<String> {
         "  set cfab {{ type ifname; elements = {{ {} }} }}\n",
         owned.join(",")
     ));
-    // Spec §5.2, ruling 6: the VMs this member currently knows on each workload leg. Declared
-    // empty and filled at runtime by `workload::hostroutes` — an empty set means "no VM is
-    // local", which is the safe reading of "cfab is not running the reconcile".
+    // Spec §5.2, ruling 6: the VMs this member currently knows on each workload leg. Seeded
+    // by `apply` from what it can read (`hostroutes::seed_locals`) so a re-render does not
+    // black-hole a live VM, and kept level by `workload::hostroutes` after that — an empty set
+    // means "no VM is local", which is the safe reading of "we could not read one".
     for row in view.workload_rows() {
-        out.push_str(&format!(
-            "  set {} {{ type ipv4_addr; }}\n",
-            row.wl.local_set()
-        ));
+        let set = row.wl.local_set();
+        match locals.get(&set).filter(|v| !v.is_empty()) {
+            None => out.push_str(&format!("  set {set} {{ type ipv4_addr; }}\n")),
+            Some(vms) => out.push_str(&format!(
+                "  set {set} {{ type ipv4_addr; elements = {{ {} }} }}\n",
+                vms.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
     out.push_str(
         "  chain forward {\n\
@@ -420,6 +447,45 @@ mod tests {
         assert_ne!(
             without_local_elements(empty),
             without_local_elements("table inet cfab-fwd {\n}\n")
+        );
+    }
+
+    /// Ruling 6, the re-apply window: `nft -f` replaces the whole table atomically, so a set
+    /// declared empty means every fabric packet for a VM is dropped until the reconcile's next
+    /// tick fills it — on EVERY live re-apply, not only the first. Seeding it from the same
+    /// derivation the reconcile uses closes that window; an unseeded row is still empty, which
+    /// is the safe reading of "we do not know".
+    #[test]
+    fn a_seeded_local_set_carries_its_vms_and_an_unseeded_one_is_empty() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut locals = std::collections::BTreeMap::new();
+        locals.insert(
+            "cfab-work-vms-local".to_string(),
+            [
+                "192.168.20.103".parse().unwrap(),
+                "192.168.20.104".parse().unwrap(),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<std::net::Ipv4Addr>>(),
+        );
+        let seeded = generate_seeded(&v, &locals).unwrap();
+        assert!(
+            seeded.contains(
+                "  set cfab-work-vms-local { type ipv4_addr; \
+                 elements = { 192.168.20.103, 192.168.20.104 } }\n"
+            ),
+            "{seeded}"
+        );
+        assert!(
+            generate(&v)
+                .unwrap()
+                .contains("  set cfab-work-vms-local { type ipv4_addr; }\n")
+        );
+        // The seed is the only difference: nothing else in the table moves with it.
+        assert_eq!(
+            without_local_elements(&seeded),
+            without_local_elements(&generate(&v).unwrap())
         );
     }
 }

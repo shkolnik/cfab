@@ -113,7 +113,7 @@ cfab_workload_vms_seen{name="vms"} 3
 # TYPE cfab_workload_guard_drops counter
 cfab_workload_guard_drops_total{name="vms",kind="claim"} 2
 cfab_workload_guard_drops_total{name="vms",kind="request"} 7
-# HELP cfab_workload_stray_forwards Fabric packets this member refused to put on this row's leg because their destination is not a VM it currently knows (spec 5.2, ruling 6), summed over the row's one drop rule per allowed zone; reset to 0 when apply re-renders inet cfab-fwd or the row's VM set is empty for a moment after it; absent when the forward chain carries no such rule.
+# HELP cfab_workload_stray_forwards Fabric packets this member refused to put on this row's leg because their destination is not a VM it currently knows (spec 5.2, ruling 6), summed over the row's one drop rule per allowed zone; reset to 0 when apply re-renders inet cfab-fwd; absent when the forward chain carries no such rule.
 # TYPE cfab_workload_stray_forwards counter
 cfab_workload_stray_forwards_total{name="vms"} 4
 # HELP cfab_workload_rx_bytes `/sys/class/net/<ifname>/statistics/rx_bytes` for this row; the gateway's own forwarding, not cross-host VM-to-VM traffic, which stays on the physical switch.

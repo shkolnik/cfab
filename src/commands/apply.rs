@@ -1173,7 +1173,12 @@ fn enable_forwarding(
     legs: &[&str],
 ) -> Result<()> {
     let f = view.fabric;
-    let policy = emit::policy::generate(view)?;
+    // Seed each workload row's local set from the VMs this member can see NOW: `nft -f`
+    // replaces the table atomically, and the stray-forward drop goes live with it, so a set
+    // declared empty black-holes every VM on the member until the reconcile's next tick — on
+    // every live re-apply, not only the first. A row we cannot read seeds empty.
+    let locals = crate::workload::hostroutes::seed_locals(sys, view);
+    let policy = emit::policy::generate_seeded(view, &locals)?;
     let path = format!("{}/policy.nft", f.run_dir);
     sys.write(&path, &policy)?;
     run_ok(sys, &["nft", "-f", &path])?; // one transaction: atomic replace

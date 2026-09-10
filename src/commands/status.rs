@@ -1982,19 +1982,8 @@ fn local_vms_seen(
     wl: &crate::model::Workload,
     uplink_ports: &[String],
 ) -> Option<u32> {
-    let leg = wl.leg_ifname();
-    let neigh = sys.run(&["ip", "-j", "neigh", "show", "dev", &leg]).ok()?;
-    if !neigh.ok() {
-        return None;
-    }
-    let fdb = sys
-        .run(&["bridge", "-j", "fdb", "show", "br", &wl.uplink])
-        .ok()?;
-    if !fdb.ok() {
-        return None;
-    }
-    let vms =
-        crate::workload::hostroutes::local_vms(&neigh.stdout, &fdb.stdout, view, wl, uplink_ports)?;
+    let _ = uplink_ports; // the join reads the uplink's ports itself, from the same sysfs
+    let vms = crate::workload::hostroutes::read_local_vms(sys, view, wl)?;
     u32::try_from(vms.len()).ok()
 }
 
