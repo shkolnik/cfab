@@ -543,6 +543,15 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
             w.name, w.router
         ))
     })?;
+    // cfab creates the leg, so a vid the kernel would refuse — or one that means "untagged" on
+    // a vlan-aware bridge — is caught at `check`, not at the first `ip link add`.
+    if !(2..=4094).contains(&w.vid) {
+        return Err(Error::config(format!(
+            "workload {}: vid {} is outside 2-4094 (1 is the bridge's untagged default; 0 and \
+             4095 are reserved)",
+            w.name, w.vid
+        )));
+    }
     let span = match w.span.as_deref() {
         None | Some("switch") => Span::Switch,
         Some("host") => {
@@ -2031,6 +2040,24 @@ mod tests {
             "fabric.toml: workload vms: prefix 10.99.20.0/24 overlaps zone storage block \
              10.99.0.0/16"
         );
+    }
+
+    /// cfab creates the leg now, so a vid the kernel would refuse (or that means "untagged")
+    /// is a declaration fault `check` catches before `up` ever runs `ip link add`.
+    #[test]
+    fn check_refuses_a_workload_vid_outside_the_802_1q_range() {
+        for bad in ["0", "1", "4095", "65535"] {
+            let e = wl_err(|t| t.replace("vid = 3\nprefix", &format!("vid = {bad}\nprefix")));
+            assert_eq!(
+                e,
+                format!(
+                    "fabric.toml: workload vms: vid {bad} is outside 2-4094 (1 is the bridge's \
+                     untagged default; 0 and 4095 are reserved)"
+                )
+            );
+        }
+        assert!(wl_fabric_edit(|t| t.replace("vid = 3\nprefix", "vid = 2\nprefix")).is_ok());
+        assert!(wl_fabric_edit(|t| t.replace("vid = 3\nprefix", "vid = 4094\nprefix")).is_ok());
     }
 
     /// IFNAMSIZ leaves 15 usable bytes and `cfab-work-` eats 10 of them, so the row name is
