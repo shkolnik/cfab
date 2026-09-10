@@ -294,7 +294,9 @@ impl HostDefaultState {
         for line in common::sync_floor_rules(sys, &addrs)? {
             out.push(format!("cfab: host default: {line}"));
         }
-        // `&[]`: the pref-2099 pins are the line above; this is 2100 and 2101.
+        // `&[]`: the pref-2099 pins are the line above. This is 2100 and 2101, plus call 8's
+        // per-row 2102/2103 VM-source pair, which the watchdog restores for free because it
+        // restores whatever `host_default_rules` returns.
         for r in common::host_default_rules(view, &[]) {
             if common::fabric_rule_present(sys, &r)? {
                 continue;

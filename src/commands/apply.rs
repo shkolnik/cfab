@@ -3393,10 +3393,12 @@ pub(crate) mod tests {
         // This mock answers each `show` empty, so no `del` follows — the kernel's own readback
         // is what `remove_host_default` deletes from on a live host.
         assert_eq!(
-            sys.calls[sys.calls.len() - 4..],
+            sys.calls[sys.calls.len() - 6..],
             [
                 "ip route del default table 250 proto 206",
                 "ip rule show pref 2099",
+                "ip rule show pref 2102",
+                "ip rule show pref 2103",
                 "ip rule show pref 2100",
                 "ip rule show pref 2101",
             ]

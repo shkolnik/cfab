@@ -612,7 +612,7 @@ mod tests {
         assert!(
             sys.ran(
                 "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
-                 192.168.20.103/32"
+                 192.168.20.2/32 192.168.20.103/32"
             ),
             "{:?}",
             sys.calls

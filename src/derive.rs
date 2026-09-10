@@ -3,6 +3,7 @@
 //! `View`, never the declaration tables directly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 use crate::error::{Error, Result};
 use crate::model::{Fabric, Member, MemberKind, SegScope, Workload, Zone, gw_ifname};
@@ -70,6 +71,10 @@ pub struct WorkloadRow<'a> {
     pub wl: &'a Workload,
     /// This member's address on the row's leg, e.g. `192.168.20.2/24`.
     pub address: String,
+    /// The same address, bare. Kept typed beside the CIDR because the leg address is also a
+    /// route this member originates (`/32`), and re-parsing the rendered CIDR to get it back
+    /// would make an infallible fact fallible.
+    pub addr: Ipv4Addr,
 }
 
 /// Where a (member, zone) wire order came from: the default producer, or a a member's `prefs` row.
@@ -181,6 +186,7 @@ impl<'a> View<'a> {
                     .map(|mw| WorkloadRow {
                         wl,
                         address: mw.address_cidr(),
+                        addr: mw.address,
                     })
             })
             .collect()

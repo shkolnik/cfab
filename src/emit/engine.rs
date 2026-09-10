@@ -251,7 +251,7 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
         "ietf-interfaces:interfaces".into(),
         json!({ "interface": interfaces }),
     );
-    if let Some((routing_policy, bgp)) = ingress_bgp(view, &gw_rows)? {
+    if let Some((routing_policy, bgp)) = ingress_bgp(view, &gw_rows, routes)? {
         protocols.push(bgp);
         tree.insert("ietf-routing-policy:routing-policy".into(), routing_policy);
     }
@@ -275,6 +275,12 @@ fn leaf_set(zone: &str) -> String {
     format!("cfab-{zone}-leaf")
 }
 
+/// The workload prefix set of a gw zone: one `[[workload]]` row's `prefix`, masked 32..32, so
+/// the row's VM /32s and this member's own leg /32 match it and the row's /24 does not.
+fn wl_set(zone: &str, workload: &str) -> String {
+    format!("cfab-{zone}-wl-{workload}")
+}
+
 fn import_policy(zone: &str) -> String {
     format!("cfab-{zone}-import")
 }
@@ -291,11 +297,16 @@ fn export_policy(zone: &str) -> String {
 /// Every policy name this tree references is defined in the same tree: holo resolves a
 /// neighbor's policy names with `shared.policies.get(name).unwrap()`
 /// (`holo-bgp/src/ibus/rx.rs`), so a dangling name is a panic in the engine, not a warning.
-fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>> {
+fn ingress_bgp(
+    view: &View,
+    gw_rows: &[GwRow],
+    routes: &WorkloadRoutes,
+) -> Result<Option<(Value, Value)>> {
     let f = view.fabric;
     if gw_rows.is_empty() {
         return Ok(None);
     }
+    let workload_rows = view.workload_rows();
 
     let mut prefix_sets: Vec<Value> = Vec::new();
     let mut policies: Vec<Value> = Vec::new();
@@ -392,6 +403,35 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
                 "ietf-bgp-policy:bgp-actions": { "set-next-hop": "self" },
             },
         }));
+        // The workload half of the export policy (spec §5.5). holo runs the NEIGHBOR export
+        // policy over locally originated routes too, with `default-export-policy` =
+        // reject-route (`holo-bgp/src/events.rs` `nbr_export_policy_apply`), so without a
+        // statement of their own the `holo-bgp:network` /32s below are written, accepted by
+        // libyang, and dropped at the Adj-RIB-Out with the session Established and PfxSnt
+        // unchanged. One set and one statement per row, named to sort after the leaf reject.
+        // The IMPORT policy is deliberately NOT extended: a peer's VM /32 arrives here by OSPF,
+        // and keeping it out of BGP is what stops this host re-advertising another host's VM.
+        for row in &workload_rows {
+            prefix_sets.push(json!({
+                "name": wl_set(&z.name, &row.wl.name),
+                "mode": "ipv4",
+                "prefixes": { "prefix-list": [ {
+                    "ip-prefix": row.wl.prefix.to_string(),
+                    "mask-length-lower": 32,
+                    "mask-length-upper": 32,
+                } ] },
+            }));
+            export_stmts.push(json!({
+                "name": format!("wl-{}", row.wl.name),
+                "conditions": { "match-prefix-set": {
+                    "prefix-set": wl_set(&z.name, &row.wl.name),
+                } },
+                "actions": {
+                    "policy-result": "accept-route",
+                    "ietf-bgp-policy:bgp-actions": { "set-next-hop": "self" },
+                },
+            }));
+        }
         policies.push(json!({
             "name": export_policy(&z.name),
             "statements": { "statement": export_stmts },
@@ -432,6 +472,19 @@ fn ingress_bgp(view: &View, gw_rows: &[GwRow]) -> Result<Option<(Value, Value)>>
                 "apply-policy": { "export-policy": [ export_policy(&z.name) ] },
             } ] },
         }));
+    }
+
+    // The live host routes this member originates (spec §5.5): every local VM /32 and this
+    // member's own leg /32, which `workload::hostroutes` puts in the same set. `network`
+    // originates them with MED 0 (`holo-bgp/src/events.rs::network_originate`), so the router
+    // prefers the host that actually holds the VM over any transit. Redistribution cannot do
+    // this job: BGP redistributes `ospfv2`, and every host learns every OTHER host's VM /32 as
+    // a type-5, so a permissive import would have all hosts advertise all VMs.
+    for cidr in routes.values().flatten() {
+        let net = Value::String(cidr.to_string());
+        if !networks.contains(&net) {
+            networks.push(net);
+        }
     }
 
     // The BGP router-id. `/routing/router-id` is deviated `not-supported` in holo, so
@@ -1630,13 +1683,17 @@ mod tests {
     }
 
     /// SECURITY BOUNDARY, and it rests on a schema default, so it gets a named test: a VM /32
-    /// now exists in the fabric as an OSPF type-5 external, and `holo-bgp:redistribution`
-    /// carries `ietf-ospf:ospfv2` — so the only thing keeping 192.168.20.103/32 off the
-    /// upstream router is that it matches NO statement of the ingress import policy and
-    /// holo's `default-import-policy` is `reject-route`. Assert all three: the emitted policy
-    /// accepts neither the VM /32 nor the workload /24, cfab never overrides the default, and
-    /// the default is still `reject-route` at the pinned holo. Also: the whole BGP subtree is
-    /// byte-identical with and without the routes, and static is not redistributed into BGP.
+    /// exists in the fabric as an OSPF type-5 external, and `holo-bgp:redistribution` carries
+    /// `ietf-ospf:ospfv2` — so the only thing keeping ANOTHER host's 192.168.20.103/32 off the
+    /// upstream router is that it matches NO statement of the ingress IMPORT policy and holo's
+    /// `default-import-policy` is `reject-route`. Assert all three: the import policy accepts
+    /// neither the VM /32 nor the workload /24, cfab never overrides the default, and the
+    /// default is still `reject-route` at the pinned holo.
+    ///
+    /// Phase 2 narrowed this test from "no policy" to "the import policy" (spec §5.5): the
+    /// EXPORT policy now deliberately accepts this host's own /32s, which reach the Adj-RIB-Out
+    /// as `holo-bgp:network` originations and never through redistribution. The import gate is
+    /// what makes that safe, and is what this test guards.
     #[test]
     fn a_redistributed_vm_route_is_accepted_by_no_bgp_statement_and_the_default_rejects_it() {
         let f = wl_fabric();
@@ -1650,12 +1707,16 @@ mod tests {
         );
 
         let pol = &t["ietf-routing-policy:routing-policy"];
+        let imports: Vec<&Value> = pol["policy-definitions"]["policy-definition"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["name"].as_str().unwrap().ends_with("-import"))
+            .collect();
+        assert!(!imports.is_empty(), "no import policy in {pol}");
         for shape in ["192.168.20.103/32", "192.168.20.0/24"] {
             let net: ipnetwork::Ipv4Network = shape.parse().unwrap();
-            for p in pol["policy-definitions"]["policy-definition"]
-                .as_array()
-                .unwrap()
-            {
+            for p in &imports {
                 for stmt in p["statements"]["statement"].as_array().unwrap() {
                     let set = stmt["conditions"]["match-prefix-set"]["prefix-set"]
                         .as_str()
@@ -1679,9 +1740,23 @@ mod tests {
             holo_utils::policy::DefaultPolicyType::RejectRoute
         );
 
-        // Nothing about the BGP side moved, and static is not one of BGP's sources.
+        // The live route set moves `holo-bgp:network` and NOTHING else on the BGP side: the
+        // policy is derived from the declaration, so it is in force before the first VM is
+        // seen and stays in force across a withdrawal. Static is still not a BGP source.
         let bare = generate(&v).unwrap();
-        assert_eq!(bgp_instance(&t).unwrap(), bgp_instance(&bare).unwrap());
+        assert_eq!(
+            pol, &bare["ietf-routing-policy:routing-policy"],
+            "the routing policy must not follow the live route set"
+        );
+        let (mut with, mut without) = (
+            bgp_instance(&t).unwrap().clone(),
+            bgp_instance(&bare).unwrap().clone(),
+        );
+        for b in [&mut with, &mut without] {
+            b["ietf-bgp:bgp"]["global"]["afi-safis"]["afi-safi"][0]["ipv4-unicast"]["holo-bgp:network"] =
+                json!(null);
+        }
+        assert_eq!(with, without);
         let redist = &bgp_instance(&t).unwrap()["ietf-bgp:bgp"]["global"]["afi-safis"]["afi-safi"]
             [0]["ipv4-unicast"]["holo-bgp:redistribution"];
         assert_eq!(
@@ -1691,6 +1766,138 @@ mod tests {
                 { "type": "ietf-ospf:ospfv2" },
             ])
         );
+    }
+
+    /// The `holo-bgp:network` list of the one BGP instance.
+    fn networks(t: &Value) -> Vec<String> {
+        bgp_instance(t).unwrap()["ietf-bgp:bgp"]["global"]["afi-safis"]["afi-safi"][0]
+            ["ipv4-unicast"]["holo-bgp:network"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// What `policy` decides for `net`, the way holo does it: statements in the BTreeMap order
+    /// of their names, first `accept-route` or `reject-route` whose prefix set matches wins,
+    /// and a fall-through is the default policy — `reject-route`, holo's schema default, which
+    /// cfab never overrides.
+    fn verdict(pol: &Value, policy: &str, net: ipnetwork::Ipv4Network) -> String {
+        let p = pol["policy-definitions"]["policy-definition"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == policy)
+            .unwrap_or_else(|| panic!("no policy {policy}"));
+        let mut stmts: Vec<&Value> = p["statements"]["statement"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect();
+        stmts.sort_by_key(|s| s["name"].as_str().unwrap());
+        for s in stmts {
+            let set = s["conditions"]["match-prefix-set"]["prefix-set"]
+                .as_str()
+                .unwrap();
+            if prefix_set_matches(pol, set, net) {
+                return s["actions"]["policy-result"].as_str().unwrap().to_string();
+            }
+        }
+        "reject-route".to_string()
+    }
+
+    /// Test (ii), spec §5.5 N1 — THE load-bearing half of gate D. `holo-bgp:network` writes a
+    /// prefix into the RIB, but what reaches the neighbor is filtered by the per-neighbor
+    /// EXPORT policy with `default-export-policy = reject-route`
+    /// (`holo-bgp/src/events.rs::nbr_update_out`, VERIFIED at the pinned rev), so a VM /32 and
+    /// this host's leg /32 leave the host only because the workload prefix set and its accept
+    /// exist. Without them the session sits Established with PfxSnt unchanged and nothing says
+    /// so. The /24 itself must stay out (32..32), and next-hop-self is what makes the route
+    /// resolvable at the router.
+    #[test]
+    fn the_export_policy_admits_this_hosts_vm_and_leg_slash_32s_and_not_the_workload_slash_24() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        let pol = &t["ietf-routing-policy:routing-policy"];
+        let zones: Vec<String> = v.gw_rows().iter().map(|r| r.zone.clone()).collect();
+        assert!(!zones.is_empty(), "the fixture declares a gw zone");
+        for z in &zones {
+            for shape in ["192.168.20.103/32", "192.168.20.2/32"] {
+                assert_eq!(
+                    verdict(pol, &export_policy(z), shape.parse().unwrap()),
+                    "accept-route",
+                    "{z} export drops {shape}"
+                );
+            }
+            // The /24 and the peer-learned shapes stay out of the export, and the import
+            // policy is untouched by any of it.
+            assert_eq!(
+                verdict(pol, &export_policy(z), "192.168.20.0/24".parse().unwrap()),
+                "reject-route"
+            );
+            for shape in ["192.168.20.103/32", "192.168.20.0/24"] {
+                assert_eq!(
+                    verdict(pol, &import_policy(z), shape.parse().unwrap()),
+                    "reject-route",
+                    "{z} import accepts {shape}"
+                );
+            }
+            // Both prefix sets are defined, and the workload one is masked 32..32.
+            let sets = pol["defined-sets"]["prefix-sets"]["prefix-set"]
+                .as_array()
+                .unwrap();
+            let wl = sets
+                .iter()
+                .find(|p| p["name"] == wl_set(z, "vms"))
+                .unwrap_or_else(|| panic!("no workload prefix set for {z}"));
+            let entry = &wl["prefixes"]["prefix-list"][0];
+            assert_eq!(entry["ip-prefix"], "192.168.20.0/24");
+            assert_eq!(entry["mask-length-lower"], 32);
+            assert_eq!(entry["mask-length-upper"], 32);
+            assert!(sets.iter().any(|p| p["name"] == id_set(z)));
+            // The accept carries next-hop-self: the /32's own next hop is a leg address the
+            // router cannot resolve.
+            let stmt = pol["policy-definitions"]["policy-definition"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == export_policy(z))
+                .unwrap()["statements"]["statement"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == "wl-vms")
+                .unwrap()
+                .clone();
+            assert_eq!(
+                stmt["actions"]["ietf-bgp-policy:bgp-actions"]["set-next-hop"],
+                "self"
+            );
+        }
+    }
+
+    /// Test (i): only what THIS host holds is originated. A peer's VM /32 reaches this host as
+    /// an OSPF type-5 and must never become a `network` statement — that is what keeps two
+    /// hosts from both advertising one VM. The set is exactly the identities plus the live
+    /// route set, and the /24 is never in it (call 5: /32s only).
+    #[test]
+    fn only_this_hosts_own_live_routes_are_originated_into_bgp() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32", "192.168.20.2/32"])]);
+        let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+        let mut want: Vec<String> = v
+            .gw_rows()
+            .iter()
+            .map(|r| format!("{}/32", v.identity_addr(f.zone(&r.zone).unwrap())))
+            .collect();
+        want.extend(["192.168.20.2/32".into(), "192.168.20.103/32".into()]);
+        assert_eq!(networks(&t), want);
+        // The peer's VM, learned by OSPF, is nowhere in the tree's BGP side.
+        assert!(!networks(&t).iter().any(|n| n == "192.168.20.104/32"));
+        assert!(!networks(&t).iter().any(|n| n == "192.168.20.0/24"));
     }
 
     #[test]

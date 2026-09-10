@@ -285,6 +285,10 @@ ip rule show pref 2100
 ip rule add pref 2100 from all iif lo lookup main suppress_prefixlength 0
 ip rule show pref 2101
 ip rule add pref 2101 from all iif lo lookup 250
+ip rule show pref 2102
+ip rule add pref 2102 from 192.168.20.0/24 lookup main suppress_prefixlength 0
+ip rule show pref 2103
+ip rule add pref 2103 from 192.168.20.0/24 lookup 250
 ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 table 250 proto 206
 ip -j neigh show dev cfab-work-vms
 bridge -j fdb show br primary

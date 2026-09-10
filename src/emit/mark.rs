@@ -224,6 +224,22 @@ pub fn generate(view: &View) -> Result<String> {
                     row.wl.leg_ifname(), z.dscp, row.wl.name, zname
                 ));
             }
+            // Call 7's accept pair carries the VM north-south over the gw LEG, an interface no
+            // zone in `allow` names, so the loop above never reaches it and VM egress toward the
+            // router would leave with whatever DSCP the VM itself set. Same rule, same reason:
+            // the gw zone's own bulk class, so a DSCP-trusting switch queues VM north-south the
+            // way it queues that zone's bulk and never the control queue.
+            for r in view.gw_rows() {
+                let z = f.zone(&r.zone)?;
+                out.push_str(&format!(
+                    "    iifname \"{}\" oifname \"{}\" ip dscp set {} comment \"dscp-{}-gw{}\"\n",
+                    row.wl.leg_ifname(),
+                    r.ifname,
+                    z.dscp,
+                    row.wl.name,
+                    z.id
+                ));
+            }
         }
         out.push_str("  }\n");
     }
@@ -273,6 +289,28 @@ mod tests {
             ),
             "{fwd}"
         );
+    }
+
+    /// Call 7 sends VM north-south over the gw LEG, which no zone in `allow` names, so the
+    /// per-zone loop above cannot reach it. Without a rule of its own a VM's packet to the
+    /// router keeps whatever DSCP the VM set for itself — including the control class the
+    /// per-zone rules exist to keep it out of.
+    #[test]
+    fn a_workload_overwrites_dscp_toward_the_gw_leg_too() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        let fwd = t.split("chain forward {").nth(1).expect("fwd chain");
+        assert!(
+            fwd.contains(
+                "iifname \"cfab-work-vms\" oifname \"cfab-gw249\" ip dscp set cs2 \
+                 comment \"dscp-vms-gw249\""
+            ),
+            "{fwd}"
+        );
+        // The teeth of naming the INTERFACE: the gw zone is not in `allow`, so a rule spelled
+        // the per-zone way would silently not exist here.
+        assert!(!v.fabric.workloads[0].allow.contains(&"mgmt".to_string()));
     }
 
     /// nft parses chain names as identifiers, so a name that is also an nft keyword fails to

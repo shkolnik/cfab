@@ -326,7 +326,71 @@ pub fn host_default_rules(view: &View, floor_addrs: &[String]) -> Vec<FabricRule
     }
     let mut out: Vec<FabricRule> = floor_addrs.iter().map(|a| floor_rule(a)).collect();
     out.extend(lookup_rules());
+    for row in view.workload_rows() {
+        out.extend(workload_lookup_rules(&row.wl.prefix.to_string()));
+    }
     out
+}
+
+/// The same two lookups as `lookup_rules`, keyed on a workload's SOURCE prefix instead of
+/// `iif lo` (spec §5.5, call 8 RULED (b)). `iif lo` is locally originated traffic, so a
+/// FORWARDED VM packet never reaches table 250 at all: measured on the rack,
+/// `ip route get 1.1.1.1 from 192.168.20.104 iif cfab-work-vms` selected `via 192.168.10.1 dev
+/// primary`, the host's admin floor.
+///
+/// Fail-closed is not in these rules and is not meant to be: when table 250 is empty the lookup
+/// falls through to the kernel's own `32766 lookup main` and the packet is routed at the floor —
+/// where the forward policy has no accept for it (`emit::policy` opens the gw leg and nothing
+/// else) and `default-deny` takes it. The VMs lose north-south while the host keeps its floor.
+fn workload_lookup_rules(prefix: &str) -> [FabricRule; 2] {
+    [
+        FabricRule::new(
+            "2102",
+            format!("from {prefix} lookup main suppress_prefixlength 0"),
+            &[
+                "from",
+                prefix,
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ],
+        ),
+        // Needle without the table, for the reason pref 2101's is: `ip rule show` renders
+        // table 250 by its rt_tables name on a host carrying the package's fragment and by
+        // number on one without it.
+        FabricRule::new(
+            "2103",
+            format!("from {prefix}"),
+            &["from", prefix, "lookup", HOST_DEFAULT_TABLE],
+        ),
+    ]
+}
+
+/// The workload source prefixes prefs 2102/2103 are installed for, read back from the kernel.
+/// `remove_host_default` consults no declaration by design — a member whose workload row was
+/// removed since `up` still has these rules and they are still cfab's — so the prefixes come
+/// from the rules themselves, exactly as the pref-2099 pins do.
+fn installed_workload_sources(sys: &mut dyn Sys) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for pref in ["2102", "2103"] {
+        for line in sys
+            .run(&["ip", "rule", "show", "pref", pref])?
+            .stdout
+            .lines()
+        {
+            let Some((_, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            if let ["from", src, "lookup", ..] = w.as_slice()
+                && !out.iter().any(|s| s == src)
+            {
+                out.push((*src).to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The two rules that reach table 250, in install order. They depend on nothing this host has
@@ -574,6 +638,11 @@ pub fn remove_host_default(sys: &mut dyn Sys) -> Result<()> {
     )?;
     for a in installed_floor_addresses(sys)? {
         drop_fabric_rule(sys, &floor_rule(&a))?;
+    }
+    for src in installed_workload_sources(sys)? {
+        for r in workload_lookup_rules(&src) {
+            drop_fabric_rule(sys, &r)?;
+        }
     }
     for r in lookup_rules() {
         drop_fabric_rule(sys, &r)?;
@@ -1282,6 +1351,93 @@ mod host_default_tests {
             rules[3].add,
             vec!["from", "all", "iif", "lo", "lookup", "250"]
         );
+    }
+
+    /// Spec §5.5, call 8 RULED (b). 2100/2101 are `from all iif lo`: locally originated traffic
+    /// only, so a FORWARDED VM packet never reaches table 250 and takes the host's admin floor
+    /// instead (measured: `ip route get 1.1.1.1 from 192.168.20.104 iif cfab-work-vms` → `via
+    /// 192.168.10.1 dev primary`). The row's pair is the same two lookups keyed on the VM
+    /// SOURCE — and the host's own two must not move, or the fix would have widened what the
+    /// host itself does.
+    #[test]
+    fn a_workload_row_adds_a_vm_source_pair_into_table_250_and_leaves_the_iif_lo_pair_alone() {
+        let f = Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let rules = host_default_rules(&v, &[]);
+        let prefs: Vec<&str> = rules.iter().map(|r| r.pref.as_str()).collect();
+        assert_eq!(prefs, ["2100", "2101", "2102", "2103"]);
+        // The host's own pair, unchanged.
+        assert_eq!(
+            rules[1].add,
+            vec!["from", "all", "iif", "lo", "lookup", "250"]
+        );
+        // The VM pair: the row's prefix, no `iif lo`, into the same table.
+        assert_eq!(
+            rules[2].add,
+            vec![
+                "from",
+                "192.168.20.0/24",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0"
+            ]
+        );
+        assert_eq!(
+            rules[3].add,
+            vec!["from", "192.168.20.0/24", "lookup", "250"]
+        );
+        for r in &rules[2..] {
+            assert!(!r.add.iter().any(|w| w == "lo"), "{:?}", r.add);
+        }
+        // A member with no gw zone has no table 250 to look up, so it gets neither pair.
+        assert!(host_default_rules(&View::new(&f, "pve3-tb").unwrap(), &[]).is_empty());
+    }
+
+    /// Teardown removes the pair from the kernel's own readback, never from the declaration —
+    /// a row deleted since `up` still has its rules and they are still cfab's. Both renderings
+    /// of table 250 are read back (`ip rule show` names it `cfab-default` where the package's
+    /// rt_tables fragment is installed), and the `del` names it by number either way, exactly
+    /// as pref 2101 already does.
+    #[test]
+    fn the_vm_source_pair_is_torn_down_from_the_kernels_readback() {
+        let mut parse = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2102"],
+                "2102:\tfrom 192.168.20.0/24 lookup main suppress_prefixlength 0\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2103"],
+                "2103:\tfrom 192.168.20.0/24 lookup cfab-default\n",
+            );
+        assert_eq!(
+            installed_workload_sources(&mut parse).unwrap(),
+            vec!["192.168.20.0/24".to_string()],
+            "one source, read from both prefs and deduplicated"
+        );
+
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2102"],
+                "2102:\tfrom 192.168.20.0/24 lookup main suppress_prefixlength 0\n",
+            )
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2103"],
+                "2103:\tfrom 192.168.20.0/24 lookup 250\n",
+            );
+        remove_host_default(&mut sys).unwrap();
+        for del in [
+            "ip rule del pref 2102 from 192.168.20.0/24 lookup main suppress_prefixlength 0",
+            "ip rule del pref 2103 from 192.168.20.0/24 lookup 250",
+        ] {
+            assert!(sys.calls.iter().any(|c| c == del), "{:?}", sys.calls);
+        }
     }
 
     /// No floor default on the host means no 2099 rules — and the other two, and the 250

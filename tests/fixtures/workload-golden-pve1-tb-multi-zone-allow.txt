@@ -41,6 +41,8 @@ table inet cfab-fwd {
     iifname @storage oifname "cfab-work-vms" counter accept comment "allow-storage-vms"
     iifname "cfab-work-vms" oifname @mgmt counter accept comment "allow-vms-mgmt"
     iifname @mgmt oifname "cfab-work-vms" counter accept comment "allow-mgmt-vms"
+    iifname "cfab-work-vms" oifname "cfab-gw249" counter accept comment "allow-vms-gw249"
+    iifname "cfab-gw249" oifname "cfab-work-vms" counter accept comment "allow-gw249-vms"
     counter comment "default-deny"
   }
 }
@@ -74,6 +76,7 @@ table inet cfab {
     type filter hook forward priority mangle; policy accept;
     iifname "cfab-work-vms" oifname { "cfab-st","cfab-st-bk","cfab-st-b2","cfab-st-fb" } ip dscp set cs0 comment "dscp-vms-storage"
     iifname "cfab-work-vms" oifname { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } ip dscp set cs2 comment "dscp-vms-mgmt"
+    iifname "cfab-work-vms" oifname "cfab-gw249" ip dscp set cs2 comment "dscp-vms-gw249"
   }
 }
 
@@ -180,6 +183,19 @@ table inet cfab {
                 }
               ]
             }
+          },
+          {
+            "name": "cfab-mgmt-wl-vms",
+            "mode": "ipv4",
+            "prefixes": {
+              "prefix-list": [
+                {
+                  "ip-prefix": "192.168.20.0/24",
+                  "mask-length-lower": 32,
+                  "mask-length-upper": 32
+                }
+              ]
+            }
           }
         ]
       }
@@ -238,6 +254,20 @@ table inet cfab {
                 "conditions": {
                   "match-prefix-set": {
                     "prefix-set": "cfab-mgmt-id"
+                  }
+                },
+                "actions": {
+                  "policy-result": "accept-route",
+                  "ietf-bgp-policy:bgp-actions": {
+                    "set-next-hop": "self"
+                  }
+                }
+              },
+              {
+                "name": "wl-vms",
+                "conditions": {
+                  "match-prefix-set": {
+                    "prefix-set": "cfab-mgmt-wl-vms"
                   }
                 },
                 "actions": {
