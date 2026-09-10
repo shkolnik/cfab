@@ -385,6 +385,16 @@ mod tests {
         }
     }
 
+    /// Is the `cfab` `ietf-routing:static` instance in this tree at all? Its presence is what
+    /// makes a withdrawal a per-route delete in holo's diff rather than an instance delete.
+    fn has_static_instance(t: &serde_json::Value) -> bool {
+        t["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["type"] == "ietf-routing:static" && p["name"] == "cfab")
+    }
+
     /// Every static destination in a committed tree, in emitted order.
     fn static_routes(t: &serde_json::Value) -> Vec<String> {
         t["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
@@ -467,9 +477,11 @@ mod tests {
     /// at commit, and an ibus interface update never re-resolves it. A leg the watchdog
     /// rebuilt has a new ifindex, and re-sending the same set would diff to nothing and leave
     /// every route pointing at the dead one. So a moved ifindex commits the empty set FIRST
-    /// and the wanted set second — and the order is what makes it work.
+    /// and the wanted set second — and the order is what makes it work. The first tree keeps
+    /// the `cfab` static instance and empties its route list, so holo's diff of it is a
+    /// per-route delete (which uninstalls) and not an instance delete (which does not).
     #[test]
-    fn an_ifindex_change_commits_the_empty_set_before_the_wanted_one() {
+    fn an_ifindex_change_deletes_per_route_before_it_installs_the_wanted_set() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (trees, state) = EngineState::new()
@@ -482,6 +494,10 @@ mod tests {
             .unwrap();
         assert_eq!(trees.len(), 2);
         assert!(static_routes(&trees[0]).is_empty(), "{:?}", trees[0]);
+        assert!(
+            has_static_instance(&trees[0]),
+            "the withdraw tree deleted the instance; holo would leave the route installed"
+        );
         assert_eq!(static_routes(&trees[1]), ["192.168.20.103/32"]);
         assert_eq!(state.routes["primary.3"].0, 43);
     }

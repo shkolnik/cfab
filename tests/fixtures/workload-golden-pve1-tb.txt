@@ -332,7 +332,12 @@ table inet cfab {
                   }
                 }
               ]
-            }
+            },
+            "holo-ospf:redistribution": [
+              {
+                "type": "ietf-routing:static"
+              }
+            ]
           }
         },
         {
@@ -484,6 +489,15 @@ table inet cfab {
                   }
                 }
               ]
+            }
+          }
+        },
+        {
+          "type": "ietf-routing:static",
+          "name": "cfab",
+          "static-routes": {
+            "ietf-ipv4-unicast-routing:ipv4": {
+              "route": []
             }
           }
         },

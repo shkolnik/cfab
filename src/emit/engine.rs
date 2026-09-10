@@ -178,14 +178,13 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
         // The per-VM host routes reach this zone as AS-External (type 5) LSAs, and only this
         // zone: the subscription is per instance, so it is written on the instances the
         // workload's `allow` names and on no other. `metric` is omitted so each route's own
-        // metric (0, for a static route) is what is advertised. Nothing subscribes while no
-        // route exists — an entry with no routes behind it is a live type-5 subscriber that
-        // would originate the moment any static route appeared for any reason.
-        if workload_rows
-            .iter()
-            .filter(|r| r.wl.allow.contains(&z.name))
-            .any(|r| routes.get(&r.wl.ifname).is_some_and(|s| !s.is_empty()))
-        {
+        // metric (0, for a static route) is what is advertised. The entry does not follow the
+        // routes — it follows the `allow`, so it is in force before the first VM is seen and
+        // stays in force across a withdrawal (see the static instance below for why the tree
+        // must not go structurally quiet when the route set empties). cfab is the only writer
+        // of static routes in this holo, so a subscriber with nothing behind it originates
+        // nothing.
+        if workload_rows.iter().any(|r| r.wl.allow.contains(&z.name)) {
             ospf["holo-ospf:redistribution"] = json!([{ "type": "ietf-routing:static" }]);
         }
         protocols.push(json!({
@@ -217,7 +216,20 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
             }));
         }
     }
-    if !static_routes.is_empty() {
+    // The instance exists whenever this member carries a workload row at all, EMPTY ROUTE
+    // LIST INCLUDED, and disappears only with the last row — so a withdrawal changes the
+    // route list and never the instance list.
+    //
+    // Not cosmetic: holo-northbound fires exactly ONE `Delete` callback for a deleted list
+    // entry and none for its descendants (`holo-northbound/src/configuration.rs:426-434`),
+    // and holo-routing's `ControlPlaneProtocolChange::Delete`
+    // (`holo-routing/src/northbound/configuration.rs:180-188`) only drops the instance entry
+    // — it never touches `master.static_routes`. Deleting the instance to withdraw therefore
+    // left the route in holo's RIB and in the kernel and re-advertised the stale /32 on the
+    // next request (VERIFIED on the testbed 2026-09-10 02:07 UTC). Keeping the instance makes
+    // the withdrawal a per-route `Delete` (`configuration.rs:211-213`), which does uninstall.
+    // libyang accepts the empty `route` list (proved by the parse_candidate test below).
+    if !workload_rows.is_empty() {
         protocols.push(json!({
             "type": "ietf-routing:static",
             "name": STATIC_INSTANCE,
@@ -1305,27 +1317,107 @@ mod tests {
         assert_eq!(got, ["storage", "mgmt"]);
     }
 
-    /// The withdrawal: an empty wanted set — the map absent, or the leg present with no
-    /// cidrs — emits NOTHING, not an empty static instance and not a redistribution entry
-    /// that would keep the type-5 subscriber alive with no routes behind it. The tree must
-    /// be identical to the one the engine committed before any VM was seen.
+    /// A member that carries a `[[workload]]` row emits the `cfab` static instance and the
+    /// redistribution entry whether or not it has a route to put in them: the withdrawal is
+    /// the SAME instance with an empty `route` list, never a missing instance.
+    ///
+    /// VERIFIED on the testbed 2026-09-10 02:07 UTC, root cause read in the pinned holo:
+    /// holo-northbound fires exactly one `Delete` callback for a deleted list entry and none
+    /// for its descendants (`holo-northbound/src/configuration.rs:426-434`), and
+    /// holo-routing's `ControlPlaneProtocolChange::Delete`
+    /// (`holo-routing/src/northbound/configuration.rs:180-188`) only drops the instance entry
+    /// — it never touches `master.static_routes`. Deleting the instance therefore left the
+    /// route in holo's RIB and in the kernel (`192.168.20.103 dev primary.3 proto cfab-static
+    /// metric 1` survived the withdraw) and the next request re-advertised the stale /32.
+    /// Keeping the instance makes the withdrawal a per-route `Delete`
+    /// (`configuration.rs:211-213`), which does uninstall.
     #[test]
-    fn an_empty_route_set_emits_no_static_instance_and_no_redistribution() {
+    fn an_empty_route_set_still_emits_the_static_instance_and_the_redistribution() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let base = generate(&v).unwrap();
-        assert!(static_instance(&base).is_none());
         for routes in [WorkloadRoutes::new(), wl_routes(&[("primary.3", &[])])] {
             let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
-            assert_eq!(t, base);
+            assert_eq!(t, base, "the empty set is exactly what `generate` emits");
+            let stat = static_instance(&t).expect("no static instance");
+            assert_eq!(stat["name"], "cfab");
+            assert_eq!(
+                stat["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+                json!([])
+            );
+            let want = json!([{ "type": "ietf-routing:static" }]);
             for inst in ospf_instances(&t) {
-                assert!(
-                    inst["ietf-ospf:ospf"]["holo-ospf:redistribution"].is_null(),
-                    "{}",
-                    inst["name"]
-                );
+                let got = &inst["ietf-ospf:ospf"]["holo-ospf:redistribution"];
+                if inst["name"] == "storage" {
+                    assert_eq!(got, &want, "{}", inst["name"]);
+                } else {
+                    assert!(got.is_null(), "{}: {got}", inst["name"]);
+                }
             }
         }
+    }
+
+    /// The other half of the rule: a member with no `[[workload]]` row at all emits neither
+    /// the instance nor the redistribution entry, so nothing that never hosts a VM carries a
+    /// live type-5 subscriber.
+    #[test]
+    fn a_member_with_no_workload_row_emits_no_static_instance_and_no_redistribution() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(v.workload_rows().is_empty(), "fixture has a workload row");
+        let t = generate(&v).unwrap();
+        assert!(static_instance(&t).is_none());
+        for inst in ospf_instances(&t) {
+            assert!(
+                inst["ietf-ospf:ospf"]["holo-ospf:redistribution"].is_null(),
+                "{}",
+                inst["name"]
+            );
+        }
+    }
+
+    /// The withdrawal seen as holo sees it: the instance's list key is unchanged across the
+    /// two trees, so holo's diff is a per-route delete and not an instance delete.
+    #[test]
+    fn the_static_instance_survives_a_withdraw_so_the_diff_is_per_route() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let live = generate_with(
+            &v,
+            TransitCost::Declared,
+            &wl_routes(&[("primary.3", &["192.168.20.103/32"])]),
+        )
+        .unwrap();
+        let withdrawn =
+            generate_with(&v, TransitCost::Declared, &wl_routes(&[("primary.3", &[])])).unwrap();
+
+        for t in [&live, &withdrawn] {
+            let stat = static_instance(t).expect("the instance was deleted by the withdraw");
+            assert_eq!(
+                (&stat["type"], &stat["name"]),
+                (&json!("ietf-routing:static"), &json!("cfab"))
+            );
+        }
+        assert_eq!(
+            live["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .len(),
+            withdrawn["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .len(),
+            "the withdraw changed the instance list, not just the route list"
+        );
+        assert_eq!(
+            withdrawn["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["type"] == "ietf-routing:static")
+                .unwrap()["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+            json!([])
+        );
     }
 
     /// A leg no `[[workload]]` row on this member names is refused, loudly: it would emit a
@@ -1374,8 +1466,13 @@ mod tests {
                 u64::from(want_cost),
                 "{transit:?}"
             );
-            assert!(static_instance(&bare).is_none(), "{transit:?}");
-            assert!(static_instance(&with).is_some(), "{transit:?}");
+            let list = |t: &Value| {
+                static_instance(t).expect("no static instance")["static-routes"]
+                    ["ietf-ipv4-unicast-routing:ipv4"]["route"]
+                    .clone()
+            };
+            assert_eq!(list(&bare), json!([]), "{transit:?}");
+            assert_eq!(list(&with).as_array().unwrap().len(), 1, "{transit:?}");
         }
     }
 
@@ -1390,6 +1487,15 @@ mod tests {
         let routes = wl_routes(&[("primary.3", &["192.168.20.103/32"])]);
         let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
         crate::engine::northbound::parse_candidate(&t).unwrap();
+
+        // The withdrawal shape too: libyang has to accept the instance with an EMPTY `route`
+        // list, or the fix that keeps the instance across a withdraw cannot be committed.
+        let empty = generate_with(&v, TransitCost::Declared, &WorkloadRoutes::new()).unwrap();
+        assert_eq!(
+            static_instance(&empty).unwrap()["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+            json!([])
+        );
+        crate::engine::northbound::parse_candidate(&empty).unwrap();
 
         let mut broken = t.clone();
         let ifs = broken["ietf-interfaces:interfaces"]["interface"]
