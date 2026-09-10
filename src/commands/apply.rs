@@ -486,6 +486,38 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
             continue;
         }
+        // Phase 2, spec 5.1: the VM VLAN is HOST-LOCAL. With the vid on a bridge port that
+        // leaves the host, the VLAN spans the switch again — a remote VM answers ARP over the
+        // switch beside this host's proxy answer, and the leak the stray drop used to guard
+        // returns. Every port is asked, not just the first: `Uplink.ports` is a list.
+        //
+        // cfab never edits a host bridge port, so this is the FIFTH deferral rather than a
+        // refusal or a silent fix: the member stays up, the remedy (the host's own
+        // `bridge-vids` stanza) is named, and the watchdog installs the row once it clears. A
+        // probe that cannot RUN defers the row too, exactly as the vid-holder probe above
+        // does — an unanswerable question must never become a dark member.
+        let carrying = match uplink::ports_carrying_vid(sys, &up) {
+            Ok(ports) => ports,
+            Err(e) => {
+                warnings.push(format!(
+                    "workload {name}: uplink port vid probe failed: {e}; row deferred to the \
+                     watchdog"
+                ));
+                deferred_names.push(name.clone());
+                workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
+                continue;
+            }
+        };
+        if let Some(port) = carrying.first() {
+            warnings.push(format!(
+                "workload {name}: uplink {port} carries vid {} (host stanza bridge-vids?): \
+                 remove it; row deferred to the watchdog",
+                row.wl.vid
+            ));
+            deferred_names.push(name.clone());
+            workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
+            continue;
+        }
         workload_descs.push(format!(
             "{name} on {leg} ({} {})",
             uplink_word(&up.ports),
@@ -1843,6 +1875,88 @@ pub(crate) mod tests {
             "the failure names the command that failed: {warning}"
         );
         assert!(!broken.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!broken.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            broken.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        assert!(broken.ran("nft -f /run/cfab/policy.nft"));
+    }
+
+    // Phase 2, spec 5.1: the VM VLAN is host-local. A vid on a bridge PORT that leaves the
+    // host puts it back on the switch — the fifth deferral, on the same availability ruling as
+    // the other four: name the port and the remedy, keep the member up.
+    #[test]
+    fn up_defers_a_row_whose_uplink_port_carries_the_vid() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut carrying = sys.on_stdout(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]"#,
+        );
+        let warnings = run(&mut carrying, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "workload vms: uplink eth0 carries vid 3 (host stanza bridge-vids?): remove \
+                    it; row deferred to the watchdog"),
+            "{warnings:#?}"
+        );
+        assert!(!carrying.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!carrying.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            carrying.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // The member still comes up whole (availability first).
+        assert!(carrying.ran("nft -f /run/cfab/policy.nft"));
+        assert!(carrying.ran("nft -f /run/cfab/workload-bridge.nft"));
+    }
+
+    // EVERY port, not just the first: `Uplink.ports` is a list (two NICs in one bridge is the
+    // project's own additive-connectivity thesis), and a vid on the second one spans the switch
+    // exactly as a vid on the first does.
+    #[test]
+    fn up_defers_a_row_whose_second_uplink_port_carries_the_vid() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut carrying = sys
+            .file("/sys/class/net/primary/brif/eth1/state", "3\n")
+            .link("/sys/class/net/eth1/device", "../../../0000:01:00.1")
+            .file("/sys/class/net/eth1/ifindex", "3\n")
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth1"],
+                r#"[{"ifname":"eth1","vlans":[{"vlan":3}]}]"#,
+            );
+        let warnings = run(&mut carrying, &view, &opts()).unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                == "workload vms: uplink eth1 carries vid 3 (host stanza bridge-vids?): remove \
+                    it; row deferred to the watchdog"),
+            "{warnings:#?}"
+        );
+        assert_eq!(
+            carrying.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+    }
+
+    // A probe that cannot RUN defers the row too: an unanswerable question must never become a
+    // dark member (the same reasoning as the vid-holder probe above).
+    #[test]
+    fn up_defers_a_row_when_the_uplink_port_vid_probe_fails() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut broken = sys.on_fail(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            255,
+            "Cannot find device \"eth0\"",
+        );
+        let warnings = run(&mut broken, &view, &opts()).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.starts_with("workload vms: uplink port vid probe failed: "))
+            .unwrap_or_else(|| panic!("{warnings:#?}"));
+        assert!(
+            warning.ends_with("; row deferred to the watchdog"),
+            "{warning}"
+        );
         assert!(!broken.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert_eq!(
             broken.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),

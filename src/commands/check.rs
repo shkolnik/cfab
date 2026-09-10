@@ -39,6 +39,43 @@ pub fn host_preflight(sys: &dyn Sys, view: &View) -> Result<()> {
     Ok(())
 }
 
+/// Host facts a `[[workload]]` row WANTS but can live without, as warning lines: `check` prints
+/// them, `apply` does not call this at all (it defers the row instead, in its own words, which
+/// is the stronger answer and the one an operator acts on).
+///
+/// The one condition today is spec 5.1's: an uplink bridge PORT carrying the row's vid puts the
+/// host-local VLAN back on the switch. A probe that cannot run says so rather than reporting a
+/// clean bridge — "unknown" and "clean" are different facts.
+pub fn host_warnings(sys: &mut dyn Sys, view: &View) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in view.workload_rows() {
+        let bridge = &row.wl.uplink;
+        if !uplink::bridge_present(&*sys, bridge) {
+            continue;
+        }
+        let Ok(up) = uplink::identify_declared(&*sys, bridge, row.wl.vid) else {
+            continue;
+        };
+        match uplink::ports_carrying_vid(sys, &up) {
+            Ok(ports) => {
+                for port in ports {
+                    out.push(format!(
+                        "warning: workload {}: uplink {port} carries vid {} (host stanza \
+                         bridge-vids?): the VLAN is host-local and must not reach the switch; \
+                         `up` defers this row until the vid is gone",
+                        row.wl.name, row.wl.vid
+                    ));
+                }
+            }
+            Err(e) => out.push(format!(
+                "warning: workload {}: uplink port vid probe failed: {e}",
+                row.wl.name
+            )),
+        }
+    }
+    out
+}
+
 /// Can this row's relay plausibly route to `server`? Two ways, and no third: the address sits
 /// inside a zone this row is allowed into (its own `10.<id>.0.0/16` block or that zone's
 /// ingress /24), or some zone declares a `gw`, which gives the member a default route that
@@ -221,6 +258,48 @@ mod tests {
         // ...and a member with no workload row reads nothing at all.
         let leaf = View::new(&f, "pve3-tb").unwrap();
         host_preflight(&MockSys::default(), &leaf).expect("no rows, no host facts");
+    }
+
+    /// Spec 5.1: `check` warns where `up` defers — an operator running `check` on the member
+    /// meets the vid-on-the-port condition here, not as a surprise deferral at `up`.
+    #[test]
+    fn host_warnings_names_every_uplink_port_carrying_the_rows_vid() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let base =
+            || bridge_sys(Some("1\n")).link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
+        let mut carrying = base().on_stdout(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            r#"[{"ifname":"eth0","vlans":[{"vlan":3}]}]"#,
+        );
+        assert_eq!(
+            host_warnings(&mut carrying, &view),
+            vec![
+                "warning: workload vms: uplink eth0 carries vid 3 (host stanza bridge-vids?): \
+                 the VLAN is host-local and must not reach the switch; `up` defers this row \
+                 until the vid is gone"
+            ]
+        );
+        // A clean port warns about nothing.
+        let mut clean = base().on_stdout(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
+        );
+        assert!(host_warnings(&mut clean, &view).is_empty());
+        // A probe that cannot run says so: "unknown" is not "clean".
+        let mut broken = base().on_fail(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            255,
+            "Cannot find device \"eth0\"",
+        );
+        let got = host_warnings(&mut broken, &view);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].starts_with("warning: workload vms: uplink port vid probe failed: "),
+            "{got:?}"
+        );
+        // No bridge at all: nothing to say (the row defers on the bridge, and says so there).
+        assert!(host_warnings(&mut MockSys::default(), &view).is_empty());
     }
 
     /// Conflict 11: holo's `redistribution` list is per-INSTANCE, not per-route, so an entry

@@ -29,49 +29,11 @@ fn record_line(bridge: &str, vid: u16) -> String {
     format!("{bridge} {vid}")
 }
 
-/// The vids `bridge` carries on ITSELF, from `bridge -j vlan show dev <bridge>`.
-///
-/// VERIFIED shape (pve1-tb, iproute2 6.15.0, 2026-09-10):
-/// `[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]`
-/// — the bridge's own entry is listed under its own ifname, and a device that does not exist
-/// exits 255 (`Cannot find device`), which `run_ok` turns into the error it is.
+/// The vids `bridge` carries on ITSELF. One reader for the bridge's own entry and for a
+/// port's (`uplink::ports_carrying_vid` asks the same question of a port), so the two can
+/// never drift apart on a future iproute2 output change.
 pub fn self_vids(sys: &mut dyn Sys, bridge: &str) -> Result<BTreeSet<u16>> {
-    let out = run_ok(sys, &["bridge", "-j", "vlan", "show", "dev", bridge])?;
-    Ok(parse_self_vids(&out.stdout, bridge))
-}
-
-/// The `vlans` of `bridge`'s own entry. A range is `{"vlan":<first>,"vlanEnd":<last>}`;
-/// anything unparsable is simply not a vid we have seen, and the caller's `add` is idempotent
-/// enough to be safe (the kernel accepts adding a vid that is already there).
-fn parse_self_vids(json: &str, bridge: &str) -> BTreeSet<u16> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
-        return BTreeSet::new();
-    };
-    let mut out = BTreeSet::new();
-    for entry in doc.as_array().unwrap_or(&Vec::new()) {
-        if entry.get("ifname").and_then(|v| v.as_str()) != Some(bridge) {
-            continue;
-        }
-        for v in entry
-            .get("vlans")
-            .and_then(|v| v.as_array())
-            .unwrap_or(&Vec::new())
-        {
-            let Some(first) = v.get("vlan").and_then(serde_json::Value::as_u64) else {
-                continue;
-            };
-            let last = v
-                .get("vlanEnd")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(first);
-            for vid in first..=last {
-                if let Ok(vid) = u16::try_from(vid) {
-                    out.insert(vid);
-                }
-            }
-        }
-    }
-    out
+    crate::workload::uplink::vids_of(sys, bridge)
 }
 
 /// The netdev, if any, that already holds `vid` on `uplink` and is not our own `leg`.
@@ -318,25 +280,6 @@ mod tests {
         MockSys::default()
             .on_fail(&["ip", "link", "show"], 1, "Device does not exist")
             .on_stdout(&["bridge", "-j", "vlan", "show", "dev", "primary"], stdout)
-    }
-
-    #[test]
-    fn the_bridges_own_vids_are_read_from_its_own_entry_and_ranges_expand() {
-        assert_eq!(parse_self_vids(SHOW, "primary"), BTreeSet::from([1, 3]));
-        assert_eq!(parse_self_vids(SHOW, "eth0"), BTreeSet::from([1, 9]));
-        assert_eq!(parse_self_vids("[]", "primary"), BTreeSet::new());
-        assert_eq!(
-            parse_self_vids(
-                r#"[{"ifname":"primary","vlans":[{"vlan":10,"vlanEnd":12}]}]"#,
-                "primary"
-            ),
-            BTreeSet::from([10, 11, 12])
-        );
-        // Not JSON at all (an iproute2 that answered on stderr): no vid is claimed present.
-        assert_eq!(
-            parse_self_vids("Cannot find device", "primary"),
-            BTreeSet::new()
-        );
     }
 
     /// The VERIFIED output shape of `ip -d -j link show type vlan` (pve1-tb, iproute2 6.15),

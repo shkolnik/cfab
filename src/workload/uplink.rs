@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::sys::Sys;
+use crate::sys::{Sys, run_ok};
 
 /// The uplink of a workload's bridge: the declared bridge, the declared VLAN id its leg
 /// carries, and the bridge port(s) that reach off-host (a physical NIC, a bond, or a VLAN
@@ -96,6 +96,72 @@ pub fn identify_declared(sys: &dyn Sys, bridge: &str, vid: u16) -> Result<Uplink
         vid,
         ports: uplink_ports,
     })
+}
+
+/// The vids `dev` carries on ITSELF, from `bridge -j vlan show dev <dev>`. `dev` is a bridge
+/// (its own self entry) or a bridge PORT — the output shape is the same, one entry per device
+/// keyed by `ifname`, so one reader answers both questions.
+///
+/// VERIFIED shape (pve1-tb, iproute2 6.15.0, 2026-09-10):
+/// `[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]`
+/// — and a device that does not exist exits 255 (`Cannot find device`), which `run_ok` turns
+/// into the error it is. Every caller treats that error as "unanswerable", never as "no vid":
+/// a row whose ports cannot be read defers rather than installing on a guess.
+pub fn vids_of(sys: &mut dyn Sys, dev: &str) -> crate::error::Result<BTreeSet<u16>> {
+    let out = run_ok(sys, &["bridge", "-j", "vlan", "show", "dev", dev])?;
+    Ok(parse_vids(&out.stdout, dev))
+}
+
+/// The `vlans` of `dev`'s own entry. A range is `{"vlan":<first>,"vlanEnd":<last>}`; anything
+/// unparsable is simply not a vid we have seen.
+fn parse_vids(json: &str, dev: &str) -> BTreeSet<u16> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return BTreeSet::new();
+    };
+    let mut out = BTreeSet::new();
+    for entry in doc.as_array().unwrap_or(&Vec::new()) {
+        if entry.get("ifname").and_then(|v| v.as_str()) != Some(dev) {
+            continue;
+        }
+        for v in entry
+            .get("vlans")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&Vec::new())
+        {
+            let Some(first) = v.get("vlan").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let last = v
+                .get("vlanEnd")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(first);
+            for vid in first..=last {
+                if let Ok(vid) = u16::try_from(vid) {
+                    out.insert(vid);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// EVERY uplink port of `up` that carries `up.vid` — not just the first: `Uplink.ports` is a
+/// list (a bridge with two NICs in it, the project's own additive-connectivity thesis), and a
+/// vid on any one of them puts the VM VLAN back on the switch.
+///
+/// The phase-2 precondition (spec §5.1): the workload VLAN is host-local, so it must reach no
+/// bridge port that leaves the host. With the vid on a port, a remote VM answers ARP over the
+/// switch beside this host's proxy answer, and the leak the stray drop used to guard returns.
+/// cfab never edits a host bridge port (ownership rule), so the caller DEFERS the row and names
+/// the port; the remedy is the host's own `bridge-vids` stanza.
+pub fn ports_carrying_vid(sys: &mut dyn Sys, up: &Uplink) -> crate::error::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for port in &up.ports {
+        if vids_of(sys, port)?.contains(&up.vid) {
+            out.push(port.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Is `port` (a bridge port of `bridge`) in STP forwarding state (`BR_STATE_FORWARDING` = 3)?
@@ -213,6 +279,90 @@ mod tests {
             "bridge primary has no uplink port (no port has a /sys/class/net/<port>/device, \
              directly or through lower links); ports: (none)"
         );
+    }
+
+    /// The VERIFIED output shape (pve1-tb, iproute2 6.15.0): the bridge's own entry beside a
+    /// port's, so the parser is proven to read the right one — the whole point of one reader
+    /// answering both "what does the bridge carry on itself" and "what does this port carry".
+    const SHOW: &str = r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":9}]},{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]"#;
+
+    #[test]
+    fn a_devices_own_vids_are_read_from_its_own_entry_and_ranges_expand() {
+        assert_eq!(parse_vids(SHOW, "primary"), BTreeSet::from([1, 3]));
+        assert_eq!(parse_vids(SHOW, "eth0"), BTreeSet::from([1, 9]));
+        assert_eq!(parse_vids("[]", "primary"), BTreeSet::new());
+        assert_eq!(
+            parse_vids(
+                r#"[{"ifname":"primary","vlans":[{"vlan":10,"vlanEnd":12}]}]"#,
+                "primary"
+            ),
+            BTreeSet::from([10, 11, 12])
+        );
+        // Not JSON at all (an iproute2 that answered on stderr): no vid is claimed present.
+        assert_eq!(parse_vids("Cannot find device", "primary"), BTreeSet::new());
+    }
+
+    /// EVERY port is asked, in order, and only the ones carrying the row's vid come back.
+    #[test]
+    fn ports_carrying_the_vid_are_found_on_any_port_not_just_the_first() {
+        let up = Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into(), "eth1".into()],
+        };
+        // eth0 clean, eth1 carrying: the second port alone must not read as "clean".
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth1"],
+                r#"[{"ifname":"eth1","vlans":[{"vlan":3}]}]"#,
+            );
+        assert_eq!(ports_carrying_vid(&mut sys, &up).unwrap(), vec!["eth1"]);
+        // Both carrying (a range covering the vid counts), and neither.
+        let mut both = MockSys::default()
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":2,"vlanEnd":4}]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth1"],
+                r#"[{"ifname":"eth1","vlans":[{"vlan":3}]}]"#,
+            );
+        assert_eq!(
+            ports_carrying_vid(&mut both, &up).unwrap(),
+            vec!["eth0", "eth1"]
+        );
+        let mut clean = MockSys::default()
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":2}]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth1"],
+                r#"[{"ifname":"eth1","vlans":[{"vlan":2}]}]"#,
+            );
+        assert!(ports_carrying_vid(&mut clean, &up).unwrap().is_empty());
+    }
+
+    /// A probe that cannot run is an ERROR, never an empty list: the caller defers the row on
+    /// it, and reporting "no port carries the vid" from a failed read would install the row on
+    /// a guess.
+    #[test]
+    fn a_failed_port_vid_probe_is_an_error_not_an_empty_list() {
+        let up = Uplink {
+            bridge: "primary".into(),
+            vid: 3,
+            ports: vec!["eth0".into()],
+        };
+        let mut sys = MockSys::default().on_fail(
+            &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+            255,
+            "Cannot find device \"eth0\"",
+        );
+        assert!(ports_carrying_vid(&mut sys, &up).is_err());
     }
 
     #[test]

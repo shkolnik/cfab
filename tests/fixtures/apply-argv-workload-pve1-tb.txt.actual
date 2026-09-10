@@ -22,7 +22,6 @@ write /proc/sys/net/ipv4/conf/all/send_redirects
 write /proc/sys/net/ipv4/conf/default/send_redirects
 write /proc/sys/net/ipv4/conf/default/forwarding
 ip -d -j link show type vlan
-bridge -j vlan show dev eth0
 ip link show cfab-id99
 ip link show cfab-id99
 ip link add cfab-id99 type veth peer name cfab-id99-peer
