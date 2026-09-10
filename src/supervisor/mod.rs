@@ -2065,6 +2065,21 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&wl_decl_text(run_dir)).unwrap()).unwrap()
     }
 
+    /// `wl_decl_text` with `dhcp_server = <addr>` added to the "vms" row, for the relay tests
+    /// below. `decl.rs` is not mine to edit, so this is a plain string edit of the fixture's own
+    /// text rather than a second fixture constant living there.
+    fn wl_decl_text_with_relay(run_dir: &Path, dhcp_server: &str) -> String {
+        let text = wl_decl_text(run_dir);
+        let with_gw = "gw = \"192.168.20.254\"\nallow = [\"storage\"]\n";
+        assert!(text.contains(with_gw), "fixture text changed shape: {text}");
+        text.replace(
+            with_gw,
+            &format!(
+                "gw = \"192.168.20.254\"\ndhcp_server = \"{dhcp_server}\"\nallow = [\"storage\"]\n"
+            ),
+        )
+    }
+
     /// `fresh_sys` plus the host facts a workload row needs (the same shape as
     /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and
     /// one VM tap, and no self vid yet — `up` builds the leg on it.
@@ -2168,6 +2183,124 @@ mod tests {
             ),
             "{said:?}"
         );
+    }
+
+    /// Teeth: the ACK's neighbor write must go through `Cmd::DhcpAck` and land on `&mut sys` in
+    /// the main loop, never inside the relay task itself (`Sys` is not `Send`). Posting the
+    /// command directly, with no relay task involved at all, proves the loop's own handling: the
+    /// exact `ip neigh replace` argv must reach `sys`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_posted_dhcp_ack_writes_the_neighbor_through_sys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = wl_fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            // Sent as two distinct messages on the same unbounded (FIFO) channel: the loop
+            // drains one `Cmd` per select iteration, so DhcpAck is guaranteed to be handled
+            // before Terminate is even looked at.
+            driver_tx
+                .send(Cmd::DhcpAck {
+                    name: "vms".to_string(),
+                    leg: "cfab-work-vms".to_string(),
+                    yiaddr: "192.168.20.150".parse().unwrap(),
+                    chaddr: [0x4e, 0x48, 0xe9, 0x89, 0x2e, 0xe5],
+                })
+                .ok();
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &wl_decl_text(tmp.path()),
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        driver.await.unwrap();
+        assert!(
+            sys.ran(
+                "ip neigh replace 192.168.20.150 lladdr 4e:48:e9:89:2e:e5 dev cfab-work-vms nud \
+                 stale"
+            ),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// A row declaring `dhcp_server` gets a relay task spawned for it, and a bind failure (this
+    /// sandbox has no local address `192.168.20.2`, so the server-facing bind fails for real) is
+    /// recorded in `Shared` for `status`/metrics to read, and never fatal: the member still
+    /// comes up (spec §3.1, availability first: "a relay that cannot bind is a degraded row, not
+    /// a dead host"). `relay.rs` journals the same fact with a plain `eprintln!` straight to
+    /// stderr (spec: never `tracing`), by design outside the `Hooks::trace` test-only wire the
+    /// announcer's `journal()` helper uses — verified by reading `relay::run`, not asserted here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_relay_spawns_and_a_bind_failure_is_loud_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path()).file(CONFIG, &decl);
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let bound = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .relays
+                    .get("vms")
+                    .is_some_and(|r| r.last_error.is_some())
+            })
+            .await;
+            let err = sh
+                .lock()
+                .unwrap()
+                .relays
+                .get("vms")
+                .and_then(|r| r.last_error.clone());
+            driver_tx.send(Cmd::Terminate).ok();
+            (bound, err)
+        });
+        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(
+            code, 0,
+            "a relay bind failure must never take the member down"
+        );
+        let (bound, err) = driver.await.unwrap();
+        assert!(bound, "the relay must record its bind failure in Shared");
+        assert!(err.is_some(), "{err:?}");
     }
 
     /// Poll `ready` until it holds or the deadline passes; the answer is whether it holds.
