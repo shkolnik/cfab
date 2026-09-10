@@ -599,7 +599,16 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     let wl_qos: Vec<&str> = wl_qos.iter().map(String::as_str).collect();
     for r in &ready {
         leg::install(
-            sys, &f.run_dir, &r.leg, &r.uplink, r.vid, &r.address, &wl_qos,
+            sys,
+            &f.run_dir,
+            &leg::LegSpec {
+                leg: &r.leg,
+                uplink: &r.uplink,
+                vid: r.vid,
+                address: &r.address,
+                gw_cidr: &r.gw_cidr,
+            },
+            &wl_qos,
         )?;
     }
 
@@ -826,6 +835,28 @@ pub(crate) fn vlan_marker(vid: u16) -> String {
     format!("vlan protocol 802.1Q id {vid} ")
 }
 
+/// The full identity of a vlan netdev cfab built: kind vlan, THIS parent, THIS vid. All three
+/// out of the one `ip -d link show` the kind test already runs — its first line heads
+/// `<index>: <name>@<parent>:` for a vlan (VERIFIED shape, pve1-tb iproute2 6.15.0:
+/// `9: cfab-work-vms@primary: <BROADCAST,MULTICAST,UP> ... vlan protocol 802.1Q id 3
+/// <REORDER_HDR>`), so the parent is already in the document and no second probe is needed.
+///
+/// The parent half became load-bearing when the workload leg started outliving a supervisor
+/// stop (see `commands::teardown::Teardown`), reload included: a row whose `uplink` changed
+/// while cfab was stopped would otherwise keep a leg on the OLD bridge — right vid, wrong wire,
+/// silently. It holds for every cfab vlan leg because `mk_vlan` is the one builder they share.
+pub(crate) fn vlan_identity_is(
+    sys: &mut dyn Sys,
+    dev: &str,
+    lower: &str,
+    vid: u16,
+) -> Result<bool> {
+    let out = sys.run(&["ip", "-d", "link", "show", dev])?;
+    Ok(out.ok()
+        && out.stdout.contains(&vlan_marker(vid))
+        && out.stdout.contains(&format!("{dev}@{lower}:")))
+}
+
 pub(crate) fn mk_vlan(
     sys: &mut dyn Sys,
     name: &str,
@@ -836,7 +867,7 @@ pub(crate) fn mk_vlan(
     qos_map: &[&str],
 ) -> Result<()> {
     let vid_s = vid.to_string();
-    if link_exists(sys, name)? && !link_kind_is(sys, name, &vlan_marker(vid))? {
+    if link_exists(sys, name)? && !vlan_identity_is(sys, name, lower, vid)? {
         run_ok(sys, &["ip", "link", "del", name])?;
     }
     if !link_exists(sys, name)? {

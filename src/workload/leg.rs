@@ -14,8 +14,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::commands::apply::{mk_vlan, vlan_marker};
-use crate::commands::common::{link_exists, link_kind_is};
+use crate::commands::apply::{mk_vlan, vlan_identity_is};
+use crate::commands::common::link_exists;
 use crate::error::Result;
 use crate::sys::{Sys, run_ok};
 
@@ -115,20 +115,40 @@ fn parse_foreign_holder(json: &str, uplink: &str, vid: u16, leg: &str) -> Option
     })
 }
 
+/// One workload row's leg, as `install` builds it. A struct because the five facts travel
+/// together everywhere (apply's ready row, the watchdog's rebuild) and a positional list of
+/// them is a swap waiting to happen — the same shape `mk_bond_leg` takes.
+#[derive(Debug, Clone, Copy)]
+pub struct LegSpec<'a> {
+    pub leg: &'a str,
+    pub uplink: &'a str,
+    pub vid: u16,
+    /// This member's own address on the row, with the prefix's mask.
+    pub address: &'a str,
+    /// The anycast gateway. Not installed here (see `install`), only kept.
+    pub gw_cidr: &'a str,
+}
+
 /// Create (or repair) the leg and give the bridge the vid if it lacks it.
 ///
 /// `mk_vlan` is the same builder every other cfab leg uses, so a netdev of this name that is
-/// NOT a vlan of this vid is replaced rather than trusted, and one that is is left where it is.
-pub fn install(
-    sys: &mut dyn Sys,
-    run_dir: &str,
-    leg: &str,
-    uplink: &str,
-    vid: u16,
-    address: &str,
-    qos_map: &[&str],
-) -> Result<()> {
+/// not a vlan of this vid on THIS uplink is replaced rather than trusted, and one that is is
+/// left where it is.
+///
+/// `gw_cidr` is not installed here — the callers add the anycast gw only after the bridge ARP
+/// guard is up — but it is named here because this is where the leg's address list is
+/// reconciled: a leg that outlives a supervisor stop can come back to a row whose `address`
+/// changed meanwhile, and `ip addr replace` alone would leave BOTH on it.
+pub fn install(sys: &mut dyn Sys, run_dir: &str, spec: &LegSpec, qos_map: &[&str]) -> Result<()> {
+    let LegSpec {
+        leg,
+        uplink,
+        vid,
+        address,
+        gw_cidr,
+    } = *spec;
     mk_vlan(sys, leg, uplink, vid, Some(address), true, qos_map)?;
+    prune_addresses(sys, leg, &[address, gw_cidr])?;
     // Address-then-vid on purpose, and momentarily: until the bridge carries the vid the leg
     // receives nothing, so the window is one where no traffic can arrive at the address anyway
     // (unlike the anycast `gw`, which apply/the watchdog deliberately install only after the
@@ -136,6 +156,47 @@ pub fn install(
     // `install` rather than leaving a half-built leg that has to be unwound.
     ensure_self_vid(sys, run_dir, uplink, vid)?;
     Ok(())
+}
+
+/// Delete every IPv4 address on the leg other than the ones cfab means it to carry.
+///
+/// The leg is cfab's own netdev, created and named by cfab, so every address on it is cfab's to
+/// manage — and there are exactly two: this member's declared `address` and the anycast `gw`.
+/// This is scoped to the WORKLOAD leg, not to `mk_vlan`, because `mk_vlan`'s other callers do
+/// not own their addresses the same way: the gw address arrives on the workload leg through a
+/// separate `ip addr replace` AFTER the bridge ARP guard, so a prune inside `mk_vlan` would
+/// delete and re-add the anycast gateway on every apply and every watchdog restore.
+///
+/// A read that fails prunes nothing: the address list is not a fact we have, and deleting on a
+/// guess is the one thing this must never do. IPv6 never appears — `-4` asks for one family.
+fn prune_addresses(sys: &mut dyn Sys, leg: &str, keep: &[&str]) -> Result<()> {
+    let out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", leg])?;
+    if !out.ok() {
+        return Ok(());
+    }
+    for cidr in extra_addresses(&out.stdout, keep) {
+        run_ok(sys, &["ip", "addr", "del", &cidr, "dev", leg])?;
+    }
+    Ok(())
+}
+
+/// The `<addr>/<len>` tokens of an `ip -4 -br addr show dev <leg>` line that are not in `keep`.
+///
+/// VERIFIED shape (pve1-tb, iproute2 6.15.0): `cfab-work-vms UP 192.168.20.2/24
+/// 192.168.20.254/24` — ifname, state, then the addresses. Read by shape rather than by
+/// position: a token counts only if it parses as `<IPv4>/<len>`, so neither the ifname nor a
+/// state word (nor a future column) can ever be handed to `ip addr del`.
+fn extra_addresses(brief: &str, keep: &[&str]) -> Vec<String> {
+    brief
+        .split_whitespace()
+        .filter(|t| {
+            t.split_once('/').is_some_and(|(a, len)| {
+                a.parse::<std::net::Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|n| n <= 32)
+            })
+        })
+        .filter(|t| !keep.contains(t))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Give the bridge the vid on ITSELF if it lacks it, recording that cfab is the one that added
@@ -167,10 +228,12 @@ pub fn ensure_self_vid(sys: &mut dyn Sys, run_dir: &str, uplink: &str, vid: u16)
     Ok(true)
 }
 
-/// Is the leg there, and ours? A netdev of that name which is not a vlan of this vid is not
-/// this leg — the caller rebuilds (`install` replaces it) rather than counting it present.
-pub fn present(sys: &mut dyn Sys, leg: &str, vid: u16) -> Result<bool> {
-    Ok(link_exists(sys, leg)? && link_kind_is(sys, leg, &vlan_marker(vid))?)
+/// Is the leg there, and ours? Same identity `mk_vlan` applies — kind vlan, this uplink, this
+/// vid — so the watchdog and the builder can never disagree about what counts as present. A
+/// netdev of that name failing any of the three is not this leg, and the caller rebuilds
+/// (`install` replaces it) rather than counting it present.
+pub fn present(sys: &mut dyn Sys, leg: &str, uplink: &str, vid: u16) -> Result<bool> {
+    Ok(link_exists(sys, leg)? && vlan_identity_is(sys, leg, uplink, vid)?)
 }
 
 /// Remove the leg, and the bridge's vid if cfab is the one that added it.
@@ -181,7 +244,7 @@ pub fn present(sys: &mut dyn Sys, leg: &str, vid: u16) -> Result<bool> {
 /// either way, this is only the bridge's self entry). The second proof is `release_vid`, which
 /// a supervisor stop runs on its own: it keeps the netdev and gives the vid back.
 pub fn remove(sys: &mut dyn Sys, run_dir: &str, leg: &str, uplink: &str, vid: u16) -> Result<()> {
-    if present(sys, leg, vid)? {
+    if present(sys, leg, uplink, vid)? {
         run_ok(sys, &["ip", "link", "del", leg])?;
     }
     release_vid(sys, run_dir, uplink, vid)
@@ -239,6 +302,17 @@ mod tests {
     /// The VERIFIED output shape (pve1-tb, iproute2 6.15.0): the bridge's own entry beside a
     /// port's, so the parser is proven to read the right one.
     const SHOW: &str = r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":9}]},{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]"#;
+
+    /// The row every `install` test builds: `examples/fabric.toml`'s workload on pve1-tb.
+    fn spec() -> LegSpec<'static> {
+        LegSpec {
+            leg: "cfab-work-vms",
+            uplink: "primary",
+            vid: 3,
+            address: "192.168.20.2/24",
+            gw_cidr: "192.168.20.254/24",
+        }
+    }
 
     fn sys_with_vlan_show(stdout: &str) -> MockSys {
         MockSys::default()
@@ -338,16 +412,7 @@ mod tests {
         let mut sys = sys_with_vlan_show(
             r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
         );
-        install(
-            &mut sys,
-            "/run/cfab",
-            "cfab-work-vms",
-            "primary",
-            3,
-            "192.168.20.2/24",
-            &["0:0", "6:6"],
-        )
-        .unwrap();
+        install(&mut sys, "/run/cfab", &spec(), &["0:0", "6:6"]).unwrap();
         assert_eq!(
             sys.calls,
             vec![
@@ -356,6 +421,7 @@ mod tests {
                 "ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:6",
                 "ip addr replace 192.168.20.2/24 dev cfab-work-vms",
                 "ip link set cfab-work-vms up",
+                "ip -4 -br addr show dev cfab-work-vms",
                 "bridge -j vlan show dev primary",
                 "bridge vlan add dev primary vid 3 self",
                 "write /run/cfab/workload-self-vid",
@@ -370,18 +436,93 @@ mod tests {
     #[test]
     fn install_leaves_a_self_vid_the_host_already_had_and_records_nothing() {
         let mut sys = sys_with_vlan_show(SHOW);
-        install(
-            &mut sys,
-            "/run/cfab",
-            "cfab-work-vms",
-            "primary",
-            3,
-            "192.168.20.2/24",
-            &["0:0", "6:6"],
-        )
-        .unwrap();
+        install(&mut sys, "/run/cfab", &spec(), &["0:0", "6:6"]).unwrap();
         assert!(!sys.ran("bridge vlan add dev primary vid 3 self"));
         assert!(sys.writes_of("/run/cfab/workload-self-vid").is_empty());
+    }
+
+    /// A kept leg is judged by kind, PARENT and vid. A row whose `uplink` changed while cfab
+    /// was stopped comes back to a netdev with the right name and the right vid on the wrong
+    /// bridge; it is deleted and rebuilt, not trusted.
+    #[test]
+    fn a_kept_leg_on_the_wrong_uplink_is_rebuilt_and_one_on_the_right_uplink_is_left_alone() {
+        let kept = |parent: &str| {
+            sys_with_vlan_show(SHOW)
+                .on_stdout(
+                    &["ip", "link", "show", "cfab-work-vms"],
+                    "9: cfab-work-vms\n",
+                )
+                .on_stdout(
+                    &["ip", "-d", "link", "show", "cfab-work-vms"],
+                    &format!("9: cfab-work-vms@{parent}: <UP> vlan protocol 802.1Q id 3 \n"),
+                )
+        };
+        let mut moved = kept("oldbridge");
+        install(&mut moved, "/run/cfab", &spec(), &["0:0", "6:6"]).unwrap();
+        assert!(moved.ran("ip link del cfab-work-vms"));
+        assert!(moved.ran(
+            "ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:6"
+        ));
+
+        // The teeth: the same leg on the declared bridge is never touched.
+        let mut same = kept("primary");
+        install(&mut same, "/run/cfab", &spec(), &["0:0", "6:6"]).unwrap();
+        assert!(!same.ran("ip link del cfab-work-vms"));
+        assert!(!same.calls.iter().any(|c| c.starts_with("ip link add")));
+        assert!(!same.calls.iter().any(|c| c.starts_with("ip addr del")));
+
+        // The watchdog reads the same identity, so it can never call a leg on the wrong bridge
+        // present and skip the rebuild the builder would do.
+        assert!(!present(&mut kept("oldbridge"), "cfab-work-vms", "primary", 3).unwrap());
+        assert!(present(&mut kept("primary"), "cfab-work-vms", "primary", 3).unwrap());
+    }
+
+    /// A row whose `address` changed while cfab was stopped: `ip addr replace` adds the new one
+    /// and leaves the old, so every other IPv4 address on the leg is deleted. The anycast `gw`
+    /// is not "other" — the callers install it separately, after the bridge ARP guard.
+    #[test]
+    fn install_deletes_a_stale_address_the_kept_leg_still_carries_and_keeps_the_gw() {
+        let mut sys = sys_with_vlan_show(SHOW)
+            .on_stdout(
+                &["ip", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <UP> vlan protocol 802.1Q id 3 \n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.9/24 192.168.20.2/24 192.168.20.254/24\n",
+            );
+        install(&mut sys, "/run/cfab", &spec(), &["0:0", "6:6"]).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.2/24 dev cfab-work-vms"));
+        assert!(sys.ran("ip addr del 192.168.20.9/24 dev cfab-work-vms"));
+        assert_eq!(
+            sys.calls
+                .iter()
+                .filter(|c| c.starts_with("ip addr del"))
+                .count(),
+            1,
+            "the member address and the anycast gw both stay"
+        );
+    }
+
+    #[test]
+    fn the_address_list_is_read_by_shape_so_no_column_can_become_a_delete() {
+        // ifname and state are not addresses, and neither is anything else without a valid
+        // `<IPv4>/<len>`; an empty read (a leg with no address yet) deletes nothing.
+        assert_eq!(
+            extra_addresses(
+                "cfab-work-vms UP 192.168.20.9/24 192.168.20.2/24",
+                &["192.168.20.2/24"]
+            ),
+            vec!["192.168.20.9/24".to_string()]
+        );
+        assert!(extra_addresses("cfab-work-vms DOWN \n", &[]).is_empty());
+        assert!(extra_addresses("", &[]).is_empty());
+        assert!(extra_addresses("cfab-work-vms UP 192.168.20.2/99", &[]).is_empty());
+        assert!(extra_addresses("cfab-work-vms UP fe80::1/64", &[]).is_empty());
     }
 
     #[test]
@@ -430,7 +571,7 @@ mod tests {
             );
         remove(&mut foreign, "/run/cfab", "cfab-work-vms", "primary", 3).unwrap();
         assert!(!foreign.ran("ip link del cfab-work-vms"));
-        assert!(!present(&mut foreign, "cfab-work-vms", 3).unwrap());
+        assert!(!present(&mut foreign, "cfab-work-vms", "primary", 3).unwrap());
     }
 
     #[test]

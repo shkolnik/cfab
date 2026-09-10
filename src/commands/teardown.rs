@@ -215,9 +215,10 @@ pub fn run(sys: &mut dyn Sys, view: &View, mode: Teardown) -> Result<String> {
                     &row.wl.uplink,
                     row.wl.vid,
                 )?,
-                // Same ownership proof, netdev kept: the record goes with the run dir below,
-                // so a vid cfab added must be given back now or nothing will remember it was
-                // ours. `up` re-adds and re-records it.
+                // Same ownership proof, netdev kept. The record this rewrites is itself
+                // removed with the run dir a few lines below; what matters here is the KERNEL
+                // state — a vid cfab added must be given back now, because after the run dir
+                // goes nothing remembers it was ours. `up` re-adds and re-records it.
                 Teardown::Stop => {
                     crate::workload::leg::release_vid(sys, &f.run_dir, &row.wl.uplink, row.wl.vid)?
                 }
