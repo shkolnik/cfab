@@ -325,14 +325,22 @@ state_doc() {                      # one request; empty output when nothing answ
     printf 'state\n' | socat -t 5 -T 5 - UNIX-CONNECT:"$SOCK" 2>/dev/null
 }
 
-# start_engine <log> [engine args…]; sets ENGINE_PID. `ip netns exec` execs the command in
-# place (no fork), so $! is the engine's own pid; the pidfile is cross-checked at ready.
+# start_engine <log> [engine args…]; sets ENGINE_PID. `ip netns exec`, `unshare` and the `exec`
+# in the shell all replace the process in place (no fork), so $! is the engine's own pid; the
+# pidfile is cross-checked at ready.
+#
+# `unshare -u` + `hostname h` rather than a flag: cfab identifies its member by kernel hostname
+# and has no override. A netns is NOT a UTS namespace, so without this the engine would read the
+# box's real hostname and refuse as "not a declared member". Setting a real hostname in a real
+# UTS namespace is also closer to what this harness simulates than asserting one over argv was.
 # NO_COLOR=1: tracing-subscriber's fmt layer colors stderr even when it is a file (measured:
 # `count=2` arrives as `ESC[3mcount ESC[0m ESC[2m= ESC[0m2`), which defeats every grep below;
 # it honors NO_COLOR. elog() strips escapes anyway, in case a build stops honoring it.
 start_engine() {
     local log=$1; shift
-    NO_COLOR=1 ip netns exec H setsid "$ORACLE_BIN" --config "$CONF" --host h engine "$@" > "$log" 2>&1 < /dev/null &
+    NO_COLOR=1 ORACLE_BIN="$ORACLE_BIN" CONF="$CONF" ip netns exec H unshare -u \
+        sh -c 'hostname h && exec setsid "$ORACLE_BIN" --config "$CONF" engine "$@"' \
+        _ "$@" > "$log" 2>&1 < /dev/null &
     ENGINE_PID=$!
     T_SPAWN=$(date +%s.%N)
     say "engine started pid $ENGINE_PID log $log args [$*]"
