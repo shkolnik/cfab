@@ -449,10 +449,11 @@ impl HostRoutes {
         let ports = up.ports;
         let neigh = sys.run(&["ip", "-j", "neigh", "show", "dev", &leg]).ok()?;
         if !neigh.ok() {
-            self.fail(
+            self.fail_costing(
                 &name,
                 Cond::Read,
                 format!("cannot read the neighbors of {leg}"),
+                ENGINE_COST,
                 out,
             );
             return None;
@@ -461,10 +462,11 @@ impl HostRoutes {
             .run(&["bridge", "-j", "fdb", "show", "br", &wl.uplink])
             .ok()?;
         if !fdb.ok() {
-            self.fail(
+            self.fail_costing(
                 &name,
                 Cond::Read,
                 format!("cannot read the FDB of bridge {}", wl.uplink),
+                ENGINE_COST,
                 out,
             );
             return None;
@@ -478,13 +480,14 @@ impl HostRoutes {
                 Some(live)
             }
             None => {
-                self.fail(
+                self.fail_costing(
                     &name,
                     Cond::Read,
                     format!(
                         "cannot parse the neighbors of {leg} or the FDB of {}",
                         wl.uplink
                     ),
+                    ENGINE_COST,
                     out,
                 );
                 None
@@ -707,10 +710,11 @@ impl HostRoutes {
             _ => None,
         };
         let Some(held) = held else {
-            self.fail(
+            self.fail_costing(
                 &name,
                 Cond::Nft,
                 format!("cannot read the nft set {family} {table} {set}"),
+                NFT_COST,
                 out,
             );
             return;
@@ -726,10 +730,11 @@ impl HostRoutes {
                 .run(&["nft", verb, "element", family, table, &set, &braced])
                 .is_ok_and(|o| o.ok());
             if !ok {
-                self.fail(
+                self.fail_costing(
                     &name,
                     Cond::Nft,
                     format!("cannot {verb} {braced} in the nft set {family} {table} {set}"),
+                    NFT_COST,
                     out,
                 );
                 return;
@@ -742,30 +747,7 @@ impl HostRoutes {
     }
 
     /// One spelling for every fault of one condition: what went wrong, then what it costs.
-    ///
-    /// Only `Cond::Read` and `Cond::Nft` are ever handed to this function — every other
-    /// condition's cost text depends on which of several call sites raised it (an engine
-    /// refusal vs. an engine withdraw, a MAC read vs. a send), so it is computed at the call
-    /// site and passed straight to `fail_costing` instead. The other three arms are
-    /// `unreachable!()`, not prose, so a spelling that can never print never gets invented —
-    /// and a future call site that DOES route one of them through `fail()` panics under test
-    /// immediately, rather than silently adopting whatever guess is sitting here unused.
-    fn fail(&mut self, name: &str, cond: Cond, why: String, out: &mut Vec<String>) {
-        let cost = match cond {
-            Cond::Read => ENGINE_COST,
-            Cond::Nft => "the local set is unchanged",
-            Cond::Engine => unreachable!("Cond::Engine's cost is per-refusal; see ask_engine"),
-            Cond::Probe => unreachable!("Cond::Probe's cost is per-fault; see maybe_probe"),
-            Cond::AgeingTime => {
-                unreachable!(
-                    "Cond::AgeingTime's cost is fixed at its one call site; see maybe_probe"
-                )
-            }
-        };
-        self.fail_costing(name, cond, why, cost, out);
-    }
-
-    /// The same, for the one fault whose cost is not its condition's usual one.
+    /// The cost is passed in because it depends on which call site raised the condition.
     fn fail_costing(
         &mut self,
         name: &str,
@@ -784,6 +766,7 @@ impl HostRoutes {
 
 /// What every read fault and every ordinary engine refusal costs: nothing this tick.
 const ENGINE_COST: &str = "host routes unchanged";
+const NFT_COST: &str = "the local set is unchanged";
 
 /// What an engine reply to `workload-routes` means.
 enum Refusal {
@@ -823,9 +806,10 @@ const DEFAULT_AGEING: Duration = Duration::from_secs(300);
 ///
 /// `/sys/class/net/<bridge>/bridge/ageing_time` reports centiseconds (`USER_HZ`, the historic
 /// unit every bridge sysfs timer uses) — 30000 is the kernel default 300 s, which is exactly
-/// what G0 1b measured. A read that fails or does not parse falls back to `DEFAULT_AGEING`,
-/// named once in the returned fault text; the probe keeps running either way (availability
-/// first) rather than stopping because one fact about the host could not be confirmed.
+/// what G0 1b measured. A read that fails, does not parse, or reads zero falls back to
+/// `DEFAULT_AGEING`, named once in the returned fault text; the probe keeps running either way
+/// (availability first) rather than stopping because one fact about the host could not be
+/// confirmed.
 fn probe_interval(sys: &dyn Sys, bridge: &str) -> (Duration, Option<String>) {
     let path = format!("/sys/class/net/{bridge}/bridge/ageing_time");
     match sys
