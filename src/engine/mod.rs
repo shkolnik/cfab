@@ -256,24 +256,61 @@ async fn commit_steps<E>(
     req: &sock::Request,
     steps: Vec<(Step, Value, EngineState)>,
     mut commit_one: E,
-) -> Result<()>
+) -> std::result::Result<(), CommitFailure>
 where
     E: AsyncFnMut(Value) -> Result<bool>,
 {
+    let mut withdrew = false;
     for (step, tree, next) in steps {
         // Only a step that actually moved something is worth a log line, or the record of the
         // change drowns in the record of no change. A step that changed nothing is still in
         // force, so the state advances either way.
-        if commit_one(tree).await? {
-            info!(
-                request = %req.summary(),
-                step = step.as_str(),
-                "engine configuration re-committed"
-            );
+        match commit_one(tree).await {
+            Ok(moved) => {
+                if moved {
+                    info!(
+                        request = %req.summary(),
+                        step = step.as_str(),
+                        "engine configuration re-committed"
+                    );
+                }
+            }
+            Err(err) => return Err(CommitFailure { withdrew, err }),
         }
         *state = next;
+        withdrew |= step == Step::Withdraw;
     }
     Ok(())
+}
+
+/// A commit that failed, and what it left behind. `withdrew` is true when an earlier step of
+/// the SAME request already landed — for an ifindex move that is the withdraw, so holo now
+/// holds no routes for the leg at all. A driver told only "refused" would report those routes
+/// unchanged, which is the one failure here that actually costs a VM its reach.
+#[derive(Debug)]
+struct CommitFailure {
+    withdrew: bool,
+    err: Error,
+}
+
+/// The reply to a `workload-routes` request. A refusal whose withdraw already landed is an
+/// `error` reply that also says `withdrew`, so the driver can name what it cost; every other
+/// refusal is the ordinary error the socket renders from `Err`.
+fn workload_routes_reply(
+    leg: &str,
+    routes: usize,
+    outcome: std::result::Result<(), CommitFailure>,
+) -> Result<Value> {
+    match outcome {
+        Ok(()) => Ok(serde_json::json!({
+            "workload_routes": { "leg": leg, "routes": routes }
+        })),
+        Err(f) if f.withdrew => Ok(serde_json::json!({
+            "error": f.err.to_string(),
+            "withdrew": true,
+        })),
+        Err(f) => Err(f.err),
+    }
 }
 
 /// Commit what `req` asks for, in order, and adopt the state it leaves behind.
@@ -287,8 +324,11 @@ async fn commit(
     view: &View<'_>,
     state: &mut EngineState,
     req: &sock::Request,
-) -> Result<()> {
-    let steps = state.apply(view, req)?;
+) -> std::result::Result<(), CommitFailure> {
+    let steps = state.apply(view, req).map_err(|err| CommitFailure {
+        withdrew: false,
+        err,
+    })?;
     commit_steps(state, req, steps, async |tree| {
         let candidate = northbound::parse_candidate(&tree)?;
         nb.commit(candidate).await
@@ -368,15 +408,14 @@ async fn serve(
                     }
                     sock::Request::TransitCost(at) => {
                         let at = *at;
-                        commit(nb, view, state, &req).await?;
+                        // One step, always: there is nothing a failure here can have left
+                        // behind, so it is the ordinary error reply.
+                        commit(nb, view, state, &req).await.map_err(|f| f.err)?;
                         Ok(serde_json::json!({ "transit_cost": at.word() }))
                     }
                     sock::Request::WorkloadRoutes { leg, cidrs, .. } => {
-                        let reply = serde_json::json!({
-                            "workload_routes": { "leg": leg, "routes": cidrs.len() }
-                        });
-                        commit(nb, view, state, &req).await?;
-                        Ok(reply)
+                        let outcome = commit(nb, view, state, &req).await;
+                        workload_routes_reply(leg, cidrs.len(), outcome)
                     }
                 })
                 .await;
@@ -668,6 +707,7 @@ mod tests {
         })
         .await
         .unwrap_err()
+        .err
         .to_string();
 
         assert!(e.contains("the provider refused the install"), "{e}");
@@ -676,6 +716,56 @@ mod tests {
             (43, BTreeSet::new()),
             "the tracked state ran ahead of what the engine committed"
         );
+    }
+
+    /// The reply must say when the withdraw of a two-step move landed and the install did not:
+    /// the routes are GONE, and a driver told only "refused" reports them unchanged. Every
+    /// other failure stays an ordinary error reply.
+    #[tokio::test]
+    async fn the_reply_says_when_a_landed_withdraw_preceded_a_refused_install() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(true))
+            .await
+            .unwrap();
+
+        let req = routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        let mut n = 0;
+        let failure = commit_steps(&mut state, &req, steps, async |_| {
+            n += 1;
+            if n == 2 {
+                Err(Error::fatal("the provider refused the install"))
+            } else {
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(failure.withdrew);
+        let reply = workload_routes_reply("cfab-work-vms", 1, Err(failure)).unwrap();
+        assert_eq!(reply["withdrew"], serde_json::json!(true));
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("the provider refused the install"),
+            "{reply}"
+        );
+
+        // A failure with nothing behind it is an ordinary error reply, not a withdrawal.
+        let plain = CommitFailure {
+            withdrew: false,
+            err: Error::fatal("no such leg"),
+        };
+        assert!(workload_routes_reply("cfab-work-vms", 1, Err(plain)).is_err());
+        // ...and success carries the summary it always did.
+        let ok = workload_routes_reply("cfab-work-vms", 2, Ok(())).unwrap();
+        assert_eq!(ok["workload_routes"]["routes"], serde_json::json!(2));
     }
 
     /// A step whose commit changed nothing is still in force: the state advances on every

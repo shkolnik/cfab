@@ -374,15 +374,30 @@ impl HostRoutes {
         }
         line.push('\n');
         let name = wl.name.clone();
-        let why = match sys.unix_request(&sock, &line) {
-            Ok(reply) if reply.contains("\"error\"") => {
-                Some(format!("engine refused {}: {}", line.trim(), reply.trim()))
-            }
-            Ok(_) => None,
-            Err(e) => Some(format!("engine would not take {}: {e}", line.trim())),
+        let fault = match sys.unix_request(&sock, &line) {
+            Ok(reply) => match refusal(&reply) {
+                None => None,
+                // The withdraw of an ifindex move landed and the install did not: the routes
+                // are GONE, not unchanged, and the next tick re-asks for exactly this set.
+                Some(Refusal::Withdrew(e)) => Some((
+                    format!(
+                        "engine withdrew the routes of {} and refused the reinstall: {e}",
+                        wl.leg_ifname()
+                    ),
+                    "retried next tick",
+                )),
+                Some(Refusal::Plain) => Some((
+                    format!("engine refused {}: {}", line.trim(), reply.trim()),
+                    ENGINE_COST,
+                )),
+            },
+            Err(e) => Some((
+                format!("engine would not take {}: {e}", line.trim()),
+                ENGINE_COST,
+            )),
         };
-        match why {
-            Some(why) => self.fail(&name, Cond::Engine, why, out),
+        match fault {
+            Some((why, cost)) => self.fail_costing(&name, Cond::Engine, why, cost, out),
             None => self
                 .rows
                 .entry(name.clone())
@@ -445,14 +460,54 @@ impl HostRoutes {
     /// One spelling for every fault of one condition: what went wrong, then what it costs.
     fn fail(&mut self, name: &str, cond: Cond, why: String, out: &mut Vec<String>) {
         let cost = match cond {
-            Cond::Read | Cond::Engine => "host routes unchanged",
+            Cond::Read | Cond::Engine => ENGINE_COST,
             Cond::Nft => "the local set is unchanged",
         };
+        self.fail_costing(name, cond, why, cost, out);
+    }
+
+    /// The same, for the one fault whose cost is not its condition's usual one.
+    fn fail_costing(
+        &mut self,
+        name: &str,
+        cond: Cond,
+        why: String,
+        cost: &str,
+        out: &mut Vec<String>,
+    ) {
         self.rows.entry(name.to_string()).or_default().say_once(
             cond,
             format!("cfab: workload {name}: {why}; {cost}"),
             out,
         );
+    }
+}
+
+/// What every read fault and every ordinary engine refusal costs: nothing this tick.
+const ENGINE_COST: &str = "host routes unchanged";
+
+/// What an engine reply to `workload-routes` means.
+enum Refusal {
+    /// The two-step ifindex move whose withdraw landed and whose install did not: holo holds no
+    /// routes for the leg, so this refusal cost the VMs their reach until the next tick.
+    Withdrew(String),
+    /// Every other refusal — the routes holo held before it are the routes it holds after.
+    Plain,
+}
+
+/// `None` when the engine took the request. A reply we cannot parse but that carries the word
+/// is a refusal we do not understand, which is still a refusal: never taken as success.
+fn refusal(reply: &str) -> Option<Refusal> {
+    let Ok(v) = serde_json::from_str::<Value>(reply) else {
+        return reply.contains("\"error\"").then_some(Refusal::Plain);
+    };
+    let err = v.get("error")?;
+    if v["withdrew"] == Value::Bool(true) {
+        Some(Refusal::Withdrew(
+            err.as_str().unwrap_or_default().to_string(),
+        ))
+    } else {
+        Some(Refusal::Plain)
     }
 }
 
@@ -896,6 +951,24 @@ mod tests {
                  cfab-work-vms-local; the local set is unchanged"
                     .to_string(),
             ]
+        );
+    }
+
+    /// The two-step ifindex move whose withdraw landed and whose install then failed: holo
+    /// holds NO routes for the leg, so "host routes unchanged" would be a lie about the one
+    /// failure that actually costs reach. Its own spelling, and its own cost.
+    #[test]
+    fn a_withdraw_that_landed_before_a_refused_install_is_not_called_unchanged() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("").socket(
+            "/run/cfab/engine.sock",
+            "{\"error\":\"the provider refused the install\",\"withdrew\":true}\n",
+        );
+        assert_eq!(
+            HostRoutes::new().tick(&mut sys, &v, Instant::now())[0],
+            "cfab: workload vms: engine withdrew the routes of cfab-work-vms and refused the \
+             reinstall: the provider refused the install; retried next tick"
         );
     }
 
