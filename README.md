@@ -130,9 +130,10 @@ the next engine under the previous supervisor.
 unit (correct: the binary is going away) and disables it; `apt purge` also removes
 `/etc/default/cfab`.
 
-The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the engine's private
-kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other` 204,
-`cfab-return` 205, `cfab-default` 206) so `ip route` prints them instead of bare numbers —
+The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the kernel route-protocol
+ids cfab and its engine install routes with (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203,
+`cfab-other` 204 the engine's, `cfab-return` 205 and `cfab-default` 206 cfab's own, outside the
+range the engine sweeps) so `ip route` prints them instead of bare numbers —
 cosmetic only; cfab's own sweep matches the numeric ids. It also ships
 `/etc/iproute2/rt_tables.d/cfab.conf`, naming table 250 `cfab-default` for `ip route`/`ip rule`
 output the same way; see "Host default route" below.
@@ -285,10 +286,10 @@ apply; the watchdog installs the row once the condition clears.
 
 `cfab status` reports each row it carries as one line, `workload <name>: <uplink> vid <vid>
 (<leg>) <address> gw <gw> up|down, advertised to <zones>, uplink <ports>, announce trigger
-<trigger>`, followed by `, N vms seen` and `, N stray forwards` once those reads succeed — one
-spelling for every `N` including 0, never a fabricated zero when a row is not up or a read
-failed (it is simply absent then). These are the same counts `cfab_workload_vms_seen` and
-`cfab_workload_stray_forwards_total` above report.
+<trigger>`, followed by `, N vms seen` while the row is up and the neighbor read succeeded, and
+`, N stray forwards` while the forward chain carries the drop rule — one spelling for every `N`
+including 0, never a fabricated zero otherwise (it is simply absent then). These are the same
+counts `cfab_workload_vms_seen` and `cfab_workload_stray_forwards_total` above report.
 
 ## Host default route
 
@@ -298,19 +299,24 @@ in its own table so the host's existing default is never touched.
 
 - **The route** lives in table `250` (named `cfab-default` by the package's `rt_tables.d`
   fragment): `default via <the gw zone's router> dev <the gw leg> src <this member's address on
-  it> proto cfab-default` (kernel protocol id 206).
-- **Three `ip rule` entries** reach it, installed and restored as one unit: pref `2099`, one per
-  address the host's own floor default's device carries (`from <addr> iif lo lookup main`) —
-  keeps admin-sourced replies (an off-subnet ssh, a management UI) on the host's own path so they
-  never read as asymmetric at a zone firewall; pref `2100` (`from all iif lo lookup main
-  suppress_prefixlength 0`), which makes the main table skip only its own default, so anything
-  more specific still wins; pref `2101` (`from all iif lo lookup cfab-default`), which then finds
-  table 250. `iif lo` scopes both to traffic this host itself originates — a VM's or a leaf's
-  transiting packet never takes it.
-- **Gated by the ingress prober:** the route is installed only while the prober reports the gw
-  zone's router reachable over at least one wire of the leg; it is withdrawn within about 2 s of
-  every wire going dark, and reinstalled within about 2 s of the first one answering again
-  (rack-measured). `cfab_host_default_path` and `cfab status` read the same fact.
+  it> table 250 proto cfab-default` (kernel protocol id 206). With more than one `gw` zone, the
+  first in `[[zone]]` order owns table 250.
+- **Three `ip rule` prefs surround it**, installed as one unit — a failure anywhere takes back
+  everything — and kept level by the watchdog: `2099` keeps the host's own admin addresses on
+  `main` (one rule per address of the floor device, `from <addr> iif lo lookup main`) — keeps
+  admin-sourced replies (an off-subnet ssh, a management UI) on the host's own path so they never
+  read as asymmetric at a zone firewall; and `2100`/`2101` are the pair that reaches table 250:
+  `2100` (`from all iif lo lookup main suppress_prefixlength 0`) makes the main table skip only
+  its own default, so anything more specific still wins, and `2101` (`from all iif lo lookup
+  cfab-default`) then finds table 250. `iif lo` scopes both to traffic this host itself
+  originates — a VM's or a leaf's transiting packet never takes it.
+- **Gated by the ingress prober:** the route is installed at apply optimistically — the prober
+  has no opinion yet, and "no opinion" must never read as "the router is dark" — then kept or
+  withdrawn by the supervisor's reconcile: it is withdrawn within about 2 s of the router
+  answering on no wire of the leg, and reinstalled about 2 s after it answers again
+  (rack-measured). `cfab_host_default_path` and `cfab status` read the same fact. A withdrawal
+  takes only the route: the three prefs stay, and an empty table 250 falls through to the
+  kernel's own `32766 from all lookup main` — an abruptly killed cfab is never a lockout.
 - **The floor default is never modified or removed.** "Additive" means exactly that: the
   ifupdown/DHCP default already in table `main` stays as it is, and with cfab gone — table 250
   emptied, the three rules dropped — the kernel's own final `lookup main` finds it exactly as it
@@ -320,9 +326,10 @@ in its own table so the host's existing default is never touched.
   for a moment without moving the address) — an early drop would send an established off-subnet
   session's next packet over the fabric gateway instead, asymmetric at a zone firewall.
 - **A host with no floor default of its own** still gets the fabric default (table 250, rules
-  2100/2101) but no pref-2099 pins to protect it, and cfab logs one loud, standing journal line
-  saying so: a host is expected to keep its own default route (DHCP, or a static `gateway` line)
-  rather than depend on cfab's, which exists to fail outward safely, not to be a host's only path.
+  2100/2101) but no pref-2099 pins to protect it, and `cfab up` (and every re-apply) prints one
+  loud warning line saying so: a host is expected to keep its own default route (DHCP, or a
+  static `gateway` line) rather than depend on cfab's, which exists to fail outward safely, not
+  to be a host's only path.
 
 `cfab status` names which path this member's own traffic takes right now: `default: <path>`, or
 `default: <path>, <reason>` once the path is not the fabric one.

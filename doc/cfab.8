@@ -1,4 +1,4 @@
-.TH CFAB 8 "September 2026" "cfab 0.1.0" "System Administration"
+.TH CFAB 8 "September 2026" "cfab 0.5.3" "System Administration"
 .SH NAME
 cfab \- per-host runtime of the resilient converged fabric for small clusters
 .SH SYNOPSIS
@@ -529,11 +529,13 @@ is written before any apply, so a refused or reverted generation is never
 retried, even across a daemon restart.
 .TP
 .I /etc/iproute2/rt_protos.d/cfab.conf
-Names the engine's private kernel route\-protocol ids for
+Names the kernel route\-protocol ids cfab and its engine install routes with, for
 .B ip route
 output only (
-.BR cfab\-ospf ", " cfab\-static ", " cfab\-bgp ", " cfab\-other ", " cfab\-return ", " cfab\-default ,
-201\-206); cosmetic, cfab's own sweep matches the numeric ids.
+.BR cfab\-ospf " 201, " cfab\-static " 202, " cfab\-bgp " 203, "
+.BR cfab\-other " 204 the engine's, " cfab\-return " 205 and " cfab\-default ,
+206 cfab's own, outside the range the engine sweeps); cosmetic, cfab's own sweep matches the
+numeric ids.
 .TP
 .I /etc/iproute2/rt_tables.d/cfab.conf
 Names table 250
@@ -869,12 +871,12 @@ uplink <ports>, announce trigger <trigger>
 .IP
 followed by
 .B ", N vms seen"
-and
+while the row is up and the neighbor read succeeded, and
 .B ", N stray forwards"
-once those reads succeed \(em one spelling for every
+while the forward chain carries the drop rule \(em one spelling for every
 .IR N ,
-including 0, never a fabricated zero when a row is not up or a read failed (it is simply absent
-then). These are the same counts
+including 0, never a fabricated zero otherwise (it is simply absent then). These are the same
+counts
 .B cfab_workload_vms_seen
 and
 .B cfab_workload_stray_forwards_total
@@ -899,33 +901,47 @@ default via <the gw zone's router> dev <the gw leg> src <this member's address o
 table 250 proto cfab\-default
 .fi
 .IP
-(kernel protocol id 206). Three
+(kernel protocol id 206). With more than one
+.B gw
+zone, the first in
+.I [[zone]]
+order owns table 250. Three
 .B "ip rule"
-entries reach it, installed and restored as one unit: pref
-.BR 2099 ,
-one per address the host's own floor default's device carries
+prefs surround it, installed as one unit \(em a failure anywhere takes back everything \(em and
+kept level by the watchdog: pref
+.B 2099
+keeps the host's own admin addresses on
+.BR main ,
+one rule per address of the floor device
 .RB ( "from <addr> iif lo lookup main" )
 \(em keeps admin\-sourced replies (an off\-subnet ssh, a management UI) on the host's own path so
-they never read as asymmetric at a zone firewall; pref
+they never read as asymmetric at a zone firewall; and prefs
 .B 2100
-.RB ( "from all iif lo lookup main suppress_prefixlength 0" ),
-which makes the main table skip only its own default, so anything more specific still wins; and
-pref
+and
 .B 2101
-.RB ( "from all iif lo lookup cfab\-default" ),
-which then finds table 250.
+are the pair that reaches table 250: pref
+.B 2100
+.RB ( "from all iif lo lookup main suppress_prefixlength 0" )
+makes the main table skip only its own default, so anything more specific still wins, and pref
+.B 2101
+.RB ( "from all iif lo lookup cfab\-default" )
+then finds table 250.
 .B "iif lo"
 scopes both to traffic this host itself originates \(em a VM's or a leaf's transiting packet
 never takes it.
 .PP
-The route is installed only while the ingress prober reports the gw zone's router reachable over
-at least one wire of the leg (gated, not level\-checked at apply alone): it is withdrawn within
-about 2\ s of every wire going dark, and reinstalled within about 2\ s of the first one answering
-again (rack\-measured).
+The route is installed at apply optimistically \(em the prober has no opinion yet, and "no
+opinion" must never read as "the router is dark" \(em then kept or withdrawn by the supervisor's
+reconcile: it is withdrawn within about 2\ s of the router answering on no wire of the leg, and
+reinstalled about 2\ s after it answers again (rack\-measured).
 .B cfab_host_default_path
 and
 .B "cfab status"
-read the same fact. The floor default is never modified or removed \(em "additive" means exactly
+read the same fact. A withdrawal takes only the route: the three prefs stay, and an empty table
+250 falls through to the kernel's own
+.B "32766 from all lookup main"
+\(em an abruptly killed cfab is never a lockout. The floor default is never modified or removed
+\(em "additive" means exactly
 that: the ifupdown/DHCP default already in table
 .B main
 stays as it is, and with cfab gone (table 250 emptied, the three rules dropped) the kernel's own
@@ -936,8 +952,10 @@ gone from every device on the host, not merely from the floor device for one tic
 reconfiguration can drop the floor default for a moment without moving the address) \(em an
 early drop would send an established off\-subnet session's next packet over the fabric gateway
 instead, asymmetric at a zone firewall. A host with no floor default of its own still gets the
-fabric default (table 250, rules 2100/2101) but no pref\-2099 pins to protect it, and cfab logs
-one loud, standing journal line saying so: a host is expected to keep its own default route
+fabric default (table 250, rules 2100/2101) but no pref\-2099 pins to protect it, and
+.B "cfab up"
+(and every re\-apply) prints one loud warning line saying so: a host is expected to keep its own
+default route
 (DHCP, or a static
 .B gateway
 line) rather than depend on cfab's, which exists to fail outward safely, not to be a host's only
@@ -945,14 +963,14 @@ path.
 .PP
 .B "cfab status"
 names which path this member's own traffic takes right now:
-.B "default: <path>"
-, or
+.BR "default: <path>" ,
+or
 .B "default: <path>, <reason>"
 once the path is not the fabric one.
 .I path
 is
-.B "via fabric gw <router> (<leg>)" ;
-.B "via floor <via> (<dev>)" ,
+.BR "via fabric gw <router> (<leg>)" ;
+.BR "via floor <via> (<dev>)" ,
 the host's own default in main; or
 .BR none ,
 when neither table holds one.
