@@ -77,14 +77,23 @@ pub fn local_vms(
     // MAC -> the bridge ports it has been seen on. A MAC on both a VM port and the uplink (a
     // migration in flight) is local: the tap is the newer, more specific fact.
     let mut local_macs: BTreeSet<String> = BTreeSet::new();
+    let mut understood = 0usize;
     for e in fdb {
         let (Some(mac), Some(port)) = (e["mac"].as_str(), e["ifname"].as_str()) else {
             continue;
         };
+        understood += 1;
         if uplink_ports.iter().any(|p| p == port) {
             continue;
         }
         local_macs.insert(mac.to_ascii_lowercase());
+    }
+    // A non-empty document none of whose entries carried the two fields we read is an
+    // iproute2 that spells them differently, not a bridge with no MACs on it. Refusing to
+    // answer is the difference between a loud journal line and a member that silently reports
+    // "0 vms seen" and withdraws every /32 it holds (fail loud, never degrade).
+    if understood == 0 && !fdb.is_empty() {
+        return None;
     }
 
     let exclude = fabric_addresses(view, wl);
@@ -574,6 +583,21 @@ mod tests {
         assert_eq!(local_vms("not json", fdb, &v, wl, &[]), None);
         assert_eq!(local_vms(NEIGH, "", &v, wl, &[]), None);
         assert_eq!(local_vms("{}", "{}", &v, wl, &[]), None);
+        // An FDB document whose entries carry neither field we read (an iproute2 that spells
+        // them differently) must refuse, not report "no MACs on the bridge" — the latter would
+        // quietly withdraw every /32 this member holds.
+        assert_eq!(
+            local_vms(
+                NEIGH,
+                r#"[{"lladdr":"02:cf:ab:00:00:01","dev":"tap100i0"}]"#,
+                &v,
+                wl,
+                &[]
+            ),
+            None
+        );
+        // An EMPTY document is a real answer: a bridge that has learned nothing yet.
+        assert!(local_vms(NEIGH, "[]", &v, wl, &[]).unwrap().is_empty());
     }
 
     /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
