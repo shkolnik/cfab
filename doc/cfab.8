@@ -642,14 +642,16 @@ the row's classification, one of
 .BR up / deferred / announcer_not_started / broken
 with exactly one series 1;
 .BR "cfab_workload_vms_seen" ,
-IPv4 neighbor entries inside the row's
-.B prefix ,
-on its leg,
+VMs this member currently knows on the row's leg: neighbor entries inside its
+.B prefix
 in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared
 member address,
 .BR gw
 or
-.BR router ;
+.BR router ,
+whose MAC the uplink bridge holds on a non\-uplink port \(em the same derivation that
+decides which /32s this member originates.
+A VM on a peer host is learned through the uplink and counted there, not here;
 a departed VM lingers as STALE until the kernel garbage\-collects the entry
 (rack\-measured: minutes), so this counts neighbors known, not VMs alive \(em 0 is the
 alert ("gateway up, nobody home"), a nonzero value is an upper bound;
@@ -661,6 +663,13 @@ the bridge guard's
 drop counters summed over the row's uplink ports, reset to 0 when
 .B apply
 re\-renders the table or the watchdog restores it;
+.BR "cfab_workload_stray_forwards_total" ,
+fabric packets this member refused to put on the row's leg because their destination is
+not a VM it currently knows, summed over the row's one drop rule per allowed zone and
+reset to 0 when
+.B apply
+re\-renders
+.BR "inet cfab-fwd" ;
 .BR "cfab_workload_rx_bytes_total" ,
 .BR "cfab_workload_tx_bytes_total" ,
 the gateway's own forwarding on the row's leg
