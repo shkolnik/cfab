@@ -808,8 +808,9 @@ on the
 .B uplink
 (a
 .BI <bridge>. <vid>
-host stanza from before 0.5.3 \(em the kernel allows one 802.1Q device per
-parent and vid, so the leg cannot be built until it is removed) each defer that
+host stanza, or any other tool that took that pair first \(em the kernel allows
+one 802.1Q device per parent and vid, and cfab never claims the pair under that
+name, so the leg cannot be built until the holder is removed) each defer that
 one row to the watchdog (a warning names the reason and, for a holder, the
 device to remove; no leg is built and no gw address goes live) and let the rest
 of the member apply; the watchdog installs the row once the condition clears.
