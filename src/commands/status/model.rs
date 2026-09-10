@@ -4,6 +4,8 @@
 //! that more than one renderer can consume the same gather. Nothing here reads or writes: every
 //! field is a fact a renderer turns into its own words.
 
+use std::net::Ipv4Addr;
+
 use crate::derive::HostZonePref;
 use crate::model::MemberKind;
 use crate::supervisor::report::Components;
@@ -364,6 +366,25 @@ pub struct WorkloadStatus {
     /// an absent rule and a rule that has dropped nothing are different facts. The counter
     /// resets whenever `apply` re-renders `inet cfab-fwd`.
     pub stray_forwards: Option<u64>,
+    /// This row's DHCP relay (spec §5.4/§6): `None` when the row declares no `dhcp_server` —
+    /// "absent = no relay" — never a health condition of the row itself. `Some` with zero
+    /// counters and no error is the normal shape before any packet has crossed it or before a
+    /// supervisor has answered at all.
+    pub relay: Option<RelayStatus>,
+}
+
+/// One `[[workload]]` row's DHCP relay, as `status` reads it from the supervisor's `components`
+/// document (spec §5.4/§6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayStatus {
+    /// The declared `dhcp_server`.
+    pub server: Ipv4Addr,
+    pub requests: u64,
+    pub replies: u64,
+    /// The relay's last bind or socket error, for as long as it stands; `None` while healthy or
+    /// before the task has reported anything (no supervisor answering, or the task's first tick
+    /// has not run yet) — never a health condition of the row (spec §3.1, availability first).
+    pub last_error: Option<String>,
 }
 
 /// Which default route this member's own traffic takes right now (spec §6).

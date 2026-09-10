@@ -1404,6 +1404,7 @@ mod tests {
                     }),
                     bytes: Some((10_000, 20_000)),
                     stray_forwards: Some(4),
+                    relay: None,
                 }]
             } else {
                 Vec::new()

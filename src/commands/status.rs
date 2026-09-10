@@ -43,8 +43,8 @@ pub mod model;
 
 pub use model::{
     Adjacency, BondLeg, Bonding, Class, Condition, DefaultPath, DefaultReason, GuardDrops,
-    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, State,
-    StatusModel, WorkloadState, WorkloadStatus,
+    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, RelayStatus,
+    State, StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -474,6 +474,20 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         // Nothing appended when the forward chain carries no such rule (`None`).
         if let Some(n) = w.stray_forwards {
             let _ = write!(line, ", {n} stray forwards");
+        }
+        // The DHCP relay (spec §6): nothing appended when the row declares no `dhcp_server`.
+        // `last_error` rides on the same line rather than a separate condition — a bind failure
+        // must be loud, but a relay is a degraded row, never a member fault (spec §3.1).
+        if let Some(r) = &w.relay {
+            let _ = write!(
+                line,
+                ", relay to {} ({} requests, {} replies",
+                r.server, r.requests, r.replies
+            );
+            if let Some(e) = &r.last_error {
+                let _ = write!(line, ", last error: {e}");
+            }
+            line.push(')');
         }
         let _ = writeln!(out, "{line}");
     }
@@ -1872,6 +1886,7 @@ fn workload_posture(
                 guard_drops: None,
                 bytes: None,
                 stray_forwards: None,
+                relay: None,
             });
             continue;
         }
@@ -2003,6 +2018,27 @@ fn workload_posture(
         // zone and they share it, so reading only the first would under-report a row allowed
         // into two zones.
         let stray_forwards = counter_packets_sum(&fwd_chain, &format!("stray-{name}"));
+        // Absent = no relay declared (spec §4): never looked up at all when `dhcp_server` is
+        // unset, so a row with none can never grow a fragment by accident. A row that HAS one
+        // but no supervisor answered, or whose task has not reported yet, reads as zero
+        // counters and no error — the same shape a fresh `WorkloadAnnounce` has before its first
+        // trigger, not a fault of the row.
+        let relay = wl.dhcp_server.map(|server| {
+            match comps.and_then(|k| k.relays.iter().find(|r| r.name == name)) {
+                Some(r) => RelayStatus {
+                    server,
+                    requests: r.requests,
+                    replies: r.replies,
+                    last_error: r.last_error.clone(),
+                },
+                None => RelayStatus {
+                    server,
+                    requests: 0,
+                    replies: 0,
+                    last_error: None,
+                },
+            }
+        });
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
@@ -2021,6 +2057,7 @@ fn workload_posture(
             guard_drops,
             bytes,
             stray_forwards,
+            relay,
         });
     }
     Ok(())
