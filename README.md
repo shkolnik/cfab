@@ -1,5 +1,11 @@
 # cfab — Cluster Network Fabric
 
+> **Early-stage software.** cfab is in active development and testing and has not yet run in
+> production, even on its authors' own cluster. Configuration formats, commands, and behavior change
+> between releases without compatibility shims. It reconfigures host networking (bonds, VLAN legs,
+> routing tables, nftables) and can take a host off the network if misapplied. Do not use it on a
+> system you depend on. This notice comes down once the authors have run it in production for a few weeks.
+
 A resilient converged network fabric for small, heterogeneous clusters and home labs
 (Proxmox, Kubernetes, storage), borrowing principles — not complexity — from modern
 scale-out data-center fabrics.
