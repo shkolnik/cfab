@@ -642,7 +642,7 @@ impl FabricCollector {
             "cfab_workload_vms_seen",
             "VMs this member currently knows on this row's leg: neighbor entries inside the \
              row's prefix in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), \
-             other than a declared member address, gw or router, whose MAC the uplink bridge \
+             other than a declared member address or gw, whose MAC the uplink bridge \
              has on a NON-uplink port — the same derivation that decides which /32s this \
              member originates, so the two can never disagree. A VM on a peer host is learned \
              through the uplink and counted there, not here; a departed VM lingers as STALE \
@@ -685,10 +685,12 @@ impl FabricCollector {
         counter_family(
             enc,
             "cfab_workload_stray_forwards",
-            "Fabric packets this member refused to put on this row's leg because their \
-             destination is not a VM it currently knows (spec 5.2, ruling 6), summed over the \
-             row's one drop rule per allowed zone; reset to 0 when apply re-renders inet \
-             cfab-fwd; absent when the forward chain carries no such rule.",
+            "Fabric packets this member forwarded onto this row's leg for a destination that \
+             is not a VM it currently knows (spec 5.6): counted, NOT dropped — the packet \
+             goes to the leg, where the kernel's ARP either finds a local VM (discovering it) \
+             or times out. Summed over the row's one rule per allowed zone; reset to 0 when \
+             apply re-renders inet cfab-fwd; absent when the forward chain carries no such \
+             rule.",
             &stray,
         )?;
 
@@ -1353,6 +1355,7 @@ mod tests {
                     zones: vec!["storage".to_string()],
                     uplink_ports: vec!["eth0".to_string()],
                     trigger: Some("neigh events".to_string()),
+                    proxy_arp: Some(true),
                     vms_seen: Some(3),
                     guard_drops: Some(GuardDrops {
                         claim: 2,

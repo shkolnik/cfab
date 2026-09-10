@@ -182,7 +182,9 @@ pub struct GwDecl {
     pub router: String,
 }
 
-/// One VM workload VLAN (spec §4). `span` is phase 2; phase 1 accepts only its absence or "switch".
+/// One VM workload VLAN (phase-2 spec §4). The VLAN is host-local: it is routed by every host
+/// that carries the row and never spans the switch, so there is no `span` key and no VLAN-level
+/// router other than cfab's own anycast `gw`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadDecl {
@@ -194,12 +196,27 @@ pub struct WorkloadDecl {
     pub vid: u16,
     pub prefix: String,
     pub gw: String,
-    /// The VLAN's existing default router, listed inside DHCP option 121 (a client with 121
-    /// ignores option 3). RULED (spec §10 call 14): declared, like any static IP configuration.
-    pub router: String,
+    /// The DHCP server this row's relay forwards to, a bare IPv4 address outside `prefix`.
+    /// Omit it and the row has no relay at all (the VLAN then needs a DHCP server of its own,
+    /// or static addresses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dhcp_server: Option<String>,
     #[serde(default)]
     pub allow: Vec<String>,
+    /// RETIRED (phase 2). `router` used to name the VLAN's existing default router, printed
+    /// inside a DHCP option-121 snippet; the VLAN is host-local now and its only gateway is
+    /// cfab's anycast `gw`. A declaration that still carries the key is refused by name
+    /// (`model::Fabric::from_decl`) rather than by `deny_unknown_fields`' generic "unknown
+    /// field", which cannot carry a remedy. Kept out of the emitted schema: it is a tombstone
+    /// for a good error message, not a key anyone may write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub router: Option<String>,
+    /// RETIRED (phase 2). `span = "switch"` used to say the VLAN spanned the admin switch;
+    /// host-local is the only shape now, so there is nothing to choose. Refused by name, same
+    /// tombstone route as `router`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub span: Option<String>,
 }
 
@@ -668,20 +685,15 @@ mod tests {
                 wl.name.as_str(),
                 wl.uplink.as_str(),
                 wl.prefix.as_str(),
-                wl.gw.as_str(),
-                wl.router.as_str()
+                wl.gw.as_str()
             ),
-            (
-                "vms",
-                "primary",
-                "192.168.20.0/24",
-                "192.168.20.254",
-                "192.168.20.1"
-            )
+            ("vms", "primary", "192.168.20.0/24", "192.168.20.254")
         );
         assert_eq!(wl.vid, 3);
         assert_eq!(wl.allow, vec!["storage".to_string()]);
+        assert_eq!(wl.dhcp_server, None);
         assert_eq!(wl.span, None);
+        assert_eq!(wl.router, None);
         let m = d.members.iter().find(|m| m.name == "pve1-tb").unwrap();
         assert_eq!(m.workloads[0].name, "vms");
         assert_eq!(m.workloads[0].address, "192.168.20.2/24");
@@ -702,28 +714,42 @@ mod tests {
     #[test]
     fn the_removed_ifname_key_is_an_unknown_field_that_names_uplink_and_vid() {
         let block = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \
-                     \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\n\
-                     allow = [\"storage\"]\n";
+                     \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nallow = [\"storage\"]\n";
         let err = Declaration::parse(&format!("{}{block}", fixtures::example()))
             .expect_err("ifname is not a key any more")
             .to_string();
         assert!(
             err.contains(
                 "unknown field `ifname`, expected one of `name`, `uplink`, `vid`, `prefix`, \
-                 `gw`, `router`, `allow`, `span`"
+                 `gw`, `dhcp_server`, `allow`, `router`, `span`"
             ),
             "{err}"
         );
     }
 
+    /// Both retired keys still PARSE — they are tombstones, kept in the tree so
+    /// `model::Fabric::from_decl` can refuse them by name with a remedy instead of leaving
+    /// `deny_unknown_fields` to say "unknown field" (`model.rs` holds those refusal tests).
     #[test]
-    fn span_is_accepted_by_the_schema() {
+    fn the_retired_span_and_router_keys_parse_as_tombstones() {
         let text = fixtures::with_workload(&fixtures::example()).replace(
             "gw = \"192.168.20.254\"",
-            "gw = \"192.168.20.254\"\nspan = \"switch\"",
+            "gw = \"192.168.20.254\"\nspan = \"switch\"\nrouter = \"192.168.20.1\"",
         );
         let d = Declaration::parse(&text).unwrap();
         assert_eq!(d.workload[0].span.as_deref(), Some("switch"));
+        assert_eq!(d.workload[0].router.as_deref(), Some("192.168.20.1"));
+    }
+
+    /// ...and neither one appears in the schema `cfab schema` emits: a tombstone is for a good
+    /// error message, never a key an operator may write.
+    #[test]
+    fn the_retired_workload_keys_are_not_in_the_emitted_schema() {
+        let json = serde_json::to_value(schemars::schema_for!(WorkloadDecl)).unwrap();
+        let props = json["properties"].as_object().expect("properties");
+        assert!(props.contains_key("dhcp_server"), "{json}");
+        assert!(!props.contains_key("span"), "{json}");
+        assert!(!props.contains_key("router"), "{json}");
     }
 
     #[test]
@@ -896,12 +922,12 @@ pub mod fixtures {
     /// The `[[workload]]` block the tests share (`vms` on bridge `primary`, vid 3), appended as
     /// a top-level array table, and the member rows on the two hosts (inserted after their
     /// `wires` arrays).
-    pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\"]\n";
+    pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nallow = [\"storage\"]\n";
 
     /// `WORKLOAD_BLOCK` allowed into a second zone (`mgmt`, alongside `storage`): the fixture
     /// that exercises "one sibling / passive OSPF entry / forward-policy pair per allowed zone",
     /// not just the single-zone case `WORKLOAD_BLOCK` covers.
-    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\", \"mgmt\"]\n";
+    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nallow = [\"storage\", \"mgmt\"]\n";
 
     fn with_workload_block(text: &str, block: &str) -> String {
         let t = with_prefs(

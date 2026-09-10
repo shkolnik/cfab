@@ -641,6 +641,21 @@ fn guarded_ports_for(bridge_nft: &str, gw: &std::net::Ipv4Addr) -> Vec<String> {
     ports
 }
 
+/// Every condition `apply` defers a row for, asked again: the uplink's ports are all
+/// STP-forwarding, no foreign 802.1Q device holds this (parent, vid), and no uplink port
+/// carries the vid (spec 5.1, phase 2 — the VLAN is host-local). A probe that cannot answer
+/// leaves the row deferred, never installs it on a guess.
+fn row_ready(sys: &mut dyn Sys, row: &crate::derive::WorkloadRow, up: &uplink::Uplink) -> bool {
+    up.ports
+        .iter()
+        .all(|port| matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _))))
+        && matches!(
+            leg::foreign_holder(sys, &row.wl.uplink, row.wl.vid, &row.wl.leg_ifname()),
+            Ok(None)
+        )
+        && matches!(uplink::ports_carrying_vid(sys, up), Ok(ref ports) if ports.is_empty())
+}
+
 /// Install a row that just became ready (an entry in `ready_names`): everything `apply` would
 /// have built for it and did not — the leg, this member's own address, the vid on the bridge,
 /// the anycast gw address and forwarding. A failed step names the row and keeps it pending.
@@ -717,19 +732,13 @@ fn reconcile_workload_guard(
             still_pending.push(name.clone());
             continue;
         };
-        // Ready = the uplink is identifiable, every port of it is STP-forwarding, and nothing
-        // foreign holds the kernel's one 802.1Q device for this (parent, vid). Without the last
-        // clause a row deferred for a host stanza's `<bridge>.<vid>` would be called ready on
-        // the very next tick and `install` would fail on every tick thereafter.
+        // Ready = the uplink is identifiable, every port of it is STP-forwarding, nothing
+        // foreign holds the kernel's one 802.1Q device for this (parent, vid), and no uplink
+        // port carries the vid. Without the last two clauses a row deferred for a host stanza's
+        // `<bridge>.<vid>`, or for a vid on the port, would be called ready on the very next
+        // tick and install (or install wrongly) on every tick thereafter.
         let ready = match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
-            Ok(up) => {
-                up.ports.iter().all(|port| {
-                    matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _)))
-                }) && matches!(
-                    leg::foreign_holder(sys, &row.wl.uplink, row.wl.vid, &row.wl.leg_ifname()),
-                    Ok(None)
-                )
-            }
+            Ok(up) => row_ready(sys, row, &up),
             Err(_) => false,
         };
         if ready {
@@ -1221,7 +1230,7 @@ pub(crate) mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
         );
         let blocks = format!(
-            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nallow = [\"storage\"]\n",
             crate::decl::fixtures::WORKLOAD_BLOCK
         );
         Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
@@ -1885,6 +1894,57 @@ pub(crate) mod tests {
             .on_stdout(
                 &["ip", "-d", "-j", "link", "show", "type", "vlan"],
                 r#"[{"ifname":"cfab-st","link":"eth9","linkinfo":{"info_kind":"vlan","info_data":{"id":100}}}]"#,
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert!(
+            report
+                .restored
+                .contains(&"installed workload vms".to_string()),
+            "{:?}",
+            report.restored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
+    }
+
+    // Phase 2, spec 5.1 (the fifth deferral): a vid on an uplink PORT puts the host-local VLAN
+    // back on the switch. The watchdog must keep the row deferred while it is there — the
+    // uplink is otherwise perfectly healthy, so identify + STP + the holder probe would all
+    // pass and install a row whose whole premise is broken.
+    #[test]
+    fn the_watchdog_leaves_a_row_deferred_while_an_uplink_port_carries_the_vid() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":3}]}]"#,
+            );
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert!(
+            sys.writes_of("/run/cfab/workload-deferred").is_empty(),
+            "still pending: unchanged, no rewrite"
+        );
+    }
+
+    /// ...and installs it on the tick after the operator takes the vid off the port — the same
+    /// no-restart recovery every other deferral gets.
+    #[test]
+    fn the_watchdog_installs_a_row_once_the_uplink_port_stops_carrying_the_vid() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "eth0"],
+                r#"[{"ifname":"eth0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
             );
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));

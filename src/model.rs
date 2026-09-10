@@ -294,14 +294,6 @@ pub struct WirePref {
     pub order: Vec<String>,
 }
 
-/// Whether a workload's VLAN stays switch-local (phase 1) or becomes a routed per-host prefix
-/// (phase 2, not built yet). `span = "host"` is accepted by the schema and refused at load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum Span {
-    Switch,
-    Host,
-}
-
 /// An IPv4 network: address + prefix length, with the host bits cleared. `parse` refuses a
 /// string whose address is not already aligned to its own mask (e.g. `192.168.20.5/24`) with
 /// the same message a missing `/len` gets — both are "not a valid prefix", not two things.
@@ -388,14 +380,13 @@ pub struct Workload {
     /// The 802.1Q tag the VMs use on `uplink`.
     pub vid: u16,
     pub prefix: Ipv4Prefix,
-    /// The anycast gateway every host answers (bare address; the prefix's mask applies).
+    /// The anycast gateway every host answers (bare address; the prefix's mask applies), and
+    /// the VMs' default route: the VLAN is host-local, so there is no other router on it.
     pub gw: Ipv4Addr,
-    /// The VLAN's existing default router, inside DHCP option 121 (RULED, spec §10 call 14).
-    pub router: Ipv4Addr,
+    /// The DHCP server this row's relay forwards to. `None` = no relay on this row.
+    pub dhcp_server: Option<Ipv4Addr>,
     /// Zones this workload may reach; validated against the declared zones.
     pub allow: Vec<String>,
-    /// Phase 1: always `Switch` (`span = "host"` is refused at load).
-    pub span: Span,
 }
 
 impl Workload {
@@ -534,8 +525,28 @@ fn parse_ipv4_with_len(s: &str) -> Option<(Ipv4Addr, u8)> {
     Some((addr, len))
 }
 
-/// One `[[workload]]` row, typed. `prefix`/`gw`/`router` malformed-value messages are named
-/// here so `from_decl` reads as one gate per row; cross-row and cross-table meaning (zone
+/// Both keys phase 2 retired, refused BY NAME with the remedy rather than left to
+/// `deny_unknown_fields`' generic "unknown field", which cannot carry one. Same tombstone
+/// route as `driver_features` and `usb` on a wire: the field stays in `WorkloadDecl`, out of
+/// the emitted schema, for the sake of this message.
+fn refuse_retired_workload_keys(w: &crate::decl::WorkloadDecl) -> Result<()> {
+    if w.span.is_some() {
+        return Err(Error::config(format!(
+            "workload {}: 'span' is gone: phase 2: the VM VLAN is host-local; remove 'span'",
+            w.name
+        )));
+    }
+    if w.router.is_some() {
+        return Err(Error::config(format!(
+            "workload {}: 'router' is gone: phase 2: VMs default to 'gw'; remove 'router'",
+            w.name
+        )));
+    }
+    Ok(())
+}
+
+/// One `[[workload]]` row, typed. `prefix`/`gw`/`dhcp_server` malformed-value messages are
+/// named here so `from_decl` reads as one gate per row; cross-row and cross-table meaning (zone
 /// collisions, which member carries it) is `Fabric::validate`'s job.
 fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
     let prefix = Ipv4Prefix::parse(&w.prefix)
@@ -546,13 +557,19 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
             w.name, w.gw
         ))
     })?;
-    let router: Ipv4Addr = w.router.parse().map_err(|_| {
-        Error::config(format!(
-            "workload {}: router '{}' must be a bare IPv4 address (the VLAN's existing default \
-             router)",
-            w.name, w.router
-        ))
-    })?;
+    let dhcp_server = w
+        .dhcp_server
+        .as_deref()
+        .map(|s| {
+            s.parse::<Ipv4Addr>().map_err(|_| {
+                Error::config(format!(
+                    "workload {}: dhcp_server '{s}' must be a bare IPv4 address (the DHCP server \
+                     this row's relay forwards to)",
+                    w.name
+                ))
+            })
+        })
+        .transpose()?;
     // cfab creates the leg, so a vid the kernel would refuse — or one that means "untagged" on
     // a vlan-aware bridge — is caught at `check`, not at the first `ip link add`.
     if !(2..=4094).contains(&w.vid) {
@@ -562,31 +579,14 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
             w.name, w.vid
         )));
     }
-    let span = match w.span.as_deref() {
-        None | Some("switch") => Span::Switch,
-        Some("host") => {
-            return Err(Error::config(format!(
-                "workload {}: span = \"host\" is phase 2 and not built yet (omit it, or span = \
-                 \"switch\")",
-                w.name
-            )));
-        }
-        Some(s) => {
-            return Err(Error::config(format!(
-                "workload {}: span '{s}' is not one of switch, host",
-                w.name
-            )));
-        }
-    };
     Ok(Workload {
         name: w.name.clone(),
         uplink: w.uplink.clone(),
         vid: w.vid,
         prefix,
         gw,
-        router,
+        dhcp_server,
         allow: w.allow.clone(),
-        span,
     })
 }
 
@@ -707,7 +707,10 @@ impl Fabric {
         let workloads = d
             .workload
             .iter()
-            .map(resolve_workload)
+            .map(|w| {
+                refuse_retired_workload_keys(w)?;
+                resolve_workload(w)
+            })
             .collect::<Result<Vec<_>>>()?;
         let forward_allow = d
             .forward
@@ -1039,29 +1042,48 @@ impl Fabric {
                     wl.name, wl.gw, wl.prefix
                 )));
             }
-            if !wl.prefix.contains(wl.router) {
-                return Err(Error::config(format!(
-                    "workload {}: router {} is outside prefix {}",
-                    wl.name, wl.router, wl.prefix
-                )));
-            }
-            if wl.router == wl.prefix.net || wl.router == wl.prefix.broadcast() {
-                return Err(Error::config(format!(
-                    "workload {}: router {} is the network or broadcast address of {}",
-                    wl.name, wl.router, wl.prefix
-                )));
-            }
-            // I2: `router` is the natural first read of "the gateway" — accepting gw == router
-            // would have cfab hijack the VLAN's real router for every device on the segment.
-            if wl.gw == wl.router {
-                return Err(Error::config(format!(
-                    "workload {}: gw {} equals router {}; the anycast gateway and the VLAN's \
-                     existing default router must differ",
-                    wl.name, wl.gw, wl.router
-                )));
+            // The relay's server must be somewhere the host can route to, which is never the
+            // VLAN itself: a `dhcp_server` inside `prefix` would have the relay send the
+            // request back out the leg it came in on (spec §4).
+            if let Some(server) = wl.dhcp_server {
+                // Most specific first, so each condition an operator can hit is named by its
+                // own message: `gw` and every member address are themselves inside `prefix`,
+                // and the general "inside prefix" line below would otherwise swallow them.
+                if server == wl.gw {
+                    return Err(Error::config(format!(
+                        "workload {}: dhcp_server {server} is the gw; the relay forwards off \
+                         the VLAN, so the server cannot be cfab's own anycast gateway",
+                        wl.name
+                    )));
+                }
+                if let Some(m) = self.members.iter().find(|m| {
+                    m.workloads
+                        .iter()
+                        .any(|w| w.name == wl.name && w.address == server)
+                }) {
+                    return Err(Error::config(format!(
+                        "workload {}: dhcp_server {server} is member {}'s own address on this \
+                         row; the relay forwards off the VLAN",
+                        wl.name, m.name
+                    )));
+                }
+                if wl.prefix.contains(server) {
+                    return Err(Error::config(format!(
+                        "workload {}: dhcp_server {server} is inside prefix {}; the relay \
+                         forwards off the VLAN, so the server cannot be on it",
+                        wl.name, wl.prefix
+                    )));
+                }
+                if server.is_unspecified() || server == Ipv4Addr::BROADCAST {
+                    return Err(Error::config(format!(
+                        "workload {}: dhcp_server {server} is not an address a relay can \
+                         forward to (omit dhcp_server for no relay)",
+                        wl.name
+                    )));
+                }
             }
             // I2: a workload prefix overlapping a zone's own `10.<id>.0.0/16` block would make
-            // the sibling return-path rule and the option-121 aggregate self-contradictory.
+            // the sibling return-path rule and the forward policy self-contradictory.
             for z in &self.zones {
                 let block = Ipv4Prefix::parse(&format!("{}.0.0/16", z.block()))
                     .expect("a zone block is always a valid /16");
@@ -1163,17 +1185,6 @@ impl Fabric {
                         wl.name,
                         mw.address_cidr(),
                         wl.gw
-                    )));
-                }
-                // I2: as wrong as address == gw (checked above) — cfab would put a VM address
-                // on the VLAN's own router.
-                if mw.address == wl.router {
-                    return Err(Error::config(format!(
-                        "member {}: workload {}: address {} is the router {}",
-                        m.name,
-                        wl.name,
-                        mw.address_cidr(),
-                        wl.router
                     )));
                 }
                 if mw.address == wl.prefix.net || mw.address == wl.prefix.broadcast() {
@@ -1343,11 +1354,6 @@ impl Fabric {
     /// The declared `[[workload]]` row of this name, if any.
     pub fn workload(&self, name: &str) -> Option<&Workload> {
         self.workloads.iter().find(|w| w.name == name)
-    }
-
-    /// The smallest set of prefixes covering every declared zone block, for DHCP option 121.
-    pub fn aggregate(&self) -> Vec<Ipv4Prefix> {
-        crate::emit::workload::aggregate(&self.zones.iter().map(|z| z.id).collect::<Vec<_>>())
     }
 }
 
@@ -1943,8 +1949,7 @@ mod tests {
         let wl = f.workload("vms").unwrap();
         assert_eq!(wl.prefix.to_string(), "192.168.20.0/24");
         assert_eq!(wl.gw_cidr(), "192.168.20.254/24");
-        assert_eq!(wl.router.to_string(), "192.168.20.1");
-        assert_eq!(wl.span, Span::Switch);
+        assert_eq!(wl.dhcp_server, None);
         assert_eq!(
             f.member("pve1-tb").unwrap().workloads[0].address_cidr(),
             "192.168.20.2/24"
@@ -1977,60 +1982,120 @@ mod tests {
         );
     }
 
+    /// Phase 2 retired `router` (the VM VLAN is host-local; the VMs' only gateway is `gw`).
+    /// A declaration that still carries it is refused BY NAME with the remedy, not by
+    /// `deny_unknown_fields`' generic "unknown field", which cannot carry one.
     #[test]
-    fn check_refuses_a_router_outside_the_prefix_or_malformed() {
-        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.30.1\""));
+    fn the_retired_router_key_is_refused_by_name_with_the_remedy() {
+        let e = wl_err(|t| {
+            t.replace(
+                "gw = \"192.168.20.254\"",
+                "gw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"",
+            )
+        });
         assert_eq!(
             e,
-            "fabric.toml: workload vms: router 192.168.30.1 is outside prefix 192.168.20.0/24"
+            "fabric.toml: workload vms: 'router' is gone: phase 2: VMs default to 'gw'; remove \
+             'router'"
         );
-        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.1/24\""));
+    }
+
+    /// `span` retires the same way: host-local is the only shape, so there is nothing to
+    /// choose — and `span = "switch"`, the value 0.5.3 accepted, is refused as loudly as any
+    /// other, since silently accepting it would promise the old behavior.
+    #[test]
+    fn the_retired_span_key_is_refused_by_name_with_the_remedy() {
+        for value in ["switch", "host", "nonsense"] {
+            let e = wl_err(|t| {
+                t.replace(
+                    "gw = \"192.168.20.254\"",
+                    &format!("gw = \"192.168.20.254\"\nspan = \"{value}\""),
+                )
+            });
+            assert_eq!(
+                e,
+                "fabric.toml: workload vms: 'span' is gone: phase 2: the VM VLAN is host-local; \
+                 remove 'span'",
+                "span = {value}"
+            );
+        }
+    }
+
+    /// The workload fixture with `dhcp_server = <addr>` on the row.
+    fn with_dhcp_server(addr: &str) -> impl FnOnce(String) -> String + '_ {
+        move |t: String| {
+            t.replace(
+                "gw = \"192.168.20.254\"",
+                &format!("gw = \"192.168.20.254\"\ndhcp_server = \"{addr}\""),
+            )
+        }
+    }
+
+    #[test]
+    fn dhcp_server_parses_as_an_ipv4_address_and_is_optional() {
+        let f = wl_fabric_edit(with_dhcp_server("192.168.10.11")).unwrap();
         assert_eq!(
-            e,
-            "fabric.toml: workload vms: router '192.168.20.1/24' must be a bare IPv4 address \
-             (the VLAN's existing default router)"
+            f.workload("vms").unwrap().dhcp_server,
+            Some("192.168.10.11".parse().unwrap())
+        );
+        // Absent is the normal case: no relay on the row.
+        assert_eq!(
+            wl_fabric_edit(|t| t)
+                .unwrap()
+                .workload("vms")
+                .unwrap()
+                .dhcp_server,
+            None
         );
     }
 
     #[test]
-    fn check_refuses_a_router_that_is_the_network_or_broadcast_address() {
-        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.0\""));
+    fn check_refuses_a_malformed_dhcp_server() {
         assert_eq!(
-            e,
-            "fabric.toml: workload vms: router 192.168.20.0 is the network or broadcast \
-             address of 192.168.20.0/24"
-        );
-        let e = wl_err(|t| t.replace("router = \"192.168.20.1\"", "router = \"192.168.20.255\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: router 192.168.20.255 is the network or broadcast \
-             address of 192.168.20.0/24"
+            wl_err(with_dhcp_server("192.168.10.11/24")),
+            "fabric.toml: workload vms: dhcp_server '192.168.10.11/24' must be a bare IPv4 \
+             address (the DHCP server this row's relay forwards to)"
         );
     }
 
-    // I2 (whole-branch review): `gw == router` is the one the reviewer would fix before tagging
-    // — `router` is the natural first read of "the gateway", and cfab would then hijack the
-    // VLAN's real router for every device on the segment, not just VMs.
+    /// Inside `prefix` the relay would forward the request back out the leg it arrived on.
     #[test]
-    fn check_refuses_gw_equal_to_router() {
-        let e = wl_err(|t| t.replace("gw = \"192.168.20.254\"", "gw = \"192.168.20.1\""));
+    fn check_refuses_a_dhcp_server_inside_the_prefix() {
         assert_eq!(
-            e,
-            "fabric.toml: workload vms: gw 192.168.20.1 equals router 192.168.20.1; the anycast \
-             gateway and the VLAN's existing default router must differ"
+            wl_err(with_dhcp_server("192.168.20.50")),
+            "fabric.toml: workload vms: dhcp_server 192.168.20.50 is inside prefix \
+             192.168.20.0/24; the relay forwards off the VLAN, so the server cannot be on it"
         );
     }
 
-    // I2: a member address equal to the declared router is as wrong as one equal to gw (already
-    // refused above) — cfab would put a VM address on the router's own IP.
+    /// `gw` and a member's own address on the row are both inside `prefix`, so each gets its
+    /// own message ahead of the general one — an operator who wrote either meant something
+    /// specific and should be told which mistake they made.
     #[test]
-    fn check_refuses_a_member_address_equal_to_the_router() {
-        let e = wl_err(|t| t.replace("192.168.20.2/24", "192.168.20.1/24"));
+    fn check_refuses_a_dhcp_server_that_is_the_gw_or_a_member_address() {
         assert_eq!(
-            e,
-            "fabric.toml: member pve1-tb: workload vms: address 192.168.20.1/24 is the router \
-             192.168.20.1"
+            wl_err(with_dhcp_server("192.168.20.254")),
+            "fabric.toml: workload vms: dhcp_server 192.168.20.254 is the gw; the relay \
+             forwards off the VLAN, so the server cannot be cfab's own anycast gateway"
         );
+        assert_eq!(
+            wl_err(with_dhcp_server("192.168.20.3")),
+            "fabric.toml: workload vms: dhcp_server 192.168.20.3 is member pve2-tb's own \
+             address on this row; the relay forwards off the VLAN"
+        );
+    }
+
+    #[test]
+    fn check_refuses_an_unspecified_or_broadcast_dhcp_server() {
+        for addr in ["0.0.0.0", "255.255.255.255"] {
+            assert_eq!(
+                wl_err(with_dhcp_server(addr)),
+                format!(
+                    "fabric.toml: workload vms: dhcp_server {addr} is not an address a relay \
+                     can forward to (omit dhcp_server for no relay)"
+                )
+            );
+        }
     }
 
     // I2: two members declaring the same address on one workload row is a duplicate IP on the
@@ -2047,13 +2112,12 @@ mod tests {
     }
 
     // I2: a workload `prefix` overlapping a zone block would make the sibling return-path rule
-    // and the option-121 aggregate self-contradictory (spec's own `10.<id>.0.0/16` reservation).
+    // and the forward policy self-contradictory (spec's own `10.<id>.0.0/16` reservation).
     #[test]
     fn check_refuses_a_workload_prefix_overlapping_a_zone_block() {
         let e = wl_err(|t| {
             t.replace("prefix = \"192.168.20.0/24\"", "prefix = \"10.99.20.0/24\"")
                 .replace("gw = \"192.168.20.254\"", "gw = \"10.99.20.254\"")
-                .replace("router = \"192.168.20.1\"", "router = \"10.99.20.1\"")
                 .replace("192.168.20.2/24", "10.99.20.2/24")
                 .replace("192.168.20.3/24", "10.99.20.3/24")
         });
@@ -2117,7 +2181,7 @@ mod tests {
             .replace("name = \"vms\"", "name = \"vmstorage-a\"");
         let second = "\n[[workload]]\nname = \"vmstorage-b\"\nuplink = \"primary\"\nvid = 4\n\
                       prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
-                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+                      allow = [\"storage\"]\n";
         let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
             .unwrap_err()
             .to_string();
@@ -2141,7 +2205,7 @@ mod tests {
         );
         let second = "\n[[workload]]\nname = \"vms2\"\nuplink = \"primary\"\nvid = 3\n\
                       prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
-                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+                      allow = [\"storage\"]\n";
         let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
             .unwrap_err()
             .to_string();
@@ -2332,35 +2396,6 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_span_host_in_phase_1() {
-        let e = wl_err(|t| {
-            t.replace(
-                "gw = \"192.168.20.254\"",
-                "gw = \"192.168.20.254\"\nspan = \"host\"",
-            )
-        });
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: span = \"host\" is phase 2 and not built yet (omit it, \
-             or span = \"switch\")"
-        );
-    }
-
-    #[test]
-    fn check_refuses_an_unknown_span_value() {
-        let e = wl_err(|t| {
-            t.replace(
-                "gw = \"192.168.20.254\"",
-                "gw = \"192.168.20.254\"\nspan = \"Switch\"",
-            )
-        });
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: span 'Switch' is not one of switch, host"
-        );
-    }
-
-    #[test]
     fn check_refuses_a_member_address_without_a_length() {
         let e = wl_err(|t| {
             t.replace(
@@ -2406,13 +2441,6 @@ mod tests {
             "fabric.toml: workload vms: gw '192.168.20.254/24' must be a bare IPv4 address (the \
              prefix's mask is applied)"
         );
-    }
-
-    #[test]
-    fn the_aggregate_covers_every_declared_zone_block() {
-        let f = wl_fabric_edit(|t| t).unwrap();
-        let got: Vec<String> = f.aggregate().iter().map(Ipv4Prefix::to_string).collect();
-        assert_eq!(got, vec!["10.99.0.0/16", "10.199.0.0/16", "10.249.0.0/16"]);
     }
 
     #[test]

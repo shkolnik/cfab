@@ -357,7 +357,7 @@ mod tests {
         );
         let text = format!(
             "{text}\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\n\
-             prefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\n\
+             prefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\n\
              allow = [\"storage\", \"otherz\"]\n"
         );
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()

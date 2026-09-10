@@ -342,8 +342,13 @@ pub struct WorkloadStatus {
     /// `components` document; `None` when no supervisor is answering or the announcer has not
     /// started.
     pub trigger: Option<String>,
+    /// The leg's `proxy_arp` sysctl (spec 5.2): `Some(true)` while the host answers ARP for the
+    /// remote VMs it routes, `Some(false)` when it does not, `None` when the file could not be
+    /// read (the leg may not exist yet). Every host's leg needs it on — with it on one host
+    /// only, VM-to-VM across hosts is broken in one direction (G0, rack).
+    pub proxy_arp: Option<bool>,
     /// Count of neighbor entries in `prefix` recently resolved to something other than a
-    /// declared member, `gw` or `router` (a VM, presumptively). `None` when the row is not up,
+    /// declared member or `gw` (a VM, presumptively). `None` when the row is not up,
     /// or the `ip -j neigh show dev` read failed — observability, never a health condition.
     pub vms_seen: Option<u32>,
     /// The bridge guard's claim/request drop counters, summed over the row's uplink ports;

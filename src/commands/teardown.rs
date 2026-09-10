@@ -207,6 +207,12 @@ pub fn run(sys: &mut dyn Sys, view: &View, mode: Teardown) -> Result<String> {
             if has_ip_addr(&addr.stdout, &gw_cidr) {
                 run_ok(sys, &["ip", "addr", "del", &gw_cidr, "dev", ifname])?;
             }
+            // Spec 5.2, BOTH modes and before the netdev goes: a stopped member has no fabric
+            // routes, so a proxy answer it kept giving would black-hole the VM it answered. On
+            // `Stop` the netdev outlives us, so this sysctl is the only thing that stops it;
+            // on `Down` it costs one write into a file that is about to vanish, which is
+            // cheaper than a mode branch over a fact that does not differ.
+            crate::workload::leg::proxy_arp(sys, ifname, false)?;
             match mode {
                 Teardown::Down => crate::workload::leg::remove(
                     sys,
@@ -531,6 +537,13 @@ mod tests {
                 .is_empty(),
             "down leaves arp_ignore (ruling 11)"
         );
+        // Spec 5.2: proxy ARP goes off on `down` too, before the netdev does — one code path
+        // for both modes, since the fact ("a member that is not routing must not answer") does
+        // not differ between them.
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp"),
+            vec!["0"]
+        );
     }
 
     /// The restart case (RULED 2026-09-10): a supervisor stop keeps the leg NETDEV, because
@@ -567,6 +580,13 @@ mod tests {
                 .iter()
                 .any(|c| c == "ip addr del 192.168.20.2/24 dev cfab-work-vms"),
             "the member's own address rides on the leg it kept"
+        );
+        // Spec 5.2: the leg survives the stop, so the sysctl on it must be cleared EXPLICITLY
+        // — a stopped member has no fabric routes, and an answer it kept giving for a remote
+        // VM would black-hole that VM's traffic until the supervisor came back.
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp"),
+            vec!["0"]
         );
     }
 
