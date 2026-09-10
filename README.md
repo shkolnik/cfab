@@ -188,9 +188,9 @@ fabricated zero; a member with no row carries none of them:
 |---|---|---|
 | `cfab_workload_up` | gauge | 1 when the row's table is present, its addresses and sibling return-path rule are installed, the route-get proof succeeds, and its announcer is running |
 | `cfab_workload_state{state}` | gauge | the row's classification, one of `up`/`deferred`/`announcer_not_started`/`broken`; exactly one series is 1 |
-| `cfab_workload_vms_seen` | gauge | VMs this member currently knows on the row's leg: neighbor entries inside its `prefix` in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared member address, `gw` or `router`, whose MAC the uplink bridge holds on a **non-uplink** port — the same derivation that decides which /32s this member originates. A VM on a peer host is learned through the uplink and counted there, not here; a departed VM lingers as STALE until the kernel garbage-collects the entry (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is the alert ("gateway up, nobody home"), a nonzero value is an upper bound |
+| `cfab_workload_vms_seen` | gauge | VMs this member currently knows on the row's leg: neighbor entries inside its `prefix` in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared member address or `gw`, whose MAC the uplink bridge holds on a **non-uplink** port — the same derivation that decides which /32s this member originates. A VM on a peer host is learned through the uplink and counted there, not here; a departed VM lingers as STALE until the kernel garbage-collects the entry (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is the alert ("gateway up, nobody home"), a nonzero value is an upper bound |
 | `cfab_workload_guard_drops_total{kind}` | counter | the bridge guard's `claim`/`request` drop counters, summed over the row's uplink ports; resets to 0 when `apply` re-renders the table or the watchdog restores it |
-| `cfab_workload_stray_forwards_total` | counter | fabric packets this member refused to put on the row's leg because their destination is not a VM it currently knows; summed over the row's one drop rule per allowed zone, and reset to 0 when `apply` re-renders `inet cfab-fwd` |
+| `cfab_workload_stray_forwards_total` | counter | fabric packets this member forwarded onto the row's leg for a destination that is not a VM it currently knows — counted, **not** dropped: the packet goes to the leg, where the kernel's ARP either finds a local VM (discovering it) or times out; summed over the row's one rule per allowed zone, and reset to 0 when `apply` re-renders `inet cfab-fwd` |
 | `cfab_workload_rx_bytes_total`, `cfab_workload_tx_bytes_total` | counter | the gateway's own forwarding on the row's leg; not cross-host VM-to-VM traffic, which stays on the physical switch |
 | `cfab_workload_announces_total`, `cfab_workload_bursts_total` | counter | gratuitous ARPs and re-announce bursts the row's announcer has sent; a rising burst rate is flapping (MAC churn, watch deaths) |
 
@@ -215,8 +215,10 @@ the point of use, with identical single-host behavior when absent:
 ## VM workloads
 
 A `[[workload]]` row declares a VM VLAN cfab reaches into the fabric — an anycast gateway every
-member answers, a passive OSPF advertisement into the zones it may reach, and a symmetric
-forward policy. `uplink` is the host's own vlan-aware bridge carrying the VMs and `vid` is the
+member answers and every VM defaults to, a per-VM advertisement into the zones it may reach, and
+a symmetric forward policy. The VLAN is **host-local**: it must not be carried between hosts by
+the switch, so the uplink bridge's ports must not carry `vid` (a host `bridge-vids` stanza), or
+the row defers. `uplink` is the host's own vlan-aware bridge carrying the VMs and `vid` is the
 VLAN they are on; cfab creates its own leg `cfab-work-<name>` on that bridge (and gives the
 bridge that vid on itself), and removes both again on `down`. A `systemctl stop`/`restart` (a
 package upgrade included) keeps the leg itself and gives the vid back: deleting the leg would
@@ -229,8 +231,8 @@ name   = "vms"
 uplink = "primary"            # the host's vlan-aware bridge carrying the VMs
 vid    = 3                    # the VLAN the VMs are on; cfab's leg is cfab-work-vms
 prefix = "192.168.20.0/24"
-gw     = "192.168.20.254"     # the anycast gateway every host answers
-router = "192.168.20.1"       # the VLAN's existing default router, printed inside DHCP option 121
+gw     = "192.168.20.254"     # the anycast gateway every host answers, and the VMs' default
+dhcp_server = "192.168.10.11" # optional: the server this row's relay forwards DHCP to
 allow  = ["storage"]          # zones this workload may reach; default deny, counted
 
 [[member]]
@@ -238,10 +240,12 @@ name = "pve1"
 workloads = [ { name = "vms", address = "192.168.20.2/24" } ]   # this host's own address on the leg
 ```
 
-`cfab check` refuses a `gw`, `router`, or member address outside `prefix`; any of them landing on
-`prefix`'s network or broadcast address; a `gw` or `router` that is not a bare IPv4 address (no
-mask — `prefix`'s mask is applied to both); a member address without the prefix's mask or equal to
-`gw` or `router`; `gw` equal to `router`; two members declaring the same address on one workload
+`cfab check` refuses a `gw` or member address outside `prefix`; either of them landing on
+`prefix`'s network or broadcast address; a `gw` that is not a bare IPv4 address (no
+mask — `prefix`'s mask is applied); a member address without the prefix's mask or equal to
+`gw`; a `dhcp_server` that is not a bare IPv4 address, or that is `gw`, a member address on the
+row, inside `prefix`, or 0.0.0.0/255.255.255.255 (the relay forwards *off* the VLAN, so its
+server cannot be on it); two members declaring the same address on one workload
 row; an empty `allow`; an `allow` naming an unknown zone; a `vid` outside 2–4094 (1 is the bridge's
 untagged default; 0 and 4095 are reserved); a derived leg name colliding with a declared wire, a
 declared segment, or a cfab-generated bond/identity interface; two `[[workload]]` rows sharing a
@@ -249,9 +253,12 @@ name, whose names cut to the same 15-byte leg, or declaring the same `uplink` an
 per bridge and vid); a workload name that is also a zone name (workload and zone names
 share one vocabulary); a workload `prefix` overlapping a zone's own `10.<id>.0.0/16` block; a
 workload row no member carries; a member declaring the same workload row twice; a member workload
-naming an unknown row; `span = "host"` (phase 2, not built yet — omit `span` or write `"switch"`);
-an unrecognized `span` value; and a leaf carrying one (a leaf never transits). Names share the zone
-vocabulary, so `vms>storage` reads like `storage>storage`. A fabric with `[forward] enabled =
+naming an unknown row; and a leaf carrying one (a leaf never transits). The retired keys `span`
+and `router` are refused by name with the remedy: the VM VLAN is host-local (nothing for `span`
+to choose) and the VMs' only gateway is `gw`. `check` also **warns** — never refuses — when a
+declared `dhcp_server` is in no zone the row is allowed into and no zone declares a `gw`, and
+when an uplink bridge port carries the row's `vid` (the condition `up` defers on, below).
+Names share the zone vocabulary, so `vms>storage` reads like `storage>storage`. A fabric with `[forward] enabled =
 false` cannot declare a `[[workload]]` row at all — a workload with nothing to reach is refused,
 and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is off.
 
@@ -261,10 +268,14 @@ a wait, not a refusal: a bridge that is not on the host yet, an uplink that cann
 an uplink that is not yet STP-forwarding, and another vlan device already holding the row's `vid`
 on the `uplink` (a `<bridge>.<vid>` host stanza, or any other tool that took that pair first — the
 kernel allows one 802.1Q device per parent and vid, and cfab never claims the pair under that
-name, so the leg cannot be built until the holder is removed) each defer that one row to the
-watchdog (a warning names the reason and, for a holder, the device to remove; no leg is built and
-no gw address goes live) and let the rest of the member apply; the watchdog installs the row once
-the condition clears.
+name, so the leg cannot be built until the holder is removed), and any uplink bridge **port**
+carrying the row's `vid` (the VM VLAN is host-local: with the vid on a port that leaves the host
+the VLAN spans the switch again, a remote VM answers ARP beside this host's proxy, and VM frames
+leave the host — the remedy is the host's own `bridge-vids` stanza, which cfab never edits) each
+defer that one row to the
+watchdog (a warning names the reason and, for a holder or a vid-carrying port, the device to fix;
+no leg is built and no gw address goes live) and let the rest of the member apply; the watchdog
+installs the row once the condition clears.
 
 - **`up` adds:** the leg `cfab-work-<name>` as vlan `vid` on `uplink`, carrying this member's
   declared address, plus `vid` on the bridge itself (without it the leg receives nothing);
@@ -276,7 +287,11 @@ the condition clears.
   reply may arrive on a different host than the request left from); a forward-hook DSCP
   overwrite (a workload's own marking is never trusted); the anycast `gw` as a second address on
   the leg, answered with the host's own MAC, with `net.ipv4.conf.all.arp_ignore=1` so a host
-  answers `gw` only on the interface that holds it; an nft bridge rule that drops ARP for `gw`
+  answers `gw` only on the interface that holds it; `net.ipv4.conf.<leg>.proxy_arp=1`, so the leg
+  answers ARP for the remote VMs the fabric routes to it (the kernel proxies only a target whose
+  route leaves by a *different* device, so a host never answers for its own VM — and every host
+  carrying the row needs it, since one-sided proxy ARP breaks VM-to-VM in one direction); an nft
+  bridge rule that drops ARP for `gw`
   arriving on the bridge's uplink port, so hosts never contend over who answers it; and a
   gratuitous-ARP announcer, a beacon every few seconds plus a burst when the bridge learns a new
   MAC, so a migrated VM's fabric-side neighbor entries converge onto its new host.
@@ -288,25 +303,25 @@ the condition clears.
   with this member's own address, so a restart keeps its neighbor entries and the VMs on it stay
   announced. The bridge's vid is not part of that (neighbor entries live on the netdev), so it
   goes back under the same ownership test `down` uses and `up` re-adds it. The anycast `gw`
-  address still goes, so a stopped member stops answering for the gateway and VMs re-resolve it
-  to a live one.
+  address still goes, and so does `proxy_arp`, so a stopped member stops answering for the
+  gateway (VMs re-resolve it to a live one) and for the remote VMs it can no longer route to.
 - **The watchdog restores** anything of the above it finds missing or wrong, the leg and the
   bridge's vid included, the same way it restores every other cfab-owned interface, rule, or
   sysctl.
-- A VM's DHCP lease should carry option 121 (RFC 3442) with the fabric aggregate routed via `gw`,
-  plus the default route via the declared `router` inside the *same* option: a client that
-  receives option 121 ignores option 3 (VERIFIED: isc-dhclient and systemd-networkd both do,
-  so a 121 lease with no default route inside it leaves the VM with none at all). A VM without
-  option 121 still reaches fabric identities via the declared `router`, degraded, not broken. The
-  aggregate is fabric-wide: it covers every declared zone block regardless of this row's own
-  `allow`, so a zone the row does not reach still routes through `gw` rather than falling to the
-  default route — traffic this workload is not allowed into is dropped at the host, not carried
-  off toward `router`.
+- The VLAN is **host-local**: a VM's frames never leave its host on the switch, and every
+  cross-host and north-south packet is routed by the host into the fabric or out the host's own
+  default. So a VM's DHCP lease needs nothing but option 3 (`gw`) — there is no other router on
+  the VLAN and no option-121 snippet to paste.
+- A VM the fabric has not heard from is unreachable from remote VMs and from north-south until it
+  speaks. A VM that takes a lease through this row's relay is known at lease time; a **static-IP
+  VM must send one packet** (a ping to `gw` at boot is enough) before other hosts can reach it.
+  That is a runbook rule for static VMs, not a fault.
 
 `cfab status` reports each row it carries as one line, `workload <name>: <uplink> vid <vid>
-(<leg>) <address> gw <gw> up|down, advertised to <zones>, uplink <ports>, announce trigger
+(<leg>) <address> gw <gw> up|down, host-local, proxy-arp on|off|unreadable, advertised to
+<zones>, uplink <ports>, announce trigger
 <trigger>`, followed by `, N vms seen` while the row is up and the neighbor read succeeded, and
-`, N stray forwards` while the forward chain carries the drop rule — one spelling for every `N`
+`, N stray forwards` while the forward chain carries the counter rule — one spelling for every `N`
 including 0, never a fabricated zero otherwise (it is simply absent then). These are the same
 counts `cfab_workload_vms_seen` and `cfab_workload_stray_forwards_total` above report.
 

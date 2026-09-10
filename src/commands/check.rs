@@ -157,16 +157,16 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 wl.allow.join(", "),
                 carried_by
             ));
-            if let Some(server) = wl.dhcp_server {
-                if !reaches(fabric, wl, server) {
-                    out.push_str(&format!(
-                        "warning: workload {}: dhcp_server {server} is in no zone this row is \
-                         allowed into ({}) and no zone declares a gw, so the relay has no route \
-                         to it\n",
-                        wl.name,
-                        wl.allow.join(", ")
-                    ));
-                }
+            if let Some(server) = wl.dhcp_server
+                && !reaches(fabric, wl, server)
+            {
+                out.push_str(&format!(
+                    "warning: workload {}: dhcp_server {server} is in no zone this row is \
+                     allowed into ({}) and no zone declares a gw, so the relay has no route \
+                     to it\n",
+                    wl.name,
+                    wl.allow.join(", ")
+                ));
             }
         }
         // Conflict 11 (holo `b01dab56`): the `redistribution` entry cfab writes on a zone's
