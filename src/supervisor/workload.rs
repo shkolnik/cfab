@@ -203,8 +203,9 @@ impl Workloads {
         // The host-route reconcile (spec §5.2, ruling 6). Level triggered and independent of
         // the announcers: it runs for every declared row, including one still deferred (whose
         // wanted set is empty), and it owns its own standing-line dedup, so what arrives here
-        // is only what has not been said yet.
-        for line in self.hostroutes.tick(sys, view, now) {
+        // is only what has not been said yet. `io` is the same socket the beacon sends on —
+        // gate B's idle-VM probe is one more frame type on it, never a new one.
+        for line in self.hostroutes.tick(sys, view, io, now) {
             journal(&self.trace, line);
         }
         if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
@@ -477,6 +478,7 @@ mod tests {
         let (sys, view) = crate::commands::apply::tests::wl_sys_and_view("pve1-tb");
         let mut sys = sys
             .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
+            .file("/sys/class/net/primary/bridge/ageing_time", "30000\n")
             .on_stdout(
                 &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
                 r#"[{"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]}]"#,

@@ -10,6 +10,15 @@
 //! The set is derived ONCE and used by both `status`'s `vms_seen` and the routes, so the number
 //! an operator reads and the routes this member originates can never disagree (conflict 12).
 //!
+//! Gate B (spec §5.2, §5.3): a VM whose membership drops out of the WANTED set (the same moment
+//! its /32 withdraws) gets its neighbor entry deleted (`ip neigh del`), so a later packet ARPs
+//! afresh instead of riding a dead MAC, and each join/leave gets one journal line. G0 1b measured
+//! a real decay path a stale neighbor entry does not save it from: an idle VM's bridge FDB entry
+//! ages out at the bridge's own `ageing_time` (300 s default) while the neighbor entry survives
+//! STALE — so the reconcile also runs an idle-VM probe, a unicast ARP request per currently-live
+//! VM at an interval derived from that same `ageing_time`, which is the only kind of frame that
+//! draws a reply and therefore refreshes the FDB entry the beacon alone cannot touch.
+//!
 //! Level triggered on purpose: every tick sends the WHOLE wanted set to the engine and diffs
 //! the nft set against what nft actually holds, so an `apply` that re-rendered `inet cfab-fwd`
 //! (which re-declares the set empty and zeroes the drop counter) repairs itself on the next
@@ -29,7 +38,7 @@ use crate::commands::engine_ctl;
 use crate::derive::View;
 use crate::model::Workload;
 use crate::sys::Sys;
-use crate::workload::announce::PERIOD;
+use crate::workload::announce::{AnnounceIo, PERIOD, unicast_probe};
 use crate::workload::{deferred_names, uplink};
 
 /// The nft table the forward policy and its sets live in (`emit::policy`).
@@ -72,6 +81,24 @@ pub fn local_vms(
     wl: &Workload,
     uplink_ports: &[String],
 ) -> Option<BTreeSet<Ipv4Addr>> {
+    Some(
+        local_vm_macs(neigh_json, fdb_json, view, wl, uplink_ports)?
+            .into_keys()
+            .collect(),
+    )
+}
+
+/// The same join `local_vms` does, keeping each VM's MAC — the idle-VM probe's (gate B) unicast
+/// target. `local_vms` is this function's addresses alone; every doc comment above it applies
+/// here unchanged. A `lladdr` that does not parse as six hex octets (an iproute2 spelling we do
+/// not understand — never seen in practice) drops that one VM rather than guessing at its MAC.
+fn local_vm_macs(
+    neigh_json: &str,
+    fdb_json: &str,
+    view: &View,
+    wl: &Workload,
+    uplink_ports: &[String],
+) -> Option<BTreeMap<Ipv4Addr, [u8; 6]>> {
     let neigh: Value = serde_json::from_str(neigh_json).ok()?;
     let fdb: Value = serde_json::from_str(fdb_json).ok()?;
     let (neigh, fdb) = (neigh.as_array()?, fdb.as_array()?);
@@ -99,7 +126,7 @@ pub fn local_vms(
     }
 
     let exclude = fabric_addresses(view, wl);
-    let mut out = BTreeSet::new();
+    let mut out: BTreeMap<Ipv4Addr, [u8; 6]> = BTreeMap::new();
     let mut understood = 0usize;
     for e in neigh {
         // The shape test, and why it is `dst` + `state` and not the address parsing: an entry
@@ -126,8 +153,10 @@ pub fn local_vms(
         let Some(mac) = e["lladdr"].as_str() else {
             continue;
         };
-        if local_macs.contains(&mac.to_ascii_lowercase()) {
-            out.insert(dst);
+        if local_macs.contains(&mac.to_ascii_lowercase())
+            && let Some(bytes) = parse_mac(mac)
+        {
+            out.insert(dst, bytes);
         }
     }
     // Same reading as the FDB above: a non-empty document none of whose entries we could read
@@ -136,6 +165,16 @@ pub fn local_vms(
         return None;
     }
     Some(out)
+}
+
+/// `"02:cf:ab:00:00:01"` -> its six bytes. `None` for anything else.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for byte in out.iter_mut() {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// Every address on this workload the fabric itself owns: each declared member's address on the
@@ -201,6 +240,12 @@ enum Cond {
     Engine,
     /// The nft set could not be read or updated.
     Nft,
+    /// The idle-VM probe (gate B) could not send: the leg's MAC could not be read, or the send
+    /// itself failed.
+    Probe,
+    /// The bridge's `ageing_time` could not be read: the probe still runs, at the fallback
+    /// interval `DEFAULT_AGEING` assumes.
+    AgeingTime,
 }
 
 impl Cond {
@@ -210,6 +255,8 @@ impl Cond {
             Cond::Read => "VM read",
             Cond::Engine => "engine route request",
             Cond::Nft => "local set update",
+            Cond::Probe => "idle-VM probe",
+            Cond::AgeingTime => "bridge ageing_time read",
         }
     }
 }
@@ -221,6 +268,18 @@ struct Row {
     /// The line standing for each repeating condition, so a fault that lasts costs one line
     /// and not one every tick.
     standing: BTreeMap<Cond, String>,
+    /// The wanted set as of the LAST tick's reconcile (gate B): diffed against this tick's to
+    /// find who joined and who left, and departed exactly once each — never re-derived from a
+    /// broad scan, which is what makes the `neigh del` below provably ours.
+    last_wanted: BTreeSet<Ipv4Addr>,
+    /// Whether this row has ever completed a membership reconcile. The FIRST one is a baseline
+    /// (whatever is already there when cfab starts watching, or when a deferred row installs),
+    /// never a set of changes: without this, every VM already on the wire at startup would log
+    /// a "joined" line for a join that never happened.
+    seen_before: bool,
+    /// When the idle-VM probe (spec §5.2 (a)) is next due. `None` until this row's first
+    /// installed tick.
+    next_probe: Option<Instant>,
 }
 
 impl Row {
@@ -301,8 +360,16 @@ impl HostRoutes {
     }
 
     /// One reconcile pass over every declared row. Returns the journal lines to say, in order;
-    /// the caller owns stderr and the test trace.
-    pub fn tick(&mut self, sys: &mut dyn Sys, view: &View, now: Instant) -> Vec<String> {
+    /// the caller owns stderr and the test trace. `io` is the same `AnnounceIo` the announcers
+    /// send their beacon on (gate B): the idle-VM probe is one more frame type on the same
+    /// socket, never a new one.
+    pub fn tick(
+        &mut self,
+        sys: &mut dyn Sys,
+        view: &View,
+        io: &mut dyn AnnounceIo,
+        now: Instant,
+    ) -> Vec<String> {
         let mut out = Vec::new();
         let rows = view.workload_rows();
         if rows.is_empty() {
@@ -317,17 +384,25 @@ impl HostRoutes {
                 self.observe(sys, view, wl, &mut out)
             } else {
                 // A row with no leg has no local VMs to damp: forget the hold-down rather
-                // than hold routes for a leg that is not there.
-                self.rows.entry(wl.name.clone()).or_default().holddown = Holddown::default();
-                Some(BTreeSet::new())
+                // than hold routes for a leg that is not there, and forget the membership
+                // diff too — the leg is gone, and with it every neighbor entry that could
+                // have been "left" (a deleted netdev takes its neighbor table with it).
+                let r = self.rows.entry(wl.name.clone()).or_default();
+                r.holddown = Holddown::default();
+                r.last_wanted = BTreeSet::new();
+                Some(BTreeMap::new())
             };
             // A read that failed costs one tick and nothing else — never a withdrawal.
             let Some(live) = live else { continue };
+            let live_addrs: BTreeSet<Ipv4Addr> = live.keys().copied().collect();
             let ifindex = leg_ifindex(sys, &wl.leg_ifname()).unwrap_or(0);
             let wanted = {
                 let r = self.rows.entry(wl.name.clone()).or_default();
-                r.holddown.observe(&live, now)
+                r.holddown.observe(&live_addrs, now)
             };
+            if installed {
+                self.reconcile_membership(sys, wl, &wanted, &mut out);
+            }
             // The engine's set is the VMs PLUS this member's own leg address as a /32 (spec
             // fact 5): a relayed DHCP reply is unicast to `giaddr` = the leg address, and with
             // the workload /24 originated by nobody, nothing routes to it unless the host that
@@ -343,18 +418,22 @@ impl HostRoutes {
             }
             self.ask_engine(sys, view, wl, ifindex, &engine_set, &mut out);
             self.sync_set(sys, wl, &wanted, &mut out);
+            if installed {
+                self.maybe_probe(sys, io, wl, &live, now, &mut out);
+            }
         }
         out
     }
 
-    /// The live local-VM set for one row, or `None` when a read this tick could not be made.
+    /// The live local-VM set for one row, keyed by MAC, or `None` when a read this tick could
+    /// not be made. The MAC is gate B's addition — the idle-VM probe's unicast target.
     fn observe(
         &mut self,
         sys: &mut dyn Sys,
         view: &View,
         wl: &Workload,
         out: &mut Vec<String>,
-    ) -> Option<BTreeSet<Ipv4Addr>> {
+    ) -> Option<BTreeMap<Ipv4Addr, [u8; 6]>> {
         let leg = wl.leg_ifname();
         let name = wl.name.clone();
         // An uplink that cannot be identified is skipped in silence, deliberately: the
@@ -387,7 +466,7 @@ impl HostRoutes {
             );
             return None;
         }
-        match local_vms(&neigh.stdout, &fdb.stdout, view, wl, &ports) {
+        match local_vm_macs(&neigh.stdout, &fdb.stdout, view, wl, &ports) {
             Some(live) => {
                 self.rows
                     .entry(name.clone())
@@ -407,6 +486,137 @@ impl HostRoutes {
                 );
                 None
             }
+        }
+    }
+
+    /// Journal one line per address whose WANTED membership changed since the last tick, and
+    /// delete the neighbor entry of one that left (gate B, spec §5.3).
+    ///
+    /// Scoped to `wanted` — the SAME post-hold-down moment the engine's /32 and the nft set
+    /// already drop the address — never earlier: a VM that returns within the hold-down window
+    /// cancels the departure (`Holddown::observe`) before this ever sees it leave, so a flapping
+    /// VM never pays a forced re-ARP, and a `Cmd::DhcpAck` neighbor write that lands inside the
+    /// window is never raced by a delete (the very next fresh read puts the address straight
+    /// back into `live`, which cancels the hold-down outright). The deletion itself is provably
+    /// ours: one address this row's own reconcile watched leave `wanted`, on the row's own leg —
+    /// never a broad flush, never by pattern.
+    fn reconcile_membership(
+        &mut self,
+        sys: &mut dyn Sys,
+        wl: &Workload,
+        wanted: &BTreeSet<Ipv4Addr>,
+        out: &mut Vec<String>,
+    ) {
+        let name = wl.name.clone();
+        let leg = wl.leg_ifname();
+        let r = self.rows.entry(name.clone()).or_default();
+        let first = !r.seen_before;
+        r.seen_before = true;
+        let prev = std::mem::replace(&mut r.last_wanted, wanted.clone());
+        if first {
+            // Whatever is already live the first time this row is ever reconciled is a
+            // baseline, not a set of changes: nothing here "just joined".
+            return;
+        }
+        for addr in wanted.difference(&prev) {
+            out.push(format!("cfab: workload {name}: vm {addr} joined"));
+        }
+        for addr in prev.difference(wanted) {
+            let deleted = sys
+                .run(&["ip", "neigh", "del", &addr.to_string(), "dev", &leg])
+                .is_ok_and(|o| o.ok());
+            if deleted {
+                out.push(format!("cfab: workload {name}: vm {addr} left (port gone)"));
+            } else {
+                out.push(format!(
+                    "cfab: workload {name}: vm {addr} left (port gone); cannot delete its \
+                     neighbor entry on {leg}"
+                ));
+            }
+        }
+    }
+
+    /// The idle-VM probe (spec §5.2 (a), gate B). Fires at most once every `probe_interval` (a
+    /// third of the bridge's own `ageing_time`, floored at the announcer's `PERIOD`) and, when
+    /// it does, sends one unicast ARP request to every CURRENTLY live VM on this row — never a
+    /// broadcast, never a VM this tick's own fresh read did not just confirm. The point is the
+    /// reply: a frame this host sends is never learned from, so only the VM answering refreshes
+    /// the bridge FDB entry that the beacon alone cannot touch (G0 1b).
+    fn maybe_probe(
+        &mut self,
+        sys: &mut dyn Sys,
+        io: &mut dyn AnnounceIo,
+        wl: &Workload,
+        live: &BTreeMap<Ipv4Addr, [u8; 6]>,
+        now: Instant,
+        out: &mut Vec<String>,
+    ) {
+        let name = wl.name.clone();
+        let due = *self
+            .rows
+            .entry(name.clone())
+            .or_default()
+            .next_probe
+            .get_or_insert(now);
+        if now < due {
+            return;
+        }
+        let (interval, ageing_fault) = probe_interval(sys, &wl.uplink);
+        self.rows.entry(name.clone()).or_default().next_probe = Some(now + interval);
+        match ageing_fault {
+            Some(why) => self.fail_costing(
+                &name,
+                Cond::AgeingTime,
+                why,
+                &format!(
+                    "probing at the default {}s ageing_time assumption",
+                    DEFAULT_AGEING.as_secs()
+                ),
+                out,
+            ),
+            None => {
+                self.rows
+                    .entry(name.clone())
+                    .or_default()
+                    .recovered(Cond::AgeingTime, &name, out)
+            }
+        }
+        if live.is_empty() {
+            return; // nothing to refresh; the next due cycle checks again
+        }
+        let leg = wl.leg_ifname();
+        let src_mac = match io.mac(&leg) {
+            Ok(mac) => mac,
+            Err(e) => {
+                self.fail_costing(
+                    &name,
+                    Cond::Probe,
+                    format!("cannot read the MAC of {leg} for the idle-VM probe: {e}"),
+                    "no probe sent this cycle",
+                    out,
+                );
+                return;
+            }
+        };
+        let mut sent_ok = false;
+        for (&addr, &mac) in live {
+            let frame = unicast_probe(src_mac, mac, wl.gw, addr);
+            match io.send(&leg, &frame) {
+                Ok(()) => sent_ok = true,
+                Err(e) => self.fail_costing(
+                    &name,
+                    Cond::Probe,
+                    format!("idle-VM probe to {addr} on {leg} failed: {e}"),
+                    "retried next cycle",
+                    out,
+                ),
+            }
+        }
+        if sent_ok {
+            self.rows
+                .entry(name.clone())
+                .or_default()
+                .recovered(Cond::Probe, &name, out);
         }
     }
 
@@ -518,6 +728,8 @@ impl HostRoutes {
         let cost = match cond {
             Cond::Read | Cond::Engine => ENGINE_COST,
             Cond::Nft => "the local set is unchanged",
+            Cond::Probe => "no probe sent this cycle",
+            Cond::AgeingTime => "probing at the fallback interval",
         };
         self.fail_costing(name, cond, why, cost, out);
     }
@@ -567,6 +779,40 @@ fn refusal(reply: &str) -> Option<Refusal> {
     }
 }
 
+/// The Linux bridge default `ageing_time` (300 s, G0 1b measured this exact value on the
+/// testbed): the fallback the idle-VM probe uses only when the sysfs read itself fails, never a
+/// substitute for reading it.
+const DEFAULT_AGEING: Duration = Duration::from_secs(300);
+
+/// How often the idle-VM probe fires for one row: a third of the bridge's own `ageing_time`, so
+/// a single missed cycle (a busy tick, a transient read failure) still leaves a full cycle of
+/// margin before a genuinely idle VM's FDB entry could age out. Floored at the announcer's own
+/// `PERIOD`: an operator's bridge `ageing_time` is not a cfab knob, and a pathologically low one
+/// must not turn the probe into a beacon.
+///
+/// `/sys/class/net/<bridge>/bridge/ageing_time` reports centiseconds (`USER_HZ`, the historic
+/// unit every bridge sysfs timer uses) — 30000 is the kernel default 300 s, which is exactly
+/// what G0 1b measured. A read that fails or does not parse falls back to `DEFAULT_AGEING`,
+/// named once in the returned fault text; the probe keeps running either way (availability
+/// first) rather than stopping because one fact about the host could not be confirmed.
+fn probe_interval(sys: &dyn Sys, bridge: &str) -> (Duration, Option<String>) {
+    let path = format!("/sys/class/net/{bridge}/bridge/ageing_time");
+    match sys
+        .read(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        Some(centisecs) => (
+            (Duration::from_millis(centisecs * 10) / 3).max(PERIOD),
+            None,
+        ),
+        None => (
+            (DEFAULT_AGEING / 3).max(PERIOD),
+            Some(format!("cannot read {path}")),
+        ),
+    }
+}
+
 /// `/sys/class/net/<leg>/ifindex`. `None` when the leg is not there — the engine is then told
 /// ifindex 0, which is never a real netdev, so a leg that comes back always reads as a move and
 /// gets its routes re-resolved (holo resolves a static route's interface once, at commit).
@@ -604,6 +850,13 @@ mod tests {
     use crate::decl::{Declaration, fixtures};
     use crate::model::Fabric;
     use crate::sys::mock::MockSys;
+    use crate::workload::announce::mock::RecordingIo;
+
+    /// A fresh recording `AnnounceIo` for a test that does not care about the idle-VM probe's
+    /// frames — every `tick` needs one now that the probe rides the same socket.
+    fn io() -> RecordingIo {
+        RecordingIo::default()
+    }
 
     fn wl_fabric() -> Fabric {
         Fabric::from_decl(
@@ -658,6 +911,40 @@ mod tests {
             local_vms(NEIGH, FDB, &v, wl, &[]).unwrap(),
             set(&["192.168.20.1", "192.168.20.103", "192.168.20.104"])
         );
+    }
+
+    /// `parse_mac`: valid hex in, six bytes out; anything else is `None` — a malformed lladdr
+    /// costs one VM, never a panic.
+    #[test]
+    fn parse_mac_reads_six_hex_octets_and_rejects_anything_else() {
+        assert_eq!(
+            parse_mac("02:cf:ab:00:00:01"),
+            Some([0x02, 0xcf, 0xab, 0x00, 0x00, 0x01])
+        );
+        assert_eq!(parse_mac("02:cf:ab:00:00"), None, "too few groups");
+        assert_eq!(parse_mac("02:cf:ab:00:00:01:02"), None, "too many groups");
+        assert_eq!(parse_mac("gg:cf:ab:00:00:01"), None, "not hex");
+        assert_eq!(parse_mac(""), None);
+    }
+
+    /// The idle-VM probe's own read (gate B): the same join `local_vms` counts, keyed by each
+    /// VM's real MAC, which is exactly the MAC the neighbor table already carries for it (never
+    /// invented, never the uplink's).
+    #[test]
+    fn local_vm_macs_keeps_the_real_mac_of_the_one_local_vm() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        let macs = local_vm_macs(NEIGH, FDB, &v, wl, &["eth0".to_string()]).unwrap();
+        assert_eq!(
+            macs,
+            [(addr("192.168.20.103"), [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01])]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        );
+        // Same failure/empty semantics as `local_vms`, since `local_vms` is defined in terms of
+        // this function: a bad document is `None`, never "no VMs".
+        assert_eq!(local_vm_macs("not json", FDB, &v, wl, &[]), None);
     }
 
     /// The gateway is a fabric address on every member, and a MAC the bridge has no record of
@@ -855,6 +1142,7 @@ mod tests {
     fn tick_sys(elements: &str) -> MockSys {
         MockSys::default()
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/bridge/ageing_time", "30000\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
@@ -875,7 +1163,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys("");
-        let said = HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        let said = HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now());
         assert!(said.is_empty(), "a healthy tick says nothing: {said:?}");
         assert!(
             sys.ran(
@@ -907,7 +1195,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys("");
-        HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now());
         assert!(
             sys.ran(
                 "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
@@ -932,7 +1220,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys(r#","elem":["192.168.20.103","192.168.20.199"]"#);
-        HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now());
         assert!(
             sys.ran("nft delete element inet cfab-fwd cfab-work-vms-local { 192.168.20.199 }"),
             "{:?}",
@@ -945,6 +1233,282 @@ mod tests {
         );
     }
 
+    /// No VM at all: an empty document in both places, the shape a bridge that has learned
+    /// nothing yet, or a VM that has genuinely gone, presents.
+    fn no_vm(mut sys: MockSys) -> MockSys {
+        sys = sys.on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], "[]");
+        sys.on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], "[]")
+    }
+
+    /// Gate B: the FIRST tick a row is ever reconciled is a baseline (already asserted by
+    /// `the_tick_originates_the_leg_ifindex_and_the_wanted_set_and_adds_the_element`'s empty
+    /// `said`); a VM appearing on a LATER tick is a real join and gets its own line.
+    #[test]
+    fn a_vm_that_appears_on_a_later_tick_is_journaled_as_a_join() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = no_vm(tick_sys(""));
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        assert!(
+            hr.tick(&mut sys, &v, &mut io(), t0).is_empty(),
+            "the baseline (nothing here yet) is not a join"
+        );
+        let sys2 = tick_sys(""); // the VM starts talking: NEIGH/FDB show it again
+        sys.cmd_rules = sys2.cmd_rules;
+        assert_eq!(
+            hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1)),
+            vec!["cfab: workload vms: vm 192.168.20.103 joined"]
+        );
+    }
+
+    /// Gate B's core teeth: a VM that genuinely leaves gets its neighbor entry deleted and one
+    /// journal line, at the SAME moment (post hold-down) its /32 already withdraws — never
+    /// earlier. Three ticks: present (baseline), gone (inside the hold-down window: still
+    /// wanted, nothing said), gone again past the deadline (withdrawn, deleted, journaled).
+    #[test]
+    fn a_vm_that_leaves_gets_its_neighbor_entry_deleted_and_one_journal_line() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        hr.tick(&mut sys, &v, &mut io(), t0); // baseline: .103 present
+
+        sys = no_vm(sys);
+        let said = hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1));
+        assert!(
+            said.iter().all(|l| !l.contains("left")),
+            "still inside the hold-down window: {said:?}"
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("neigh del")),
+            "not deleted while still held: {:?}",
+            sys.calls
+        );
+
+        let said = hr.tick(
+            &mut sys,
+            &v,
+            &mut io(),
+            t0 + Duration::from_secs(1) + HOLDDOWN,
+        );
+        assert!(
+            sys.ran("ip neigh del 192.168.20.103 dev cfab-work-vms"),
+            "{:?}",
+            sys.calls
+        );
+        assert_eq!(
+            said,
+            vec!["cfab: workload vms: vm 192.168.20.103 left (port gone)"]
+        );
+    }
+
+    /// A `neigh del` that the kernel refuses (the entry is already gone, a race with something
+    /// else) is not swallowed: the "left" fact still stands, and the failure is named alongside
+    /// it — fail loud, never a silent partial result.
+    #[test]
+    fn a_failed_neigh_del_is_named_but_the_departure_is_still_reported() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        hr.tick(&mut sys, &v, &mut io(), t0);
+        sys = no_vm(sys).on_fail(&["ip", "neigh", "del"], 2, "No such file or directory");
+        hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1)); // inside the window
+        let said = hr.tick(
+            &mut sys,
+            &v,
+            &mut io(),
+            t0 + Duration::from_secs(1) + HOLDDOWN,
+        );
+        assert_eq!(
+            said,
+            vec![
+                "cfab: workload vms: vm 192.168.20.103 left (port gone); cannot delete its \
+                 neighbor entry on cfab-work-vms"
+            ]
+        );
+    }
+
+    /// The race gate B's own doc comment names: a VM that reappears (a real packet, or gate C's
+    /// `Cmd::DhcpAck` neighbor write) BEFORE the hold-down deadline is never treated as having
+    /// left at all — no journal line, no `neigh del`, ever. The reconcile cannot tell a real
+    /// packet from an ACK-driven `ip neigh replace`, which is exactly why this is race-safe
+    /// without knowing anything about DHCP.
+    #[test]
+    fn a_vm_that_returns_inside_the_hold_down_window_is_never_deleted() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        hr.tick(&mut sys, &v, &mut io(), t0); // baseline: present
+
+        sys = no_vm(sys);
+        hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1)); // vanishes
+
+        let sys2 = tick_sys("");
+        sys.cmd_rules = sys2.cmd_rules; // …and returns, inside the window
+        let said = hr.tick(
+            &mut sys,
+            &v,
+            &mut io(),
+            t0 + Duration::from_secs(1) + HOLDDOWN - Duration::from_millis(1),
+        );
+        assert!(
+            said.is_empty(),
+            "the return cancels the departure: {said:?}"
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("neigh del")),
+            "never deleted: {:?}",
+            sys.calls
+        );
+        // …and it stays wanted well past when the original deadline would have fired, proving
+        // the clock genuinely restarted rather than merely being checked late.
+        let said = hr.tick(
+            &mut sys,
+            &v,
+            &mut io(),
+            t0 + Duration::from_secs(1) + 2 * HOLDDOWN,
+        );
+        assert!(said.is_empty(), "{said:?}");
+    }
+
+    /// A deferred row forgets its membership baseline along with its hold-down: no leg exists
+    /// to delete a neighbor entry from, and a later reinstall must not read the pre-deferral
+    /// state as a mass, spurious "left" for every VM that was here before.
+    #[test]
+    fn a_deferred_row_reports_no_departures_and_reinstalling_reports_fresh_joins() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        hr.tick(&mut sys, &v, &mut io(), t0); // baseline: .103 present and installed
+
+        sys = sys.file(&format!("{}/workload-deferred", v.fabric.run_dir), "vms\n");
+        let said = hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1));
+        assert!(
+            said.iter().all(|l| !l.contains("left")),
+            "a deferred row's leg is gone with every neighbor entry on it, not \"left\": {said:?}"
+        );
+
+        sys.files
+            .remove(&format!("{}/workload-deferred", v.fabric.run_dir));
+        assert_eq!(
+            hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(4)),
+            vec!["cfab: workload vms: vm 192.168.20.103 joined"],
+            "reinstalling is a fresh baseline that then reports the VM as joining, not silence"
+        );
+    }
+
+    /// The idle-VM probe (spec §5.2 (a), gate B). Due immediately the first time a row is
+    /// installed (same shape as the announcer's own first-beacon-immediate rule), then at the
+    /// interval `probe_interval` derives from the bridge's `ageing_time` (30000 centiseconds =
+    /// 300 s in the fixture, so a third of that = 100 s) — never sooner, never a broadcast.
+    #[test]
+    fn the_idle_probe_sends_one_unicast_arp_per_live_vm_at_the_derived_interval() {
+        use crate::workload::announce::mock::{MOCK_MAC, SharedIo};
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let shared = SharedIo::default();
+        let mut io = shared.clone();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+
+        hr.tick(&mut sys, &v, &mut io, t0);
+        let sent = shared.sent();
+        assert_eq!(sent.len(), 1, "one probe, due immediately: {sent:?}");
+        assert_eq!(sent[0].0, "cfab-work-vms");
+        assert_eq!(
+            sent[0].1,
+            unicast_probe(
+                MOCK_MAC,
+                [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01], // .103's own MAC, from FDB/NEIGH
+                addr("192.168.20.254"),               // this host's own gw identity
+                addr("192.168.20.103"),
+            ),
+            "unicast to the VM's own MAC, sender = gw, target = the VM"
+        );
+
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(1));
+        assert_eq!(shared.sent().len(), 1, "not due yet: {:?}", shared.sent());
+
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(100));
+        assert_eq!(
+            shared.sent().len(),
+            2,
+            "due again a third of the 300 s ageing_time later"
+        );
+    }
+
+    /// A VM that has already left is not probed: the probe reads the SAME fresh `live` map the
+    /// rest of the tick derived this cycle, never a remembered roster.
+    #[test]
+    fn a_departed_vm_is_never_probed() {
+        use crate::workload::announce::mock::SharedIo;
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        let shared = SharedIo::default();
+        let mut io = shared.clone();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        hr.tick(&mut sys, &v, &mut io, t0); // probes once, immediately
+        assert_eq!(shared.sent().len(), 1);
+
+        sys = no_vm(sys);
+        // Advance to the probe's own next-due deadline (a third of the fixture's 300 s
+        // ageing_time = 100 s) WHILE the VM is absent, so the probe actually runs its
+        // `live.is_empty()` check rather than skipping on "not due yet" — still inside the
+        // membership hold-down (5 s), which is the point: even a VM `wanted` still protects
+        // from withdrawal is never probed once this tick's own fresh read no longer sees it.
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(100));
+        assert_eq!(
+            shared.sent().len(),
+            1,
+            "no probe for a VM this tick's own read no longer sees"
+        );
+    }
+
+    /// A bridge `ageing_time` that cannot be read is named once and recovers once, and the probe
+    /// still runs at the documented fallback (a third of 300 s) rather than stopping outright.
+    #[test]
+    fn an_unreadable_ageing_time_falls_back_and_is_named_once() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        sys.files
+            .remove("/sys/class/net/primary/bridge/ageing_time");
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        assert_eq!(
+            hr.tick(&mut sys, &v, &mut io(), t0),
+            vec![
+                "cfab: workload vms: cannot read \
+                 /sys/class/net/primary/bridge/ageing_time; probing at the default 300s \
+                 ageing_time assumption"
+            ]
+        );
+        assert!(
+            hr.tick(&mut sys, &v, &mut io(), t0 + Duration::from_secs(1))
+                .is_empty(),
+            "not due again yet, and said once"
+        );
+        sys.files.insert(
+            "/sys/class/net/primary/bridge/ageing_time".into(),
+            "30000\n".into(),
+        );
+        assert_eq!(
+            hr.tick(&mut sys, &v, &mut io(), t0 + DEFAULT_AGEING / 3),
+            vec!["cfab: workload vms: bridge ageing_time read recovered"]
+        );
+    }
+
     /// A deferred row has no leg: the wanted set is empty, the engine is told so with ifindex
     /// 0, and nothing is read off a netdev that does not exist.
     #[test]
@@ -953,7 +1517,7 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys(r#","elem":["192.168.20.103"]"#)
             .file(&format!("{}/workload-deferred", v.fabric.run_dir), "vms\n");
-        HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now());
         assert!(
             sys.ran("unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42"),
             "{:?}",
@@ -979,7 +1543,7 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys("");
         sys.files.remove("/sys/class/net/cfab-work-vms/ifindex");
-        HostRoutes::new().tick(&mut sys, &v, Instant::now());
+        HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now());
         assert!(
             sys.ran(
                 "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 0 \
@@ -1004,7 +1568,7 @@ mod tests {
         let mut hr = HostRoutes::new();
         let now = Instant::now();
         assert_eq!(
-            hr.tick(&mut sys, &v, now),
+            hr.tick(&mut sys, &v, &mut io(), now),
             vec![
                 "cfab: workload vms: cannot read the neighbors of cfab-work-vms; host routes \
                  unchanged"
@@ -1021,12 +1585,12 @@ mod tests {
             sys.calls
         );
         assert!(
-            hr.tick(&mut sys, &v, now).is_empty(),
+            hr.tick(&mut sys, &v, &mut io(), now).is_empty(),
             "the standing line is said once"
         );
         let mut healthy = tick_sys("");
         assert_eq!(
-            hr.tick(&mut healthy, &v, now),
+            hr.tick(&mut healthy, &v, &mut io(), now),
             vec!["cfab: workload vms: VM read recovered"]
         );
     }
@@ -1045,7 +1609,7 @@ mod tests {
                 "No such file or directory",
             );
         assert_eq!(
-            HostRoutes::new().tick(&mut sys, &v, Instant::now()),
+            HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now()),
             vec![
                 "cfab: workload vms: engine refused workload-routes cfab-work-vms 42 \
                  192.168.20.2/32 192.168.20.103/32: {\"error\":\"no such leg\"}; host routes unchanged"
@@ -1069,7 +1633,7 @@ mod tests {
             "{\"error\":\"the provider refused the install\",\"withdrew\":true}\n",
         );
         assert_eq!(
-            HostRoutes::new().tick(&mut sys, &v, Instant::now())[0],
+            HostRoutes::new().tick(&mut sys, &v, &mut io(), Instant::now())[0],
             "cfab: workload vms: engine withdrew the routes of cfab-work-vms and refused the \
              reinstall: the provider refused the install; retried next tick"
         );
