@@ -7,11 +7,6 @@
 use crate::cluster::Pmxcfs;
 use crate::sys::Sys;
 
-/// The directory holding `cap-<dev>` files: `$CFAB_CAP_DIR`, else the declaration's run dir.
-pub fn cap_dir(run_dir: &str) -> String {
-    std::env::var("CFAB_CAP_DIR").unwrap_or_else(|_| run_dir.to_string())
-}
-
 /// The cap the shape derivation prefers over the declared link speed, or `None` for the
 /// declared rate. Local file first (a present-but-garbage local file is `None` — the cluster
 /// is only consulted when the local file is ABSENT); then, when clustered, this member's own
@@ -23,8 +18,7 @@ pub fn read_cap(
     run_dir: &str,
     dev: &str,
 ) -> Option<u64> {
-    let dir = cap_dir(run_dir);
-    let local = format!("{dir}/cap-{dev}");
+    let local = format!("{run_dir}/cap-{dev}");
     if let Ok(text) = sys.read(&local) {
         return text.trim().parse().ok().filter(|v: &u64| *v > 0);
     }
@@ -50,7 +44,7 @@ pub fn read_cap(
     // Write back so the host is self-sufficient (run_dir is typically tmpfs — the published
     // cap survives a reboot when the local file does not) and the message fires once.
     let cached = sys
-        .mkdir_p(&dir)
+        .mkdir_p(run_dir)
         .and_then(|()| sys.write(&local, &format!("{v}\n")));
     match cached {
         Ok(()) => eprintln!(

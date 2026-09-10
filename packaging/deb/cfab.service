@@ -16,8 +16,6 @@ StartLimitIntervalSec=0
 [Service]
 Type=notify
 NotifyAccess=main
-# CFAB_HOST only, and only when this member's row is not named by the kernel hostname.
-EnvironmentFile=-/etc/default/cfab
 ExecStart=/usr/bin/cfab run
 # Reload re-reads /etc/cfab/fabric.toml. Unchanged declaration = re-apply in place: no
 # teardown, no netdev churn, the engine and the shape daemon restart. Changed declaration =

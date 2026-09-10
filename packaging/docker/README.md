@@ -37,15 +37,17 @@ No network privilege is needed to lint a declaration:
 ```
 docker run --rm --network none \
     -v /path/to/fabric.toml:/etc/cfab/fabric.toml:ro \
-    -e CFAB_HOST=pve1-tb \
+    --hostname pve1-tb \
     ghcr.io/shkolnik/cfab:0.4.1 check
 ```
 
 The entrypoint is `/usr/bin/cfab`, so the argv after the image name is the subcommand only —
 `check`, not `cfab check`.
 
-`CFAB_HOST` selects which ``[[member]]`` row this container is; leave it unset to fall back to
-the container's own hostname (`docker run --hostname`).
+The container's hostname selects which ``[[member]]`` row it is, and nothing else does: cfab has
+no override, so `--hostname` (compose: `hostname:`) is required whenever the container's default
+name is not the row name. This is what the container case always wanted — a container that calls
+itself `pve1-tb` IS `pve1-tb`, rather than one that answers to one name and reports another.
 
 ## Run — as a fabric member (leaf or transiting host)
 
@@ -66,8 +68,7 @@ services:
     stop_grace_period: 60s
     volumes:
       - /etc/cfab/fabric.toml:/etc/cfab/fabric.toml:ro
-    environment:
-      CFAB_HOST: ${CFAB_HOST:-}
+    hostname: pve1-tb
 ```
 
 PID 1 is `cfab run`; the restart policy is the runtime's (`restart: unless-stopped`);
@@ -99,7 +100,7 @@ bakes its own `fabric.toml` and a leaf-specific entrypoint, and is the thing act
 `cfab-leaf`).
 
 - **No baked `fabric.toml` or hostname** — the whole point of "generic": one image, any member,
-  by bind-mount + `CFAB_HOST`, per the backlog decision that the image stays generic.
+  by bind-mount + `--hostname`, per the backlog decision that the image stays generic.
 - **No systemd shims** — those exist only so a *test fixture* can assert `systemctl is-active`
   without a real init system; they are not part of running cfab and would be actively
   misleading baked into a real deployment image.

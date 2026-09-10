@@ -20,10 +20,6 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// The `[[member]]` row to run as (default: $CFAB_HOST, else this kernel's hostname)
-    #[arg(long, global = true)]
-    host: Option<String>,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -201,15 +197,13 @@ fn no_config_line(cli_config: &Option<PathBuf>, resolved: &std::path::Path) -> S
     format!("DOWN (no {})", named.display())
 }
 
-fn member_name(cli_host: &Option<String>) -> Result<String, Error> {
-    if let Some(h) = cli_host {
-        return Ok(h.clone());
-    }
-    if let Ok(h) = std::env::var("CFAB_HOST")
-        && !h.is_empty()
-    {
-        return Ok(h);
-    }
+/// This member's identity: the kernel hostname, and nothing else. There is deliberately no
+/// override — a flag or an environment variable naming a different row let `cfab status` read
+/// the RUNNING supervisor and print its live health under another member's heading (measured
+/// 2026-09-10). The declaration is installed whole on every host, so the hostname is the index
+/// into it; a host that cannot answer "who am I" the same way twice has no honest status to
+/// report.
+fn member_name() -> Result<String, Error> {
     Ok(std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map_err(|e| Error::fatal(format!("cannot read hostname: {e}")))?
         .trim()
@@ -320,8 +314,18 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Some(f) => (f, String::new()),
         None => load_fabric_text(&path)?,
     };
-    let member = member_name(&cli.host)?;
-    let view = View::new(&fabric, &member)?;
+    let member = member_name()?;
+    // The name came from the kernel hostname, so the remedy is about the HOST — there is no
+    // argument to have mistyped. `Fabric::member`'s own message is the generic lookup failure,
+    // correct for the library's other callers (a test harness resolves literal names); this adds
+    // the sentence that is true only when the name is an identity.
+    let view = View::new(&fabric, &member).map_err(|e| {
+        Error::config(format!(
+            "{e}\ncfab identifies this host by its kernel hostname ({member}), and there is no \
+             flag or environment variable to say otherwise. Rename the host to match its \
+             [[member]] row, or rename the row to match the host."
+        ))
+    })?;
 
     match cli.command {
         Command::Schema | Command::Cluster { .. } | Command::PdeathSelftest { .. } => {
@@ -363,24 +367,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 },
                 GenArtifact::Prefs => print!("{}", cfab::derive::render_prefs(&fabric)),
                 GenArtifact::Engine => {
-                    let tree = emit::engine::generate(&view)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&tree).map_err(Error::fatal)?
-                    )
+                    print!("{}", commands::render::engine_json(&view)?)
                 }
                 GenArtifact::Shape { dev, tc, expect } => {
-                    let d = shape_for(&view, &fabric, &dev)?;
-                    for w in &d.warnings {
-                        eprintln!("{w}");
-                    }
-                    if tc {
-                        print!("{}", d.render_tc());
-                    } else if expect {
-                        print!("{}", d.render_expect());
-                    } else {
-                        print!("{}", d.render_derive(&view));
-                    }
+                    let (out, err) =
+                        commands::render::shape_output(&view, &fabric, &dev, tc, expect)?;
+                    eprint!("{err}");
+                    print!("{out}");
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -501,36 +494,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             })
         }
     }
-}
-
-/// The manual `gen shape` path: cap chain + up-set from the environment — CFAB_CAP_DIR /
-/// `[runtime] run_dir` cap files with the cluster-published cap as the absent-local fallback, and
-/// CFAB_UP_IFS as the authoritative up-set, else sysfs carrier, else assume up (never demote
-/// on missing information).
-fn shape_for<'a>(
-    view: &View<'a>,
-    fabric: &cfab::model::Fabric,
-    dev: &str,
-) -> Result<emit::shape::Derivation, Error> {
-    let mut sys = RealSys::default();
-    let measured = cfab::caps::read_cap(
-        &mut sys,
-        &cfab::cluster::Pmxcfs::new(),
-        &view.member.name,
-        &fabric.run_dir,
-        dev,
-    );
-    let up_env = std::env::var("CFAB_UP_IFS").ok();
-    let up = move |w: &str| -> bool {
-        if let Some(set) = &up_env {
-            return set.split_whitespace().any(|u| u == w);
-        }
-        match std::fs::read_to_string(format!("/sys/class/net/{w}/carrier")) {
-            Ok(s) => s.trim() == "1",
-            Err(_) => true,
-        }
-    };
-    emit::shape::derive(view, dev, measured, &up)
 }
 
 #[cfg(test)]
