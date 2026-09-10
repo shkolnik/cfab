@@ -23,6 +23,13 @@ pub const PROTO_BASE: u8 = 201;
 /// sweep — both of which delete by that range — removes a route cfab owns from under itself.
 pub const CFAB_PROTO: u8 = 205;
 
+/// The kernel route-protocol id of cfab's additive host default (spec §6): the one route in
+/// table `250 cfab-default`. Its own id, not `CFAB_PROTO`, so the route an operator sees on
+/// `ip route show table cfab-default` names what put it there, and so a teardown of the host
+/// default cannot match the per-zone return-path defaults (205) by prefix and table alone.
+/// Outside the engine's purged `PROTO_BASE..=PROTO_BASE + 3` for the same reason 205 is.
+pub const CFAB_DEFAULT_PROTO: u8 = 206;
+
 /// RFC 8405 SPF back-off, in milliseconds (`ietf-ospf` units), overriding the model defaults of
 /// 5000/10000. Those defaults protect a large IGP's CPU from repeated SPF over hundreds of nodes;
 /// a fabric of three routers and nine segments computes an SPF in microseconds. Measured cost of
@@ -518,26 +525,85 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
-    /// deletes cfab's own default from under it) and must not collide with a well-known id.
+    /// Every route-protocol id cfab installs routes with itself, paired with the name the
+    /// package ships for it.
+    const CFAB_PROTOS: [(u8, &str); 2] = [
+        (CFAB_PROTO, "cfab-return"),
+        (CFAB_DEFAULT_PROTO, "cfab-default"),
+    ];
+
+    /// cfab's own route-protocol ids must sit outside the engine's swept range (or the sweep
+    /// deletes cfab's own routes from under it) and must not collide with a well-known id.
     #[test]
-    fn cfab_proto_is_outside_the_swept_range_and_not_well_known() {
+    fn cfab_protos_are_outside_the_swept_range_and_not_well_known() {
         use crate::commands::engine_ctl::PROTO_RANGE;
-        assert!(
-            !PROTO_RANGE.contains(&CFAB_PROTO),
-            "CFAB_PROTO {CFAB_PROTO} is inside the engine's swept range {PROTO_RANGE:?}"
-        );
         // The numeric ids in this host's /usr/share/iproute2/rt_protos (checked 2026-09-05):
         // kernel 2, boot 3, static 4, gated 8, ra 9, mrt 10, zebra 11, bird 12, dnrouted 13,
         // xorp 14, ntk 15, dhcp 16, keepalived 18, babel 42, ovn 84, openr 99, bgp 186,
-        // isis 187, ospf 188, rip 189, eigrp 192. cfab-return (205) is none of them.
+        // isis 187, ospf 188, rip 189, eigrp 192. cfab-return (205) and cfab-default (206)
+        // are none of them.
         const WELL_KNOWN: [u8; 21] = [
             2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 42, 84, 99, 186, 187, 188, 189, 192,
         ];
-        assert!(
-            !WELL_KNOWN.contains(&CFAB_PROTO),
-            "CFAB_PROTO {CFAB_PROTO} collides with a well-known rt_protos id"
+        for (id, name) in CFAB_PROTOS {
+            assert!(
+                !PROTO_RANGE.contains(&id),
+                "{name} ({id}) is inside the engine's swept range {PROTO_RANGE:?}"
+            );
+            assert!(
+                !WELL_KNOWN.contains(&id),
+                "{name} ({id}) collides with a well-known rt_protos id"
+            );
+        }
+        let ids: Vec<u8> = CFAB_PROTOS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len(),
+            "two cfab protocols share an id: {ids:?}"
         );
+    }
+
+    /// The packaged iproute2 fragments and the constants the code installs with are two
+    /// spellings of the same fact; a change to one without the other leaves `ip route show`
+    /// printing a bare number (or the wrong name) on every deployed host.
+    #[test]
+    fn the_packaged_iproute2_fragments_name_what_cfab_installs() {
+        use crate::commands::common::{HOST_DEFAULT_TABLE, HOST_DEFAULT_TABLE_NAME};
+        let protos = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/deb/rt_protos.d/cfab.conf"
+        ))
+        .unwrap();
+        for (id, name) in CFAB_PROTOS {
+            let want = format!("{id}\t{name}");
+            assert!(
+                protos.lines().any(|l| l == want),
+                "rt_protos.d/cfab.conf has no line `{want}`:\n{protos}"
+            );
+        }
+        let tables = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/deb/rt_tables.d/cfab.conf"
+        ))
+        .unwrap();
+        let want = format!("{HOST_DEFAULT_TABLE}\t{HOST_DEFAULT_TABLE_NAME}");
+        assert!(
+            tables.lines().any(|l| l == want),
+            "rt_tables.d/cfab.conf has no line `{want}`:\n{tables}"
+        );
+    }
+
+    /// Both fragments must be in the package, or the names exist only in the source tree.
+    #[test]
+    fn the_iproute2_fragments_are_packaged() {
+        let toml =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        for f in ["rt_protos.d/cfab.conf", "rt_tables.d/cfab.conf"] {
+            assert!(
+                toml.contains(&format!("packaging/deb/{f}")),
+                "Cargo.toml [package.metadata.deb] assets does not ship {f}"
+            );
+        }
     }
 
     fn tree(member: &str) -> Value {

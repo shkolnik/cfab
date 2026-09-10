@@ -4,6 +4,16 @@ use crate::derive::View;
 use crate::error::Result;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok, run_optional};
 
+/// The kernel routing table holding cfab's additive host default (spec §6). One route lives
+/// in it — the default through the mgmt gateway — and rule 2101 is the only thing that looks
+/// it up. cfab always addresses it by this NUMBER; `HOST_DEFAULT_TABLE_NAME` is what the
+/// packaged `rt_tables.d` fragment calls it, which is how `ip route show` and `ip rule show`
+/// render it on a host that has the package installed and not on one that does not.
+pub const HOST_DEFAULT_TABLE: &str = "250";
+
+/// The name the packaged iproute2 fragment gives `HOST_DEFAULT_TABLE`.
+pub const HOST_DEFAULT_TABLE_NAME: &str = "cfab-default";
+
 /// One `ip rule` cfab owns: the pref it lives at, the substring that proves it is present, and
 /// the `ip rule add` tail that creates it. One definition, two consumers — `up` installs them
 /// and the watchdog restores them, and a rule whose two spellings drift is a rule the watchdog
