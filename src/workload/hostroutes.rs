@@ -1607,6 +1607,81 @@ mod tests {
         );
     }
 
+    /// B2: `probe_interval`'s conversion (sysfs centiseconds -> milliseconds -> `/3`) is pinned
+    /// with an `ageing_time` OTHER than the fixture's 30000 (the fixture's own value is 100 s
+    /// either way `100 == 30000 / 30` and `100 == 30000 / 3 / 10`-shaped bugs both land on the
+    /// same number, so it proves neither the unit nor the divisor). 6000 centiseconds = 60 s;
+    /// a third of that is 20 s. Three ticks bracket the true deadline on both sides: a bug that
+    /// drops the `* 10` (reads centiseconds as milliseconds outright) computes 2 s, floored to
+    /// PERIOD = 5 s, and would already be due by the 19 s check; a bug in the divisor (anything
+    /// but `/ 3`) lands the due time somewhere else again and misses the exact 20 s check.
+    #[test]
+    fn probe_interval_converts_centiseconds_and_divides_by_three() {
+        use crate::workload::announce::mock::SharedIo;
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        sys.files.insert(
+            "/sys/class/net/primary/bridge/ageing_time".into(),
+            "6000\n".into(),
+        );
+        let shared = SharedIo::default();
+        let mut io = shared.clone();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+
+        hr.tick(&mut sys, &v, &mut io, t0);
+        assert_eq!(shared.sent().len(), 1, "one probe, due immediately");
+
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(19));
+        assert_eq!(
+            shared.sent().len(),
+            1,
+            "not yet due at 19s: a 60s ageing_time / 3 is 20s, not sooner"
+        );
+
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(20));
+        assert_eq!(
+            shared.sent().len(),
+            2,
+            "due at exactly 20s: 6000 centiseconds -> 60s -> /3"
+        );
+    }
+
+    /// B2: the `.max(PERIOD)` floor is pinned separately from the conversion above. 600
+    /// centiseconds = 6 s of `ageing_time`; a third of that is 2 s, which the floor must raise
+    /// to PERIOD (5 s) rather than let the probe run at 2 s (a pathologically low `ageing_time`
+    /// must not turn the probe into a beacon). Bracketed the same way: not yet due at 3 s (the
+    /// un-floored 2 s would already have fired), due at exactly 5 s.
+    #[test]
+    fn probe_interval_floors_at_the_announcer_period() {
+        use crate::workload::announce::mock::SharedIo;
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        sys.files.insert(
+            "/sys/class/net/primary/bridge/ageing_time".into(),
+            "600\n".into(),
+        );
+        let shared = SharedIo::default();
+        let mut io = shared.clone();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+
+        hr.tick(&mut sys, &v, &mut io, t0);
+        assert_eq!(shared.sent().len(), 1, "one probe, due immediately");
+
+        hr.tick(&mut sys, &v, &mut io, t0 + Duration::from_secs(3));
+        assert_eq!(
+            shared.sent().len(),
+            1,
+            "not yet due at 3s: the un-floored 2s must not have fired"
+        );
+
+        hr.tick(&mut sys, &v, &mut io, t0 + PERIOD);
+        assert_eq!(shared.sent().len(), 2, "due at exactly PERIOD (5s), the floor");
+    }
+
     /// A deferred row has no leg: the wanted set is empty, the engine is told so with ifindex
     /// 0, and nothing is read off a netdev that does not exist.
     #[test]
