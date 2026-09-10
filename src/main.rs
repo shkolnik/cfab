@@ -486,7 +486,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

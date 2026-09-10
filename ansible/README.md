@@ -5,8 +5,8 @@ drives a gated rollout, one operation per run, selected by tag. It carries nothi
 particular site: the declaration (`fabric.toml`) is the operator's and comes in through
 `cfab_declaration`. The collection is versioned on its own (`galaxy.yml`), separately from the cfab
 package: a release is the git tag `ansible/v<version>` on this repository (interim, until the
-collection is published to Ansible Galaxy from CI). The role works with cfab package 0.5.1 or newer
-(it needs the packaged unit's `EnvironmentFile=/etc/default/cfab`); pin the package with `cfab_version`.
+collection is published to Ansible Galaxy from CI). The role works with cfab package 0.5.1 or newer;
+pin the package with `cfab_version`.
 0.10.1 installs the declaration before the package (no ordering requirement it depends on, just no
 reason to prefer the other way) and rejects the ethtool-absent status line from `apply`'s local-failure
 check (cfab 0.5.2 made `ethtool` an optional read-only dependency, so its absence is not a fabric
@@ -42,14 +42,16 @@ Run, always `-l` one host at a time:
 
 ```
 ansible-playbook cfab.yml -l pve2 --tags probe      # read-only inventory of the host; paste it back
-ansible-playbook cfab.yml -l pve2                   # install: apt repo, package, declaration, /etc/default/cfab. No network change.
+ansible-playbook cfab.yml -l pve2                   # install: apt repo, package, declaration. No network change.
 ansible-playbook cfab.yml -l pve2 --tags apply      # arm a 10-min revert, enable+start, verify, print
 ansible-playbook cfab.yml -l pve2 --tags disarm     # keep it: stop the revert timer
 ansible-playbook cfab.yml -l pve2 --tags rollback   # undo now: disable + cfab down (package stays)
 ```
 
-Inventory names **are** the `[[member]]` names (`cfab_host` defaults to `inventory_hostname` and
-is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansible-core >= 2.15 on the control node
+Inventory names **are** the `[[member]]` names, and so is each host's kernel hostname: cfab
+indexes the declaration by hostname and takes no override, so `--tags apply` refuses a box whose
+hostname is not its row name rather than letting the apply fail as "not a declared member".
+Requires ansible-core >= 2.15 on the control node
 (`deb822_repository`) and `python3-debian` on the host (the role installs it).
 
 ## Variables
@@ -60,7 +62,6 @@ is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansi
 | `cfab_nics` | the `nic = "…"` names in the declaration | wires the probe inspects |
 | `cfab_version` | `""` = newest in the repository | pin, e.g. `0.5.1-1`; equal version = apt no-op |
 | `cfab_apt_uri` / `cfab_apt_suite` / `cfab_apt_component` | `https://pkg.jshkol.com` `stable` `main` | where the package comes from |
-| `cfab_host` | `inventory_hostname` | the `[[member]]` row this host runs as |
 | `cfab_revert_minutes` | `10` | apply arms a timed revert; `--tags disarm` within this window keeps the fabric |
 | `cfab_status_wait` | `90` | seconds `cfab status --wait` waits for UP after bringup |
 
@@ -74,7 +75,6 @@ is written to `/etc/default/cfab`, which the packaged unit reads). Requires ansi
 | `cfab` package (pulls `nftables iproute2 ethtool libpcre2-8-0`) | `/usr/bin/cfab` |
 | the declaration | `/etc/cfab/fabric.toml` |
 | `cfab-revert`, generated: what the timer and `--tags rollback` run | `/usr/local/sbin/cfab-revert` |
-| `CFAB_HOST=<cfab_host>` (the packaged unit's `EnvironmentFile`) | `/etc/default/cfab` |
 
 The unit is the package's own, `/lib/systemd/system/cfab.service`, installed disabled; the role ships
 no unit of its own. Collection versions before 0.10.0 templated a copy of the unit to

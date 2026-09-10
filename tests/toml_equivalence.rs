@@ -109,9 +109,7 @@ fn render(fabric: &Fabric, view: &View<'_>, argv: &[String]) -> (String, String)
             plain(cfab::emit::ceiling_ipt::generate(view).expect("gen mark --backend"))
         }
         ["gen", "prefs"] => plain(cfab::derive::render_prefs(fabric)),
-        ["gen", "engine"] => {
-            plain(cfab::commands::render::engine_json(view).expect("gen engine"))
-        }
+        ["gen", "engine"] => plain(cfab::commands::render::engine_json(view).expect("gen engine")),
         ["gen", "shape", dev, rest @ ..] => cfab::commands::render::shape_output(
             view,
             fabric,

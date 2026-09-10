@@ -57,7 +57,6 @@ assets = [
     ["README.md", "usr/share/doc/cfab/", "644"],
     ["doc/cfab.8", "usr/share/man/man8/", "644"],
     ["examples/fabric.toml", "usr/share/doc/cfab/examples/fabric.toml.example", "644"],
-    ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
     ["packaging/deb/rt_protos.d/cfab.conf", "etc/iproute2/rt_protos.d/cfab.conf", "644"],
     ["packaging/deb/rt_tables.d/cfab.conf", "etc/iproute2/rt_tables.d/cfab.conf", "644"],
 ]

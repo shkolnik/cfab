@@ -48,8 +48,10 @@ cfab conf publish               # validate the local fabric.toml, publish it clu
 cfab shape-daemon | conf-sync | fwd-watchdog   # service-mode subcommands started by `run`; not for hands
 ```
 
-`--config` defaults to `fabric.toml` beside the binary; `--host` to `$CFAB_HOST`, else the
-kernel hostname.
+`--config` defaults to `fabric.toml` beside the binary. Which `[[member]]` row this host runs as
+is its kernel hostname, and there is no way to say otherwise: the declaration is installed whole on
+every member, the hostname is the index into it, and a host that could name a different row could
+report that row's status while running as this one.
 
 ## Runtime requirements
 
@@ -111,8 +113,8 @@ The unit is `Type=notify`; `ExecStart` is `cfab run`, the long-lived supervisor 
 fabric and keeps the engine, shape daemon, and conf-sync alive. `ExecReload` is
 `kill -HUP $MAINPID`, which re-reads `/etc/cfab/fabric.toml` and acts on what it finds (below).
 `ConditionPathExists=/etc/cfab/fabric.toml` means a host with the package but no declaration is
-skipped at boot rather than failed. Set `CFAB_HOST` in `/etc/default/cfab` only when this
-member's row is not named by the kernel hostname.
+skipped at boot rather than failed. The unit reads no environment file: this member is the one whose
+row name is this box's hostname.
 
 A package upgrade restarts the unit once the new files are in place (teardown and re-apply:
 every identity on the host is down for the restart). It is not left running on the old binary:

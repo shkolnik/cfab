@@ -15,9 +15,23 @@
       else 'overridden by ' ~ cfab_unit.stdout ~ ', which this role did not write; remove it (or move it to a drop-in under cfab.service.d/) so the packaged unit runs' }}
     quiet: true
 
-- name: CFAB_HOST must be set for this host (install first)
-  command: grep -qx 'CFAB_HOST={{ cfab_host }}' /etc/default/cfab
+# cfab indexes the declaration by kernel hostname and has no override, so a box whose
+# hostname is not its [[member]] row name cannot start at all. Catching that here names the
+# cause; letting the apply hit it names only "not a declared member".
+- name: Read this host's kernel hostname
+  command: hostname
+  register: cfab_kernel_hostname
   changed_when: false
+
+- name: The kernel hostname must be this host's [[member]] row name
+  ansible.builtin.assert:
+    that:
+      - cfab_kernel_hostname.stdout | trim == inventory_hostname
+    fail_msg: >-
+      cfab identifies this member by its kernel hostname and takes no override: the box calls
+      itself '{{ cfab_kernel_hostname.stdout | trim }}' but its declaration row is
+      '{{ inventory_hostname }}'. Rename the host, or rename the row to match it.
+    quiet: true
 
 - name: Drop a previous revert timer (re-apply inside the window restarts the clock)
   command: systemctl stop cfab-revert.timer cfab-revert.service
@@ -51,15 +65,13 @@
 - name: Bringup failed
   fail:
     msg: |
-      bringup FAILED on {{ cfab_host }} (rc={{ cfab_start.rc }}); revert fires in {{ cfab_revert_minutes }} min,
+      bringup FAILED on {{ inventory_hostname }} (rc={{ cfab_start.rc }}); revert fires in {{ cfab_revert_minutes }} min,
       or now: --tags rollback. Last journal lines:
       {{ cfab_journal.stdout }}
   when: cfab_start.rc != 0
 
 - name: Status (wait up to {{ cfab_status_wait }} s for UP)
   command: /usr/bin/cfab status --wait {{ cfab_status_wait }}
-  environment:
-    CFAB_HOST: "{{ cfab_host }}"
   register: cfab_status
   changed_when: false
   failed_when: false
@@ -121,7 +133,7 @@
 - name: Apply report
   debug:
     msg: >-
-      {{ cfab_host }}: {{ {0: 'UP', 1: 'UP-DEGRADED', 2: 'FAILED', 3: 'DOWN'}.get(cfab_status.rc, 'UNKNOWN')
+      {{ inventory_hostname }}: {{ {0: 'UP', 1: 'UP-DEGRADED', 2: 'FAILED', 3: 'DOWN'}.get(cfab_status.rc, 'UNKNOWN')
          ~ ' (rc=' ~ cfab_status.rc ~ ')' }}{{
          ' (peers absent only: acceptable for the first member of a rollout; re-run status once a second member is up — down: ' ~ (cfab_down_nodes | join(' ')) ~ ')'
          if cfab_peers_absent_only | bool else '' }}.
@@ -134,7 +146,7 @@
 - name: Status is not UP for a local reason (fabric left up for inspection; the revert timer is still armed)
   fail:
     msg: >-
-      cfab status rc={{ cfab_status.rc }} (1 = UP-DEGRADED, 2 = FAILED, 3 = DOWN) on {{ cfab_host }} —
+      cfab status rc={{ cfab_status.rc }} (1 = UP-DEGRADED, 2 = FAILED, 3 = DOWN) on {{ inventory_hostname }} —
       see 'Status output' above.
       {{ 'local reasons: ' ~ (cfab_local_reasons | join(' / ')) if cfab_local_reasons | length > 0
          else 'not the peers-absent shape: a node is down on some links while others to it are up, or nothing is down at all' }}

@@ -1,4 +1,4 @@
-# Install = the apt repository, then the cfab package plus its declaration and /etc/default/cfab.
+# Install = the apt repository, then the cfab package plus its declaration.
 # The unit is the package's own (/lib/systemd/system/cfab.service); the role ships none, so there
 # is exactly one unit definition and it moves with the package. Nothing is enabled or started: the
 # network is untouched until `--tags apply`.
@@ -100,15 +100,6 @@
         dest: "{{ cfab_revert_script }}"
         mode: "0755"
 
-    # The packaged unit reads /etc/default/cfab (EnvironmentFile=); CFAB_HOST is the one thing the
-    # role has to say. The deb ships the file as a conffile with CFAB_HOST commented out; this
-    # overwrites it, and dpkg keeps the local copy on later upgrades.
-    - name: /etc/default/cfab (CFAB_HOST={{ cfab_host }})
-      ansible.builtin.template:
-        src: cfab.default.j2
-        dest: /etc/default/cfab
-        mode: "0644"
-
     # Collection versions before 0.10.0 templated their own copy of the unit to
     # /etc/systemd/system/cfab.service, which overrides the packaged one and went stale. Remove
     # it only when it is that copy (its Description is unique to the old template); anything
@@ -150,7 +141,7 @@
     - name: Install report
       ansible.builtin.debug:
         msg: >-
-          {{ cfab_host }}: cfab {{ cfab_dpkg.stdout }} from {{ cfab_apt_uri }},
+          {{ inventory_hostname }}: cfab {{ cfab_dpkg.stdout }} from {{ cfab_apt_uri }},
           declaration /etc/cfab/fabric.toml; unit cfab is
           {{ 'ACTIVE' if cfab_active.stdout == 'active' else 'not running' }}
           {{ '— declaration changed: run --tags apply to re-run bringup in place'

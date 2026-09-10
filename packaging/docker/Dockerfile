@@ -1,6 +1,7 @@
 # cfab generic runtime image. Bakes NOTHING member-specific: no fabric.toml, no hostname, no
-# fixture. Bind-mount /etc/cfab/fabric.toml and set CFAB_HOST at `docker run`/compose time —
-# see README.md. Embedded-engine build: the routing engine is inside /usr/bin/cfab, so there is
+# fixture. Bind-mount /etc/cfab/fabric.toml and give the container the member's name with
+# `--hostname` (compose: `hostname:`) at run time — cfab indexes the declaration by hostname and
+# takes no override. See README.md. Embedded-engine build: the routing engine is inside /usr/bin/cfab, so there is
 # no FRR in this image.
 FROM debian:trixie-slim
 
