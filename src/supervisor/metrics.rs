@@ -784,10 +784,11 @@ impl FabricCollector {
         counter_family(
             enc,
             "cfab_workload_vms_discovered",
-            "VMs this member has registered a neighbor entry for since the supervisor started, \
-             by how it learned the address: a relayed DHCPACK (source=\"dhcp\") today; a \
-             non-DHCP first packet (source=\"neigh\") is a later gate's. Absent under the same \
-             condition as cfab_workload_dhcp_relayed.",
+            "VMs this member has decided to register a neighbor entry for since the supervisor \
+             started (credited when the decision is made, not when the write lands — a failing \
+             write still counts here), by how it learned the address: a relayed DHCPACK \
+             (source=\"dhcp\") today; a non-DHCP first packet (source=\"neigh\") is a later \
+             gate's. Absent under the same condition as cfab_workload_dhcp_relayed.",
             &discovered,
         )?;
         counter_family(
