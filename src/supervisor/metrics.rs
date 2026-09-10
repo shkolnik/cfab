@@ -1294,13 +1294,15 @@ mod tests {
             workloads: if full {
                 vec![WorkloadStatus {
                     name: "vms".to_string(),
-                    ifname: "cfab-work-vms".to_string(),
+                    uplink: "primary".to_string(),
+                    vid: 3,
+                    leg: "cfab-work-vms".to_string(),
                     address: "192.168.20.2/24".to_string(),
                     gw: "192.168.20.254/24".to_string(),
                     up: true,
                     state: WorkloadState::Up,
                     zones: vec!["storage".to_string()],
-                    uplinks: vec!["eth0".to_string()],
+                    uplink_ports: vec!["eth0".to_string()],
                     trigger: Some("neigh events".to_string()),
                     vms_seen: Some(3),
                     guard_drops: Some(GuardDrops {

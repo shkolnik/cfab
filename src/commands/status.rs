@@ -375,10 +375,10 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
     // a `down` row are the conditions above, not repeated here.
     for w in &m.workloads {
         let word = if w.up { "up" } else { "down" };
-        let uplinks = if w.uplinks.is_empty() {
+        let uplinks = if w.uplink_ports.is_empty() {
             "-".to_string()
         } else {
-            w.uplinks.join(", ")
+            w.uplink_ports.join(", ")
         };
         // `Some("")` (the announcer entry exists but its trigger has not been set yet) reads
         // the same as `None` here — one dash, not an empty word in the middle of the line.
@@ -386,11 +386,15 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             Some(t) if !t.is_empty() => t,
             _ => "-",
         };
+        // The declaration's own words first (`uplink` + `vid`), then the leg cfab derives from
+        // them in parentheses: an operator reading this line is looking for what they wrote.
         let mut line = format!(
-            "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
-             trigger {trigger}",
+            "  workload {}: {} vid {} ({}) {} gw {} {word}, advertised to {}, uplink {uplinks}, \
+             announce trigger {trigger}",
             w.name,
-            w.ifname,
+            w.uplink,
+            w.vid,
+            w.leg,
             w.address,
             w.gw,
             w.zones.join(", ")
@@ -1748,19 +1752,32 @@ fn workload_posture(
         let gw_cidr = wl.gw_cidr();
 
         if deferred.contains(name) {
-            c.settling(format!(
-                "workload {name}: deferred (uplink not forwarding yet; the watchdog installs it \
-                 once it is)"
-            ));
+            // Two deferral causes, two spellings: an absent bridge is the operator's to create
+            // (or to rename back), and naming it is the whole point of the line; anything else
+            // is the uplink's own readiness, which clears on its own.
+            if crate::workload::uplink::bridge_present(&*sys, &wl.uplink) {
+                c.settling(format!(
+                    "workload {name}: deferred (uplink not forwarding yet; the watchdog installs \
+                     it once it is)"
+                ));
+            } else {
+                c.settling(format!(
+                    "workload {name}: waiting for bridge {} (the watchdog installs the leg when \
+                     it appears)",
+                    wl.uplink
+                ));
+            }
             c.workload(WorkloadStatus {
                 name: name.to_string(),
-                ifname: leg.clone(),
+                uplink: wl.uplink.clone(),
+                vid: wl.vid,
+                leg: leg.clone(),
                 address: row.address.clone(),
                 gw: gw_cidr,
                 up: WorkloadState::Deferred.is_up(),
                 state: WorkloadState::Deferred,
                 zones: wl.allow.clone(),
-                uplinks: Vec::new(),
+                uplink_ports: Vec::new(),
                 trigger: None,
                 vms_seen: None,
                 guard_drops: None,
@@ -1778,9 +1795,11 @@ fn workload_posture(
         let link = sys.run(&["ip", "-br", "link", "show", "dev", &leg])?;
         let mut uplinks = Vec::new();
         if !link.ok() {
-            // Standing: `ifname` is baseline-owned (cfab never creates or deletes it), so its
-            // disappearance is an external fact the fabric itself never clears.
-            c.standing(format!("workload {name}: interface {leg} does not exist"));
+            // Settling: cfab creates this leg, and the forwarding watchdog rebuilds it on the
+            // next tick — the message says who fixes it rather than leaving an operator to.
+            c.settling(format!(
+                "workload {name}: leg {leg} does not exist (the watchdog rebuilds it)"
+            ));
             broken = true;
         } else {
             let addr = sys
@@ -1875,13 +1894,15 @@ fn workload_posture(
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
-            ifname: leg.clone(),
+            uplink: wl.uplink.clone(),
+            vid: wl.vid,
+            leg: leg.clone(),
             address: row.address.clone(),
             gw: gw_cidr,
             up,
             state,
             zones: wl.allow.clone(),
-            uplinks,
+            uplink_ports: uplinks,
             trigger,
             vms_seen,
             guard_drops,
@@ -3331,8 +3352,9 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: cfab-work-vms 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
-                 to storage, uplink eth0, announce trigger neigh events\n"
+                "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
+                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
+                 neigh events\n"
             ),
             "{text}"
         );
@@ -3372,8 +3394,9 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: cfab-work-vms 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
-                 to storage, uplink eth0, announce trigger neigh events, 1 vms seen\n"
+                "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
+                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
+                 neigh events, 1 vms seen\n"
             ),
             "{text}"
         );
@@ -3484,8 +3507,8 @@ mod tests {
                     1,
                     "Device \"cfab-work-vms\" does not exist.",
                 ),
-                "workload vms: interface cfab-work-vms does not exist".into(),
-                Class::Standing,
+                "workload vms: leg cfab-work-vms does not exist (the watchdog rebuilds it)".into(),
+                Class::Settling,
             ),
             (
                 wl_status_sys(&f, &view).on_stdout(
@@ -3642,6 +3665,33 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(!m.workloads[0].up);
         assert_eq!(m.workloads[0].state, WorkloadState::Broken);
+    }
+
+    /// A row deferred because its declared bridge is not on the host yet says exactly that, and
+    /// says it once (spec §5.1, James's availability ruling): the bridge is the operator's, and
+    /// "uplink not forwarding yet" would name the wrong thing to go look at.
+    #[test]
+    fn a_row_deferred_for_a_missing_bridge_names_the_bridge() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n");
+        sys.files.remove("/sys/class/net/primary/brif/eth0/state");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].state, WorkloadState::Deferred);
+        let lines: Vec<&Condition> = m
+            .conditions
+            .iter()
+            .filter(|c| c.text.starts_with("workload vms:"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].text,
+            "workload vms: waiting for bridge primary (the watchdog installs the leg when it \
+             appears)"
+        );
+        assert_eq!(lines[0].class, Class::Settling);
     }
 
     /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy

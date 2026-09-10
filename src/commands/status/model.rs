@@ -313,14 +313,19 @@ pub struct GuardDrops {
 }
 
 /// One `[[workload]]` row on this member, as `status` read it (spec §5.1 item 10). A row exists
-/// only on a member that carries the interface (`view.workload_rows()`) — a member the workload
-/// merely reaches (an allowed zone with no address on `ifname`) has none, and is checked by the
+/// only on a member that carries the leg (`view.workload_rows()`) — a member the workload merely
+/// reaches (an allowed zone with no address on the leg) has none, and is checked by the
 /// return-path/route-get conditions alone (`return_path_and_ingress`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadStatus {
     pub name: String,
-    pub ifname: String,
-    /// This member's declared address on `ifname`, e.g. `192.168.20.2/24`.
+    /// The declared bridge this row's leg is a vlan of, e.g. `primary`.
+    pub uplink: String,
+    /// The declared vlan id on that bridge.
+    pub vid: u16,
+    /// The leg cfab derives and creates, e.g. `cfab-work-vms`.
+    pub leg: String,
+    /// This member's declared address on `leg`, e.g. `192.168.20.2/24`.
     pub address: String,
     /// The anycast gateway with the prefix's mask, e.g. `192.168.20.254/24`.
     pub gw: String,
@@ -331,8 +336,8 @@ pub struct WorkloadStatus {
     pub state: WorkloadState,
     /// Zones this workload is advertised into (the declared `allow` list).
     pub zones: Vec<String>,
-    /// The bridge's uplink port(s), from `uplink::identify`; empty when unidentified.
-    pub uplinks: Vec<String>,
+    /// The bridge's uplink port(s), from `uplink::identify_declared`; empty when unidentified.
+    pub uplink_ports: Vec<String>,
     /// What wakes the announcer (`neigh events` / `fdb poll (...)`), from the supervisor's
     /// `components` document; `None` when no supervisor is answering or the announcer has not
     /// started.
