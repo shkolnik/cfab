@@ -135,8 +135,7 @@ the next engine under the previous supervisor.
   exactly as it was and `cfab status` names the refusal on its `components:` line.
 
 `apt remove` stops the
-unit (correct: the binary is going away) and disables it; `apt purge` also removes
-`/etc/default/cfab`.
+unit (correct: the binary is going away) and disables it.
 
 The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the kernel route-protocol
 ids cfab and its engine install routes with (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203,

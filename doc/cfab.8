@@ -609,10 +609,7 @@ on the old binary: the supervisor respawns its children from
 so an un\-restarted upgrade would run the next engine under the previous supervisor.
 .PP
 .B "apt remove"
-stops the unit (correct: the binary is going away) and disables it;
-.B "apt purge"
-also removes
-.IR /etc/default/cfab .
+stops the unit (correct: the binary is going away) and disables it.
 .SH METRICS
 The supervisor serves this member's state as metrics on
 .B 0.0.0.0:23232
