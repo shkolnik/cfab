@@ -131,9 +131,11 @@ unit (correct: the binary is going away) and disables it; `apt purge` also remov
 `/etc/default/cfab`.
 
 The package also ships `/etc/iproute2/rt_protos.d/cfab.conf`, naming the engine's private
-kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other`
-204) so `ip route` prints them instead of bare numbers — cosmetic only; cfab's own sweep
-matches the numeric ids.
+kernel route-protocol ids (`cfab-ospf` 201, `cfab-static` 202, `cfab-bgp` 203, `cfab-other` 204,
+`cfab-return` 205, `cfab-default` 206) so `ip route` prints them instead of bare numbers —
+cosmetic only; cfab's own sweep matches the numeric ids. It also ships
+`/etc/iproute2/rt_tables.d/cfab.conf`, naming table 250 `cfab-default` for `ip route`/`ip rule`
+output the same way; see "Host default route" below.
 
 ## Metrics
 
@@ -164,6 +166,12 @@ If the port cannot be bound, the supervisor logs one `WARN` naming the port and 
 a standing `cfab status` line `metrics endpoint not listening on :23232 (...)` for as long as
 the bind keeps failing, and retries every 60 s. The fabric is unaffected: a bind failure is
 never fatal and never delays the apply.
+
+A member with a `gw` zone also serves its host default's path (see "Host default route" below):
+
+| series | type | meaning |
+|---|---|---|
+| `cfab_host_default_path` | gauge | 0 while this member's own traffic takes cfab's additive default through the fabric gateway (table 250), 1 while it takes the host's own floor default in main — because the ingress prober reports the router unreachable, because the default was withdrawn, or because cfab is not running; absent on a member with no `gw` zone and on one with no default route at all |
 
 A member carrying at least one `[[workload]]` row also serves, all labeled `{name}` and all
 absent for a row whose source field is `None` (deferred, or the read failed) rather than a
@@ -274,6 +282,62 @@ apply; the watchdog installs the row once the condition clears.
   `allow`, so a zone the row does not reach still routes through `gw` rather than falling to the
   default route — traffic this workload is not allowed into is dropped at the host, not carried
   off toward `router`.
+
+`cfab status` reports each row it carries as one line, `workload <name>: <uplink> vid <vid>
+(<leg>) <address> gw <gw> up|down, advertised to <zones>, uplink <ports>, announce trigger
+<trigger>`, followed by `, N vms seen` and `, N stray forwards` once those reads succeed — one
+spelling for every `N` including 0, never a fabricated zero when a row is not up or a read
+failed (it is simply absent then). These are the same counts `cfab_workload_vms_seen` and
+`cfab_workload_stray_forwards_total` above report.
+
+## Host default route
+
+On a member with a `gw` zone, cfab additionally offers this host's own locally originated
+traffic the same path outbound: an additive default route through the zone's router, installed
+in its own table so the host's existing default is never touched.
+
+- **The route** lives in table `250` (named `cfab-default` by the package's `rt_tables.d`
+  fragment): `default via <the gw zone's router> dev <the gw leg> src <this member's address on
+  it> proto cfab-default` (kernel protocol id 206).
+- **Three `ip rule` entries** reach it, installed and restored as one unit: pref `2099`, one per
+  address the host's own floor default's device carries (`from <addr> iif lo lookup main`) —
+  keeps admin-sourced replies (an off-subnet ssh, a management UI) on the host's own path so they
+  never read as asymmetric at a zone firewall; pref `2100` (`from all iif lo lookup main
+  suppress_prefixlength 0`), which makes the main table skip only its own default, so anything
+  more specific still wins; pref `2101` (`from all iif lo lookup cfab-default`), which then finds
+  table 250. `iif lo` scopes both to traffic this host itself originates — a VM's or a leaf's
+  transiting packet never takes it.
+- **Gated by the ingress prober:** the route is installed only while the prober reports the gw
+  zone's router reachable over at least one wire of the leg; it is withdrawn within about 2 s of
+  every wire going dark, and reinstalled within about 2 s of the first one answering again
+  (rack-measured). `cfab_host_default_path` and `cfab status` read the same fact.
+- **The floor default is never modified or removed.** "Additive" means exactly that: the
+  ifupdown/DHCP default already in table `main` stays as it is, and with cfab gone — table 250
+  emptied, the three rules dropped — the kernel's own final `lookup main` finds it exactly as it
+  did before cfab ran.
+- **A pref-2099 pin is dropped only once its address is gone from every device on the host**, not
+  merely from the floor device for one tick (a bridge reconfiguration can drop the floor default
+  for a moment without moving the address) — an early drop would send an established off-subnet
+  session's next packet over the fabric gateway instead, asymmetric at a zone firewall.
+- **A host with no floor default of its own** still gets the fabric default (table 250, rules
+  2100/2101) but no pref-2099 pins to protect it, and cfab logs one loud, standing journal line
+  saying so: a host is expected to keep its own default route (DHCP, or a static `gateway` line)
+  rather than depend on cfab's, which exists to fail outward safely, not to be a host's only path.
+
+`cfab status` names which path this member's own traffic takes right now: `default: <path>`, or
+`default: <path>, <reason>` once the path is not the fabric one.
+
+- path: `via fabric gw <router> (<leg>)`; `via floor <via> (<dev>)`, the host's own default in
+  main; or `none`, when neither table holds one.
+- reason: `router unreachable`, the prober says no wire of the leg reaches the gw zone's router;
+  `no gw zone`, this member (every leaf included) never had a fabric default to offer; or
+  `withdrawn`, table 250 is empty for any other reason — cfab is not running, `down` ran, or the
+  install failed.
+
+```
+default: via fabric gw 192.168.249.254 (cfab-gw249)
+default: via floor 192.168.1.1 (primary), router unreachable
+```
 
 ## Design
 
