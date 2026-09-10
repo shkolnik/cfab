@@ -563,10 +563,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     // The workload leg: `cfab-work-<name>` on the declared bridge, tagged `vid`, carrying this
     // member's own address — plus the vid on the bridge itself, without which the leg receives
     // nothing (VERIFIED 2026-09-08 22:38 UTC). A deferred row builds nothing: the watchdog
-    // creates its leg when the condition that deferred it clears. The qos map is the fabric's,
-    // not a zone's: a workload belongs to no zone, so unmarked traffic keeps pcp 0 and only
-    // control-marked traffic keeps its pcp.
-    let wl_qos = ["0:0".to_string(), format!("{p}:{p}", p = f.pcp_ctrl)];
+    // creates its leg when the condition that deferred it clears.
+    let wl_qos = workload_qos(f);
     let wl_qos: Vec<&str> = wl_qos.iter().map(String::as_str).collect();
     for r in &ready {
         leg::install(
@@ -785,6 +783,14 @@ pub(crate) fn qos_map(f: &crate::model::Fabric, z: &crate::model::Zone) -> [Stri
         format!("0:{}", z.pcp),
         format!("{}:{}", f.pcp_ctrl, f.pcp_ctrl),
     ]
+}
+
+/// The `egress-qos-map` a workload leg is created with. A workload belongs to no zone, so
+/// unmarked traffic keeps pcp 0 and only control-marked traffic keeps its pcp. One definition —
+/// `apply` builds the leg with it and the forwarding watchdog rebuilds one with it, so the two
+/// cannot drift.
+pub(crate) fn workload_qos(f: &crate::model::Fabric) -> [String; 2] {
+    ["0:0".to_string(), format!("{p}:{p}", p = f.pcp_ctrl)]
 }
 
 /// One class-segment leg, exactly as the per-class-netdevs section builds it: the tagged

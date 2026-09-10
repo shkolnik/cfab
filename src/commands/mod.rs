@@ -27,8 +27,23 @@ mod workload_lifecycle {
         let (mut sys, view) = apply::tests::wl_sys_and_view("pve1-tb");
         apply::run(&mut sys, &view, &apply::tests::opts()).unwrap();
 
-        // an operator deletes the sibling rule and the guard table
+        // The mock does not model netdev creation, so what `apply` just built is stated here:
+        // the leg exists and is a vlan of vid 3, and the bridge now carries vid 3 on itself.
+        // Without this the watchdog below would read the pre-apply host and rebuild both.
+        // Then: an operator deletes the sibling rule and the guard table.
         let mut sys = sys
+            .on_stdout(
+                &["ip", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <BROADCAST,MULTICAST,UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <UP> vlan protocol 802.1Q id 3 \n",
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]"#,
+            )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
                 "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",

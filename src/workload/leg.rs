@@ -88,8 +88,16 @@ pub fn install(
     qos_map: &[&str],
 ) -> Result<()> {
     mk_vlan(sys, leg, uplink, vid, Some(address), true, qos_map)?;
+    ensure_self_vid(sys, run_dir, uplink, vid)?;
+    Ok(())
+}
+
+/// Give the bridge the vid on ITSELF if it lacks it, recording that cfab is the one that added
+/// it (`remove` reads that record back before it dares delete a vid). `Ok(true)` when this call
+/// added it — the watchdog re-adds a vid an operator or an `ifreload` took away, and says so.
+pub fn ensure_self_vid(sys: &mut dyn Sys, run_dir: &str, uplink: &str, vid: u16) -> Result<bool> {
     if self_vids(sys, uplink)?.contains(&vid) {
-        return Ok(());
+        return Ok(false);
     }
     run_ok(
         sys,
@@ -109,7 +117,8 @@ pub fn install(
     sys.write(
         &record_path(run_dir),
         &lines.into_iter().collect::<Vec<_>>().join("\n"),
-    )
+    )?;
+    Ok(true)
 }
 
 /// Is the leg there, and ours? A netdev of that name which is not a vlan of this vid is not

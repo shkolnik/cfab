@@ -28,7 +28,7 @@ use crate::model::MemberKind;
 use crate::prober::HeldPrimaries;
 use crate::sys::{Sys, run_ignore, run_ok};
 use crate::wire_drivers;
-use crate::workload::{deferred_names, uplink};
+use crate::workload::{deferred_names, leg, uplink};
 
 pub struct WatchdogReport {
     /// None = healthy; Some(reason) = failed closed.
@@ -373,9 +373,99 @@ fn restore_workloads(
             Err(e) => unrestored.push(format!("unrestored workload {names}: {e}")),
         }
     }
-    if let Err(e) = reconcile_workload_guard(sys, view, &rows, restored, unrestored) {
+    // M3 (whole-branch review): the one shared parser (`status` and the supervisor already read
+    // it this way) — a second hand-rolled split here could silently drift from it (e.g. one
+    // trims blank lines, the other does not) and read a different pending set than `status`
+    // reports.
+    let pending = deferred_names(sys, view);
+    if let Err(e) = reconcile_workload_guard(sys, view, &rows, &pending, restored, unrestored) {
         unrestored.push(format!("unrestored workload {names}: {e}"));
     }
+    // After the guard, never before: a leg rebuilt here gets the anycast gw address back, and
+    // that address must never go live over an uplink the guard is not covering.
+    restore_workload_legs(sys, view, &rows, &pending, restored, unrestored);
+    Ok(())
+}
+
+/// A row cfab already installed, whose leg or whose bridge-side vid has since gone missing.
+///
+/// The leg is cfab's own netdev now (`uplink` + `vid`, not a host-provided sub-interface), so
+/// its absence is this watchdog's business exactly like a class leg's: an operator's `ip link
+/// del`, a bridge that went away and came back, a boot race. The vid on the bridge ITSELF can
+/// go missing on its own — an `ifreload` rewrites the bridge without it — and the leg then sits
+/// there receiving nothing (VERIFIED 2026-09-08 22:38 UTC), so it is checked even when the leg
+/// is present.
+///
+/// Rows still in `workload-deferred` are skipped: installing them (leg included) is
+/// `reconcile_workload_guard`'s job, which has already run this tick and knows whether their
+/// uplink is ready. A row whose declared bridge is absent is skipped in silence, like an absent
+/// wire's legs: `apply` named the deferral and `status` keeps saying so; a three-second tick
+/// must not journal it over and over.
+///
+/// Steady-state cost: one `ip link show` plus one `ip -d link show` per row, and one
+/// `bridge -j vlan show` per declared bridge. No writes.
+fn restore_workload_legs(
+    sys: &mut dyn Sys,
+    view: &View,
+    rows: &[crate::derive::WorkloadRow],
+    pending: &std::collections::BTreeSet<String>,
+    restored: &mut Vec<String>,
+    unrestored: &mut Vec<String>,
+) {
+    for row in rows.iter().filter(|r| !pending.contains(&r.wl.name)) {
+        let name = &row.wl.name;
+        let bridge = &row.wl.uplink;
+        let vid = row.wl.vid;
+        let leg = row.wl.leg_ifname();
+        if !uplink::bridge_present(sys, bridge) {
+            continue;
+        }
+        match leg::present(sys, &leg, vid) {
+            Ok(true) => match leg::ensure_self_vid(sys, &view.fabric.run_dir, bridge, vid) {
+                Ok(true) => restored.push(format!(
+                    "re-added vid {vid} on bridge {bridge} itself (workload {name})"
+                )),
+                Ok(false) => {}
+                Err(e) => unrestored.push(format!("unrestored workload {name}: {e}")),
+            },
+            Ok(false) => match build_workload_row(sys, view, row) {
+                Ok(()) => restored.push(format!("rebuilt workload {name} leg {leg} on {bridge}")),
+                Err(e) => unrestored.push(format!(
+                    "unrestored workload {name}: leg {leg} not rebuilt: {e}"
+                )),
+            },
+            Err(e) => unrestored.push(format!("unrestored workload {name}: {e}")),
+        }
+    }
+}
+
+/// Build one workload row exactly as `apply` builds it: the leg (with this member's own address
+/// and the vid on the bridge itself), then the anycast gw address, then forwarding. The caller
+/// has already reconciled the bridge ARP guard over this row's uplink — the gw address must
+/// never go live before that guard does.
+fn build_workload_row(
+    sys: &mut dyn Sys,
+    view: &View,
+    row: &crate::derive::WorkloadRow,
+) -> Result<()> {
+    let f = view.fabric;
+    let leg = row.wl.leg_ifname();
+    let qos = apply::workload_qos(f);
+    let qos: Vec<&str> = qos.iter().map(String::as_str).collect();
+    leg::install(
+        sys,
+        &f.run_dir,
+        &leg,
+        &row.wl.uplink,
+        row.wl.vid,
+        &row.address,
+        &qos,
+    )?;
+    run_ok(
+        sys,
+        &["ip", "addr", "replace", &row.wl.gw_cidr(), "dev", &leg],
+    )?;
+    set_leg_forwarding(sys, view, &leg)?;
     Ok(())
 }
 
@@ -430,10 +520,12 @@ fn guarded_ports_for(bridge_nft: &str, gw: &std::net::Ipv4Addr) -> Vec<String> {
     ports
 }
 
-/// Install a row that just became ready (an entry in `ready_names`): the gw address it never got
-/// at `apply` time. A failed `ip addr replace` names the row and keeps it pending.
+/// Install a row that just became ready (an entry in `ready_names`): everything `apply` would
+/// have built for it and did not — the leg, this member's own address, the vid on the bridge,
+/// the anycast gw address and forwarding. A failed step names the row and keeps it pending.
 fn install_ready_rows(
     sys: &mut dyn Sys,
+    view: &View,
     rows: &[crate::derive::WorkloadRow],
     ready_names: &[String],
     restored: &mut Vec<String>,
@@ -445,18 +537,8 @@ fn install_ready_rows(
             .iter()
             .find(|r| &r.wl.name == name)
             .expect("checked above");
-        match run_ok(
-            sys,
-            &[
-                "ip",
-                "addr",
-                "replace",
-                &row.wl.gw_cidr(),
-                "dev",
-                &row.wl.leg_ifname(),
-            ],
-        ) {
-            Ok(_) => restored.push(format!("installed workload {name}")),
+        match build_workload_row(sys, view, row) {
+            Ok(()) => restored.push(format!("installed workload {name}")),
             Err(e) => {
                 unrestored.push(format!("unrestored workload {name}: {e}"));
                 still_pending.push(name.clone());
@@ -493,19 +575,15 @@ fn reconcile_workload_guard(
     sys: &mut dyn Sys,
     view: &View,
     rows: &[crate::derive::WorkloadRow],
+    pending: &std::collections::BTreeSet<String>,
     restored: &mut Vec<String>,
     unrestored: &mut Vec<String>,
 ) -> Result<()> {
     let path = format!("{}/workload-deferred", view.fabric.run_dir);
-    // M3 (whole-branch review): the one shared parser (`status` and the supervisor already read
-    // it this way) — a second hand-rolled split here could silently drift from it (e.g. one
-    // trims blank lines, the other does not) and read a different pending set than `status`
-    // reports.
-    let pending = deferred_names(sys, view);
     let original_len = pending.len();
     let mut still_pending: Vec<String> = Vec::new();
     let mut ready_names: Vec<String> = Vec::new();
-    for name in &pending {
+    for name in pending {
         let Some(row) = rows.iter().find(|r| &r.wl.name == name) else {
             // The declaration dropped this row (or the file is stale/corrupt): nothing left to
             // install for it, but it must not just vanish from the bookkeeping — journal it
@@ -540,6 +618,7 @@ fn reconcile_workload_guard(
             if old == new_nft {
                 install_ready_rows(
                     sys,
+                    view,
                     rows,
                     &ready_names,
                     restored,
@@ -575,6 +654,7 @@ fn reconcile_workload_guard(
                         restored.extend(drifted);
                         install_ready_rows(
                             sys,
+                            view,
                             rows,
                             &ready_names,
                             restored,
@@ -1086,9 +1166,13 @@ pub(crate) mod tests {
         legs_present(rules_present(sys, view), view)
     }
 
-    /// `healthy_sys` plus the workload facts in their healthy state.
+    /// `healthy_sys` plus the workload facts in their healthy state: each row's leg present and
+    /// of the right vlan kind, and each declared bridge already carrying that row's vid on
+    /// itself. The bridge's PORTS are deliberately not stubbed here — a test that wants the
+    /// uplink identified adds them, and one that does not gets the absent-bridge case, which
+    /// costs the tick nothing.
     fn wl_healthy_sys(view: &View) -> MockSys {
-        healthy_sys(view)
+        let mut sys = healthy_sys(view)
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
             .file("/run/cfab/workload-bridge.nft", "table bridge cfab\n")
             .on_stdout(
@@ -1099,7 +1183,23 @@ pub(crate) mod tests {
                 &["ip", "rule", "show", "pref", "2000"],
                 "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n\
                  2000:\tfrom 10.99.0.0/16 to 192.168.20.0/24 lookup main\n",
-            )
+            );
+        for r in view.workload_rows() {
+            let leg = r.wl.leg_ifname();
+            sys = sys
+                .on_stdout(
+                    &["ip", "-d", "link", "show", &leg],
+                    &format!("9: {leg}: <UP> {} \n", apply::vlan_marker(r.wl.vid)),
+                )
+                .on_stdout(
+                    &["bridge", "-j", "vlan", "show", "dev", &r.wl.uplink],
+                    &format!(
+                        r#"[{{"ifname":"{}","vlans":[{{"vlan":1,"flags":["PVID","Egress Untagged"]}},{{"vlan":{}}}]}}]"#,
+                        r.wl.uplink, r.wl.vid
+                    ),
+                );
+        }
+        sys
     }
 
     #[test]
@@ -1298,6 +1398,155 @@ pub(crate) mod tests {
         assert!(
             sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
                 .is_empty()
+        );
+    }
+
+    /// cfab builds the workload leg now (it used to demand a host-provided `primary.3`), so it
+    /// owns putting one back: a netdev that vanished with its bridge, was deleted by an
+    /// operator, or never survived a boot race. The rebuild is the same builder `apply` uses,
+    /// with both addresses (this member's own and the anycast gw) and forwarding.
+    #[test]
+    fn a_workload_leg_that_vanished_is_rebuilt_with_both_addresses_on_the_next_tick() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_fail(
+                &["ip", "link", "show", "cfab-work-vms"],
+                1,
+                "Device \"cfab-work-vms\" does not exist.",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran(
+            "ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:6"
+        ));
+        assert!(sys.ran("ip addr replace 192.168.20.2/24 dev cfab-work-vms"));
+        assert!(sys.ran("ip link set cfab-work-vms up"));
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding"),
+            vec!["1"]
+        );
+        assert!(
+            report
+                .restored
+                .contains(&"rebuilt workload vms leg cfab-work-vms on primary".to_string()),
+            "{:?}",
+            report.restored
+        );
+    }
+
+    /// The leg can be perfectly healthy while the bridge has lost the vid on ITSELF (an
+    /// operator's `bridge vlan del dev primary vid 3 self`, an `ifreload`): without it the leg
+    /// receives nothing (VERIFIED 2026-09-08). Re-add exactly that, and never rebuild a leg
+    /// that is present and of the right kind.
+    #[test]
+    fn a_self_vid_the_bridge_lost_is_re_added_without_touching_a_present_leg() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("bridge vlan add dev primary vid 3 self"));
+        assert!(!sys.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!sys.ran("ip link del cfab-work-vms"));
+        assert_eq!(
+            sys.writes_of("/run/cfab/workload-self-vid"),
+            vec!["primary 3"]
+        );
+        assert!(
+            report
+                .restored
+                .contains(&"re-added vid 3 on bridge primary itself (workload vms)".to_string()),
+            "{:?}",
+            report.restored
+        );
+    }
+
+    /// A row `apply` deferred has no leg at all — it never built one. Installing it means the
+    /// whole build, not just the gw address: the leg with this member's own address first, the
+    /// anycast gw only after (and, as the guard tests below pin, only after the bridge guard is
+    /// loaded over its uplink).
+    #[test]
+    fn installing_a_deferred_row_builds_its_leg_before_the_gw_address() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_fail(
+                &["ip", "link", "show", "cfab-work-vms"],
+                1,
+                "Device \"cfab-work-vms\" does not exist.",
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        let pos = |needle: &str| {
+            sys.calls
+                .iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not run: {:#?}", sys.calls))
+        };
+        assert!(
+            pos("ip link add link primary name cfab-work-vms")
+                < pos("ip addr replace 192.168.20.2/24 dev cfab-work-vms")
+        );
+        assert!(
+            pos("ip addr replace 192.168.20.2/24 dev cfab-work-vms")
+                < pos("ip addr replace 192.168.20.254/24 dev cfab-work-vms")
+        );
+        assert_eq!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding"),
+            vec!["1"]
+        );
+        assert!(
+            report
+                .restored
+                .contains(&"installed workload vms".to_string()),
+            "{:?}",
+            report.restored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
+    }
+
+    /// The steady state: leg present and of the right kind, vid on the bridge, guard already
+    /// matching the identified uplink. Not one write, and above all not one `ip link del` on a
+    /// live leg carrying VM traffic.
+    #[test]
+    fn a_present_leg_and_a_present_self_vid_cost_the_watchdog_no_writes() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let current = emit::workload::bridge_table(&[(
+            "192.168.20.254".parse().unwrap(),
+            uplink::Uplink {
+                bridge: "primary".into(),
+                vid: 3,
+                ports: vec!["eth0".into()],
+            },
+        )]);
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-bridge.nft", &current)
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!sys.ran("ip link del cfab-work-vms"));
+        assert!(!sys.ran("bridge vlan add dev primary"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert!(
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
+                .is_empty()
+        );
+        assert!(
+            !report.restored.iter().any(|l| l.contains("workload")),
+            "{:?}",
+            report.restored
         );
     }
 
