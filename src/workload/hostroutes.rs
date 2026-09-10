@@ -529,11 +529,13 @@ impl HostRoutes {
                 .run(&["ip", "neigh", "del", &addr.to_string(), "dev", &leg])
                 .is_ok_and(|o| o.ok());
             if deleted {
-                out.push(format!("cfab: workload {name}: vm {addr} left (port gone)"));
+                out.push(format!(
+                    "cfab: workload {name}: vm {addr} left (no longer seen as a local VM)"
+                ));
             } else {
                 out.push(format!(
-                    "cfab: workload {name}: vm {addr} left (port gone); cannot delete its \
-                     neighbor entry on {leg}"
+                    "cfab: workload {name}: vm {addr} left (no longer seen as a local VM); \
+                     cannot delete its neighbor entry on {leg}"
                 ));
             }
         }
@@ -1303,7 +1305,7 @@ mod tests {
         );
         assert_eq!(
             said,
-            vec!["cfab: workload vms: vm 192.168.20.103 left (port gone)"]
+            vec!["cfab: workload vms: vm 192.168.20.103 left (no longer seen as a local VM)"]
         );
     }
 
@@ -1329,8 +1331,8 @@ mod tests {
         assert_eq!(
             said,
             vec![
-                "cfab: workload vms: vm 192.168.20.103 left (port gone); cannot delete its \
-                 neighbor entry on cfab-work-vms"
+                "cfab: workload vms: vm 192.168.20.103 left (no longer seen as a local VM); \
+                 cannot delete its neighbor entry on cfab-work-vms"
             ]
         );
     }
