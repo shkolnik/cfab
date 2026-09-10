@@ -138,13 +138,22 @@ pub(crate) fn remove_gw_leg(
 /// 328 -> 362 and `0 vms seen`. A restart therefore keeps the leg (RULED, James 2026-09-10);
 /// `cfab down` still removes it, because a host after `down` must look as it did before cfab.
 ///
+/// ONLY the netdev is kept. Neighbor entries live on the netdev, not on the bridge's vlan
+/// configuration — MEASURED on pve2 2026-09-10 14:41 UTC: with an entry in DELAY on the leg,
+/// `bridge vlan del dev primary vid 3 self` left `ip neigh show dev cfab-work-vms` unchanged,
+/// and re-adding the vid restored the leg. So a stop gives the bridge's self-vid back under
+/// the same ownership proof `down` uses, and `up` re-adds it: the ownership record lives in
+/// the run dir, which a stop removes, and a vid held past that point would be one nothing
+/// remembers cfab added.
+///
 /// Passed in by the caller, never inferred from the environment: the supervisor knows it is
 /// stopping, and nothing on the box distinguishes a stop from a `down` after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Teardown {
-    /// The supervisor's stop sequence (SIGTERM: `systemctl stop`/`restart`). Keeps the leg,
-    /// its member address and the bridge's self-vid; removes everything else `Down` removes,
-    /// the anycast `gw` address included — a stopped member must not answer for `gw`.
+    /// The supervisor's stop sequence (SIGTERM: `systemctl stop`/`restart`). Keeps the leg
+    /// netdev and its member address, and nothing else: the self-vid goes back, and so does
+    /// everything `Down` removes — the anycast `gw` address included, because a stopped member
+    /// must not answer for `gw`.
     Stop,
     /// `cfab down`: remove the leg and, if cfab's record says cfab added it, the self-vid.
     Down,
@@ -177,10 +186,11 @@ pub fn run(sys: &mut dyn Sys, view: &View, mode: Teardown) -> Result<String> {
     // row); `arp_ignore` is left exactly as `up` set it (ruling 11) — `down` never touches it.
     // `leg::remove` proves ownership twice before it destroys anything: the netdev must be a
     // vlan of this vid, and the vid on the bridge must be one cfab's own record says cfab
-    // added. The UPLINK is the host's bridge and is never a delete candidate. On `Stop` that
-    // last step is skipped entirely (see `Teardown`): the leg outlives a restart so its
-    // neighbor entries — the record of which VMs are here — do too. The gw address above comes
-    // off either way, so a stopped member stops answering for the anycast gateway.
+    // added. The UPLINK is the host's bridge and is never a delete candidate. On `Stop` only
+    // the second proof runs (see `Teardown`): the leg netdev outlives a restart so its neighbor
+    // entries — the record of which VMs are here — do too, while the vid goes back with the
+    // record that says it was ours. The gw address above comes off either way, so a stopped
+    // member stops answering for the anycast gateway.
     if !view.workload_rows().is_empty() {
         // M2 (whole-branch review): `have_tool`-guarded like the mark removal above — a missing
         // nft must never abort `down` before the gw address and rule removal below it run.
@@ -197,8 +207,20 @@ pub fn run(sys: &mut dyn Sys, view: &View, mode: Teardown) -> Result<String> {
             if has_ip_addr(&addr.stdout, &gw_cidr) {
                 run_ok(sys, &["ip", "addr", "del", &gw_cidr, "dev", ifname])?;
             }
-            if mode == Teardown::Down {
-                crate::workload::leg::remove(sys, &f.run_dir, ifname, &row.wl.uplink, row.wl.vid)?;
+            match mode {
+                Teardown::Down => crate::workload::leg::remove(
+                    sys,
+                    &f.run_dir,
+                    ifname,
+                    &row.wl.uplink,
+                    row.wl.vid,
+                )?,
+                // Same ownership proof, netdev kept: the record goes with the run dir below,
+                // so a vid cfab added must be given back now or nothing will remember it was
+                // ours. `up` re-adds and re-records it.
+                Teardown::Stop => {
+                    crate::workload::leg::release_vid(sys, &f.run_dir, &row.wl.uplink, row.wl.vid)?
+                }
             }
         }
     }
@@ -510,27 +532,26 @@ mod tests {
         );
     }
 
-    /// The restart case (RULED 2026-09-10): a supervisor stop keeps the leg, because deleting
-    /// the netdev flushes the neighbor entries this member's VM discovery reads — an idle VM
-    /// would go unannounced until it next sent something. Everything else `down` removes still
-    /// comes off, the anycast gw address first of all: a stopped member must not answer for it.
+    /// The restart case (RULED 2026-09-10): a supervisor stop keeps the leg NETDEV, because
+    /// deleting it flushes the neighbor entries this member's VM discovery reads — an idle VM
+    /// would go unannounced until it next sent something. The bridge's self-vid is not part of
+    /// that (MEASURED pve2 14:41 UTC: dropping it leaves the entries alone), so it goes back
+    /// with the record that says cfab added it. Everything else `down` removes still comes off,
+    /// the anycast gw address first of all: a stopped member must not answer for it.
     #[test]
-    fn stop_keeps_the_workload_leg_and_the_self_vid_and_removes_everything_else() {
+    fn stop_keeps_the_workload_leg_netdev_and_gives_the_self_vid_back() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys();
         run(&mut sys, &view, Teardown::Stop).unwrap();
-        // The teeth: the two calls `down` makes and a stop must not.
+        // The teeth: the one call `down` makes and a stop must not.
         assert!(
             !sys.ran("ip link del cfab-work-vms"),
             "the leg survives a restart, neighbor entries and all"
         );
-        assert!(
-            !sys.calls
-                .iter()
-                .any(|c| c.starts_with("bridge vlan del dev primary")),
-            "the vid the leg needs stays with it"
-        );
+        // The vid cfab added is cfab's to give back, and the record goes with the run dir.
+        assert!(sys.ran("bridge vlan del dev primary vid 3 self"));
+        assert!(sys.ran("rm /run/cfab/workload-self-vid"));
         // …and everything else is exactly the `down` teardown.
         assert!(sys.ran("nft delete table bridge cfab"));
         assert!(sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
@@ -548,27 +569,39 @@ mod tests {
         );
     }
 
-    /// The other half of the same ruling, spelled as a difference: only the leg and its vid
-    /// tell `Stop` and `Down` apart. If a later change makes the stop path remove something
-    /// else — or stop removing something — this is the test that says so.
+    /// Prove ownership before destroy, on the stop path too: a vid the HOST already had is not
+    /// in cfab's record, so a stop gives nothing back — the same proof `down` uses, because it
+    /// is the same code.
     #[test]
-    fn stop_and_down_differ_only_in_the_leg_and_its_self_vid() {
+    fn stop_leaves_a_self_vid_cfab_never_added() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys();
+        sys.files.remove("/run/cfab/workload-self-vid");
+        run(&mut sys, &view, Teardown::Stop).unwrap();
+        assert!(!sys.ran("ip link del cfab-work-vms"));
+        assert!(!sys.ran("bridge vlan del dev primary vid 3 self"));
+    }
+
+    /// The other half of the same ruling, spelled as a difference: the leg NETDEV is the only
+    /// thing that tells `Stop` and `Down` apart. If a later change makes the stop path remove
+    /// something else — or stop removing something — this is the test that says so.
+    #[test]
+    fn stop_and_down_differ_only_in_the_leg_netdev() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut stop = wl_down_sys();
         run(&mut stop, &view, Teardown::Stop).unwrap();
         let mut down = wl_down_sys();
         run(&mut down, &view, Teardown::Down).unwrap();
-        let leg_only = |c: &String| {
+        // The `ip link del`, and the two probes that prove the netdev is ours before it runs.
+        let netdev_only = |c: &String| {
             c == "ip link del cfab-work-vms"
-                || c.starts_with("bridge vlan del dev primary")
                 || c == "ip link show cfab-work-vms"
                 || c == "ip -d link show cfab-work-vms"
-                || c == "rm /run/cfab/workload-self-vid"
-                || c == "bridge -j vlan show dev primary"
         };
         let strip = |calls: &[String]| -> Vec<String> {
-            calls.iter().filter(|c| !leg_only(c)).cloned().collect()
+            calls.iter().filter(|c| !netdev_only(c)).cloned().collect()
         };
         assert_eq!(strip(&stop.calls), strip(&down.calls));
         assert!(down.ran("ip link del cfab-work-vms"));

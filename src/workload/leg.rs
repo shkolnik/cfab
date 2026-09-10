@@ -178,11 +178,20 @@ pub fn present(sys: &mut dyn Sys, leg: &str, vid: u16) -> Result<bool> {
 /// Ownership is proven twice before anything is destroyed: the netdev must be a vlan of this
 /// vid (a foreign netdev that happens to carry the name is left alone), and the vid must be in
 /// cfab's own record (a vid the host had before cfab ran stays — VM ports keep their own vids
-/// either way, this is only the bridge's self entry).
+/// either way, this is only the bridge's self entry). The second proof is `release_vid`, which
+/// a supervisor stop runs on its own: it keeps the netdev and gives the vid back.
 pub fn remove(sys: &mut dyn Sys, run_dir: &str, leg: &str, uplink: &str, vid: u16) -> Result<()> {
     if present(sys, leg, vid)? {
         run_ok(sys, &["ip", "link", "del", leg])?;
     }
+    release_vid(sys, run_dir, uplink, vid)
+}
+
+/// Give the bridge's self-vid back if — and only if — cfab's own record says cfab added it, and
+/// forget the record either way. The netdev is not touched: this is the half of `remove` a
+/// supervisor stop runs, and `install`'s `ensure_self_vid` is what puts the vid back at the
+/// next `up`.
+pub fn release_vid(sys: &mut dyn Sys, run_dir: &str, uplink: &str, vid: u16) -> Result<()> {
     let mut lines = read_record(sys, run_dir);
     if !lines.remove(&record_line(uplink, vid)) {
         return Ok(());
