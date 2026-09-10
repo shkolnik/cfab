@@ -97,6 +97,9 @@ cfab_bgp_neighbor_state{zone="mgmt",neighbor="192.168.249.254",state="absent"} 0
 # HELP cfab_bgp_neighbor_prefixes_sent Prefixes this member has sent the gateway router.
 # TYPE cfab_bgp_neighbor_prefixes_sent gauge
 cfab_bgp_neighbor_prefixes_sent{zone="mgmt",neighbor="192.168.249.254"} 3
+# HELP cfab_host_default_path 0 while this member's locally originated traffic takes cfab's additive default through the fabric gateway (table 250), 1 while it takes the host's own floor default in main — because the ingress prober reports the router unreachable, because the default was withdrawn, or because cfab is not running. Absent on a member with no gw zone and on one with no default route at all.
+# TYPE cfab_host_default_path gauge
+cfab_host_default_path 0
 # HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.
 # TYPE cfab_component_state gauge
 cfab_component_state{component="engine",state="starting"} 0

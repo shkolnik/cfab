@@ -27,8 +27,23 @@ mod workload_lifecycle {
         let (mut sys, view) = apply::tests::wl_sys_and_view("pve1-tb");
         apply::run(&mut sys, &view, &apply::tests::opts()).unwrap();
 
-        // an operator deletes the sibling rule and the guard table
+        // The mock does not model netdev creation, so what `apply` just built is stated here:
+        // the leg exists and is a vlan of vid 3, and the bridge now carries vid 3 on itself.
+        // Without this the watchdog below would read the pre-apply host and rebuild both.
+        // Then: an operator deletes the sibling rule and the guard table.
         let mut sys = sys
+            .on_stdout(
+                &["ip", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <BROADCAST,MULTICAST,UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <UP> vlan protocol 802.1Q id 3 \n",
+            )
+            .on_stdout(
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":3}]}]"#,
+            )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
                 "2000:\tfrom 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0\n",
@@ -52,8 +67,8 @@ mod workload_lifecycle {
                 "table bridge cfab {\n}\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             );
         teardown::run(&mut sys, &view).unwrap();
 
@@ -69,15 +84,29 @@ mod workload_lifecycle {
             2,
             "apply + restore"
         );
-        assert_eq!(count("ip addr replace 192.168.20.254/24 dev primary.3"), 1);
+        assert_eq!(
+            count("ip addr replace 192.168.20.254/24 dev cfab-work-vms"),
+            1
+        );
         assert_eq!(count("nft delete table bridge cfab"), 1);
-        assert_eq!(count("ip addr del 192.168.20.254/24 dev primary.3"), 1);
+        assert_eq!(count("ip addr del 192.168.20.254/24 dev cfab-work-vms"), 1);
         assert_eq!(
             count("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
             1
         );
-        assert_eq!(count("ip link del primary.3"), 0);
-        assert_eq!(count("ip link set primary.3 down"), 0);
+        assert_eq!(
+            count("ip link add link primary name cfab-work-vms"),
+            1,
+            "apply built it once; the watchdog found it present"
+        );
+        assert_eq!(count("bridge vlan add dev primary vid 3 self"), 1);
+        assert_eq!(
+            count("ip link del cfab-work-vms"),
+            1,
+            "down removes the leg cfab built"
+        );
+        assert_eq!(count("bridge vlan del dev primary vid 3 self"), 1);
+        assert_eq!(count("ip link del primary"), 0, "never the host's bridge");
         let down_at = calls
             .iter()
             .position(|c| c.contains("nft delete table bridge cfab"))
@@ -91,7 +120,7 @@ mod workload_lifecycle {
             &calls[down_at..]
         );
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"0"),
             "down leaves forwarding off"

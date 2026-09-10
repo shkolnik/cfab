@@ -313,14 +313,19 @@ pub struct GuardDrops {
 }
 
 /// One `[[workload]]` row on this member, as `status` read it (spec §5.1 item 10). A row exists
-/// only on a member that carries the interface (`view.workload_rows()`) — a member the workload
-/// merely reaches (an allowed zone with no address on `ifname`) has none, and is checked by the
+/// only on a member that carries the leg (`view.workload_rows()`) — a member the workload merely
+/// reaches (an allowed zone with no address on the leg) has none, and is checked by the
 /// return-path/route-get conditions alone (`return_path_and_ingress`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadStatus {
     pub name: String,
-    pub ifname: String,
-    /// This member's declared address on `ifname`, e.g. `192.168.20.2/24`.
+    /// The declared bridge this row's leg is a vlan of, e.g. `primary`.
+    pub uplink: String,
+    /// The declared vlan id on that bridge.
+    pub vid: u16,
+    /// The leg cfab derives and creates, e.g. `cfab-work-vms`.
+    pub leg: String,
+    /// This member's declared address on `leg`, e.g. `192.168.20.2/24`.
     pub address: String,
     /// The anycast gateway with the prefix's mask, e.g. `192.168.20.254/24`.
     pub gw: String,
@@ -331,8 +336,8 @@ pub struct WorkloadStatus {
     pub state: WorkloadState,
     /// Zones this workload is advertised into (the declared `allow` list).
     pub zones: Vec<String>,
-    /// The bridge's uplink port(s), from `uplink::identify`; empty when unidentified.
-    pub uplinks: Vec<String>,
+    /// The bridge's uplink port(s), from `uplink::identify_declared`; empty when unidentified.
+    pub uplink_ports: Vec<String>,
     /// What wakes the announcer (`neigh events` / `fdb poll (...)`), from the supervisor's
     /// `components` document; `None` when no supervisor is answering or the announcer has not
     /// started.
@@ -348,6 +353,72 @@ pub struct WorkloadStatus {
     /// `(rx_bytes, tx_bytes)` from `/sys/class/net/<ifname>/statistics/`; `None` on a read
     /// failure.
     pub bytes: Option<(u64, u64)>,
+    /// The forward chain's `stray-<name>` drop counter, summed over the row's one rule per
+    /// allowed zone (spec §5.2, ruling 6): fabric packets this member refused to put on its
+    /// leg for a VM it does not know. `None` when the chain carries no such rule at all —
+    /// an absent rule and a rule that has dropped nothing are different facts. The counter
+    /// resets whenever `apply` re-renders `inet cfab-fwd`.
+    pub stray_forwards: Option<u64>,
+}
+
+/// Which default route this member's own traffic takes right now (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultPath {
+    /// cfab's additive default in table 250, through the fabric gateway.
+    Fabric { via: String, dev: String },
+    /// The host's own default in main — the floor cfab adds to and never removes.
+    Floor { via: String, dev: String },
+    /// Neither table holds one: this member has no default route at all.
+    None,
+}
+
+/// Why this member's own traffic is not taking the fabric gateway. Typed, not prose, so the
+/// metric can tell "this host has no gw zone at all" from "its router went dark" without
+/// matching on the text of a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultReason {
+    /// The ingress prober says no wire of the gw leg reaches the router.
+    RouterUnreachable,
+    /// This member declares no `gw` zone, so cfab never had a default to add (every leaf).
+    NoGwZone,
+    /// Table 250 is empty and nothing says the router is dark: cfab is down, `down` ran, or the
+    /// install failed.
+    Withdrawn,
+}
+
+impl DefaultReason {
+    /// The one spelling of each, in status prose.
+    pub fn word(self) -> &'static str {
+        match self {
+            DefaultReason::RouterUnreachable => "router unreachable",
+            DefaultReason::NoGwZone => "no gw zone",
+            DefaultReason::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+/// The host default as `status` read it: which path locally originated traffic takes, and why
+/// it is not the fabric one when it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDefault {
+    pub path: DefaultPath,
+    /// `None` while the fabric default is in force.
+    pub reason: Option<DefaultReason>,
+}
+
+impl HostDefault {
+    /// The line `status` prints after `default: `.
+    pub fn render(&self) -> String {
+        let head = match &self.path {
+            DefaultPath::Fabric { via, dev } => format!("via fabric gw {via} ({dev})"),
+            DefaultPath::Floor { via, dev } => format!("via floor {via} ({dev})"),
+            DefaultPath::None => "none".to_string(),
+        };
+        match self.reason {
+            Some(r) => format!("{head}, {}", r.word()),
+            None => head,
+        }
+    }
 }
 
 /// Which member this gather describes.
@@ -399,4 +470,7 @@ pub struct StatusModel {
     pub prefs: Vec<HostZonePref>,
     /// The run dir, which every "no supervisor answering" line names.
     pub run_dir: String,
+    /// Which default route this member's own traffic takes (spec §6). `None` on a leaf and on
+    /// a member with no fabric applied — neither has one of cfab's to describe.
+    pub host_default: Option<HostDefault>,
 }

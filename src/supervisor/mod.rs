@@ -767,6 +767,11 @@ pub(crate) async fn run_with(
     );
     workloads.publish(&shared);
 
+    // 5d. The additive host default (spec §6). `apply` installed it optimistically; from here
+    // the prober's router-reachability fact drives it — the prober tick on an edge, the
+    // forwarding-watchdog tick at level.
+    let mut host_default = fwd_watchdog::HostDefaultState::default();
+
     // The watchdog feed (spec §8): only when systemd set WATCHDOG_USEC, so `WatchdogSec` lives
     // in the unit file alone. Absent that, the feed never runs.
     let feed_period = feed_period();
@@ -963,13 +968,13 @@ pub(crate) async fn run_with(
             // reads and `ip rule` shows, sub-second) — nowhere near `WatchdogSec` — unlike a
             // reapply, which is why only the reapply gets interior feeds.
             _ = fwd_tick.tick(), if hooks.run_watchdog => {
-                watchdog_tick(sys, view, &shared);
+                watchdog_tick(sys, view, &shared, &mut host_default);
             }
             // Same arm shape as the watchdog above, and the same reason it needs no interior
             // watchdog feed: the tick is bounded by construction (non-blocking reads, at most
             // two sysfs writes) and nowhere near `WatchdogSec`.
             _ = probe_tick.tick(), if hooks.run_prober && !prober.is_empty() => {
-                prober_tick(sys, &mut prober, &mut probe_io, &shared);
+                prober_tick(sys, view, &mut prober, &mut probe_io, &shared, &mut host_default);
             }
             // Same arm shape and the same `block_in_place` reasoning as the watchdog tick: the
             // gather is read-only and bounded, and it must not pin the runtime thread.
@@ -1467,18 +1472,31 @@ fn feed_period() -> Option<Duration> {
 /// `cfab.sock` accept loop on a silent wire.
 fn prober_tick(
     sys: &mut dyn Sys,
+    view: &View,
     prober: &mut Prober,
     io: &mut dyn ProbeIo,
     shared: &Arc<Mutex<Shared>>,
+    host_default: &mut fwd_watchdog::HostDefaultState,
 ) {
     let rows = prober.tick(sys, io, Instant::now());
     for line in prober.drain_log() {
         eprintln!("{line}");
     }
     let held = prober.held_primaries();
-    let mut st = shared.lock().unwrap();
-    st.probed = rows;
-    st.held = held;
+    let wanted = fwd_watchdog::default_wanted(&rows.ingress, view);
+    {
+        let mut st = shared.lock().unwrap();
+        st.probed = rows;
+        st.held = held;
+    }
+    // The EDGE alone (spec §6): the withdrawal must land within the prober's own 3-miss flip,
+    // which this arm is, but a level check every 500 ms would cost four subprocesses a tick
+    // forever. The watchdog tick below is the level.
+    if host_default.changed(wanted) {
+        for line in host_default.reconcile(sys, view, wanted) {
+            eprintln!("{line}");
+        }
+    }
 }
 
 /// One forwarding-watchdog tick (spec §5): run the synchronous check with `block_in_place` — on
@@ -1538,15 +1556,30 @@ fn refresh_snapshot(
     }
 }
 
-fn watchdog_tick(sys: &mut dyn Sys, view: &View, shared: &Arc<Mutex<Shared>>) {
+fn watchdog_tick(
+    sys: &mut dyn Sys,
+    view: &View,
+    shared: &Arc<Mutex<Shared>>,
+    host_default: &mut fwd_watchdog::HostDefaultState,
+) {
     // Snapshot first: the socket server and the stream readers take this same lock, and the
     // check below runs for as long as a `block_in_place` needs.
-    let held = shared.lock().unwrap().held.clone();
+    let (held, probed) = {
+        let st = shared.lock().unwrap();
+        (st.held.clone(), st.probed.clone())
+    };
     let (result, detail) = match tokio::task::block_in_place(|| fwd_watchdog::run(sys, view, &held))
     {
         Ok(report) => summarize_watchdog(&report),
         Err(e) => ("error".to_string(), Some(e.to_string())),
     };
+    // The host default's LEVEL check (spec §6), the same shape every other restore in the
+    // watchdog has: what the prober believes, re-asserted against what the kernel holds, and
+    // pref 2099 refreshed from the floor device's current addresses.
+    let wanted = fwd_watchdog::default_wanted(&probed.ingress, view);
+    for line in tokio::task::block_in_place(|| host_default.reconcile(sys, view, wanted)) {
+        eprintln!("{line}");
+    }
     let mut st = shared.lock().unwrap();
     st.wd_last_tick = Some(Instant::now());
     st.wd_result = result;
@@ -1883,30 +1916,22 @@ mod tests {
     }
 
     /// `fresh_sys` plus the host facts a workload row needs (the same shape as
-    /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and one
-    /// VM tap, and `primary.3` up, addressed, with its own MAC.
+    /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and
+    /// one VM tap, and no self vid yet — `up` builds the leg on it.
     fn wl_fresh_sys(view: &View, run_dir: &Path) -> MockSys {
         fresh_sys(view, run_dir)
             .file(CONFIG, &wl_decl_text(run_dir))
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/bridge/vlan_filtering", "1\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/eth0/ifindex", "2\n")
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "primary.3"],
-                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
-            )
-            .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24\n",
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
             )
     }
 
@@ -1964,7 +1989,7 @@ mod tests {
                 c.workloads[0].ifname.as_str(),
                 c.workloads[0].trigger.as_str()
             ),
-            ("vms", "primary.3", "neigh events")
+            ("vms", "cfab-work-vms", "neigh events")
         );
         assert!(
             said.contains(&"cfab: workload vms: announcer trigger neigh events".to_string()),
@@ -2072,7 +2097,7 @@ mod tests {
         assert!(burst, "a neigh event on a VM port must start a burst");
         assert!(frames, "and the burst's first frame must reach the socket");
         assert!(
-            sent.iter().all(|(port, frame)| port == "primary.3"
+            sent.iter().all(|(port, frame)| port == "cfab-work-vms"
                 && frame[..]
                     == crate::workload::announce::gratuitous(
                         [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
@@ -3165,7 +3190,14 @@ mod tests {
             )
             .file("/sys/class/net/cfab-gw249/bonding/primary", "cfab-gw249-c");
         let shared = Arc::new(Mutex::new(Shared::new(1)));
-        prober_tick(&mut sys, &mut prober, &mut io, &shared);
+        prober_tick(
+            &mut sys,
+            &view,
+            &mut prober,
+            &mut io,
+            &shared,
+            &mut fwd_watchdog::HostDefaultState::default(),
+        );
         let snap = shared.lock().unwrap().components(Instant::now());
         assert_eq!(snap.ingress.len(), 1, "{:?}", snap.ingress);
         assert_eq!(snap.ingress[0].zone, "mgmt");
@@ -3188,7 +3220,14 @@ mod tests {
         let mut io = crate::prober::io::mock::ScriptedIo::answering_on("192.168.249.254", &[]);
         let mut sys = crate::sys::mock::MockSys::default();
         let shared = Arc::new(Mutex::new(Shared::new(1)));
-        prober_tick(&mut sys, &mut prober, &mut io, &shared);
+        prober_tick(
+            &mut sys,
+            &view,
+            &mut prober,
+            &mut io,
+            &shared,
+            &mut fwd_watchdog::HostDefaultState::default(),
+        );
         assert!(
             shared
                 .lock()
@@ -3261,7 +3300,12 @@ mod tests {
         let view = View::new(&f, "pve3-tb").unwrap(); // a leaf
         let mut sys = healthy_leaf_sys(&view);
         let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
-        watchdog_tick(&mut sys, &view, &shared);
+        watchdog_tick(
+            &mut sys,
+            &view,
+            &shared,
+            &mut fwd_watchdog::HostDefaultState::default(),
+        );
         let snap = shared.lock().unwrap().components(Instant::now());
         assert_eq!(
             snap.watchdog.result, "ok",
@@ -3671,5 +3715,104 @@ mod tests {
             let v = tokio::task::block_in_place(|| 40 + 2);
             assert_eq!(v, 42, "block_in_place must be usable in run()'s runtime");
         });
+    }
+
+    /// The floor and the pref-2099/2100/2101 rules as a host carries them right after `up`
+    /// (spec §6), on top of a fixture that is otherwise healthy.
+    fn with_host_default_facts(sys: MockSys) -> MockSys {
+        sys.on_stdout(
+            &["ip", "route", "show", "table", "main", "default"],
+            "default via 192.168.10.254 dev eth0 onlink\n",
+        )
+        .on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
+            "eth0 UP 192.168.10.1/24\n",
+        )
+        .on_stdout(
+            &["ip", "rule", "show", "pref", "2099"],
+            "2099:\tfrom 192.168.10.1 iif lo lookup main\n",
+        )
+        .on_stdout(
+            &["ip", "rule", "show", "pref", "2100"],
+            "2100:\tfrom all iif lo lookup main suppress_prefixlength 0\n",
+        )
+        .on_stdout(
+            &["ip", "rule", "show", "pref", "2101"],
+            "2101:\tfrom all iif lo lookup cfab-default\n",
+        )
+    }
+
+    const HOST_DEFAULT_INSTALL: &str = "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+         table 250 proto 206";
+
+    /// The prober tick drives the host default on the EDGE (spec §6): the first observation is
+    /// one (no opinion yet), and a repeat of the same verdict is not — a level check at 500 ms
+    /// would cost four subprocesses a tick forever.
+    #[test]
+    fn the_prober_tick_reconciles_the_host_default_on_the_edge_only() {
+        let f = example_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut prober = Prober::from_view(&view);
+        let mut io = crate::prober::io::mock::ScriptedIo::answering_on(
+            "192.168.249.254",
+            &["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"],
+        );
+        let mut sys = with_host_default_facts(crate::sys::mock::MockSys::default());
+        // Carrier on every port of the gw leg: a wire with none reaches nothing, whatever the
+        // probes said, so `default_wanted` would read an unplugged fixture as a dark router.
+        for port in ["cfab-gw249-a", "cfab-gw249-b", "cfab-gw249-c"] {
+            sys = sys.port(
+                port,
+                crate::netlink::PortState {
+                    link: Some(crate::prober::decide::BondLink::Up),
+                    carrier: true,
+                    master: Some(1),
+                },
+            );
+        }
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let mut hd = fwd_watchdog::HostDefaultState::default();
+        prober_tick(&mut sys, &view, &mut prober, &mut io, &shared, &mut hd);
+        assert!(sys.ran(HOST_DEFAULT_INSTALL), "{:?}", sys.calls);
+        let after_first = sys.calls.len();
+        prober_tick(&mut sys, &view, &mut prober, &mut io, &shared, &mut hd);
+        assert!(
+            !sys.calls[after_first..]
+                .iter()
+                .any(|c| c.contains("table 250")),
+            "no edge, no reconcile: {:?}",
+            &sys.calls[after_first..]
+        );
+    }
+
+    /// The watchdog tick is the LEVEL check: it asks what the kernel holds on every tick,
+    /// whether or not the prober's verdict moved, and puts the route back if it is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_watchdog_tick_reconciles_the_host_default_at_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fabric_at(tmp.path());
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            with_host_default_facts(crate::commands::fwd_watchdog::tests::healthy_sys(&view));
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let mut hd = fwd_watchdog::HostDefaultState::default();
+        // No prober rows have been published at all, which is "wanted" (conflict 8).
+        watchdog_tick(&mut sys, &view, &shared, &mut hd);
+        assert!(sys.ran(HOST_DEFAULT_INSTALL), "{:?}", sys.calls);
+        let after_first = sys.calls.len();
+        watchdog_tick(&mut sys, &view, &shared, &mut hd);
+        assert!(
+            sys.calls[after_first..]
+                .iter()
+                .any(|c| c == "ip route show table 250 default"),
+            "the level check re-reads every tick: {:?}",
+            &sys.calls[after_first..]
+        );
+        assert!(
+            sys.calls[after_first..]
+                .iter()
+                .any(|c| c == HOST_DEFAULT_INSTALL),
+            "the route is still absent in this mock, so it goes back in"
+        );
     }
 }

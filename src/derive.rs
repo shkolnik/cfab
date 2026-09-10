@@ -68,7 +68,7 @@ pub struct FallbackRow {
 #[derive(Debug, Clone)]
 pub struct WorkloadRow<'a> {
     pub wl: &'a Workload,
-    /// This member's address on `wl.ifname`, e.g. `192.168.20.2/24`.
+    /// This member's address on the row's leg, e.g. `192.168.20.2/24`.
     pub address: String,
 }
 
@@ -266,7 +266,7 @@ impl<'a> View<'a> {
             }
         }
         for r in self.workload_rows() {
-            out.push((r.wl.ifname.clone(), transit));
+            out.push((r.wl.leg_ifname(), transit));
         }
         for z in &f.zones {
             let (id, peer) = crate::model::identity_ifnames(z.id);
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_forwarding_includes_the_workload_ifname() {
+    fn owned_forwarding_includes_the_workload_leg() {
         let text = fixtures::with_workload(&fixtures::example());
         let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let get = |member: &str, ifname: &str| {
@@ -950,8 +950,8 @@ mod tests {
                 .find(|(n, _)| n == ifname)
                 .map(|(_, t)| *t)
         };
-        assert_eq!(get("pve1-tb", "primary.3"), Some(true));
-        assert_eq!(get("pve3-tb", "primary.3"), None);
+        assert_eq!(get("pve1-tb", "cfab-work-vms"), Some(true));
+        assert_eq!(get("pve3-tb", "cfab-work-vms"), None);
 
         // host_forward off: the workload row's transit bit follows the same gate as every
         // other forwarding row, not the workload's own `allow` list. `validate` now refuses any
@@ -965,7 +965,7 @@ mod tests {
                 .unwrap()
                 .owned_forwarding()
                 .iter()
-                .find(|(n, _)| n == "primary.3")
+                .find(|(n, _)| n == "cfab-work-vms")
                 .map(|(_, t)| *t),
             Some(false)
         );

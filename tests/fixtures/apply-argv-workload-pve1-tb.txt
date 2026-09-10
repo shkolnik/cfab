@@ -21,8 +21,6 @@ write /proc/sys/net/ipv4/conf/all/ignore_routes_with_linkdown
 write /proc/sys/net/ipv4/conf/all/send_redirects
 write /proc/sys/net/ipv4/conf/default/send_redirects
 write /proc/sys/net/ipv4/conf/default/forwarding
-ip -br link show dev primary.3
-ip -4 -br addr show dev primary.3
 ip link show cfab-id99
 ip link show cfab-id99
 ip link add cfab-id99 type veth peer name cfab-id99-peer
@@ -247,6 +245,14 @@ write /proc/sys/net/ipv4/conf/cfab-mg-fb/rp_filter
 write /proc/sys/net/ipv4/conf/cfab-mg-fb/send_redirects
 write /proc/sys/net/ipv4/conf/cfab-mg-fb/forwarding
 ip link set cfab-mg-fb up
+ip link show cfab-work-vms
+ip link show cfab-work-vms
+ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:6
+ip addr replace 192.168.20.2/24 dev cfab-work-vms
+ip link set cfab-work-vms up
+bridge -j vlan show dev primary
+bridge vlan add dev primary vid 3 self
+write /run/cfab/workload-self-vid
 ip rule show pref 2000
 ip rule add pref 2000 from 10.99.0.0/16 to 10.99.0.0/16 lookup main suppress_prefixlength 0
 ip rule show pref 2000
@@ -267,6 +273,17 @@ ip rule show pref 2001
 ip rule add pref 2001 from 10.249.0.0/16 lookup 249
 ip rule show pref 2002
 ip rule add pref 2002 from 10.249.0.0/16 unreachable
+ip route show table main default
+ip -4 -br addr show dev eth0
+ip rule show pref 2099
+ip rule add pref 2099 from 192.168.10.1 iif lo lookup main
+ip rule show pref 2100
+ip rule add pref 2100 from all iif lo lookup main suppress_prefixlength 0
+ip rule show pref 2101
+ip rule add pref 2101 from all iif lo lookup 250
+ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 table 250 proto 206
+ip -j neigh show dev cfab-work-vms
+bridge -j fdb show br primary
 write /run/cfab/policy.nft
 nft -f /run/cfab/policy.nft
 nft list chain inet cfab-fwd forward
@@ -288,14 +305,14 @@ write /proc/sys/net/ipv4/conf/cfab-mg-fb/forwarding
 write /proc/sys/net/ipv4/conf/eth9/forwarding
 write /proc/sys/net/ipv4/conf/eth1/forwarding
 write /proc/sys/net/ipv4/conf/eth0/forwarding
-write /proc/sys/net/ipv4/conf/primary.3/forwarding
+write /proc/sys/net/ipv4/conf/cfab-work-vms/forwarding
 iptables -S DOCKER-USER
 write /run/cfab/workload-bridge.nft
 nft -f /run/cfab/workload-bridge.nft
 nft -s list table bridge cfab
 write /run/cfab/workload-bridge.applied
 write /run/cfab/workload-deferred
-ip addr replace 192.168.20.254/24 dev primary.3
+ip addr replace 192.168.20.254/24 dev cfab-work-vms
 write /proc/sys/net/ipv4/conf/all/arp_ignore
 write /run/cfab/mark.backend
 /usr/bin/env sh -c command -v iptables-legacy

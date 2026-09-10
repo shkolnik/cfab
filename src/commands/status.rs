@@ -24,7 +24,7 @@ use crate::derive::{Port, View, segments_of};
 use crate::emit;
 use crate::emit::ceiling_ipt::Backend as MarkBackend;
 use crate::error::Result;
-use crate::model::{Fabric, Ipv4Prefix, MemberKind};
+use crate::model::{Fabric, MemberKind};
 use crate::supervisor::child::State as CompState;
 use crate::supervisor::report::{Component, Components, ProbedLeg, render_line};
 use crate::sys::{Output, Sys, have_tool, run_optional};
@@ -42,8 +42,9 @@ const WATCHDOG_STALE_SECS: u64 = 10;
 pub mod model;
 
 pub use model::{
-    Adjacency, BondLeg, Bonding, Class, Condition, GuardDrops, Headline, HomeCarrier, Ingress,
-    LegKind, LegPort, MemberInfo, Reach, State, StatusModel, WorkloadState, WorkloadStatus,
+    Adjacency, BondLeg, Bonding, Class, Condition, DefaultPath, DefaultReason, GuardDrops,
+    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, State,
+    StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -230,6 +231,12 @@ fn gather_with(
         ));
     }
     let conditions = c.conditions();
+    // Read before the model takes ownership of `components`.
+    let host_default = if applied {
+        Some(read_host_default(sys, view, components.as_ref())?)
+    } else {
+        None
+    };
     Ok(StatusModel {
         member: MemberInfo {
             name: view.member.name.clone(),
@@ -246,6 +253,56 @@ fn gather_with(
         components,
         prefs: view.prefs(),
         run_dir: f.run_dir.clone(),
+        // Nothing applied means no cfab default to describe: the host's own routing is its own
+        // business and cfab has not touched it.
+        host_default,
+    })
+}
+
+/// Which default route this member's own traffic takes right now (spec §6): table 250 if cfab's
+/// is in force, else the floor in main, with the reason it is not the fabric one.
+///
+/// Two `ip route show table …` reads and the prober rows already in the `components` document —
+/// no new argv prefix, and no second opinion about reachability: `default_wanted` is the same
+/// function the supervisor's reconcile decides with.
+fn read_host_default(
+    sys: &mut dyn Sys,
+    view: &View,
+    comps: Option<&Components>,
+) -> Result<HostDefault> {
+    let ours = crate::commands::common::host_default(view);
+    if let Some(hd) = &ours
+        && hd.present(sys)?
+    {
+        return Ok(HostDefault {
+            path: DefaultPath::Fabric {
+                via: hd.via.clone(),
+                dev: hd.dev.clone(),
+            },
+            reason: None,
+        });
+    }
+    let reason = match &ours {
+        None => DefaultReason::NoGwZone,
+        Some(_) => {
+            let ingress = comps.map(|c| c.ingress.as_slice()).unwrap_or_default();
+            if crate::commands::fwd_watchdog::default_wanted(ingress, view) {
+                DefaultReason::Withdrawn
+            } else {
+                DefaultReason::RouterUnreachable
+            }
+        }
+    };
+    let path = match crate::commands::common::floor_default(sys)? {
+        Some(floor) => DefaultPath::Floor {
+            via: floor.via,
+            dev: floor.dev,
+        },
+        None => DefaultPath::None,
+    };
+    Ok(HostDefault {
+        path,
+        reason: Some(reason),
     })
 }
 
@@ -375,10 +432,10 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
     // a `down` row are the conditions above, not repeated here.
     for w in &m.workloads {
         let word = if w.up { "up" } else { "down" };
-        let uplinks = if w.uplinks.is_empty() {
+        let uplinks = if w.uplink_ports.is_empty() {
             "-".to_string()
         } else {
-            w.uplinks.join(", ")
+            w.uplink_ports.join(", ")
         };
         // `Some("")` (the announcer entry exists but its trigger has not been set yet) reads
         // the same as `None` here — one dash, not an empty word in the middle of the line.
@@ -386,11 +443,15 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
             Some(t) if !t.is_empty() => t,
             _ => "-",
         };
+        // The declaration's own words first (`uplink` + `vid`), then the leg cfab derives from
+        // them in parentheses: an operator reading this line is looking for what they wrote.
         let mut line = format!(
-            "  workload {}: {} {} gw {} {word}, advertised to {}, uplink {uplinks}, announce \
-             trigger {trigger}",
+            "  workload {}: {} vid {} ({}) {} gw {} {word}, advertised to {}, uplink {uplinks}, \
+             announce trigger {trigger}",
             w.name,
-            w.ifname,
+            w.uplink,
+            w.vid,
+            w.leg,
             w.address,
             w.gw,
             w.zones.join(", ")
@@ -401,7 +462,17 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         if let Some(n) = w.vms_seen {
             let _ = write!(line, ", {n} vms seen");
         }
+        // Same rule, one spelling for every N: the stray-forward drop's counter (ruling 6).
+        // Nothing appended when the forward chain carries no such rule (`None`).
+        if let Some(n) = w.stray_forwards {
+            let _ = write!(line, ", {n} stray forwards");
+        }
         let _ = writeln!(out, "{line}");
+    }
+    // Which default this member's own traffic takes (spec §6), and why it is not the fabric one
+    // when it is not. Absent on a member with no fabric applied.
+    if let Some(d) = &m.host_default {
+        let _ = writeln!(out, "  default: {}", d.render());
     }
     // The one always-printed line (spec §9): last, so the reasons read as a block above it.
     if with_components {
@@ -944,7 +1015,7 @@ fn posture(
             let loaded = sys
                 .read(&format!("{}/policy.nft", f.run_dir))
                 .unwrap_or_default();
-            if want_policy != loaded {
+            if drifted(&want_policy, &loaded) {
                 // Standing: a mismatch against generated state, repaired by `up` alone.
                 c.standing("policy drift — re-run cfab up");
             }
@@ -952,7 +1023,7 @@ fn posture(
             let applied = sys
                 .read(&format!("{}/policy.applied", f.run_dir))
                 .unwrap_or_default();
-            if !live.ok() || live.stdout != applied {
+            if !live.ok() || drifted(&live.stdout, &applied) {
                 c.standing("ruleset drift — re-run cfab up");
             }
             let chain = sys
@@ -1740,30 +1811,56 @@ fn workload_posture(
         None
     };
     let bridge_ok = bridge.as_ref().is_some_and(|b| b.ok());
+    // The forward chain, for the stray-forward counters (spec §5.2, ruling 6). Read here and
+    // not carried over from `posture`: this gather runs on members `posture` never reached the
+    // forward block for (a leaf has no `[[workload]]` row, but a host whose nft is missing
+    // does), and one extra bounded read is cheaper than an ordering dependency between two
+    // gather steps that would silently report `None` if they were ever reordered.
+    let fwd_chain = if bridge.is_some() {
+        sys.run(&["nft", "list", "chain", "inet", "cfab-fwd", "forward"])?
+            .stdout
+    } else {
+        String::new()
+    };
 
     for row in rows {
         let wl = row.wl;
         let name = wl.name.as_str();
+        let leg = wl.leg_ifname();
         let gw_cidr = wl.gw_cidr();
 
         if deferred.contains(name) {
-            c.settling(format!(
-                "workload {name}: deferred (uplink not forwarding yet; the watchdog installs it \
-                 once it is)"
-            ));
+            // Two deferral causes, two spellings: an absent bridge is the operator's to create
+            // (or to rename back), and naming it is the whole point of the line; anything else
+            // is the uplink's own readiness, which clears on its own.
+            if crate::workload::uplink::bridge_present(&*sys, &wl.uplink) {
+                c.settling(format!(
+                    "workload {name}: deferred (uplink not forwarding yet; the watchdog installs \
+                     it once it is)"
+                ));
+            } else {
+                c.settling(format!(
+                    "workload {name}: waiting for bridge {} (the watchdog installs the leg when \
+                     it appears)",
+                    wl.uplink
+                ));
+            }
             c.workload(WorkloadStatus {
                 name: name.to_string(),
-                ifname: wl.ifname.clone(),
+                uplink: wl.uplink.clone(),
+                vid: wl.vid,
+                leg: leg.clone(),
                 address: row.address.clone(),
                 gw: gw_cidr,
                 up: WorkloadState::Deferred.is_up(),
                 state: WorkloadState::Deferred,
                 zones: wl.allow.clone(),
-                uplinks: Vec::new(),
+                uplink_ports: Vec::new(),
                 trigger: None,
                 vms_seen: None,
                 guard_drops: None,
                 bytes: None,
+                stray_forwards: None,
             });
             continue;
         }
@@ -1774,35 +1871,31 @@ fn workload_posture(
         // apart so precedence (`Broken` over `AnnouncerNotStarted`) is a fact of the code, not
         // an accident of evaluation order.
         let mut broken = false;
-        let link = sys.run(&["ip", "-br", "link", "show", "dev", &wl.ifname])?;
+        let link = sys.run(&["ip", "-br", "link", "show", "dev", &leg])?;
         let mut uplinks = Vec::new();
         if !link.ok() {
-            // Standing: `ifname` is baseline-owned (cfab never creates or deletes it), so its
-            // disappearance is an external fact the fabric itself never clears.
-            c.standing(format!(
-                "workload {name}: interface {} does not exist",
-                wl.ifname
+            // Settling: cfab creates this leg, and the forwarding watchdog rebuilds it on the
+            // next tick — the message says who fixes it rather than leaving an operator to.
+            c.settling(format!(
+                "workload {name}: leg {leg} does not exist (the watchdog rebuilds it)"
             ));
             broken = true;
         } else {
             let addr = sys
-                .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
+                .run(&["ip", "-4", "-br", "addr", "show", "dev", &leg])?
                 .stdout;
             if !has_ip_addr(&addr, &row.address) {
                 c.settling(format!(
-                    "workload {name}: address {} missing on {}",
-                    row.address, wl.ifname
+                    "workload {name}: address {} missing on {leg}",
+                    row.address
                 ));
                 broken = true;
             }
             if !has_ip_addr(&addr, &gw_cidr) {
-                c.settling(format!(
-                    "workload {name}: gw {gw_cidr} missing on {}",
-                    wl.ifname
-                ));
+                c.settling(format!("workload {name}: gw {gw_cidr} missing on {leg}"));
                 broken = true;
             }
-            match crate::workload::uplink::identify(&*sys, &wl.ifname) {
+            match crate::workload::uplink::identify_declared(&*sys, &wl.uplink, wl.vid) {
                 Ok(u) => uplinks = u.ports,
                 Err(e) => {
                     c.standing(format!("workload {name}: {e}"));
@@ -1868,46 +1961,36 @@ fn workload_posture(
             } else {
                 None
             };
-        let bytes = sysfs_bytes(sys, &wl.ifname);
+        let bytes = sysfs_bytes(sys, &leg);
         let vms_seen = if up {
-            let mut exclude = workload_member_addresses(view.fabric, name);
-            exclude.push(wl.gw);
-            exclude.push(wl.router);
-            neighbors_seen(sys, &wl.ifname, &wl.prefix, &exclude)
+            local_vms_seen(sys, view, wl, &uplinks)
         } else {
             None
         };
+        // Summed over every rule carrying the comment: the drop is emitted once per allowed
+        // zone and they share it, so reading only the first would under-report a row allowed
+        // into two zones.
+        let stray_forwards = counter_packets_sum(&fwd_chain, &format!("stray-{name}"));
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
-            ifname: wl.ifname.clone(),
+            uplink: wl.uplink.clone(),
+            vid: wl.vid,
+            leg: leg.clone(),
             address: row.address.clone(),
             gw: gw_cidr,
             up,
             state,
             zones: wl.allow.clone(),
-            uplinks,
+            uplink_ports: uplinks,
             trigger,
             vms_seen,
             guard_drops,
             bytes,
+            stray_forwards,
         });
     }
     Ok(())
-}
-
-/// Every declared member's address on workload `name`, across the whole fabric (not just this
-/// member — `View::workload_rows` is this-member-only). The exclusion set for `vms_seen`: without
-/// it a peer's own resolution of the gateway counts as a VM (a 3-host testbed would read 1 with
-/// zero VMs).
-fn workload_member_addresses(fabric: &Fabric, name: &str) -> Vec<std::net::Ipv4Addr> {
-    fabric
-        .members
-        .iter()
-        .flat_map(|m| m.workloads.iter())
-        .filter(|mw| mw.name == name)
-        .map(|mw| mw.address)
-        .collect()
 }
 
 /// `/sys/class/net/<ifname>/statistics/{rx,tx}_bytes`, as `(rx, tx)`; `None` if either read or
@@ -1922,49 +2005,48 @@ fn sysfs_bytes(sys: &dyn Sys, ifname: &str) -> Option<(u64, u64)> {
     Some((rx.trim().parse().ok()?, tx.trim().parse().ok()?))
 }
 
-/// One neighbor read on `ifname` (`ip -j neigh show dev`, JSON), counting IPv4 entries inside
-/// `prefix` whose state is REACHABLE/STALE/DELAY/PROBE/PERMANENT (RULED, gate M1 review I1,
-/// research commit 0e9bced: a static neighbor is a resolved host too) and whose address is not
-/// in `exclude` (every declared member's address on this workload, `gw`, `router`). NOARP,
-/// FAILED and INCOMPLETE never carry a resolved lladdr and do not count. Out-of-prefix entries
-/// are excluded by the `prefix.contains` check, not a separate list. `None` on a read or parse
-/// failure — this is observability, never a health condition.
-fn neighbors_seen(
+/// How many VMs this member currently knows on `wl`'s leg — the SAME derivation that decides
+/// which /32s it originates (`workload::hostroutes::local_vms`, conflict 12), so the number an
+/// operator reads and the routes the fabric carries can never disagree. Two reads: the leg's
+/// neighbors and the uplink bridge's FDB.
+///
+/// `None` when either read fails or does not parse — observability, never a health condition.
+/// Whether two renderings of the forward policy differ in anything `cfab up` would repair.
+/// The elements of each `<leg>-local` set are excluded: the reconcile moves them as VMs come
+/// and go, so counting them would report every host with a live VM as drifted forever.
+fn drifted(want: &str, have: &str) -> bool {
+    emit::policy::without_local_elements(want) != emit::policy::without_local_elements(have)
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::drifted;
+
+    /// A VM appearing on a leg fills the row's local set at runtime. `up` does not put it
+    /// there and re-running `up` would not repair it, so it must never be reported as drift —
+    /// before this, `nft -s list table` carried the element and the `up`-time baseline did
+    /// not, and every host with one live VM stood at "ruleset drift" forever.
+    #[test]
+    fn a_live_vm_in_a_local_set_is_never_drift_but_everything_else_is() {
+        let base = "\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t}\n\t\
+                    chain forward {\n\t\tct state invalid counter\n\t}\n";
+        let with_vm = "\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t\t\
+                       elements = { 192.168.20.103 }\n\t}\n\t\
+                       chain forward {\n\t\tct state invalid counter\n\t}\n";
+        assert!(!drifted(base, with_vm));
+        assert!(drifted(base, &base.replace("ct state invalid counter", "")));
+    }
+}
+
+fn local_vms_seen(
     sys: &mut dyn Sys,
-    ifname: &str,
-    prefix: &Ipv4Prefix,
-    exclude: &[std::net::Ipv4Addr],
+    view: &View,
+    wl: &crate::model::Workload,
+    uplink_ports: &[String],
 ) -> Option<u32> {
-    let out = sys
-        .run(&["ip", "-j", "neigh", "show", "dev", ifname])
-        .ok()?;
-    if !out.ok() {
-        return None;
-    }
-    let doc: Value = serde_json::from_str(&out.stdout).ok()?;
-    let entries = doc.as_array()?;
-    let mut count = 0u32;
-    for e in entries {
-        let Some(dst) = e["dst"]
-            .as_str()
-            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
-        else {
-            continue;
-        };
-        if !prefix.contains(dst) || exclude.contains(&dst) {
-            continue;
-        }
-        let resolved = e["state"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.as_str())
-            .any(|s| matches!(s, "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT"));
-        if resolved {
-            count += 1;
-        }
-    }
-    Some(count)
+    let _ = uplink_ports; // the join reads the uplink's ports itself, from the same sysfs
+    let vms = crate::workload::hostroutes::read_local_vms(sys, view, wl)?;
+    u32::try_from(vms.len()).ok()
 }
 
 /// `counter_packets`, restricted to the rule(s) on one uplink port: the bridge guard emits one
@@ -2339,6 +2421,23 @@ fn counter_packets(chain: &str, comment: &str) -> Option<u64> {
     words.get(i + 2)?.parse().ok()
 }
 
+/// `counter_packets`, summed over EVERY rule carrying `comment` rather than the first one.
+/// The stray-forward drop is emitted once per allowed zone, all carrying one comment, so the
+/// honest reading of "how many packets did this row's drop take" is their sum. `None` when no
+/// rule carries the comment at all — absent and zero are different facts.
+fn counter_packets_sum(chain: &str, comment: &str) -> Option<u64> {
+    let mut total = None;
+    for line in chain
+        .lines()
+        .filter(|l| l.contains(&format!("comment \"{comment}\"")))
+    {
+        if let Some(n) = counter_packets(line, comment) {
+            total = Some(total.unwrap_or(0) + n);
+        }
+    }
+    total
+}
+
 /// Every argv `status` is allowed to run, and the one socket request. This list is the
 /// invariant's teeth: `MockSys` records writes, mkdirs, removes, renames and spawns in
 /// `calls` too, so anything that is not on it fails the test by name. Shared with the
@@ -2352,6 +2451,10 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip -4 -br addr show dev ",
         "ip -br link show dev ",
         "ip -j neigh show dev ",
+        // The FDB half of the local-VM join (conflict 12). The `-j` is part of the prefix on
+        // purpose: `bridge` is otherwise a write tool (`fdb del`, `vlan add`), so the
+        // allowlist names the one document `status` reads and nothing else.
+        "bridge -j fdb show br ",
         "nft list ",
         "nft -s list ",
         "nft -j list ",
@@ -2694,6 +2797,10 @@ mod tests {
             // default) — reading it would fail, and status must never read it on a leaf
             .on_fail(&["ip", "route", "show", "table", "249"], 2,
                 "Error: ipv4: FIB table does not exist.")
+            // No gw zone means no table 250 to read, but the host's own floor default is
+            // still there and `status` names it.
+            .on_stdout(&["ip", "route", "show", "table", "main", "default"],
+                "default via 192.168.10.1 dev primary onlink\n")
     }
 
     /// Every expected BFD session, up.
@@ -2773,7 +2880,7 @@ mod tests {
             .workload_rows()
             .into_iter()
             .map(|r| {
-                serde_json::json!({"name": r.wl.name, "ifname": r.wl.ifname,
+                serde_json::json!({"name": r.wl.name, "ifname": r.wl.leg_ifname(),
                     "trigger": "neigh events", "announces": 12, "bursts": 1})
             })
             .collect();
@@ -2980,7 +3087,13 @@ mod tests {
         .on_stdout(&["ip", "rule", "show", "pref", "2002"],
             "2002: from 10.99.0.0/16 unreachable\n2002: from 10.199.0.0/16 unreachable\n2002: from 10.249.0.0/16 unreachable\n")
         .on_stdout(&["ip", "route", "show", "table", "249"],
-            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n");
+            "default via 10.249.3.1 dev cfab-mg proto ospf metric 20\n")
+        // The additive host default (spec §6) in force: cfab's own route in table 250, with
+        // the floor still sitting in main under it.
+        .on_stdout(&["ip", "route", "show", "table", "250", "default"],
+            "default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 proto cfab-default\n")
+        .on_stdout(&["ip", "route", "show", "table", "main", "default"],
+            "default via 192.168.10.1 dev primary onlink\n");
         shaped(sys, view)
     }
 
@@ -3270,7 +3383,7 @@ mod tests {
             .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
-    /// The example fabric plus one `[[workload]]` row (`vms` on `primary.3`, allowed into
+    /// The example fabric plus one `[[workload]]` row (`vms` on `cfab-work-vms`, allowed into
     /// `storage`), carried by pve1-tb and pve2-tb; pve3-tb (a leaf) carries none, but still
     /// needs the sibling rule and the route-get proof (spec §5.1 item 5, R4).
     fn wl_fabric() -> Fabric {
@@ -3295,21 +3408,16 @@ mod tests {
     fn wl_status_sys(f: &Fabric, view: &View) -> MockSys {
         let identity = identity_of(f, view);
         healthy_host(f, view)
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "primary.3"],
-                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             )
             .on_stdout(
                 &["nft", "list", "table", "bridge", "cfab"],
@@ -3322,8 +3430,34 @@ mod tests {
             )
             .on_stdout(
                 &["ip", "route", "get", "192.168.20.1", "from", &identity],
-                "192.168.20.1 from 10.99.0.1 dev primary.3 uid 0\n    cache\n",
+                "192.168.20.1 from 10.99.0.1 dev cfab-work-vms uid 0\n    cache\n",
             )
+            // The forward chain with the row's stray-forward drop in it, so the counter has
+            // somewhere to be read from; a test that means "no such rule" overrides it.
+            .on_stdout(
+                &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+                "chain forward {\n  type filter hook forward priority filter; policy drop;\n                     iifname @admin counter packets 0 bytes 0 drop comment \"admin-in\"\n                     oifname @admin counter packets 0 bytes 0 drop comment \"admin-out\"\n                     iifname @storage oifname \"cfab-work-vms\" ip daddr != @cfab-work-vms-local                  counter packets 7 bytes 588 drop comment \"stray-vms\"\n                     counter packets 0 bytes 0 comment \"default-deny\"\n}",
+            )
+            // Every neighbor in the fixtures below resolves to a MAC on the VM tap: the FDB
+            // join is what makes them local, so a test that means "a VM is here" must say it
+            // here too (conflict 12 — `vms_seen` and the /32 set are one derivation).
+            .on_stdout(
+                &["bridge", "-j", "fdb", "show", "br", "primary"],
+                &fdb_on_tap(&[
+                    "00:00:00:00:00:02",
+                    "00:00:00:00:00:50",
+                    "00:00:00:00:00:51",
+                ]),
+            )
+    }
+
+    /// A `bridge -j fdb show br primary` document putting every MAC on the VM tap.
+    fn fdb_on_tap(macs: &[&str]) -> String {
+        let entries: Vec<serde_json::Value> = macs
+            .iter()
+            .map(|m| serde_json::json!({"mac": m, "ifname": "tap100i0", "master": "primary"}))
+            .collect();
+        serde_json::Value::Array(entries).to_string()
     }
 
     /// A healthy workload row renders one line, exactly the spec's example plus the trigger, and
@@ -3341,8 +3475,9 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
-                 to storage, uplink eth0, announce trigger neigh events\n"
+                "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
+                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
+                 neigh events, 7 stray forwards\n"
             ),
             "{text}"
         );
@@ -3369,11 +3504,11 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:50", "state": ["REACHABLE"]},
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3382,8 +3517,9 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
-                 to storage, uplink eth0, announce trigger neigh events, 1 vms seen\n"
+                "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
+                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
+                 neigh events, 1 vms seen, 7 stray forwards\n"
             ),
             "{text}"
         );
@@ -3396,7 +3532,7 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([]).to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3404,7 +3540,7 @@ mod tests {
         assert_eq!(m.workloads[0].vms_seen, Some(0));
         let text = render_text(&m, false, true).output;
         assert!(
-            text.contains("announce trigger neigh events, 0 vms seen\n"),
+            text.contains("announce trigger neigh events, 0 vms seen, 7 stray forwards\n"),
             "{text}"
         );
     }
@@ -3418,8 +3554,8 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.2/2400 192.168.20.254/2400\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.2/2400 192.168.20.254/2400\n",
         );
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
@@ -3467,7 +3603,7 @@ mod tests {
         let blank_trigger = components_doc(
             true,
             serde_json::json!([
-                {"name": "vms", "ifname": "primary.3", "trigger": "", "announces": 0, "bursts": 0}
+                {"name": "vms", "ifname": "cfab-work-vms", "trigger": "", "announces": 0, "bursts": 0}
             ]),
         );
         let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &blank_trigger);
@@ -3476,7 +3612,10 @@ mod tests {
         assert_eq!(m.workloads[0].trigger.as_deref(), Some(""));
         assert!(m.workloads[0].up, "an empty trigger is not itself a fault");
         let text = render_text(&m, false, true).output;
-        assert!(text.contains("announce trigger -\n"), "{text}");
+        assert!(
+            text.contains("announce trigger -, 7 stray forwards\n"),
+            "{text}"
+        );
     }
 
     /// Each workload fault earns exactly one reason line and takes the row down — never more
@@ -3490,19 +3629,19 @@ mod tests {
         let cases: Vec<(MockSys, String, Class)> = vec![
             (
                 wl_status_sys(&f, &view).on_fail(
-                    &["ip", "-br", "link", "show", "dev", "primary.3"],
+                    &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
                     1,
-                    "Device \"primary.3\" does not exist.",
+                    "Device \"cfab-work-vms\" does not exist.",
                 ),
-                "workload vms: interface primary.3 does not exist".into(),
-                Class::Standing,
+                "workload vms: leg cfab-work-vms does not exist (the watchdog rebuilds it)".into(),
+                Class::Settling,
             ),
             (
                 wl_status_sys(&f, &view).on_stdout(
-                    &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                    "primary.3 UP 192.168.20.2/24\n",
+                    &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                    "cfab-work-vms UP 192.168.20.2/24\n",
                 ),
-                "workload vms: gw 192.168.20.254/24 missing on primary.3".into(),
+                "workload vms: gw 192.168.20.254/24 missing on cfab-work-vms".into(),
                 Class::Settling,
             ),
             (
@@ -3573,15 +3712,15 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.254/24\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.254/24\n",
         );
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(
             m.conditions
                 .iter()
-                .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
+                .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on cfab-work-vms")
         );
         assert!(!m.workloads[0].up);
         assert_eq!(m.workloads[0].state, WorkloadState::Broken);
@@ -3652,6 +3791,33 @@ mod tests {
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(!m.workloads[0].up);
         assert_eq!(m.workloads[0].state, WorkloadState::Broken);
+    }
+
+    /// A row deferred because its declared bridge is not on the host yet says exactly that, and
+    /// says it once (spec §5.1, James's availability ruling): the bridge is the operator's, and
+    /// "uplink not forwarding yet" would name the wrong thing to go look at.
+    #[test]
+    fn a_row_deferred_for_a_missing_bridge_names_the_bridge() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            wl_status_sys(&f, &view).file(&format!("{}/workload-deferred", f.run_dir), "vms\n");
+        sys.files.remove("/sys/class/net/primary/brif/eth0/state");
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].state, WorkloadState::Deferred);
+        let lines: Vec<&Condition> = m
+            .conditions
+            .iter()
+            .filter(|c| c.text.starts_with("workload vms:"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0].text,
+            "workload vms: waiting for bridge primary (the watchdog installs the leg when it \
+             appears)"
+        );
+        assert_eq!(lines[0].class, Class::Settling);
     }
 
     /// A row named in `workload-deferred` (ruling 2026-09-09) reports one line — neither healthy
@@ -3766,7 +3932,7 @@ mod tests {
         assert!(
             !render_text(&m, false, true)
                 .output
-                .contains("  workload vms: primary.3 ")
+                .contains("  workload vms: cfab-work-vms ")
         );
     }
 
@@ -3788,19 +3954,19 @@ mod tests {
 
     /// The uplink's own failure text (`workload::uplink::identify`) is reported verbatim, never
     /// reworded here — one spelling shared with `apply` and the watchdog. Same MockSys shape the
-    /// watchdog's own test for this fault uses: the lower link torn out from under a running
-    /// bridge (`an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer`
-    /// in `src/supervisor/workload.rs`).
+    /// watchdog's own test for this fault uses: the bridge's only off-host port loses the
+    /// `device` link that made it one (`an_uplink_that_cannot_be_identified_journals_the_reason
+    /// _and_starts_no_announcer` in `src/supervisor/workload.rs`).
     #[test]
     fn an_unidentifiable_uplink_reports_its_own_message() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view);
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
-        let want = "workload vms: workload interface primary.3 is not a VLAN sub-interface of a \
-                    bridge (no lower link in /sys/class/net/primary.3)";
+        let want = "workload vms: bridge primary has no uplink port (no port has a \
+                    /sys/class/net/<port>/device, directly or through lower links); ports: eth0";
         let hit = m
             .conditions
             .iter()
@@ -3930,6 +4096,7 @@ mod tests {
              prefs storage: eth9 eth1 eth0 (derived)\n  \
              prefs cluster: eth1 eth9 eth0 (derived)\n  \
              prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             default: via fabric gw 192.168.249.254 (cfab-gw249)\n  \
              components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
              (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
         );
@@ -4021,6 +4188,7 @@ mod tests {
              prefs storage: eth9 eth1 eth0 (derived)\n  \
              prefs cluster: eth1 eth9 eth0 (derived)\n  \
              prefs mgmt: eth0 eth9 eth1 (derived)\n  \
+             default: via fabric gw 192.168.249.254 (cfab-gw249)\n  \
              components: engine running 1h00m (0 restarts) | shape-daemon running 1h00m \
              (0 restarts) | conf-sync stopped (not clustered) | watchdog ok 2s ago\n"
         );
@@ -4360,148 +4528,42 @@ table bridge cfab {
         );
     }
 
-    /// Every declared member's address on the workload, across the whole fabric — not just this
-    /// member's own row.
-    #[test]
-    fn workload_member_addresses_covers_every_member_not_just_this_one() {
-        let f = wl_fabric();
-        let mut addrs = workload_member_addresses(&f, "vms");
-        addrs.sort();
-        assert_eq!(
-            addrs,
-            vec![
-                "192.168.20.2".parse::<std::net::Ipv4Addr>().unwrap(),
-                "192.168.20.3".parse().unwrap(),
-            ]
-        );
-        assert!(workload_member_addresses(&f, "no-such-workload").is_empty());
-    }
-
     /// `sysfs_bytes`: both reads must succeed and parse, or the row gets `None` — never a
     /// partial pair.
     #[test]
     fn sysfs_bytes_is_none_unless_both_counters_read_and_parse() {
         let sys = MockSys::default()
-            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1000\n")
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
-        assert_eq!(sysfs_bytes(&sys, "primary.3"), Some((1000, 2000)));
+            .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1000\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&sys, "cfab-work-vms"), Some((1000, 2000)));
         // tx missing entirely.
-        let half = MockSys::default().file("/sys/class/net/primary.3/statistics/rx_bytes", "1\n");
-        assert_eq!(sysfs_bytes(&half, "primary.3"), None);
+        let half =
+            MockSys::default().file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1\n");
+        assert_eq!(sysfs_bytes(&half, "cfab-work-vms"), None);
         // Present but unparseable.
         let garbage = MockSys::default()
             .file(
-                "/sys/class/net/primary.3/statistics/rx_bytes",
+                "/sys/class/net/cfab-work-vms/statistics/rx_bytes",
                 "not-a-number\n",
             )
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
-        assert_eq!(sysfs_bytes(&garbage, "primary.3"), None);
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&garbage, "cfab-work-vms"), None);
     }
 
-    /// `neighbors_seen`: excludes every member address, `gw` and `router`, excludes
-    /// out-of-prefix entries via `prefix.contains` alone, and only counts a resolved state
-    /// (never `FAILED`/`INCOMPLETE`). Fixture: one VM, two peer members, the router, and one
-    /// out-of-prefix entry → 1.
+    /// A healthy row carries every observability field, read from the fixture: the guard sum
+    /// over the row's one uplink port, the sysfs byte counters, `vms_seen` from the
+    /// neighbor/FDB join (one VM; this member's own address, the gw and the router are all
+    /// excluded by `workload::hostroutes::local_vms`, the same derivation the /32 set uses),
+    /// and the stray-forward counter off the forward chain.
     #[test]
-    fn neighbors_seen_excludes_members_gw_router_and_out_of_prefix() {
-        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
-        let exclude: Vec<std::net::Ipv4Addr> = vec![
-            "192.168.20.2".parse().unwrap(),   // this member
-            "192.168.20.3".parse().unwrap(),   // a peer member
-            "192.168.20.1".parse().unwrap(),   // router
-            "192.168.20.254".parse().unwrap(), // gw
-        ];
-        let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.2", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.3", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
-            {"dst": "192.168.20.1", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.254", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:06", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.50", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
-            {"dst": "192.168.21.5", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
-        ])
-        .to_string();
-        let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
-            &neigh_json,
-        );
-        assert_eq!(
-            neighbors_seen(&mut sys, "primary.3", &prefix, &exclude),
-            Some(1)
-        );
-    }
-
-    /// A state that never resolved anything (`FAILED`, `INCOMPLETE`) is not counted.
-    #[test]
-    fn neighbors_seen_does_not_count_an_unresolved_entry() {
-        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
-        let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["FAILED"]},
-            {"dst": "192.168.20.51", "dev": "primary.3", "state": ["INCOMPLETE"]},
-            // NOARP never carries a resolved lladdr either (RULED, gate M1 review I1): a
-            // no-ARP interface entry, not a host that answered.
-            {"dst": "192.168.20.52", "dev": "primary.3", "state": ["NOARP"]},
-        ])
-        .to_string();
-        let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
-            &neigh_json,
-        );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(0));
-    }
-
-    /// A `PERMANENT` (statically pinned) neighbor counts (RULED, gate M1 review I1, research
-    /// commit 0e9bced): a static neighbor is a resolved host, and a statically-pinned VM must
-    /// not read as absent.
-    #[test]
-    fn neighbors_seen_counts_a_permanent_entry() {
-        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
-        let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["PERMANENT"]},
-        ])
-        .to_string();
-        let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
-            &neigh_json,
-        );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(1));
-    }
-
-    /// A read or parse failure is `None`, never a fault and never a fabricated zero.
-    #[test]
-    fn neighbors_seen_is_none_on_a_read_failure() {
-        let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
-        let mut sys = MockSys::default().on_fail(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
-            1,
-            "Device \"primary.3\" does not exist.",
-        );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), None);
-
-        let mut garbled =
-            MockSys::default().on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], "{");
-        assert_eq!(
-            neighbors_seen(&mut garbled, "primary.3", &prefix, &[]),
-            None
-        );
-    }
-
-    /// A healthy row carries all three new fields, read from the fixture: the guard sum over the
-    /// row's one uplink port, the sysfs byte counters, and `vms_seen` from the neighbor read
-    /// (one VM, this member's own address, the gw and the router — all three of the latter
-    /// excluded by `workload_posture` itself, not a hand-built slice — leaving 1). This is the
-    /// end-to-end proof that `exclude.push(wl.gw)` / `exclude.push(wl.router)` in
-    /// `workload_posture` do something: deleting either push turns this red (`vms_seen` would go
-    /// to `Some(2)`), which `neighbors_seen_excludes_members_gw_router_and_out_of_prefix` alone
-    /// cannot show since it hands `neighbors_seen` a hand-built `exclude` slice.
-    #[test]
-    fn a_healthy_row_carries_guard_drops_bytes_and_vms_seen_from_the_fixture() {
+    fn a_healthy_row_carries_guard_drops_bytes_vms_seen_and_stray_forwards() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.2", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.254", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.1", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.2", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:02", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:51", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.1", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:51", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:50", "state": ["REACHABLE"]},
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view)
@@ -4513,10 +4575,10 @@ table bridge cfab {
                  daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \
                  \"gw-request-from-uplink\"\n    }\n}\n",
             )
-            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1234\n")
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "5678\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1234\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "5678\n")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
                 &neigh_json,
             );
         let expected = expected_links(&view).unwrap();
@@ -4532,6 +4594,51 @@ table bridge cfab {
         );
         assert_eq!(row.bytes, Some((1234, 5678)));
         assert_eq!(row.vms_seen, Some(1));
+        assert_eq!(
+            row.stray_forwards,
+            Some(7),
+            "the stray-vms counter off the forward chain"
+        );
+    }
+
+    /// The teeth for the FDB half of the join, end to end: move the VM's MAC onto the uplink
+    /// (it lives on a peer host) and `status` must stop counting it — the same fact that stops
+    /// this member originating its /32.
+    #[test]
+    fn a_vm_whose_mac_is_on_the_uplink_is_not_counted_here() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let neigh_json = serde_json::json!([
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "lladdr": "00:00:00:00:00:50", "state": ["REACHABLE"]},
+        ])
+        .to_string();
+        let mut sys = wl_status_sys(&f, &view)
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &neigh_json,
+            )
+            .on_stdout(
+                &["bridge", "-j", "fdb", "show", "br", "primary"],
+                r#"[{"mac":"00:00:00:00:00:50","ifname":"eth0","master":"primary"}]"#,
+            );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].vms_seen, Some(0));
+    }
+
+    /// The stray counter is `None`, never 0, when the chain does not carry the rule: an absent
+    /// rule and a rule that has dropped nothing are different facts.
+    #[test]
+    fn stray_forwards_is_none_when_the_forward_chain_has_no_such_rule() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_status_sys(&f, &view).on_stdout(
+            &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
+            "chain forward {\n  type filter hook forward priority filter; policy drop;\n}\n",
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].stray_forwards, None);
     }
 
     /// A row that is not up never takes the neighbor read at all (never takes it and discards
@@ -4589,8 +4696,16 @@ table bridge cfab {
     /// write) is still refused.
     #[test]
     fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
-        assert!(is_read_only("ip -j neigh show dev primary.3"));
-        assert!(!is_read_only("ip neigh flush dev primary.3"));
+        assert!(is_read_only("ip -j neigh show dev cfab-work-vms"));
+        assert!(!is_read_only("ip neigh flush dev cfab-work-vms"));
+        // The FDB half of the same join (conflict 12) is a read; every other `bridge` verb is
+        // a write and stays refused.
+        assert!(is_read_only("bridge -j fdb show br primary"));
+        assert!(!is_read_only(
+            "bridge fdb del 02:cf:ab:00:00:01 dev tap100i0"
+        ));
+        assert!(!is_read_only("bridge fdb show br primary"));
+        assert!(!is_read_only("bridge vlan add dev primary vid 3 self"));
     }
 
     /// Spec §12 (b), the reporting half. A host whose forward policy is gone has failed closed:
@@ -4637,7 +4752,8 @@ table bridge cfab {
             "UP (2/2 | 18/18 | 6/6) on pve3-tb (leaf)\n  mark: nft\n\
              \x20 prefs storage: eth9 eth1 eth0 (derived)\n\
              \x20 prefs cluster: eth1 eth9 eth0 (derived)\n\
-             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n  components: engine running 1h00m \
+             \x20 prefs mgmt: eth0 eth9 eth1 (derived)\n\
+             \x20 default: via floor 192.168.10.1 (primary), no gw zone\n  components: engine running 1h00m \
              (0 restarts) | shape-daemon stopped (host only) | conf-sync stopped (not clustered) \
              | watchdog ok 2s ago\n",
             "{}",
@@ -4836,8 +4952,16 @@ table bridge cfab {
         let mut sys = healthy_leaf(&view);
         let report = run(&mut sys, &view, 0, false, None).unwrap();
         assert_eq!(report.state, State::Up, "output:\n{}", report.output);
+        // The `default:` line says "no gw zone" on a leaf, which is the opposite of reporting
+        // a gw return path — every other line is what this guards.
+        let lines: String = report
+            .output
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("default:"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !report.output.contains("gw ") && !report.output.contains("table 249"),
+            !lines.contains("gw ") && !lines.contains("table 249"),
             "a leaf must not report the gw return path: {}",
             report.output
         );
@@ -7492,5 +7616,138 @@ table bridge cfab {
             )],
             "the record of a daemon that is not running is not an expectation"
         );
+    }
+
+    /// Spec §6: the additive host default in force is the one line an operator reads to know
+    /// which way this member's own traffic leaves.
+    #[test]
+    fn the_host_default_line_names_the_fabric_gateway_when_table_250_carries_it() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view);
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via fabric gw 192.168.249.254 (cfab-gw249)\n"),
+            "{}",
+            report.output
+        );
+        let mut sys = healthy_host(&f, &view);
+        let m = gather(
+            &mut sys,
+            &view,
+            &expected_links(&view).unwrap(),
+            &Ctx::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            m.host_default.as_ref().map(|h| h.path.clone()),
+            Some(DefaultPath::Fabric {
+                via: "192.168.249.254".to_string(),
+                dev: GW_BOND.to_string(),
+            })
+        );
+        assert!(m.host_default.unwrap().reason.is_none());
+    }
+
+    /// The prober says no wire of the ingress leg reaches the router, so the reconcile has
+    /// withdrawn the route on purpose: the line names the floor that is carrying traffic AND
+    /// the reason, which is the half that tells an operator where to look.
+    #[test]
+    fn a_withdrawn_default_over_a_dark_router_names_the_floor_and_the_router() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_with_ingress(&view, &["eth9", "eth1", "eth0"]),
+            );
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), router unreachable\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Table 250 empty while the router is answering is not a deliberate withdrawal: nothing
+    /// installed it (yet). The word is `withdrawn` either way, but the path is still the floor.
+    #[test]
+    fn an_empty_table_250_with_a_live_router_reads_withdrawn() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), withdrawn\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// A member with no gw zone has no fabric default to offer and never reads table 250: the
+    /// reason says so rather than reading as a fault.
+    #[test]
+    fn a_member_with_no_gw_zone_says_no_gw_zone_and_never_reads_table_250() {
+        let f = fabric();
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = healthy_leaf(&leaf);
+        let report = run(&mut sys, &leaf, 0, false, None).unwrap();
+        assert!(
+            report
+                .output
+                .contains("  default: via floor 192.168.10.1 (primary), no gw zone\n"),
+            "{}",
+            report.output
+        );
+        assert!(
+            !sys.ran("ip route show table 250 default"),
+            "a member with no gw zone has no table 250 to read"
+        );
+    }
+
+    /// No default route anywhere — cfab's withdrawn and the host's own gone too. `none` is a
+    /// fact worth printing: this member currently reaches nothing off its declared subnets.
+    #[test]
+    fn no_default_route_at_all_reads_none() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = healthy_host(&f, &view)
+            .on_stdout(&["ip", "route", "show", "table", "250", "default"], "")
+            .on_stdout(&["ip", "route", "show", "table", "main", "default"], "");
+        let report = run(&mut sys, &view, 0, false, None).unwrap();
+        assert!(
+            report.output.contains("  default: none, withdrawn\n"),
+            "{}",
+            report.output
+        );
+    }
+
+    /// Nothing applied means cfab has not touched this host's routing: no line, and no read of
+    /// either table — the host's own default is its own business.
+    #[test]
+    fn an_unapplied_member_has_no_host_default_and_reads_neither_table() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        let m = gather(
+            &mut sys,
+            &view,
+            &expected_links(&view).unwrap(),
+            &Ctx::default(),
+        )
+        .unwrap();
+        assert!(m.host_default.is_none());
+        let report = render_text(&m, false, false);
+        assert!(!report.output.contains("default:"), "{}", report.output);
+        assert!(!sys.ran("ip route show table 250 default"));
+        assert!(!sys.ran("ip route show table main default"));
     }
 }

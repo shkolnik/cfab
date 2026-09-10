@@ -1,14 +1,50 @@
 //! `cfab check`: validate the declaration and report the fabric as declared, what THIS member
 //! gets, and (with `[[workload]]` rows) each row and the fabric aggregate.
 
+use std::collections::BTreeSet;
+
 use crate::derive::View;
+use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
+use crate::sys::Sys;
+use crate::workload::uplink;
+
+/// Host facts a `[[workload]]` row needs that the declaration cannot state, read where the
+/// member actually runs: `check` calls it before it prints, and `apply`'s pass 1 calls it
+/// again, so the refusal has one spelling and an operator meets it before `up` touches a
+/// netdev.
+///
+/// The one condition today is the uplink bridge's `vlan_filtering`: cfab's leg only receives
+/// its tag while the bridge carries that vid on itself (`bridge vlan ... self`), which a bridge
+/// that is not vlan-aware has no notion of — the leg would come up and silently see nothing.
+/// A bridge that is not there at all is NOT a refusal: that row defers (spec 5.1), on this host
+/// and at `up` alike. A present bridge whose `vlan_filtering` cannot be read is refused with the
+/// rest: cfab cannot prove the leg would work, and this is the gate that exists to say so.
+pub fn host_preflight(sys: &dyn Sys, view: &View) -> Result<()> {
+    for row in view.workload_rows() {
+        let bridge = &row.wl.uplink;
+        if !uplink::bridge_present(sys, bridge) {
+            continue;
+        }
+        let path = format!("/sys/class/net/{bridge}/bridge/vlan_filtering");
+        let vlan_aware = sys.read(&path).is_ok_and(|v| v.trim() == "1");
+        if !vlan_aware {
+            return Err(Error::fatal(format!(
+                "workload {}: bridge {bridge} is not vlan-aware (bridge-vlan-aware yes in \
+                 /etc/network/interfaces)",
+                row.wl.name
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The lines `cfab check` prints. The per-member line is the last thing an operator sees before
 /// `up` creates the netdevs, so it names every leg `up` will build — the fallback legs included:
 /// their ports fan out per wire, so their count is member-dependent and not derivable from the
-/// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, ifname,
-/// prefix, gw, router, allow, and the members that carry it), then the fabric aggregate — the
+/// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, uplink,
+/// vid, the leg cfab creates, prefix, gw, router, allow, and the members that carry it), then
+/// the fabric aggregate — the
 /// smallest set of prefixes covering every declared zone block — followed by one RFC 3442
 /// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw`, `router`,
 /// and the row's own `prefix` differ per row): each snippet is a comment naming the EXISTING
@@ -50,14 +86,43 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
-                "workload {}: {} {} gw {} router {} allow {}; carried by {}\n",
+                "workload {}: {} vid {} ({}) {} gw {} router {} allow {}; carried by {}\n",
                 wl.name,
-                wl.ifname,
+                wl.uplink,
+                wl.vid,
+                wl.leg_ifname(),
                 wl.prefix,
                 wl.gw,
                 wl.router,
                 wl.allow.join(", "),
                 carried_by
+            ));
+        }
+        // Conflict 11 (holo `b01dab56`): the `redistribution` entry cfab writes on a zone's
+        // OSPF instance subscribes to ALL static routes in the RIB, not to the ones belonging
+        // to the row that zone allows. With one row that is moot; with two whose `allow` sets
+        // differ, each zone advertises both rows' /32s. Said once, naming the rows, because an
+        // operator would otherwise read `allow` as a route filter — it is a forward-policy
+        // filter, which is what actually decides reach.
+        // As SETS, not as declared: `allow` names zones, so ["storage", "mgmt"] and
+        // ["mgmt", "storage"] are one policy and must not read as a conflict.
+        let allow_sets: BTreeSet<BTreeSet<&str>> = fabric
+            .workloads
+            .iter()
+            .map(|w| w.allow.iter().map(String::as_str).collect())
+            .collect();
+        if allow_sets.len() > 1 {
+            out.push_str(&format!(
+                "warning: workload rows {} declare different allow sets; every allowed zone's \
+                 OSPF instance advertises the per-VM routes of ALL rows (holo redistributes \
+                 static routes per instance, not per route) — reach is decided by the forward \
+                 policy, not by which routes exist\n",
+                fabric
+                    .workloads
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         let aggregate = fabric.aggregate();
@@ -83,6 +148,7 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
 mod tests {
     use super::*;
     use crate::decl::Declaration;
+    use crate::sys::mock::MockSys;
 
     fn wl_fabric() -> Fabric {
         Fabric::from_decl(
@@ -94,6 +160,92 @@ mod tests {
         .unwrap()
     }
 
+    /// A vlan-aware bridge, its `vlan_filtering` off, and no bridge at all.
+    fn bridge_sys(vlan_filtering: Option<&str>) -> MockSys {
+        let mut sys = MockSys::default().file("/sys/class/net/primary/brif/eth0/state", "3\n");
+        if let Some(v) = vlan_filtering {
+            sys = sys.file("/sys/class/net/primary/bridge/vlan_filtering", v);
+        }
+        sys
+    }
+
+    #[test]
+    fn host_preflight_refuses_an_uplink_bridge_that_is_not_vlan_aware() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let want = "FATAL: workload vms: bridge primary is not vlan-aware (bridge-vlan-aware \
+                    yes in /etc/network/interfaces)";
+        assert_eq!(
+            host_preflight(&bridge_sys(Some("0\n")), &view)
+                .unwrap_err()
+                .to_string(),
+            want
+        );
+        // Present but unreadable: cfab cannot prove the leg would receive its tag, and this is
+        // the gate that exists to say so — same condition, same words.
+        assert_eq!(
+            host_preflight(&bridge_sys(None), &view)
+                .unwrap_err()
+                .to_string(),
+            want
+        );
+        host_preflight(&bridge_sys(Some("1\n")), &view).expect("vlan-aware passes");
+    }
+
+    /// An uplink that is not there yet defers (spec 5.1) — `check` on a host whose bridge is
+    /// still coming up, or on any other machine, must not refuse the declaration for it.
+    #[test]
+    fn host_preflight_passes_when_the_uplink_bridge_is_absent() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        host_preflight(&MockSys::default(), &view).expect("an absent bridge is a deferral");
+        // ...and a member with no workload row reads nothing at all.
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        host_preflight(&MockSys::default(), &leaf).expect("no rows, no host facts");
+    }
+
+    /// Conflict 11: holo's `redistribution` list is per-INSTANCE, not per-route, so an entry
+    /// for `ietf-routing:static` on a zone's OSPF instance advertises every static route cfab
+    /// installs — including the /32s of a workload row that zone is not in the `allow` list of.
+    /// `check` says so once, naming the rows, rather than letting an operator read the `allow`
+    /// lists as route filters.
+    #[test]
+    fn check_warns_when_two_workload_rows_declare_different_allow_sets() {
+        let two = format!(
+            "{}\n[[workload]]\nname = \"dmz\"\nuplink = \"primary\"\nvid = 4\n\
+             prefix = \"192.168.21.0/24\"\ngw = \"192.168.21.254\"\n\
+             router = \"192.168.21.1\"\nallow = [\"storage\", \"mgmt\"]\n",
+            crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
+                 { name = \"dmz\", address = \"192.168.21.2/24\" }]",
+            )
+        );
+        let f = Fabric::from_decl(&Declaration::parse(&two).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let want = "warning: workload rows vms, dmz declare different allow sets; every allowed \
+                    zone's OSPF instance advertises the per-VM routes of ALL rows (holo \
+                    redistributes static routes per instance, not per route) — reach is decided \
+                    by the forward policy, not by which routes exist\n";
+        assert!(report(&f, &view).contains(want), "{}", report(&f, &view));
+        // One row, or two that agree: nothing to warn about, and the line is absent.
+        let one = wl_fabric();
+        assert!(!report(&one, &View::new(&one, "pve1-tb").unwrap()).contains("warning:"));
+        let agree = two.replace("allow = [\"storage\", \"mgmt\"]", "allow = [\"storage\"]");
+        let f2 = Fabric::from_decl(&Declaration::parse(&agree).unwrap()).unwrap();
+        assert!(!report(&f2, &View::new(&f2, "pve1-tb").unwrap()).contains("warning:"));
+        // ...and the same two zones in the other order is the SAME set: `allow` is a set of
+        // zones, so declaration order must not decide whether an operator is warned.
+        // vms becomes ["mgmt", "storage"] beside dmz's ["storage", "mgmt"]: one set, two orders.
+        let reordered = two.replace("allow = [\"storage\"]", "allow = [\"mgmt\", \"storage\"]");
+        let f3 = Fabric::from_decl(&Declaration::parse(&reordered).unwrap()).unwrap();
+        assert!(
+            !report(&f3, &View::new(&f3, "pve1-tb").unwrap()).contains("warning:"),
+            "{}",
+            report(&f3, &View::new(&f3, "pve1-tb").unwrap())
+        );
+    }
+
     #[test]
     fn report_lists_workloads_and_the_aggregate() {
         let f = wl_fabric();
@@ -103,7 +255,8 @@ mod tests {
             "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n\
-             workload vms: primary.3 192.168.20.0/24 gw 192.168.20.254 router 192.168.20.1 \
+             workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 \
+             router 192.168.20.1 \
              allow storage; carried by pve1-tb, pve2-tb\n\
              fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, \
              10.249.0.0/16\n\

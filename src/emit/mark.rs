@@ -221,7 +221,7 @@ pub fn generate(view: &View) -> Result<String> {
                     .join(",");
                 out.push_str(&format!(
                     "    iifname \"{}\" oifname {{ {ifs} }} ip dscp set {} comment \"dscp-{}-{}\"\n",
-                    row.wl.ifname, z.dscp, row.wl.name, zname
+                    row.wl.leg_ifname(), z.dscp, row.wl.name, zname
                 ));
             }
         }
@@ -268,7 +268,7 @@ mod tests {
         );
         assert!(
             fwd.contains(
-                "iifname \"primary.3\" oifname { \"cfab-st\",\"cfab-st-bk\",\"cfab-st-b2\",\"cfab-st-fb\" } \
+                "iifname \"cfab-work-vms\" oifname { \"cfab-st\",\"cfab-st-bk\",\"cfab-st-b2\",\"cfab-st-fb\" } \
                  ip dscp set cs0 comment \"dscp-vms-storage\""
             ),
             "{fwd}"
@@ -356,7 +356,7 @@ mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
         );
         let text = format!(
-            "{text}\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\n\
+            "{text}\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\n\
              prefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\n\
              allow = [\"storage\", \"otherz\"]\n"
         );
@@ -375,7 +375,7 @@ mod tests {
         assert!(!t.contains("otherz"), "{t}");
         assert!(
             t.contains(
-                "iifname \"primary.3\" oifname { \"cfab-st\" } ip dscp set cs0 \
+                "iifname \"cfab-work-vms\" oifname { \"cfab-st\" } ip dscp set cs0 \
                  comment \"dscp-vms-storage\""
             ),
             "the reachable zone still gets its rule: {t}"

@@ -6,16 +6,21 @@ pub mod northbound;
 pub mod sock;
 pub mod state;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use holo_utils::bfd::BfdSocketPolicy;
 use holo_utils::bgp::BgpListenPolicy;
 use holo_utils::southbound::FibPolicy;
+use ipnetwork::Ipv4Network;
+use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{info, warn};
 
 use crate::derive::View;
-use crate::emit::engine::{PROTO_BASE, TransitCost, generate, generate_at, prefsrc_rules};
+use crate::emit::engine::{
+    PROTO_BASE, TransitCost, WorkloadRoutes, generate, generate_with, prefsrc_rules,
+};
 use crate::error::{Error, Result};
 use crate::model::Fabric;
 
@@ -115,6 +120,222 @@ fn bgp_listen_policy(_fabric: &Fabric) -> BgpListenPolicy {
     BgpListenPolicy::NoListener
 }
 
+/// Which half of a request that takes two commits a tree is. Only an ifindex move has a
+/// `Withdraw` in front of it (see `apply`); every other request is one `Install`. It exists
+/// for the journal: both commits of a move carry the same `request=` summary, so without this
+/// the record of a move is two identical lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Withdraw,
+    Install,
+}
+
+impl Step {
+    /// One spelling per step, everywhere.
+    fn as_str(self) -> &'static str {
+        match self {
+            Step::Withdraw => "withdraw",
+            Step::Install => "install",
+        }
+    }
+}
+
+/// Everything a re-commit rebuilds the configuration tree from, so that no request can undo
+/// another's effect: before this, `transit-cost` regenerated from the `View` alone and would
+/// have withdrawn every workload route as a side effect of a forward-policy flap.
+///
+/// No lock, and none needed: `serve()` handles ONE event at a time — it awaits `serve_one`
+/// to completion before the next `accept()` — so two requests are never in flight against
+/// this at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineState {
+    /// What this member's transit links are advertised at (spec §12 (b)).
+    transit: TransitCost,
+    /// Per workload leg: the leg's ifindex as the driver last reported it, and the host
+    /// routes this member wants to originate out of it.
+    routes: BTreeMap<String, (u32, BTreeSet<Ipv4Network>)>,
+}
+
+impl EngineState {
+    /// What `run` committed before the socket was ever bound.
+    fn new() -> Self {
+        EngineState {
+            transit: TransitCost::Declared,
+            routes: BTreeMap::new(),
+        }
+    }
+
+    /// The routes as the generator wants them: the ifindex is a change detector, never
+    /// configuration.
+    fn wanted(&self) -> WorkloadRoutes {
+        self.routes
+            .iter()
+            .map(|(leg, (_, cidrs))| (leg.clone(), cidrs.clone()))
+            .collect()
+    }
+
+    /// Every tree `req` must commit, IN ORDER, each with its label and THE STATE THAT STEP
+    /// LEAVES BEHIND — per step, not per request, so the caller can adopt each state the
+    /// moment that step is in force and never claim more than the engine has (`commit_steps`).
+    /// Pure: the ordering is the whole point (see the ifindex comment below), and it is tested
+    /// without a live engine. Every tree is generated before any is committed, so a request
+    /// the generator refuses leaves the caller's state untouched.
+    fn apply(&self, view: &View, req: &sock::Request) -> Result<Vec<(Step, Value, EngineState)>> {
+        let mut steps: Vec<(Step, EngineState)> = Vec::new();
+        match req {
+            sock::Request::State => {}
+            sock::Request::TransitCost(at) => {
+                let mut next = self.clone();
+                next.transit = *at;
+                steps.push((Step::Install, next));
+            }
+            sock::Request::WorkloadRoutes {
+                leg,
+                ifindex,
+                cidrs,
+            } => {
+                // holo resolves a static route's outgoing interface to an ifindex ONCE, at
+                // commit (`holo-routing`'s `static_nexthop_get`), and an ibus interface
+                // update never re-resolves it. A leg the watchdog rebuilt therefore keeps
+                // its routes pointing at the dead ifindex, and re-sending the same set is a
+                // diff of nothing. So a leg whose ifindex moved withdraws first, in its own
+                // commit, and installs the wanted set in a second — nothing else needs two.
+                let moved = !cidrs.is_empty()
+                    && self
+                        .routes
+                        .get(leg)
+                        .is_some_and(|(had, had_cidrs)| had != ifindex && !had_cidrs.is_empty());
+                if moved {
+                    let mut withdraw = self.clone();
+                    withdraw
+                        .routes
+                        .insert(leg.clone(), (*ifindex, BTreeSet::new()));
+                    steps.push((Step::Withdraw, withdraw));
+                }
+                let mut next = steps.last().map_or(self, |(_, s)| s).clone();
+                next.routes.insert(leg.clone(), (*ifindex, cidrs.clone()));
+                steps.push((Step::Install, next));
+            }
+        }
+        steps
+            .into_iter()
+            .map(|(step, s)| {
+                let tree = generate_with(view, s.transit, &s.wanted())?;
+                Ok((step, tree, s))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl EngineState {
+    /// `apply` reduced to what a test about tree ORDER or CONTENT reads: the trees in order,
+    /// and the state after the last step. The per-step states `apply` really returns are what
+    /// `commit_steps` needs, and they have their own tests.
+    fn apply_trees(&self, view: &View, req: &sock::Request) -> Result<(Vec<Value>, EngineState)> {
+        let steps = self.apply(view, req)?;
+        let last = steps
+            .last()
+            .map_or_else(|| self.clone(), |(_, _, s)| s.clone());
+        Ok((steps.into_iter().map(|(_, t, _)| t).collect(), last))
+    }
+}
+
+/// Commit `steps` in order, adopting each step's state as soon as that step is in force.
+///
+/// `state` must never run ahead of the engine. An ifindex move is two commits, and if the
+/// withdraw lands and the install then fails — a refused candidate, a provider error — holo
+/// holds no routes for that leg while the caller's state would, before this, still have
+/// claimed the wanted set. The next identical request would then diff to nothing and the leg
+/// would stay withdrawn until something else moved it.
+///
+/// Taking the commit as a closure is what lets a test fail a chosen step without a live holo;
+/// `commit` passes the real one.
+async fn commit_steps<E>(
+    state: &mut EngineState,
+    req: &sock::Request,
+    steps: Vec<(Step, Value, EngineState)>,
+    mut commit_one: E,
+) -> std::result::Result<(), CommitFailure>
+where
+    E: AsyncFnMut(Value) -> Result<bool>,
+{
+    let mut withdrew = false;
+    for (step, tree, next) in steps {
+        // Only a step that actually moved something is worth a log line, or the record of the
+        // change drowns in the record of no change. A step that changed nothing is still in
+        // force, so the state advances either way.
+        match commit_one(tree).await {
+            Ok(moved) => {
+                if moved {
+                    info!(
+                        request = %req.summary(),
+                        step = step.as_str(),
+                        "engine configuration re-committed"
+                    );
+                }
+            }
+            Err(err) => return Err(CommitFailure { withdrew, err }),
+        }
+        *state = next;
+        withdrew |= step == Step::Withdraw;
+    }
+    Ok(())
+}
+
+/// A commit that failed, and what it left behind. `withdrew` is true when an earlier step of
+/// the SAME request already landed — for an ifindex move that is the withdraw, so holo now
+/// holds no routes for the leg at all. A driver told only "refused" would report those routes
+/// unchanged, which is the one failure here that actually costs a VM its reach.
+#[derive(Debug)]
+struct CommitFailure {
+    withdrew: bool,
+    err: Error,
+}
+
+/// The reply to a `workload-routes` request. A refusal whose withdraw already landed is an
+/// `error` reply that also says `withdrew`, so the driver can name what it cost; every other
+/// refusal is the ordinary error the socket renders from `Err`.
+fn workload_routes_reply(
+    leg: &str,
+    routes: usize,
+    outcome: std::result::Result<(), CommitFailure>,
+) -> Result<Value> {
+    match outcome {
+        Ok(()) => Ok(serde_json::json!({
+            "workload_routes": { "leg": leg, "routes": routes }
+        })),
+        Err(f) if f.withdrew => Ok(serde_json::json!({
+            "error": f.err.to_string(),
+            "withdrew": true,
+        })),
+        Err(f) => Err(f.err),
+    }
+}
+
+/// Commit what `req` asks for, in order, and adopt the state it leaves behind.
+/// `Northbound::commit` diffs against running, so re-asking for what is already in force is
+/// free — every driver of this socket re-asserts on a tick rather than keeping a state file
+/// that could disagree with the engine. VERIFIED on the container fixture 2026-09-05: a
+/// cost-only diff re-originates the Router-LSA (+30000 on every transit link) in 2.8 ms with
+/// no carrier change and no adjacency or BFD session drop.
+async fn commit(
+    nb: &mut northbound::Northbound,
+    view: &View<'_>,
+    state: &mut EngineState,
+    req: &sock::Request,
+) -> std::result::Result<(), CommitFailure> {
+    let steps = state.apply(view, req).map_err(|err| CommitFailure {
+        withdrew: false,
+        err,
+    })?;
+    commit_steps(state, req, steps, async |tree| {
+        let candidate = northbound::parse_candidate(&tree)?;
+        nb.commit(candidate).await
+    })
+    .await
+}
+
 /// Commit, publish readiness (the socket), answer state requests until a signal.
 async fn serve(
     nb: &mut northbound::Northbound,
@@ -136,6 +357,9 @@ async fn serve(
     // whole run is already proven by the `engine.lock` flock held before `serve` was called;
     // `bind`'s own `refuse_if_live` is only the stale-socket-path re-check.
     let listener = sock::bind(sock_path)?;
+
+    // What every re-commit regenerates from. It starts at exactly what `run` committed above.
+    let mut state = EngineState::new();
 
     // One event at a time, handled AFTER the select: `transit-cost` needs `&mut nb`, which
     // it cannot take while the select's other arms hold borrows of it.
@@ -168,7 +392,8 @@ async fn serve(
                 return Ok(());
             }
             Ev::Accepted(stream) => {
-                sock::serve_one(stream, async |req| match req {
+                let state = &mut state;
+                sock::serve_one(stream, async |req| match &req {
                     sock::Request::State => {
                         // A provider that stops answering Get must not wedge the engine
                         // (this loop also handles SIGTERM): bounded, logged by serve_one.
@@ -182,35 +407,21 @@ async fn serve(
                         Ok(state::document(true, cfg, &[tree]))
                     }
                     sock::Request::TransitCost(at) => {
-                        set_transit_cost(nb, view, at).await?;
+                        let at = *at;
+                        // One step, always: there is nothing a failure here can have left
+                        // behind, so it is the ordinary error reply.
+                        commit(nb, view, state, &req).await.map_err(|f| f.err)?;
                         Ok(serde_json::json!({ "transit_cost": at.word() }))
+                    }
+                    sock::Request::WorkloadRoutes { leg, cidrs, .. } => {
+                        let outcome = commit(nb, view, state, &req).await;
+                        workload_routes_reply(leg, cidrs.len(), outcome)
                     }
                 })
                 .await;
             }
         }
     }
-}
-
-/// Re-advertise this member's transit links at `at` (spec §12 (b)): regenerate the tree with
-/// the new costs and re-commit it. `Northbound::commit` diffs against running, so re-asking
-/// for the cost already in force is free — the watchdog re-asserts on every tick rather than
-/// keeping a state file that could disagree with the engine. VERIFIED on the container fixture
-/// 2026-09-05: a cost-only diff re-originates the Router-LSA (+30000 on every transit link)
-/// in 2.8 ms with no carrier change and no adjacency or BFD session drop.
-async fn set_transit_cost(
-    nb: &mut northbound::Northbound,
-    view: &View<'_>,
-    at: TransitCost,
-) -> Result<()> {
-    let tree = generate_at(view, at)?;
-    let candidate = northbound::parse_candidate(&tree)?;
-    // The watchdog re-asserts on every tick; only a tick that actually moved the cost is
-    // worth a log line, or the record of the change drowns in the record of no change.
-    if nb.commit(candidate).await? {
-        info!(?at, "transit cost re-committed");
-    }
-    Ok(())
 }
 
 /// Remove the socket file. Safe unconditionally: the caller still holds the `engine.lock`
@@ -264,6 +475,368 @@ fn control_priority(fabric: &Fabric) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wl_fabric() -> Fabric {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fabric.toml"))
+                .unwrap();
+        let text = crate::decl::fixtures::with_workload(&text);
+        Fabric::from_decl(&crate::decl::Declaration::parse(&text).unwrap()).unwrap()
+    }
+
+    fn routes_req(leg: &str, ifindex: u32, cidrs: &[&str]) -> sock::Request {
+        sock::Request::WorkloadRoutes {
+            leg: leg.to_string(),
+            ifindex,
+            cidrs: cidrs.iter().map(|c| c.parse().unwrap()).collect(),
+        }
+    }
+
+    /// Is the `cfab` `ietf-routing:static` instance in this tree at all? Its presence is what
+    /// makes a withdrawal a per-route delete in holo's diff rather than an instance delete.
+    fn has_static_instance(t: &serde_json::Value) -> bool {
+        t["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["type"] == "ietf-routing:static" && p["name"] == "cfab")
+    }
+
+    /// Every static destination in a committed tree, in emitted order.
+    fn static_routes(t: &serde_json::Value) -> Vec<String> {
+        t["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["type"] == "ietf-routing:static")
+            .flat_map(|p| {
+                p["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["destination-prefix"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The OSPF cost of the storage zone's first segment in a committed tree.
+    fn seg_cost(t: &serde_json::Value) -> u64 {
+        t["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "storage" && p["type"] == "ietf-ospf:ospfv2")
+            .unwrap()["ietf-ospf:ospf"]["areas"]["area"][0]["interfaces"]["interface"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "cfab-st")
+            .unwrap()["cost"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// The engine regenerates from BOTH inputs, so a `transit-cost` re-commit keeps the
+    /// routes: before this, `set_transit_cost` regenerated from the `View` alone and a
+    /// forward-policy flap would have withdrawn every VM route as a side effect.
+    #[test]
+    fn a_transit_cost_recommit_keeps_the_workload_routes() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let (_, state) = EngineState::new()
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+            .unwrap();
+        let (trees, state) = state
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(static_routes(&trees[0]), ["192.168.20.103/32"]);
+        assert_eq!(state.transit, TransitCost::LeafOffset);
+    }
+
+    /// ...and the other way round: a `workload-routes` request keeps the leaf offset in
+    /// force, so a host that failed its forward policy closed does not silently become a
+    /// preferred transit again the moment one of its VMs answers an ARP.
+    #[test]
+    fn a_workload_routes_request_keeps_the_leaf_offset_cost() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let declared = seg_cost(&generate(&v).unwrap());
+        let (trees, _) = EngineState::new()
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .unwrap();
+        let offset = seg_cost(&trees[0]);
+        assert_eq!(offset, declared + u64::from(f.leaf_cost_offset));
+
+        let (_, state) = EngineState::new()
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .unwrap();
+        let (trees, state) = state
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+            .unwrap();
+        assert_eq!(seg_cost(trees.last().unwrap()), offset);
+        assert_eq!(static_routes(trees.last().unwrap()), ["192.168.20.103/32"]);
+        assert_eq!(state.transit, TransitCost::LeafOffset);
+    }
+
+    /// Plan conflict 2: holo resolves a static route's outgoing interface to an ifindex ONCE,
+    /// at commit, and an ibus interface update never re-resolves it. A leg the watchdog
+    /// rebuilt has a new ifindex, and re-sending the same set would diff to nothing and leave
+    /// every route pointing at the dead one. So a moved ifindex commits the empty set FIRST
+    /// and the wanted set second — and the order is what makes it work. The first tree keeps
+    /// the `cfab` static instance and empties its route list, so holo's diff of it is a
+    /// per-route delete (which uninstalls) and not an instance delete (which does not).
+    #[test]
+    fn an_ifindex_change_deletes_per_route_before_it_installs_the_wanted_set() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let (trees, state) = EngineState::new()
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+            .unwrap();
+        assert_eq!(trees.len(), 1, "the first sighting is one commit");
+
+        let (trees, state) = state
+            .apply_trees(&v, &routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]))
+            .unwrap();
+        assert_eq!(trees.len(), 2);
+        assert!(static_routes(&trees[0]).is_empty(), "{:?}", trees[0]);
+        assert!(
+            has_static_instance(&trees[0]),
+            "the withdraw tree deleted the instance; holo would leave the route installed"
+        );
+        assert_eq!(static_routes(&trees[1]), ["192.168.20.103/32"]);
+        assert_eq!(state.routes["cfab-work-vms"].0, 43);
+    }
+
+    /// Everything else is one commit: an unchanged ifindex, and a withdrawal (which needs no
+    /// re-resolution — there is nothing left to point anywhere).
+    #[test]
+    fn an_unchanged_ifindex_and_a_withdrawal_are_one_commit_each() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let (_, state) = EngineState::new()
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+            .unwrap();
+
+        let (trees, _) = state
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.104/32"]))
+            .unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(static_routes(&trees[0]), ["192.168.20.104/32"]);
+
+        let (trees, withdrawn) = state
+            .apply_trees(&v, &routes_req("cfab-work-vms", 43, &[]))
+            .unwrap();
+        assert_eq!(trees.len(), 1);
+        assert!(static_routes(&trees[0]).is_empty());
+        assert!(withdrawn.wanted()["cfab-work-vms"].is_empty());
+    }
+
+    /// A request the generator refuses leaves the state exactly as it was: a typo in one
+    /// request must not poison every later one, and must not withdraw a live VM's route.
+    #[test]
+    fn a_refused_request_changes_no_state() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let (_, state) = EngineState::new()
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+            .unwrap();
+        // Both spellings of the typo: an install on an unknown leg, and a WITHDRAWAL on one.
+        // The withdrawal refuses in the same words, before any tree is generated, and — like
+        // the install — leaves no entry for the unknown leg behind in the state.
+        for cidrs in [&["192.168.20.104/32"][..], &[][..]] {
+            let e = state
+                .apply_trees(&v, &routes_req("cfab-work-nope", 9, cidrs))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no workload interface cfab-work-nope on this member"),
+                "{cidrs:?}: {e}"
+            );
+            assert!(!state.routes.contains_key("cfab-work-nope"), "{cidrs:?}");
+        }
+        let (trees, _) = state
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::Declared))
+            .unwrap();
+        assert_eq!(static_routes(&trees[0]), ["192.168.20.103/32"]);
+    }
+
+    /// `state` commits nothing.
+    #[test]
+    fn a_state_request_commits_nothing() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let before = EngineState::new();
+        let (trees, after) = before.apply_trees(&v, &sock::Request::State).unwrap();
+        assert!(trees.is_empty());
+        assert_eq!(after, before);
+    }
+
+    /// The tracked state must equal what the engine ACTUALLY has in force, step by step.
+    /// Before this, `commit` adopted the whole request's end state only after every tree had
+    /// landed — so an ifindex move whose withdraw committed and whose install then failed
+    /// (`parse_candidate`, or the provider) left the state claiming the wanted routes while
+    /// holo held none. The next identical request would diff to nothing and the leg would
+    /// stay withdrawn until something else moved.
+    #[tokio::test]
+    async fn a_second_commit_that_fails_leaves_the_state_at_the_first() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(true))
+            .await
+            .unwrap();
+        assert_eq!(state.routes["cfab-work-vms"].0, 42);
+
+        // The ifindex moved: withdraw, then install. Fail the install.
+        let req = routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        assert_eq!(steps.len(), 2);
+        let mut n = 0;
+        let e = commit_steps(&mut state, &req, steps, async |_| {
+            n += 1;
+            if n == 2 {
+                Err(Error::fatal("the provider refused the install"))
+            } else {
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap_err()
+        .err
+        .to_string();
+
+        assert!(e.contains("the provider refused the install"), "{e}");
+        assert_eq!(
+            state.routes["cfab-work-vms"],
+            (43, BTreeSet::new()),
+            "the tracked state ran ahead of what the engine committed"
+        );
+    }
+
+    /// The reply must say when the withdraw of a two-step move landed and the install did not:
+    /// the routes are GONE, and a driver told only "refused" reports them unchanged. Every
+    /// other failure stays an ordinary error reply.
+    #[tokio::test]
+    async fn the_reply_says_when_a_landed_withdraw_preceded_a_refused_install() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(true))
+            .await
+            .unwrap();
+
+        let req = routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        let mut n = 0;
+        let failure = commit_steps(&mut state, &req, steps, async |_| {
+            n += 1;
+            if n == 2 {
+                Err(Error::fatal("the provider refused the install"))
+            } else {
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(failure.withdrew);
+        let reply = workload_routes_reply("cfab-work-vms", 1, Err(failure)).unwrap();
+        assert_eq!(reply["withdrew"], serde_json::json!(true));
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("the provider refused the install"),
+            "{reply}"
+        );
+
+        // A failure with nothing behind it is an ordinary error reply, not a withdrawal.
+        let plain = CommitFailure {
+            withdrew: false,
+            err: Error::fatal("no such leg"),
+        };
+        assert!(workload_routes_reply("cfab-work-vms", 1, Err(plain)).is_err());
+        // ...and success carries the summary it always did.
+        let ok = workload_routes_reply("cfab-work-vms", 2, Ok(())).unwrap();
+        assert_eq!(ok["workload_routes"]["routes"], serde_json::json!(2));
+    }
+
+    /// A step whose commit changed nothing is still in force: the state advances on every
+    /// step that did not fail, not only on the ones holo had a diff for.
+    #[tokio::test]
+    async fn a_step_that_changed_nothing_still_advances_the_state() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(false))
+            .await
+            .unwrap();
+        assert_eq!(state.wanted()["cfab-work-vms"].len(), 1);
+    }
+
+    /// The two commits of an ifindex move are one journal line each and must be told apart:
+    /// they carry the same `request=` summary, so the step is what distinguishes them. One
+    /// spelling for each, and every single-commit request is an `install`.
+    #[test]
+    fn every_step_is_labeled_and_an_ifindex_move_is_withdraw_then_install() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let labels = |steps: &[(Step, serde_json::Value, EngineState)]| {
+            steps.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>()
+        };
+
+        let (state, one) = {
+            let s = EngineState::new();
+            let steps = s
+                .apply(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
+                .unwrap();
+            (steps.last().unwrap().2.clone(), labels(&steps))
+        };
+        assert_eq!(one, ["install"]);
+
+        let moved = state
+            .apply(&v, &routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]))
+            .unwrap();
+        assert_eq!(labels(&moved), ["withdraw", "install"]);
+
+        let withdrawn = state
+            .apply(&v, &routes_req("cfab-work-vms", 42, &[]))
+            .unwrap();
+        assert_eq!(labels(&withdrawn), ["install"]);
+
+        let cost = state
+            .apply(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .unwrap();
+        assert_eq!(labels(&cost), ["install"]);
+    }
+
+    /// The journal line for a request never carries the whole route set.
+    #[test]
+    fn a_request_summary_is_one_short_line() {
+        assert_eq!(sock::Request::State.summary(), "state");
+        assert_eq!(
+            sock::Request::TransitCost(TransitCost::LeafOffset).summary(),
+            "transit-cost leaf"
+        );
+        assert_eq!(
+            routes_req(
+                "cfab-work-vms",
+                42,
+                &["192.168.20.103/32", "192.168.20.104/32"]
+            )
+            .summary(),
+            "workload-routes cfab-work-vms 42 (2 routes)"
+        );
+    }
 
     #[test]
     fn cleanup_removes_the_socket_file() {

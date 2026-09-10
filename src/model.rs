@@ -372,12 +372,21 @@ impl fmt::Display for Ipv4Prefix {
     }
 }
 
+/// The usable bytes of a netdev name (IFNAMSIZ 16, less the NUL).
+const IFNAME_MAX: usize = 15;
+
+/// Every workload leg's name starts with this; the row name fills what is left.
+const LEG_PREFIX: &str = "cfab-work-";
+
 /// One `[[workload]]` row, typed (spec §4): a VM workload VLAN, its anycast gateway, and the
 /// zones it may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workload {
     pub name: String,
-    pub ifname: String,
+    /// The vlan-aware bridge the VMs attach to. Host-provided; cfab adds only its own leg.
+    pub uplink: String,
+    /// The 802.1Q tag the VMs use on `uplink`.
+    pub vid: u16,
     pub prefix: Ipv4Prefix,
     /// The anycast gateway every host answers (bare address; the prefix's mask applies).
     pub gw: Ipv4Addr,
@@ -390,9 +399,38 @@ pub struct Workload {
 }
 
 impl Workload {
+    /// The leg cfab creates for this row: `cfab-work-<name>` on `uplink`, tagged `vid`
+    /// (ruling 1). Derived, never declared — one row, one leg, one name everywhere.
+    ///
+    /// IFNAMSIZ is 16 with the NUL, so a netdev name has 15 usable bytes and the kernel
+    /// refuses a longer one outright; `cfab-work-` takes 10, leaving 5 for the row name. The
+    /// cut lands on a char boundary (a name is arbitrary UTF-8 as far as TOML is concerned),
+    /// and `Fabric::validate` refuses two rows whose names cut to one leg.
+    pub fn leg_ifname(&self) -> String {
+        let room = IFNAME_MAX - LEG_PREFIX.len();
+        let cut = self
+            .name
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|end| *end <= room)
+            .last()
+            .unwrap_or(0);
+        format!("{LEG_PREFIX}{}", &self.name[..cut])
+    }
+
     /// `gw` with the prefix's mask, e.g. `192.168.20.254/24`.
     pub fn gw_cidr(&self) -> String {
         format!("{}/{}", self.gw, self.prefix.len)
+    }
+
+    /// The nft set of the VMs this member currently knows on this row's leg (spec §5.2,
+    /// ruling 6), named off the leg: `cfab-work-vms-local`. Derived in one place because two
+    /// unrelated pieces of code must agree on it exactly — `emit::policy` declares the set and
+    /// writes the drop rule that reads it, and `workload::hostroutes` fills it at runtime — and
+    /// a typo in either would silently mean "no VM is local" (every fabric packet for a VM
+    /// dropped) or "the rule matches nothing".
+    pub fn local_set(&self) -> String {
+        format!("{}-local", self.leg_ifname())
     }
 }
 
@@ -515,6 +553,15 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
             w.name, w.router
         ))
     })?;
+    // cfab creates the leg, so a vid the kernel would refuse — or one that means "untagged" on
+    // a vlan-aware bridge — is caught at `check`, not at the first `ip link add`.
+    if !(2..=4094).contains(&w.vid) {
+        return Err(Error::config(format!(
+            "workload {}: vid {} is outside 2-4094 (1 is the bridge's untagged default; 0 and \
+             4095 are reserved)",
+            w.name, w.vid
+        )));
+    }
     let span = match w.span.as_deref() {
         None | Some("switch") => Span::Switch,
         Some("host") => {
@@ -533,7 +580,8 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
     };
     Ok(Workload {
         name: w.name.clone(),
-        ifname: w.ifname.clone(),
+        uplink: w.uplink.clone(),
+        vid: w.vid,
         prefix,
         gw,
         router,
@@ -908,8 +956,10 @@ impl Fabric {
         }
         // ---- workloads ----
         let mut seen = BTreeSet::new();
-        let mut seen_ifnames: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen_legs: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen_vlans: BTreeMap<(String, u16), String> = BTreeMap::new();
         for wl in &self.workloads {
+            let leg = wl.leg_ifname();
             if self.zone(&wl.name).is_ok() {
                 return Err(Error::config(format!(
                     "workload {}: name is also a zone (workload and zone names share one \
@@ -923,13 +973,24 @@ impl Fabric {
                     wl.name
                 )));
             }
-            // I2 (whole-branch review): two rows sharing an ifname is a plausible "two subnets
-            // on one VLAN" declaration nothing else refuses — `emit::engine` would push two
-            // OSPF passive entries for the same interface into one instance.
-            if let Some(other) = seen_ifnames.insert(wl.ifname.clone(), wl.name.clone()) {
+            // Two names that differ only past the fifth byte cut to ONE leg name — one
+            // interface each row would create, address and advertise on top of the other's.
+            if let Some(other) = seen_legs.insert(leg.clone(), wl.name.clone()) {
                 return Err(Error::config(format!(
-                    "workload {}: ifname '{}' is also used by workload {other}",
-                    wl.name, wl.ifname
+                    "workload {}: leg '{leg}' is also used by workload {other} \
+                     ({LEG_PREFIX}<name>, cut to {IFNAME_MAX} bytes)",
+                    wl.name
+                )));
+            }
+            // cfab creates the vlan device, and a bridge carries one device per vid: two rows
+            // on the same (uplink, vid) are two rows trying to create the same interface. The
+            // second `ip link add` would fail at `up` with a raw RTNETLINK error, on every
+            // member, after the first row was already applied.
+            if let Some(other) = seen_vlans.insert((wl.uplink.clone(), wl.vid), wl.name.clone()) {
+                return Err(Error::config(format!(
+                    "workload {}: uplink '{}' vid {} is also used by workload {other} (one leg \
+                     per bridge and vid)",
+                    wl.name, wl.uplink, wl.vid
                 )));
             }
             // Every bond ifname that fans out into per-domain ports (a universal/fallback
@@ -946,23 +1007,24 @@ impl Fabric {
                 .collect::<Vec<_>>();
             // An ifname cfab already creates or owns by declaration: a declared wire, a
             // declared segment/universal sub-if, a bond port, or a zone's generated
-            // ingress/identity leg.
+            // ingress/identity leg. The leg name is derived now, so the collision is checked
+            // the other way round — `cfab-work-<name>` against everything else on the member.
             let collides = self
                 .members
                 .iter()
-                .any(|m| m.wires.iter().any(|w| w.name == wl.ifname))
-                || self.segments.iter().any(|s| s.ifname == wl.ifname)
+                .any(|m| m.wires.iter().any(|w| w.name == leg))
+                || self.segments.iter().any(|s| s.ifname == leg)
                 || bond_ifnames
                     .iter()
-                    .any(|b| self.domains.iter().any(|d| wl.ifname == format!("{b}-{d}")))
+                    .any(|b| self.domains.iter().any(|d| leg == format!("{b}-{d}")))
                 || self.zones.iter().any(|z| {
                     let (id, peer) = identity_ifnames(z.id);
-                    wl.ifname == gw_ifname(z.id) || wl.ifname == id || wl.ifname == peer
+                    leg == gw_ifname(z.id) || leg == id || leg == peer
                 });
             if collides {
                 return Err(Error::config(format!(
-                    "workload {}: ifname '{}' collides with an interface cfab creates",
-                    wl.name, wl.ifname
+                    "workload {}: leg '{leg}' collides with an interface cfab creates",
+                    wl.name
                 )));
             }
             if !wl.prefix.contains(wl.gw) {
@@ -1984,31 +2046,6 @@ mod tests {
         );
     }
 
-    // I2: two `[[workload]]` rows sharing an `ifname` is a plausible "two subnets on one VLAN"
-    // declaration that nothing refused — `emit::engine` would push two OSPF passive entries for
-    // the same interface into one instance, which most likely fails at engine start rather than
-    // at `check` (fail-loud, but too late).
-    #[test]
-    fn check_refuses_two_workload_rows_sharing_an_ifname() {
-        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
-        let base = base.replace(
-            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
-            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
-             { name = \"vms2\", address = \"192.168.30.2/24\" }]",
-        );
-        let second_block = "\n[[workload]]\nname = \"vms2\"\nifname = \"primary.3\"\n\
-             prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\n\
-             allow = [\"storage\"]\n";
-        let text = format!("{base}{second_block}");
-        let e = Fabric::from_decl(&Declaration::parse(&text).unwrap())
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms2: ifname 'primary.3' is also used by workload vms"
-        );
-    }
-
     // I2: a workload `prefix` overlapping a zone block would make the sibling return-path rule
     // and the option-121 aggregate self-contradictory (spec's own `10.<id>.0.0/16` reservation).
     #[test]
@@ -2027,42 +2064,109 @@ mod tests {
         );
     }
 
+    /// cfab creates the leg now, so a vid the kernel would refuse (or that means "untagged")
+    /// is a declaration fault `check` catches before `up` ever runs `ip link add`.
     #[test]
-    fn check_refuses_a_workload_ifname_colliding_with_an_interface_cfab_creates() {
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"eth9\""));
+    fn check_refuses_a_workload_vid_outside_the_802_1q_range() {
+        for bad in ["0", "1", "4095", "65535"] {
+            let e = wl_err(|t| t.replace("vid = 3\nprefix", &format!("vid = {bad}\nprefix")));
+            assert_eq!(
+                e,
+                format!(
+                    "fabric.toml: workload vms: vid {bad} is outside 2-4094 (1 is the bridge's \
+                     untagged default; 0 and 4095 are reserved)"
+                )
+            );
+        }
+        assert!(wl_fabric_edit(|t| t.replace("vid = 3\nprefix", "vid = 2\nprefix")).is_ok());
+        assert!(wl_fabric_edit(|t| t.replace("vid = 3\nprefix", "vid = 4094\nprefix")).is_ok());
+    }
+
+    /// IFNAMSIZ leaves 15 usable bytes and `cfab-work-` eats 10 of them, so the row name is
+    /// cut to its first 5 — the kernel would refuse a longer name outright.
+    #[test]
+    fn the_leg_name_is_cfab_work_plus_the_row_name_cut_to_fifteen_bytes() {
+        let leg = |name: &str| {
+            wl_fabric_edit(|t| t.replace("name = \"vms\"", &format!("name = \"{name}\"")))
+                .unwrap()
+                .workload(name)
+                .unwrap()
+                .leg_ifname()
+        };
+        assert_eq!(leg("vms"), "cfab-work-vms");
+        assert_eq!(leg("vmstore"), "cfab-work-vmsto");
+        assert_eq!(leg("v"), "cfab-work-v");
+        assert!(leg("vmstore").len() <= 15);
+    }
+
+    /// Two rows whose names differ only past the fifth byte truncate to ONE leg name — an
+    /// interface each row would then create, address and advertise on top of the other's.
+    #[test]
+    fn check_refuses_two_workload_rows_whose_leg_names_truncate_alike() {
+        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
+        let base = base
+            .replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+                "workloads = [{ name = \"vmstorage-a\", address = \"192.168.20.2/24\" }, \
+                 { name = \"vmstorage-b\", address = \"192.168.30.2/24\" }]",
+            )
+            .replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.3/24\" }]",
+                "workloads = [{ name = \"vmstorage-a\", address = \"192.168.20.3/24\" }]",
+            )
+            .replace("name = \"vms\"", "name = \"vmstorage-a\"");
+        let second = "\n[[workload]]\nname = \"vmstorage-b\"\nuplink = \"primary\"\nvid = 4\n\
+                      prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
+                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+        let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             e,
-            "fabric.toml: workload vms: ifname 'eth9' collides with an interface cfab creates"
+            "fabric.toml: workload vmstorage-b: leg 'cfab-work-vmsto' is also used by workload \
+             vmstorage-a (cfab-work-<name>, cut to 15 bytes)"
         );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-st\""));
+    }
+
+    /// cfab creates the vlan device now, so two rows on the same bridge and the same vid are
+    /// two rows trying to create one interface: the second `ip link add` would fail at `up`
+    /// with a raw RTNETLINK error, on every member, after the first row was already applied.
+    /// Refuse it where every other declaration fault is caught.
+    #[test]
+    fn check_refuses_two_workload_rows_on_the_same_uplink_and_vid() {
+        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
+                 { name = \"vms2\", address = \"192.168.30.2/24\" }]",
+        );
+        let second = "\n[[workload]]\nname = \"vms2\"\nuplink = \"primary\"\nvid = 3\n\
+                      prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
+                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+        let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             e,
-            "fabric.toml: workload vms: ifname 'cfab-st' collides with an interface cfab \
+            "fabric.toml: workload vms2: uplink 'primary' vid 3 is also used by workload vms \
+             (one leg per bridge and vid)"
+        );
+    }
+
+    /// The leg name is cfab's now, so the collision runs the other way: a declaration whose
+    /// own wire, segment, bond port or generated leg is already called `cfab-work-<name>`.
+    #[test]
+    fn check_refuses_a_workload_leg_colliding_with_an_interface_cfab_creates() {
+        let e = wl_err(|t| t.replace("ifname = \"cfab-st\"", "ifname = \"cfab-work-vms\""));
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms: leg 'cfab-work-vms' collides with an interface cfab \
              creates"
         );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249\""));
+        let e = wl_err(|t| t.replace("nic = \"eth9\"", "nic = \"cfab-work-vms\""));
         assert_eq!(
             e,
-            "fabric.toml: workload vms: ifname 'cfab-gw249' collides with an interface cfab \
+            "fabric.toml: workload vms: leg 'cfab-work-vms' collides with an interface cfab \
              creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249-a\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-gw249-a' collides with an interface cfab \
-             creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-id249' collides with an interface cfab \
-             creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249-peer\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-id249-peer' collides with an interface \
-             cfab creates"
         );
     }
 

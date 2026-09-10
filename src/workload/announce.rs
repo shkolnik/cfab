@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn the_beacon_fires_on_a_fixed_5s_schedule_regardless_of_when_fire_is_called() {
         let a0 = t0();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         assert_eq!(a.next_due(), a0, "first beacon is immediate");
         assert!(a.fire(a0));
         assert_eq!(a.next_due(), a0 + PERIOD);
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn an_event_starts_a_burst_of_three_one_second_apart_and_the_beacon_keeps_its_schedule() {
         let a0 = t0();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         a.fire(a0);
         let e = a0 + 2 * S;
         a.on_event(e);
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn events_within_one_period_of_a_burst_start_do_not_start_another() {
         let a0 = t0();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         a.fire(a0);
         a.on_event(a0 + S);
         for _ in 0..3 {
@@ -367,7 +367,7 @@ mod tests {
     fn announce_due_puts_exactly_the_due_frames_on_the_named_interface() {
         let a0 = t0();
         let mut io = mock::RecordingIo::default();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         let mac = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01];
 
         assert!(a.announce_due(&mut io, mac, a0).unwrap());
@@ -378,7 +378,7 @@ mod tests {
             a.announce_due(&mut io, mac, d).unwrap();
         }
         assert_eq!(io.sent.len(), 4, "one beacon plus a burst of three");
-        assert!(io.sent.iter().all(|(port, f)| port == "primary.3"
+        assert!(io.sent.iter().all(|(port, f)| port == "cfab-work-vms"
             && f[..] == gratuitous(mac, "192.168.20.254".parse().unwrap())[..]));
     }
 
@@ -388,7 +388,7 @@ mod tests {
     fn a_caller_late_by_several_periods_sends_once_and_lands_on_the_original_grid() {
         let a0 = t0();
         let mut io = mock::RecordingIo::default();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         let mac = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01];
         assert!(a.announce_due(&mut io, mac, a0).unwrap());
         assert_eq!(a.next_due(), a0 + PERIOD);
@@ -412,7 +412,7 @@ mod tests {
     fn a_burst_frame_landing_on_a_beacon_deadline_sends_one_frame_and_counts_one() {
         let a0 = t0();
         let mut io = mock::RecordingIo::default();
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         let mac = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01];
         a.announce_due(&mut io, mac, a0).unwrap(); // beacon grid: a0, a0 + 5 s, a0 + 10 s
         a.on_event(a0 + 3 * S); // burst frames: a0 + 3 s, a0 + 4 s, a0 + 5 s
@@ -440,10 +440,10 @@ mod tests {
     fn a_send_failure_is_returned_to_the_caller_and_the_schedule_still_advances() {
         let a0 = t0();
         let mut io = mock::RecordingIo {
-            fail: Some("primary.3: cannot send probe: ENODEV".into()),
+            fail: Some("cfab-work-vms: cannot send probe: ENODEV".into()),
             ..Default::default()
         };
-        let mut a = Announcer::new("primary.3", "192.168.20.254".parse().unwrap(), a0);
+        let mut a = Announcer::new("cfab-work-vms", "192.168.20.254".parse().unwrap(), a0);
         let e = a.announce_due(&mut io, [0; 6], a0).unwrap_err();
         assert!(e.to_string().contains("cannot send probe"));
         assert_eq!(

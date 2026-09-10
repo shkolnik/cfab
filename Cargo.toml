@@ -1,6 +1,6 @@
 [package]
 name = "cfab"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 rust-version = "1.98"
 description = "Per-host runtime of a resilient converged network fabric for small clusters: fabric.toml declares the fabric; cfab validates it, generates every artifact from it, applies, verifies, and tears it down"
@@ -59,6 +59,7 @@ assets = [
     ["examples/fabric.toml", "usr/share/doc/cfab/examples/fabric.toml.example", "644"],
     ["packaging/deb/cfab.default", "etc/default/cfab", "644"],
     ["packaging/deb/rt_protos.d/cfab.conf", "etc/iproute2/rt_protos.d/cfab.conf", "644"],
+    ["packaging/deb/rt_tables.d/cfab.conf", "etc/iproute2/rt_tables.d/cfab.conf", "644"],
 ]
 # No hand-written maintainer scripts: the directory is named only because cargo-deb
 # generates no systemd maintainer-script fragments at all unless this key is set

@@ -20,6 +20,7 @@ use std::time::Instant;
 use crate::derive::View;
 use crate::sys::Sys;
 use crate::workload::announce::{AnnounceIo, Announcer};
+use crate::workload::hostroutes::HostRoutes;
 use crate::workload::neigh::{self, NeighSignal};
 use crate::workload::uplink::{self, Uplink};
 use crate::workload::{Trigger, deferred_names};
@@ -149,6 +150,10 @@ pub(crate) struct Workloads {
     /// Rows already reported as deferred, so the 3 s tick says it once rather than 20 times a
     /// minute for as long as an uplink takes to forward.
     deferred_said: BTreeSet<String>,
+    /// The per-VM host routes (spec §5.2): the same rows, reconciled on the same tick, so the
+    /// set an announcer bursts for and the set this member originates /32s for are read from
+    /// one place at one moment.
+    hostroutes: HostRoutes,
     trace: Trace,
 }
 
@@ -168,6 +173,7 @@ impl Workloads {
             trigger: None,
             rows: Vec::new(),
             deferred_said: BTreeSet::new(),
+            hostroutes: HostRoutes::new(),
             trace,
         };
         if view.workload_rows().is_empty() {
@@ -194,6 +200,13 @@ impl Workloads {
     ) {
         self.start_pending(sys, view, io, now);
         self.refresh_uplinks(sys, view);
+        // The host-route reconcile (spec §5.2, ruling 6). Level triggered and independent of
+        // the announcers: it runs for every declared row, including one still deferred (whose
+        // wanted set is empty), and it owns its own standing-line dedup, so what arrives here
+        // is only what has not been said yet.
+        for line in self.hostroutes.tick(sys, view, now) {
+            journal(&self.trace, line);
+        }
         if !matches!(self.trigger, Some(Trigger::FdbPoll { .. })) {
             return;
         }
@@ -218,7 +231,7 @@ impl Workloads {
     /// double-report it.
     fn refresh_uplinks(&mut self, sys: &mut dyn Sys, view: &View) {
         for row in view.workload_rows() {
-            let Ok(up) = uplink::identify(sys, &row.wl.ifname) else {
+            let Ok(up) = uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) else {
                 continue;
             };
             let Some(r) = self.rows.iter_mut().find(|r| r.name == row.wl.name) else {
@@ -271,8 +284,9 @@ impl Workloads {
                 }
                 continue;
             }
-            let ifname = &row.wl.ifname;
-            let started = uplink::identify(sys, ifname)
+            let leg = row.wl.leg_ifname();
+            let ifname = leg.as_str();
+            let started = uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid)
                 .and_then(|up| read_mac(io, ifname).map(|mac| (up, mac)));
             match started {
                 Ok((up, mac)) => {
@@ -454,9 +468,28 @@ mod tests {
     /// pve1-tb carrying the "vms" row: `apply`'s own workload fixture (bridge `primary`, uplink
     /// eth0 forwarding at ifindex 2, one VM tap `tap100i0` at ifindex 10), plus the watchdog's
     /// deferred-row list where a test wants one. The MAC comes from the io seam, not from sysfs.
+    ///
+    /// It also answers everything the host-route reconcile reads on a HEALTHY member — the leg's
+    /// ifindex, one VM neighbor whose MAC is on the tap, an empty nft set, an engine that takes
+    /// the request — so a test about the announcers sees a quiet reconcile beside them, and a
+    /// test about the reconcile breaks exactly one of those reads and asserts what it says.
     fn wl(deferred: Option<&str>) -> (MockSys, View<'static>) {
         let (sys, view) = crate::commands::apply::tests::wl_sys_and_view("pve1-tb");
-        let mut sys = sys;
+        let mut sys = sys
+            .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                r#"[{"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]}]"#,
+            )
+            .on_stdout(
+                &["bridge", "-j", "fdb", "show", "br", "primary"],
+                r#"[{"mac":"02:cf:ab:00:00:01","ifname":"tap100i0","master":"primary"}]"#,
+            )
+            .on_stdout(
+                &["nft", "-j", "list", "set", "inet", "cfab-fwd"],
+                r#"{"nftables":[{"set":{"name":"cfab-work-vms-local","type":"ipv4_addr"}}]}"#,
+            )
+            .socket("/run/cfab/engine.sock", "{\"workload_routes\":{}}\n");
         if let Some(names) = deferred {
             sys = sys.file(&deferred_path(&view), names);
         }
@@ -533,7 +566,7 @@ mod tests {
                 rows[0].ifname.as_str(),
                 rows[0].trigger.as_str()
             ),
-            ("vms", "primary.3", "neigh events")
+            ("vms", "cfab-work-vms", "neigh events")
         );
         assert_eq!(w.next_due(), Some(t), "the first beacon is immediate");
         assert_eq!(
@@ -550,12 +583,114 @@ mod tests {
         assert_eq!(w.rows_for_status().len(), 1);
     }
 
-    /// An uplink that cannot be identified after a successful apply (the bridge was torn down
-    /// under us): journal the reason, start nothing, never panic.
+    /// Task 3: the host-route reconcile rides the announcers' own 3 s tick and the same row
+    /// set, so a member with no `[[workload]]` row never runs it at all and a member with one
+    /// originates the /32 and fills the nft set the stray drop reads.
+    #[test]
+    fn the_tick_reconciles_the_host_routes_beside_the_announcers() {
+        let (mut sys, view) = wl(None);
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(rec()),
+            opens,
+            t0,
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("workload-routes")),
+            "the reconcile is the tick's, not start's: {:?}",
+            sys.calls
+        );
+        w.tick(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            t0 + Duration::from_secs(3),
+        );
+        assert!(
+            sys.ran(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.103/32"
+            ),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            sys.ran("nft add element inet cfab-fwd cfab-work-vms-local { 192.168.20.103 }"),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// The reconcile's own journal is the supervisor's journal: a fault it names is said on
+    /// stderr and to the trace, exactly once, like every other repeating condition here.
+    #[test]
+    fn what_the_host_route_reconcile_says_reaches_the_journal_once() {
+        let (sys, view) = wl(None);
+        let mut sys = sys.on_fail(
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            1,
+            "Cannot talk to rtnetlink",
+        );
+        let trace = rec();
+        let t0 = Instant::now();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(trace.clone()),
+            opens,
+            t0,
+        );
+        for n in [3, 6] {
+            w.tick(
+                &mut sys,
+                &view,
+                &mut RecordingIo::default(),
+                t0 + Duration::from_secs(n),
+            );
+        }
+        assert_eq!(
+            said(&trace)
+                .iter()
+                .filter(|l| l.contains("host routes unchanged"))
+                .collect::<Vec<_>>(),
+            vec![
+                "cfab: workload vms: cannot read the neighbors of cfab-work-vms; host routes \
+                 unchanged"
+            ]
+        );
+    }
+
+    /// A member with no `[[workload]]` row pays nothing: no reconcile, no reads, no request.
+    #[test]
+    fn a_member_without_workload_rows_runs_no_reconcile() {
+        let f = crate::model::Fabric::from_decl(
+            &crate::decl::Declaration::parse(&crate::decl::fixtures::example()).unwrap(),
+        )
+        .unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default();
+        let mut w = Workloads::start(
+            &mut sys,
+            &view,
+            &mut RecordingIo::default(),
+            Some(rec()),
+            opens,
+            Instant::now(),
+        );
+        w.tick(&mut sys, &view, &mut RecordingIo::default(), Instant::now());
+        assert!(sys.calls.is_empty(), "{:?}", sys.calls);
+    }
+
+    /// An uplink that cannot be identified after a successful apply (the bridge's last
+    /// off-host port went away under us): journal the reason, start nothing, never panic.
     #[test]
     fn an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer() {
         let (mut sys, view) = wl(None);
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         let trace = rec();
         let w = Workloads::start(
             &mut sys,
@@ -569,8 +704,9 @@ mod tests {
         assert_eq!(
             said(&trace),
             vec![
-                "cfab: workload vms: workload interface primary.3 is not a VLAN sub-interface \
-                 of a bridge (no lower link in /sys/class/net/primary.3); announcer not started"
+                "cfab: workload vms: bridge primary has no uplink port (no port has a \
+                 /sys/class/net/<port>/device, directly or through lower links); ports: eth0, \
+                 tap100i0; announcer not started"
             ]
         );
     }
@@ -596,7 +732,7 @@ mod tests {
         assert_eq!(
             said(&trace),
             vec![
-                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                "cfab: workload vms: cannot read the MAC of cfab-work-vms: FATAL: cfab-work-vms: no \
                  link-layer address (no netdev?); announcer not started"
             ]
         );
@@ -634,7 +770,7 @@ mod tests {
                 .filter(|l| l.contains("MAC changed"))
                 .collect::<Vec<_>>(),
             vec![
-                "cfab: workload vms: primary.3 MAC changed 00:11:22:33:44:55 -> 02:cf:ab:00:00:09"
+                "cfab: workload vms: cfab-work-vms MAC changed 00:11:22:33:44:55 -> 02:cf:ab:00:00:09"
             ]
         );
         // Unchanged from here on: the line is said once per change, not once per beacon.
@@ -674,7 +810,7 @@ mod tests {
                 .filter(|l| l.contains("cannot read the MAC"))
                 .collect::<Vec<_>>(),
             vec![
-                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                "cfab: workload vms: cannot read the MAC of cfab-work-vms: FATAL: cfab-work-vms: no \
                  link-layer address (no netdev?); announcing the last known MAC"
             ]
         );
@@ -900,7 +1036,7 @@ mod tests {
             opens,
             t0,
         );
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         w.tick(&mut sys, &view, &mut RecordingIo::default(), t0);
         w.on_neigh(
             &mut sys,
@@ -953,7 +1089,7 @@ mod tests {
             t0,
         );
         let mut io = RecordingIo {
-            fail: Some("primary.3: cannot send probe: ENODEV".into()),
+            fail: Some("cfab-work-vms: cannot send probe: ENODEV".into()),
             ..Default::default()
         };
         w.fire_due(&mut io, t0);
@@ -965,7 +1101,7 @@ mod tests {
         assert_eq!(
             failures,
             vec![
-                "cfab: workload vms: announce on primary.3 failed: FATAL: primary.3: cannot \
+                "cfab: workload vms: announce on cfab-work-vms failed: FATAL: cfab-work-vms: cannot \
                  send probe: ENODEV"
             ],
             "the same error twice is one line"
@@ -976,7 +1112,7 @@ mod tests {
             "the schedule advances whether or not the socket takes the frame"
         );
 
-        io.fail = Some("primary.3: cannot send probe: ENETDOWN".into());
+        io.fail = Some("cfab-work-vms: cannot send probe: ENETDOWN".into());
         w.fire_due(&mut io, t0 + 2 * PERIOD);
         assert_eq!(
             said(&trace)
@@ -1093,7 +1229,7 @@ mod tests {
         let mut io = RecordingIo::default();
         w.fire_due(&mut io, t0);
         assert_eq!(io.sent.len(), 1);
-        assert_eq!(io.sent[0].0, "primary.3");
+        assert_eq!(io.sent[0].0, "cfab-work-vms");
         assert_eq!(
             io.sent[0].1,
             crate::workload::announce::gratuitous(

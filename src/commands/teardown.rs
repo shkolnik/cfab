@@ -147,13 +147,15 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
     if backend != Some(MarkBackend::Nft) {
         crate::commands::common::remove_mark_ipt(sys)?;
     }
-    // Workload bridge ARP guard and gw address (the exact reverse of apply's order): the guard
-    // table is one per member, not one per row, so it comes off once, gated on the FIRST row
-    // (an empty `workload_rows()` skips this entirely — a member with no `[[workload]]` row
-    // never ran `nft list table bridge cfab` at all). `forwarding_off` above already covers the
-    // ifname (it iterates `owned_forwarding()`, which lists every workload row); `arp_ignore`
-    // is left exactly as `up` set it (ruling 11) — `down` never touches it. The interface itself
-    // is never a delete candidate: cfab did not create it and never runs `ip link del` on it.
+    // Workload bridge ARP guard, gw address, then the leg itself (the exact reverse of apply's
+    // order): the guard table is one per member, not one per row, so it comes off once, gated
+    // on the FIRST row (an empty `workload_rows()` skips this entirely — a member with no
+    // `[[workload]]` row never ran `nft list table bridge cfab` at all). `forwarding_off` above
+    // already covers the leg (it iterates `owned_forwarding()`, which lists every workload
+    // row); `arp_ignore` is left exactly as `up` set it (ruling 11) — `down` never touches it.
+    // `leg::remove` proves ownership twice before it destroys anything: the netdev must be a
+    // vlan of this vid, and the vid on the bridge must be one cfab's own record says cfab
+    // added. The UPLINK is the host's bridge and is never a delete candidate.
     if !view.workload_rows().is_empty() {
         // M2 (whole-branch review): `have_tool`-guarded like the mark removal above — a missing
         // nft must never abort `down` before the gw address and rule removal below it run.
@@ -164,12 +166,13 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             }
         }
         for row in view.workload_rows() {
-            let ifname = &row.wl.ifname;
+            let ifname = &row.wl.leg_ifname();
             let gw_cidr = row.wl.gw_cidr();
             let addr = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
             if has_ip_addr(&addr.stdout, &gw_cidr) {
                 run_ok(sys, &["ip", "addr", "del", &gw_cidr, "dev", ifname])?;
             }
+            crate::workload::leg::remove(sys, &f.run_dir, ifname, &row.wl.uplink, row.wl.vid)?;
         }
     }
     // The engine stops (and its routes are swept) before any interface goes away, so it never
@@ -242,6 +245,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             ],
         )?;
     }
+
+    // The additive host default (spec §6): the 250 route by its exact key, then the pref
+    // 2099-2101 rules that reach it — the same function the unwind of a half-installed `up`
+    // uses, and idempotent, so a member that never carried one tears down clean.
+    crate::commands::common::remove_host_default(sys)?;
 
     // Review finding 11 (2026-09-05, escalated to blocking — B3): refuse before destroying
     // the run_dir if `engine.lock` is still held. `stop_and_sweep` above only signals a
@@ -405,23 +413,33 @@ mod tests {
         .unwrap()
     }
 
-    /// The state `up` leaves: every netdev absent (the `.on_fail(ip link show)` baseline the
-    /// rest of this file's minimal-state tests share — there is no separate "healthy teardown"
-    /// fixture here), guard table present, gw on the interface, both 2000 rules.
+    /// The state `up` leaves: every other netdev absent (the `.on_fail(ip link show)` baseline
+    /// the rest of this file's minimal-state tests share — there is no separate "healthy
+    /// teardown" fixture here), the workload leg present and of the vid `up` built it with, the
+    /// vid `up` gave the bridge recorded as cfab's, guard table present, gw on the leg, both
+    /// 2000 rules.
     fn wl_down_sys() -> MockSys {
         MockSys::default()
             .on_fail(&["ip", "link", "show"], 1, "no")
-            // `primary.3` is a real conf entry left by `up`'s `enable_forwarding` (the interface
-            // is not cfab's own creation, but the kernel already has a conf/<ifname>/ dir for
-            // it) — `forwarding_off`'s `conf_interfaces` scan needs it present to find it.
-            .file("/proc/sys/net/ipv4/conf/primary.3/forwarding", "1\n")
+            .on_stdout(
+                &["ip", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <UP>\n",
+            )
+            .on_stdout(
+                &["ip", "-d", "link", "show", "cfab-work-vms"],
+                "9: cfab-work-vms@primary: <UP> vlan protocol 802.1Q id 3 \n",
+            )
+            .file("/run/cfab/workload-self-vid", "primary 3")
+            // The conf entry `up`'s `enable_forwarding` left on the leg —
+            // `forwarding_off`'s `conf_interfaces` scan needs it present to find it.
+            .file("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding", "1\n")
             .on_stdout(
                 &["nft", "list", "table", "bridge", "cfab"],
                 "table bridge cfab {\n}\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
@@ -430,28 +448,69 @@ mod tests {
             )
     }
 
+    /// cfab creates the leg and gives the bridge the vid, so `down` takes both away again — and
+    /// nothing else: the bridge is the host's, and its other vids (the untagged default, every
+    /// VM port's) are none of cfab's business.
     #[test]
-    fn down_removes_the_bridge_table_the_gw_address_and_the_sibling_rules_but_never_the_interface()
-    {
+    fn down_removes_the_bridge_table_the_gw_address_the_sibling_rules_the_leg_and_the_self_vid() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys();
         run(&mut sys, &view).unwrap();
         assert!(sys.ran("nft delete table bridge cfab"));
-        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"0")
         );
-        assert!(!sys.ran("ip link del primary.3"));
-        assert!(!sys.ran("ip link set primary.3 down"));
+        assert!(sys.ran("ip link del cfab-work-vms"));
+        assert!(sys.ran("bridge vlan del dev primary vid 3 self"));
+        assert!(sys.ran("rm /run/cfab/workload-self-vid"));
+        assert!(
+            !sys.calls.iter().any(|c| c == "ip link del primary"),
+            "the uplink is the host's: never deleted"
+        );
+        assert!(
+            !sys.ran("bridge vlan del dev primary vid 1"),
+            "only the vid cfab added"
+        );
         assert!(
             sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
                 .is_empty(),
             "down leaves arp_ignore (ruling 11)"
         );
+    }
+
+    /// Prove ownership before destroy, half one: a vid the HOST already had when cfab came up
+    /// is not in cfab's record, so `down` leaves it on the bridge — deleting it would cut every
+    /// VM on that vlan off from the rest of the world.
+    #[test]
+    fn down_leaves_a_self_vid_cfab_never_added() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys();
+        sys.files.remove("/run/cfab/workload-self-vid");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("ip link del cfab-work-vms"));
+        assert!(!sys.ran("bridge vlan del dev primary"));
+    }
+
+    /// Prove ownership before destroy, half two: a netdev carrying the leg's name that is NOT a
+    /// vlan of this vid is somebody else's and is left where it is. The vid cfab recorded still
+    /// comes off — cfab added that itself, whatever later happened to the name.
+    #[test]
+    fn down_leaves_a_foreign_netdev_that_only_carries_the_legs_name() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_down_sys().on_stdout(
+            &["ip", "-d", "link", "show", "cfab-work-vms"],
+            "9: cfab-work-vms: <UP> bond \n",
+        );
+        run(&mut sys, &view).unwrap();
+        assert!(!sys.ran("ip link del cfab-work-vms"));
+        assert!(sys.ran("bridge vlan del dev primary vid 3 self"));
     }
 
     #[test]
@@ -465,8 +524,8 @@ mod tests {
                 "Error: No such file or directory",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24\n",
             )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
@@ -485,11 +544,11 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys().on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.2/24 1192.168.20.254/24\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.2/24 1192.168.20.254/24\n",
         );
         run(&mut sys, &view).unwrap();
-        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
     }
 
     // M2 (whole-branch review): the bridge-guard presence read used a bare `?`, unlike the
@@ -504,10 +563,10 @@ mod tests {
         run(&mut sys, &view).unwrap();
         assert!(!sys.ran("nft list table bridge cfab"));
         assert!(!sys.ran("nft delete table bridge cfab"));
-        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"0")
         );
@@ -1106,5 +1165,54 @@ mod tests {
         assert!(!sys.ran("ip rule show pref 1000"), "{:?}", sys.calls);
         assert!(!sys.ran("ip rule show pref 1001"), "{:?}", sys.calls);
         assert!(!sys.ran("ip rule del"), "{:?}", sys.calls);
+    }
+
+    /// Spec §6: `down` removes the additive host default whole — the 250 route by prefix +
+    /// table + proto (never a flush of the table), and the three rule prefs, idempotently.
+    #[test]
+    fn down_removes_the_host_default_route_and_all_three_rule_prefs() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "no")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.1 iif lo lookup main\n",
+            )
+            // ...and empty from the second read on, so `drop_rules`'s loop terminates the way a
+            // real kernel's does once the rule is gone.
+            .on_stdout(&["ip", "rule", "show", "pref", "2099"], "");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("ip route del default table 250 proto 206"));
+        for pref in ["2099", "2100", "2101"] {
+            assert!(
+                sys.ran(&format!("ip rule show pref {pref}")),
+                "pref {pref} was never examined: {:?}",
+                sys.calls
+            );
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("ip route flush")),
+            "the table is never flushed: {:?}",
+            sys.calls
+        );
+    }
+
+    /// A leaf never installed one; `down` still asks, because the objects are cfab's whether or
+    /// not the current declaration would install them (a gw zone removed since `up`).
+    #[test]
+    fn down_on_a_leaf_still_asks_for_the_host_default_objects_and_finds_none() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("ip route del default table 250 proto 206"));
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c.starts_with("ip rule del pref 21")),
+            "nothing to delete: {:?}",
+            sys.calls
+        );
     }
 }

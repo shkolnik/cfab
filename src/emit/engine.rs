@@ -4,6 +4,9 @@
 //! passive identity/ingress interfaces, plus the bare interface list the OSPF interface
 //! leafrefs require (name + type only: `ip` stays the sole writer of link state and addresses).
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use ipnetwork::Ipv4Network;
 use serde_json::{Map, Value, json};
 
 use crate::derive::{GwRow, View, identity_addr_of};
@@ -19,6 +22,13 @@ pub const PROTO_BASE: u8 = 201;
 /// `PROTO_BASE..=PROTO_BASE + 3` (201..204), so neither the engine's startup purge nor `down`'s
 /// sweep — both of which delete by that range — removes a route cfab owns from under itself.
 pub const CFAB_PROTO: u8 = 205;
+
+/// The kernel route-protocol id of cfab's additive host default (spec §6): the one route in
+/// table `250 cfab-default`. Its own id, not `CFAB_PROTO`, so the route an operator sees on
+/// `ip route show table cfab-default` names what put it there, and so a teardown of the host
+/// default cannot match the per-zone return-path defaults (205) by prefix and table alone.
+/// Outside the engine's purged `PROTO_BASE..=PROTO_BASE + 3` for the same reason 205 is.
+pub const CFAB_DEFAULT_PROTO: u8 = 206;
 
 /// RFC 8405 SPF back-off, in milliseconds (`ietf-ospf` units), overriding the model defaults of
 /// 5000/10000. Those defaults protect a large IGP's CPU from repeated SPF over hundreds of nodes;
@@ -55,11 +65,25 @@ impl TransitCost {
     }
 }
 
+/// The host routes this member currently originates, keyed by the workload leg they leave by
+/// (`[[workload]]` `ifname`). Not derivable from the declaration: it is the live set of VMs
+/// this host sees, pushed in over `engine.sock` (`workload-routes`), so it is the engine's
+/// second regeneration input beside `TransitCost`.
+pub type WorkloadRoutes = BTreeMap<String, BTreeSet<Ipv4Network>>;
+
+/// The name of the one `ietf-routing:static` instance cfab writes. holo keys static routes by
+/// prefix across every instance, so a second instance would buy nothing.
+const STATIC_INSTANCE: &str = "cfab";
+
 pub fn generate(view: &View) -> Result<Value> {
     generate_at(view, TransitCost::Declared)
 }
 
 pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
+    generate_with(view, transit, &WorkloadRoutes::new())
+}
+
+pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes) -> Result<Value> {
     let f = view.fabric;
     let class_rows = view.class_rows();
     let fallback_rows = view.fallback_rows();
@@ -89,7 +113,7 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
         add_if(r.ifname.clone());
     }
     for r in &workload_rows {
-        add_if(r.wl.ifname.clone());
+        add_if(r.wl.leg_ifname());
     }
     let interfaces: Vec<Value> = if_names
         .iter()
@@ -145,22 +169,80 @@ pub fn generate_at(view: &View, transit: TransitCost) -> Result<Value> {
             .iter()
             .filter(|r| r.wl.allow.contains(&z.name))
         {
-            ospf_ifs.push(json!({ "name": r.wl.ifname, "passive": true }));
+            ospf_ifs.push(json!({ "name": r.wl.leg_ifname(), "passive": true }));
+        }
+        let mut ospf = json!({
+            "explicit-router-id": view.identity_addr(z),
+            "spf-control": { "ietf-spf-delay": {
+                "long-delay": SPF_LONG_DELAY_MS,
+                "hold-down": SPF_HOLD_DOWN_MS,
+            } },
+            "areas": { "area": [ {
+                "area-id": "0.0.0.0",
+                "interfaces": { "interface": ospf_ifs },
+            } ] },
+        });
+        // The per-VM host routes reach this zone as AS-External (type 5) LSAs, and only this
+        // zone: the subscription is per instance, so it is written on the instances the
+        // workload's `allow` names and on no other. `metric` is omitted so each route's own
+        // metric (0, for a static route) is what is advertised. The entry does not follow the
+        // routes — it follows the `allow`, so it is in force before the first VM is seen and
+        // stays in force across a withdrawal (see the static instance below for why the tree
+        // must not go structurally quiet when the route set empties). cfab is the only writer
+        // of static routes in this holo, so a subscriber with nothing behind it originates
+        // nothing.
+        if workload_rows.iter().any(|r| r.wl.allow.contains(&z.name)) {
+            ospf["holo-ospf:redistribution"] = json!([{ "type": "ietf-routing:static" }]);
         }
         protocols.push(json!({
             "type": "ietf-ospf:ospfv2",
             "name": z.name,
-            "ietf-ospf:ospf": {
-                "explicit-router-id": view.identity_addr(z),
-                "spf-control": { "ietf-spf-delay": {
-                    "long-delay": SPF_LONG_DELAY_MS,
-                    "hold-down": SPF_HOLD_DOWN_MS,
-                } },
-                "areas": { "area": [ {
-                    "area-id": "0.0.0.0",
-                    "interfaces": { "interface": ospf_ifs },
-                } ] },
-            },
+            "ietf-ospf:ospf": ospf,
+        }));
+    }
+
+    // One static route per wanted cidr, out its leg. `outgoing-interface` is an
+    // `if:interface-ref` leafref, so the leg has to be in the interface list above — it is,
+    // as every workload row's ifname. holo resolves that name to an ifindex once, at commit
+    // (`holo-routing` `static_nexthop_get`), which is why the driver reports the leg's
+    // ifindex and the engine withdraws before re-installing when it moves.
+    let mut static_routes: Vec<Value> = Vec::new();
+    for (leg, cidrs) in routes {
+        // The leg is checked before its cidrs are read, so a WITHDRAWAL on an unknown leg is
+        // refused in the same words as an install on one. An unknown leg is a typo or a stale
+        // driver either way, and letting the empty set through (nothing to emit, so nothing
+        // visibly goes wrong) would make the same mistake loud or silent depending only on
+        // how many VMs happened to be up at the time.
+        if !workload_rows.iter().any(|r| r.wl.leg_ifname() == *leg) {
+            return Err(Error::config(format!(
+                "no workload interface {leg} on this member"
+            )));
+        }
+        for cidr in cidrs {
+            static_routes.push(json!({
+                "destination-prefix": cidr.to_string(),
+                "next-hop": { "outgoing-interface": leg },
+            }));
+        }
+    }
+    // The instance exists whenever this member carries a workload row at all, EMPTY ROUTE
+    // LIST INCLUDED, and disappears only with the last row — so a withdrawal changes the
+    // route list and never the instance list.
+    //
+    // Not cosmetic: holo-northbound fires exactly ONE `Delete` callback for a deleted list
+    // entry and none for its descendants (`holo-northbound/src/configuration.rs:426-434`),
+    // and holo-routing's `ControlPlaneProtocolChange::Delete`
+    // (`holo-routing/src/northbound/configuration.rs:180-188`) only drops the instance entry
+    // — it never touches `master.static_routes`. Deleting the instance to withdraw therefore
+    // left the route in holo's RIB and in the kernel and re-advertised the stale /32 on the
+    // next request (VERIFIED on the testbed 2026-09-10 02:07 UTC). Keeping the instance makes
+    // the withdrawal a per-route `Delete` (`configuration.rs:211-213`), which does uninstall.
+    // libyang accepts the empty `route` list (proved by the parse_candidate test below).
+    if !workload_rows.is_empty() {
+        protocols.push(json!({
+            "type": "ietf-routing:static",
+            "name": STATIC_INSTANCE,
+            "static-routes": { "ietf-ipv4-unicast-routing:ipv4": { "route": static_routes } },
         }));
     }
 
@@ -436,33 +518,92 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// The example fabric plus the shared `[[workload]]` fixture (`vms` on `primary.3`,
+    /// The example fabric plus the shared `[[workload]]` fixture (`vms` on `cfab-work-vms`,
     /// `allow = ["storage"]`, carried by pve1-tb and pve2-tb).
     fn wl_fabric() -> Fabric {
         let text = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// cfab's own route-protocol id must sit outside the engine's swept range (or the sweep
-    /// deletes cfab's own default from under it) and must not collide with a well-known id.
+    /// Every route-protocol id cfab installs routes with itself, paired with the name the
+    /// package ships for it.
+    const CFAB_PROTOS: [(u8, &str); 2] = [
+        (CFAB_PROTO, "cfab-return"),
+        (CFAB_DEFAULT_PROTO, "cfab-default"),
+    ];
+
+    /// cfab's own route-protocol ids must sit outside the engine's swept range (or the sweep
+    /// deletes cfab's own routes from under it) and must not collide with a well-known id.
     #[test]
-    fn cfab_proto_is_outside_the_swept_range_and_not_well_known() {
+    fn cfab_protos_are_outside_the_swept_range_and_not_well_known() {
         use crate::commands::engine_ctl::PROTO_RANGE;
-        assert!(
-            !PROTO_RANGE.contains(&CFAB_PROTO),
-            "CFAB_PROTO {CFAB_PROTO} is inside the engine's swept range {PROTO_RANGE:?}"
-        );
         // The numeric ids in this host's /usr/share/iproute2/rt_protos (checked 2026-09-05):
         // kernel 2, boot 3, static 4, gated 8, ra 9, mrt 10, zebra 11, bird 12, dnrouted 13,
         // xorp 14, ntk 15, dhcp 16, keepalived 18, babel 42, ovn 84, openr 99, bgp 186,
-        // isis 187, ospf 188, rip 189, eigrp 192. cfab-return (205) is none of them.
+        // isis 187, ospf 188, rip 189, eigrp 192. cfab-return (205) and cfab-default (206)
+        // are none of them.
         const WELL_KNOWN: [u8; 21] = [
             2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 42, 84, 99, 186, 187, 188, 189, 192,
         ];
-        assert!(
-            !WELL_KNOWN.contains(&CFAB_PROTO),
-            "CFAB_PROTO {CFAB_PROTO} collides with a well-known rt_protos id"
+        for (id, name) in CFAB_PROTOS {
+            assert!(
+                !PROTO_RANGE.contains(&id),
+                "{name} ({id}) is inside the engine's swept range {PROTO_RANGE:?}"
+            );
+            assert!(
+                !WELL_KNOWN.contains(&id),
+                "{name} ({id}) collides with a well-known rt_protos id"
+            );
+        }
+        let ids: Vec<u8> = CFAB_PROTOS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len(),
+            "two cfab protocols share an id: {ids:?}"
         );
+    }
+
+    /// The packaged iproute2 fragments and the constants the code installs with are two
+    /// spellings of the same fact; a change to one without the other leaves `ip route show`
+    /// printing a bare number (or the wrong name) on every deployed host.
+    #[test]
+    fn the_packaged_iproute2_fragments_name_what_cfab_installs() {
+        use crate::commands::common::{HOST_DEFAULT_TABLE, HOST_DEFAULT_TABLE_NAME};
+        let protos = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/deb/rt_protos.d/cfab.conf"
+        ))
+        .unwrap();
+        for (id, name) in CFAB_PROTOS {
+            let want = format!("{id}\t{name}");
+            assert!(
+                protos.lines().any(|l| l == want),
+                "rt_protos.d/cfab.conf has no line `{want}`:\n{protos}"
+            );
+        }
+        let tables = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/packaging/deb/rt_tables.d/cfab.conf"
+        ))
+        .unwrap();
+        let want = format!("{HOST_DEFAULT_TABLE}\t{HOST_DEFAULT_TABLE_NAME}");
+        assert!(
+            tables.lines().any(|l| l == want),
+            "rt_tables.d/cfab.conf has no line `{want}`:\n{tables}"
+        );
+    }
+
+    /// Both fragments must be in the package, or the names exist only in the source tree.
+    #[test]
+    fn the_iproute2_fragments_are_packaged() {
+        let toml =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        for f in ["rt_protos.d/cfab.conf", "rt_tables.d/cfab.conf"] {
+            assert!(
+                toml.contains(&format!("packaging/deb/{f}")),
+                "Cargo.toml [package.metadata.deb] assets does not ship {f}"
+            );
+        }
     }
 
     fn tree(member: &str) -> Value {
@@ -579,27 +720,29 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let cfg = generate(&v).unwrap();
         let storage = instance(&cfg, "storage");
-        let p = ospf_if(storage, "primary.3");
+        let p = ospf_if(storage, "cfab-work-vms");
         assert_eq!(p["passive"], true, "{p}");
-        assert!(p.get("cost").is_none(), "primary.3 carries a cost");
-        assert!(p.get("bfd").is_none(), "primary.3 carries bfd");
+        assert!(p.get("cost").is_none(), "cfab-work-vms carries a cost");
+        assert!(p.get("bfd").is_none(), "cfab-work-vms carries bfd");
         let cluster = instance(&cfg, "cluster");
         assert!(
-            !ospf_ifs(cluster).iter().any(|i| i["name"] == "primary.3"),
-            "primary.3 in an instance not in allow: {cluster}"
+            !ospf_ifs(cluster)
+                .iter()
+                .any(|i| i["name"] == "cfab-work-vms"),
+            "cfab-work-vms in an instance not in allow: {cluster}"
         );
-        assert!(if_names(&cfg).contains(&"primary.3".to_string()));
+        assert!(if_names(&cfg).contains(&"cfab-work-vms".to_string()));
         // A member that carries no row (the leaf pve3-tb) emits nothing for the ifname.
         let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
         assert!(
-            !if_names(&leaf).contains(&"primary.3".to_string()),
+            !if_names(&leaf).contains(&"cfab-work-vms".to_string()),
             "{leaf}"
         );
         assert!(
             !ospf_ifs(instance(&leaf, "storage"))
                 .iter()
-                .any(|i| i["name"] == "primary.3"),
-            "primary.3 passive on a non-carrier"
+                .any(|i| i["name"] == "cfab-work-vms"),
+            "cfab-work-vms passive on a non-carrier"
         );
     }
 
@@ -1171,6 +1314,383 @@ mod tests {
                 assert!(!s.contains("passive-mode"), "{member}: {s}");
             }
         }
+    }
+
+    // ---- workload host routes (spec §5.0/§5.2, gate G0) ----
+
+    fn wl_routes(rows: &[(&str, &[&str])]) -> WorkloadRoutes {
+        rows.iter()
+            .map(|(leg, cidrs)| {
+                (
+                    leg.to_string(),
+                    cidrs.iter().map(|c| c.parse().unwrap()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn static_instance(t: &Value) -> Option<&Value> {
+        instances(t)
+            .iter()
+            .find(|p| p["type"] == "ietf-routing:static")
+    }
+
+    /// A live VM on the leg: ONE `ietf-routing:static` instance named `cfab`, one route per
+    /// cidr in set order out the leg, and `holo-ospf:redistribution` on every zone instance
+    /// the row's `allow` names — and on no other instance, so a VM /32 never enters a zone
+    /// the workload may not reach.
+    #[test]
+    fn workload_routes_emit_one_static_instance_and_redistribution_on_the_allowed_zones() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.104/32", "192.168.20.103/32"])]);
+        let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+
+        let stat = static_instance(&t).expect("no static instance");
+        assert_eq!(stat["name"], "cfab");
+        assert_eq!(
+            stat["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+            json!([
+                { "destination-prefix": "192.168.20.103/32",
+                  "next-hop": { "outgoing-interface": "cfab-work-vms" } },
+                { "destination-prefix": "192.168.20.104/32",
+                  "next-hop": { "outgoing-interface": "cfab-work-vms" } },
+            ])
+        );
+
+        let want = json!([{ "type": "ietf-routing:static" }]);
+        for inst in ospf_instances(&t) {
+            let got = &inst["ietf-ospf:ospf"]["holo-ospf:redistribution"];
+            if inst["name"] == "storage" {
+                assert_eq!(got, &want, "{}", inst["name"]);
+            } else {
+                assert!(got.is_null(), "{}: {got}", inst["name"]);
+            }
+        }
+    }
+
+    /// `allow` with two zones redistributes into both instances and still into no third.
+    #[test]
+    fn a_multi_zone_allow_redistributes_into_each_allowed_zone() {
+        let text = crate::decl::fixtures::with_multi_zone_allow_workload(
+            &crate::decl::fixtures::example(),
+        );
+        let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
+        let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+        let got: Vec<&str> = ospf_instances(&t)
+            .iter()
+            .filter(|i| !i["ietf-ospf:ospf"]["holo-ospf:redistribution"].is_null())
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, ["storage", "mgmt"]);
+    }
+
+    /// A member that carries a `[[workload]]` row emits the `cfab` static instance and the
+    /// redistribution entry whether or not it has a route to put in them: the withdrawal is
+    /// the SAME instance with an empty `route` list, never a missing instance.
+    ///
+    /// VERIFIED on the testbed 2026-09-10 02:07 UTC, root cause read in the pinned holo:
+    /// holo-northbound fires exactly one `Delete` callback for a deleted list entry and none
+    /// for its descendants (`holo-northbound/src/configuration.rs:426-434`), and
+    /// holo-routing's `ControlPlaneProtocolChange::Delete`
+    /// (`holo-routing/src/northbound/configuration.rs:180-188`) only drops the instance entry
+    /// — it never touches `master.static_routes`. Deleting the instance therefore left the
+    /// route in holo's RIB and in the kernel (`192.168.20.103 dev cfab-work-vms proto cfab-static
+    /// metric 1` survived the withdraw) and the next request re-advertised the stale /32.
+    /// Keeping the instance makes the withdrawal a per-route `Delete`
+    /// (`configuration.rs:211-213`), which does uninstall.
+    #[test]
+    fn an_empty_route_set_still_emits_the_static_instance_and_the_redistribution() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let base = generate(&v).unwrap();
+        for routes in [WorkloadRoutes::new(), wl_routes(&[("cfab-work-vms", &[])])] {
+            let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+            assert_eq!(t, base, "the empty set is exactly what `generate` emits");
+            let stat = static_instance(&t).expect("no static instance");
+            assert_eq!(stat["name"], "cfab");
+            assert_eq!(
+                stat["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+                json!([])
+            );
+            let want = json!([{ "type": "ietf-routing:static" }]);
+            for inst in ospf_instances(&t) {
+                let got = &inst["ietf-ospf:ospf"]["holo-ospf:redistribution"];
+                if inst["name"] == "storage" {
+                    assert_eq!(got, &want, "{}", inst["name"]);
+                } else {
+                    assert!(got.is_null(), "{}: {got}", inst["name"]);
+                }
+            }
+        }
+    }
+
+    /// The other half of the rule: a member with no `[[workload]]` row at all emits neither
+    /// the instance nor the redistribution entry, so nothing that never hosts a VM carries a
+    /// live type-5 subscriber.
+    #[test]
+    fn a_member_with_no_workload_row_emits_no_static_instance_and_no_redistribution() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert!(v.workload_rows().is_empty(), "fixture has a workload row");
+        let t = generate(&v).unwrap();
+        assert!(static_instance(&t).is_none());
+        for inst in ospf_instances(&t) {
+            assert!(
+                inst["ietf-ospf:ospf"]["holo-ospf:redistribution"].is_null(),
+                "{}",
+                inst["name"]
+            );
+        }
+    }
+
+    /// The withdrawal seen as holo sees it: the instance's list key is unchanged across the
+    /// two trees, so holo's diff is a per-route delete and not an instance delete.
+    #[test]
+    fn the_static_instance_survives_a_withdraw_so_the_diff_is_per_route() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let live = generate_with(
+            &v,
+            TransitCost::Declared,
+            &wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]),
+        )
+        .unwrap();
+        let withdrawn = generate_with(
+            &v,
+            TransitCost::Declared,
+            &wl_routes(&[("cfab-work-vms", &[])]),
+        )
+        .unwrap();
+
+        for t in [&live, &withdrawn] {
+            let stat = static_instance(t).expect("the instance was deleted by the withdraw");
+            assert_eq!(
+                (&stat["type"], &stat["name"]),
+                (&json!("ietf-routing:static"), &json!("cfab"))
+            );
+        }
+        assert_eq!(
+            live["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .len(),
+            withdrawn["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .len(),
+            "the withdraw changed the instance list, not just the route list"
+        );
+        assert_eq!(
+            withdrawn["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["type"] == "ietf-routing:static")
+                .unwrap()["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+            json!([])
+        );
+    }
+
+    /// A leg no `[[workload]]` row on this member names is refused, loudly: it would emit a
+    /// route out an interface the tree never declares, which libyang rejects with a leafref
+    /// error naming nothing useful.
+    ///
+    /// The EMPTY set is refused the same way and in the same words. A withdrawal is not a
+    /// weaker request than an install: an unknown leg is a typo or a stale driver either way,
+    /// and accepting it quietly (there is nothing to emit, so nothing goes wrong) would make
+    /// the same mistake fail loudly or silently depending on how many VMs happened to be up.
+    #[test]
+    fn a_route_on_an_undeclared_leg_is_refused_by_name_whether_or_not_it_has_cidrs() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        for cidrs in [&["192.168.20.103/32"][..], &[][..]] {
+            let routes = wl_routes(&[("cfab-work-nope", cidrs)]);
+            let e = generate_with(&v, TransitCost::Declared, &routes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no workload interface cfab-work-nope on this member"),
+                "{cidrs:?}: {e}"
+            );
+        }
+    }
+
+    /// The route set never disturbs the costs, and the leaf offset never disturbs the routes:
+    /// the two regeneration inputs are independent (plan conflict 1).
+    #[test]
+    fn the_leaf_offset_and_the_route_set_are_independent() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
+        let offset = f.leaf_cost_offset;
+        let declared = generate_at(&v, TransitCost::Declared).unwrap();
+        for (transit, want_cost) in [
+            (TransitCost::Declared, 0),
+            (TransitCost::LeafOffset, offset),
+        ] {
+            let bare = generate_at(&v, transit).unwrap();
+            let with = generate_with(&v, transit, &routes).unwrap();
+            let seg = |t: &Value| {
+                ospf_ifs(instance(t, "storage"))
+                    .iter()
+                    .find(|i| i["name"] == "cfab-st")
+                    .unwrap()["cost"]
+                    .as_u64()
+                    .unwrap()
+            };
+            assert_eq!(seg(&with), seg(&bare), "{transit:?}");
+            assert_eq!(
+                seg(&with) - seg(&declared),
+                u64::from(want_cost),
+                "{transit:?}"
+            );
+            let list = |t: &Value| {
+                static_instance(t).expect("no static instance")["static-routes"]
+                    ["ietf-ipv4-unicast-routing:ipv4"]["route"]
+                    .clone()
+            };
+            assert_eq!(list(&bare), json!([]), "{transit:?}");
+            assert_eq!(list(&with).as_array().unwrap().len(), 1, "{transit:?}");
+        }
+    }
+
+    /// libyang is the real check on this shape: `outgoing-interface` is an `if:interface-ref`
+    /// leafref, and the `holo-ospf:redistribution` augment carries a `when` on the instance
+    /// being OSPFv2. Teeth: the same tree with the leg out of the interface list, and the
+    /// same tree pointing at an interface that was never declared, must both be REFUSED.
+    #[test]
+    fn the_workload_route_tree_is_accepted_by_libyang_and_refused_without_the_leg() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
+        let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+        crate::engine::northbound::parse_candidate(&t).unwrap();
+
+        // The withdrawal shape too: libyang has to accept the instance with an EMPTY `route`
+        // list, or the fix that keeps the instance across a withdraw cannot be committed.
+        let empty = generate_with(&v, TransitCost::Declared, &WorkloadRoutes::new()).unwrap();
+        assert_eq!(
+            static_instance(&empty).unwrap()["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
+            json!([])
+        );
+        crate::engine::northbound::parse_candidate(&empty).unwrap();
+
+        let mut broken = t.clone();
+        let ifs = broken["ietf-interfaces:interfaces"]["interface"]
+            .as_array_mut()
+            .unwrap();
+        let before = ifs.len();
+        ifs.retain(|i| i["name"] != "cfab-work-vms");
+        assert_eq!(
+            ifs.len(),
+            before - 1,
+            "the leg was not in the interface list"
+        );
+        assert!(
+            crate::engine::northbound::parse_candidate(&broken).is_err(),
+            "libyang accepted a route out an interface the tree does not declare"
+        );
+
+        // The static route's own leafref, isolated: everything else stays.
+        let mut stray = t.clone();
+        stray["ietf-routing:routing"]["control-plane-protocols"]["control-plane-protocol"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter(|p| p["type"] == "ietf-routing:static")
+            .for_each(|p| {
+                p["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"][0]["next-hop"]
+                    ["outgoing-interface"] = json!("cfab-work-nope");
+            });
+        assert!(crate::engine::northbound::parse_candidate(&stray).is_err());
+    }
+
+    /// Does `set` match `net` the way holo does (`holo-utils/src/policy.rs`:
+    /// `contains(ip) && len >= lower && len <= upper`)?
+    fn prefix_set_matches(pol: &Value, set: &str, net: ipnetwork::Ipv4Network) -> bool {
+        pol["defined-sets"]["prefix-sets"]["prefix-set"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == set)
+            .unwrap_or_else(|| panic!("no prefix set {set}"))["prefixes"]["prefix-list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| {
+                let block: ipnetwork::Ipv4Network =
+                    p["ip-prefix"].as_str().unwrap().parse().unwrap();
+                let lower = p["mask-length-lower"].as_u64().unwrap() as u8;
+                let upper = p["mask-length-upper"].as_u64().unwrap() as u8;
+                block.contains(net.ip()) && net.prefix() >= lower && net.prefix() <= upper
+            })
+    }
+
+    /// SECURITY BOUNDARY, and it rests on a schema default, so it gets a named test: a VM /32
+    /// now exists in the fabric as an OSPF type-5 external, and `holo-bgp:redistribution`
+    /// carries `ietf-ospf:ospfv2` — so the only thing keeping 192.168.20.103/32 off the
+    /// upstream router is that it matches NO statement of the ingress import policy and
+    /// holo's `default-import-policy` is `reject-route`. Assert all three: the emitted policy
+    /// accepts neither the VM /32 nor the workload /24, cfab never overrides the default, and
+    /// the default is still `reject-route` at the pinned holo. Also: the whole BGP subtree is
+    /// byte-identical with and without the routes, and static is not redistributed into BGP.
+    #[test]
+    fn a_redistributed_vm_route_is_accepted_by_no_bgp_statement_and_the_default_rejects_it() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
+        let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
+        let text = serde_json::to_string(&t).unwrap();
+        assert!(
+            text.contains("192.168.20.103/32"),
+            "the fixture lost the VM"
+        );
+
+        let pol = &t["ietf-routing-policy:routing-policy"];
+        for shape in ["192.168.20.103/32", "192.168.20.0/24"] {
+            let net: ipnetwork::Ipv4Network = shape.parse().unwrap();
+            for p in pol["policy-definitions"]["policy-definition"]
+                .as_array()
+                .unwrap()
+            {
+                for stmt in p["statements"]["statement"].as_array().unwrap() {
+                    let set = stmt["conditions"]["match-prefix-set"]["prefix-set"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        !(prefix_set_matches(pol, set, net)
+                            && stmt["actions"]["policy-result"] == "accept-route"),
+                        "{} statement {} accepts {shape}",
+                        p["name"],
+                        stmt["name"]
+                    );
+                }
+            }
+        }
+
+        // cfab never writes either default, so holo's schema default is what applies.
+        assert!(!text.contains("default-import-policy"), "{text}");
+        assert!(!text.contains("default-export-policy"), "{text}");
+        assert_eq!(
+            holo_utils::policy::DefaultPolicyType::default(),
+            holo_utils::policy::DefaultPolicyType::RejectRoute
+        );
+
+        // Nothing about the BGP side moved, and static is not one of BGP's sources.
+        let bare = generate(&v).unwrap();
+        assert_eq!(bgp_instance(&t).unwrap(), bgp_instance(&bare).unwrap());
+        let redist = &bgp_instance(&t).unwrap()["ietf-bgp:bgp"]["global"]["afi-safis"]["afi-safi"]
+            [0]["ipv4-unicast"]["holo-bgp:redistribution"];
+        assert_eq!(
+            redist,
+            &json!([
+                { "type": "ietf-routing:direct" },
+                { "type": "ietf-ospf:ospfv2" },
+            ])
+        );
     }
 
     #[test]

@@ -276,7 +276,7 @@ mod tests {
         assert!(c.workloads.is_empty(), "an absent workloads key is no rows");
         let with_rows = FIXTURE.replace(
             "\"watchdog\":",
-            "\"workloads\": [{\"name\": \"vms\", \"ifname\": \"primary.3\",
+            "\"workloads\": [{\"name\": \"vms\", \"ifname\": \"cfab-work-vms\",
               \"trigger\": \"neigh events\", \"announces\": 7, \"bursts\": 2}],
              \"watchdog\":",
         );
@@ -289,7 +289,7 @@ mod tests {
                 c.workloads[0].announces,
                 c.workloads[0].bursts
             ),
-            ("vms", "primary.3", "neigh events", 7, 2)
+            ("vms", "cfab-work-vms", "neigh events", 7, 2)
         );
         let back: Components = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.workloads[0].announces, 7);
