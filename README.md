@@ -33,7 +33,7 @@ depend on.
 ## Commands
 
 ```
-cfab check                      # parse + validate fabric.toml, print this member's resolved view
+cfab check                      # parse + validate the whole fabric.toml, print every member's resolved view
 cfab schema                     # the fabric.toml declaration schema as JSON Schema
 cfab gen policy|mark|engine     # pure generators: print the derived artifacts
 cfab gen shape <dev> [--tc|--expect]
@@ -263,7 +263,7 @@ Names share the zone vocabulary, so `vms>storage` reads like `storage>storage`. 
 false` cannot declare a `[[workload]]` row at all — a workload with nothing to reach is refused,
 and reaching a zone requires forwarding, so there is no valid `allow` once forwarding is off.
 
-`cfab check` and `cfab up` refuse a `uplink` bridge that is not vlan-aware (`bridge-vlan-aware
+`cfab check` and the supervisor's apply refuse a `uplink` bridge that is not vlan-aware (`bridge-vlan-aware
 yes` in `/etc/network/interfaces`) — a tagged leg on it would receive nothing. Everything else is
 a wait, not a refusal: a bridge that is not on the host yet, an uplink that cannot be identified,
 an uplink that is not yet STP-forwarding, and another vlan device already holding the row's `vid`
@@ -361,7 +361,7 @@ in its own table so the host's existing default is never touched.
   for a moment without moving the address) — an early drop would send an established off-subnet
   session's next packet over the fabric gateway instead, asymmetric at a zone firewall.
 - **A host with no floor default of its own** still gets the fabric default (table 250, rules
-  2100/2101) but no pref-2099 pins to protect it, and `cfab up` (and every re-apply) prints one
+  2100/2101) but no pref-2099 pins to protect it, and the supervisor's apply (and every re-apply) prints one
   loud warning line saying so: a host is expected to keep its own default route (DHCP, or a
   static `gateway` line) rather than depend on cfab's, which exists to fail outward safely, not
   to be a host's only path.

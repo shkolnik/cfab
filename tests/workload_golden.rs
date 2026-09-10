@@ -40,7 +40,7 @@ fn render_text(decl_text: &str, member: &str) -> String {
         out.push_str(&format!("== {name} ==\n{body}\n"));
     };
 
-    section("check", check::report(&f, &v));
+    section("check", check::report(&f));
     section(
         "rules",
         return_path_rules(&v)

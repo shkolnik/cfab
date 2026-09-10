@@ -32,21 +32,25 @@ docker build --build-arg CFAB_DEB=cfab_0.4.1-1_amd64.deb -t cfab packaging/docke
 
 ## Run — validate only (`cfab check`)
 
-No network privilege is needed to lint a declaration:
+No network privilege is needed to lint a declaration, and no hostname either: `check` reports the
+WHOLE file — every declared member — so it does not care which one the container claims to be.
 
 ```
 docker run --rm --network none \
     -v /path/to/fabric.toml:/etc/cfab/fabric.toml:ro \
-    --hostname pve1-tb \
     ghcr.io/shkolnik/cfab:0.4.1 check
 ```
+
+Its last line will say the container is no declared member and that the host checks were skipped,
+which for a lint container is the correct answer rather than a failure. Add `--hostname pve1-tb`
+only if you also want the host-fitness section for that row.
 
 The entrypoint is `/usr/bin/cfab`, so the argv after the image name is the subcommand only —
 `check`, not `cfab check`.
 
 The container's hostname selects which ``[[member]]`` row it is, and nothing else does: cfab has
 no override, so `--hostname` (compose: `hostname:`) is required whenever the container's default
-name is not the row name. This is what the container case always wanted — a container that calls
+name is not the row name — for every verb but `check`, which is scoped to no member at all. This is what the container case always wanted — a container that calls
 itself `pve1-tb` IS `pve1-tb`, rather than one that answers to one name and reports another.
 
 ## Run — as a fabric member (leaf or transiting host)

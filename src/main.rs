@@ -26,8 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and validate fabric.toml; print the resolved view for this member; with
-    /// [[workload]] rows, also print the fabric aggregate and the DHCP option 121 snippet
+    /// Parse and validate the whole fabric.toml; print every declared member's resolved view,
+    /// each [[workload]] row, and which declared member (if any) this host is
     Check,
     /// Print the fabric.toml declaration schema as JSON Schema
     Schema,
@@ -315,6 +315,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         None => load_fabric_text(&path)?,
     };
     let member = member_name()?;
+    // `check` is the whole file's verdict, not this host's: it is dispatched BEFORE the identity
+    // gate below so a box that declares no member of this fabric still validates and reports it.
+    if let Command::Check = cli.command {
+        let mut sys = RealSys::default();
+        commands::check::run_cli(&mut sys, &fabric, &member, &mut std::io::stdout())?;
+        return Ok(ExitCode::SUCCESS);
+    }
     // The name came from the kernel hostname, so the remedy is about the HOST — there is no
     // argument to have mistyped. `Fabric::member`'s own message is the generic lookup failure,
     // correct for the library's other callers (a test harness resolves literal names); this adds
@@ -328,7 +335,10 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     })?;
 
     match cli.command {
-        Command::Schema | Command::Cluster { .. } | Command::PdeathSelftest { .. } => {
+        Command::Schema
+        | Command::Check
+        | Command::Cluster { .. }
+        | Command::PdeathSelftest { .. } => {
             unreachable!("handled above")
         }
         Command::Conf {
@@ -343,17 +353,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 "{}",
                 commands::cluster::publish(&mut sys, &cfab::cluster::Pmxcfs::new(), &conf_text)?
             );
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Check => {
-            // Host facts before the report: an operator running `check` on the member is
-            // meant to meet a bridge that cannot carry the leg here, not at `up`.
-            let mut sys = RealSys::default();
-            commands::check::host_preflight(&sys, &view)?;
-            for w in commands::check::host_warnings(&mut sys, &view) {
-                println!("{w}");
-            }
-            print!("{}", commands::check::report(&fabric, &view));
             Ok(ExitCode::SUCCESS)
         }
         Command::Gen { artifact } => {
@@ -511,17 +510,38 @@ mod tests {
             .unwrap()
     }
 
-    /// The per-member line is the only output that says what THIS host will get, and `up`
-    /// builds one bond per fallback leg with one port per wire under it. It must say so.
+    /// One line per DECLARED member, not one for the host that happens to be running: the
+    /// supervisor builds one bond per fallback leg with one port per wire under it, and an
+    /// operator reading the file needs that count for every member it will run on. The report
+    /// carries no identity at all, so it is the same bytes on every host.
     #[test]
-    fn check_names_this_members_fallback_legs() {
+    fn check_names_every_members_fallback_legs() {
         let f = fabric_from(&example());
-        let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
-            commands::check::report(&f, &view),
+            commands::check::report(&f),
             "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
-             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             3 fallback leg(s), 1 ingress leg(s)\n"
+             member pve1-tb (node 1, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 1 ingress leg(s)\n\
+             member pve2-tb (node 2, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 1 ingress leg(s)\n\
+             member pve3-tb (node 3, leaf): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 0 ingress leg(s)\n"
+        );
+    }
+
+    /// The host section is the ONLY part that depends on who is running, and a box that is no
+    /// declared member still gets the report above it — it is told what it is missing, not
+    /// handed a clean-looking page.
+    #[test]
+    fn the_host_line_names_this_box_or_says_it_is_no_member() {
+        let f = fabric_from(&example());
+        assert_eq!(
+            commands::check::host_line(&f, "pve1-tb"),
+            "this host: pve1-tb\n"
+        );
+        assert_eq!(
+            commands::check::host_line(&f, "build01"),
+            "this host: build01 is not a declared member of this fabric; host checks skipped\n"
         );
     }
 
@@ -558,12 +578,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let f = fabric_from(&text);
-        let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
-            commands::check::report(&f, &view),
+            commands::check::report(&f),
             "fabric.toml OK: 3 zones, 9 segments, 0 fallback legs, 3 members\n\
-             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
-             0 fallback leg(s), 1 ingress leg(s)\n"
+             member pve1-tb (node 1, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             0 fallback leg(s), 1 ingress leg(s)\n\
+             member pve2-tb (node 2, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             0 fallback leg(s), 1 ingress leg(s)\n\
+             member pve3-tb (node 3, leaf): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             0 fallback leg(s), 0 ingress leg(s)\n"
         );
     }
 }

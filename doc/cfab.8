@@ -90,17 +90,33 @@ skips its different\-driver check for it.
 .PP
 Most subcommands require root. The generators
 .RB ( "cfab gen" ,
-.BR "cfab check" ,
 .BR "cfab schema" )
 are pure: they read the declaration and change nothing.
+.B "cfab check"
+changes nothing either, but it is not only a generator \(em it reads this
+host as well as the declaration; see below.
 .SH SUBCOMMANDS
 .TP
 .B check
-Parse and validate
-.BR fabric.toml ;
-print the resolved view for this member (zones, segments, wires, ingress
-legs). Validation fails loudly on any inconsistency; an unknown key in the
-declaration is a parse error naming its line and column.
+Parse and validate the WHOLE
+.BR fabric.toml ,
+and print the resolved view of every declared member (zones, segments, wires,
+ingress legs) \(em not just of the host running it. Validation fails loudly on
+any inconsistency; an unknown key in the declaration is a parse error naming
+its line and column. The declaration is installed whole on every member, so a
+defect anywhere in it is every host's problem; the report carries no identity
+and is therefore the same bytes on every host, which makes a diff across the
+cluster a proof that they hold the same file.
+.IP
+A last section is about the host: one line naming which declared member this
+box is, then the host facts a
+.B [[workload]]
+row needs and the declaration cannot state (below). A box that is no declared
+member of this fabric \(em a laptop, a build host, a host renamed out of its
+row \(em still gets the full report, and is told that the host checks were
+skipped rather than left to read a clean-looking page. The report is printed
+before the host checks run, so a host that cannot carry a row never costs the
+operator the verdict on the file.
 .TP
 .B schema
 Print the
@@ -786,9 +802,9 @@ row at all: reaching a zone requires forwarding, so no
 value is ever valid once it is off.
 .PP
 .B cfab check
-and
-.B cfab up
-refuse an
+and the supervisor's apply
+.RB ( "cfab run" ,
+which is what the unit starts) refuse an
 .B uplink
 bridge that is not vlan\-aware
 .RB ( "bridge\-vlan\-aware yes"
@@ -984,9 +1000,8 @@ gone from every device on the host, not merely from the floor device for one tic
 reconfiguration can drop the floor default for a moment without moving the address) \(em an
 early drop would send an established off\-subnet session's next packet over the fabric gateway
 instead, asymmetric at a zone firewall. A host with no floor default of its own still gets the
-fabric default (table 250, rules 2100/2101) but no pref\-2099 pins to protect it, and
-.B "cfab up"
-(and every re\-apply) prints one loud warning line saying so: a host is expected to keep its own
+fabric default (table 250, rules 2100/2101) but no pref\-2099 pins to protect it, and the
+supervisor's apply (and every re\-apply) prints one loud warning line saying so: a host is expected to keep its own
 default route
 (DHCP, or a static
 .B gateway

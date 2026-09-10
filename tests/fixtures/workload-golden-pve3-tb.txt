@@ -1,6 +1,8 @@
 == check ==
 fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members
-this member: pve3-tb (node 3, leaf); 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 0 ingress leg(s)
+member pve1-tb (node 1, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 1 ingress leg(s)
+member pve2-tb (node 2, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 1 ingress leg(s)
+member pve3-tb (node 3, leaf): 9 segment sub-ifs on wires [eth0 eth1 eth9], 3 fallback leg(s), 0 ingress leg(s)
 workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 host-local, no dhcp_server (no relay), allow storage; carried by pve1-tb, pve2-tb
 
 == rules ==

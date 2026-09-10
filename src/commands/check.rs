@@ -1,18 +1,27 @@
-//! `cfab check`: validate the declaration and report the fabric as declared, what THIS member
-//! gets, and (with `[[workload]]` rows) each row.
+//! `cfab check`: validate the declaration and report the WHOLE file — the fabric as declared,
+//! what every declared member gets, and (with `[[workload]]` rows) each row.
+//!
+//! Nothing here is scoped to the host running it. The declaration is installed whole on every
+//! member, so a defect anywhere in it is every host's problem, and `check` is the verb that says
+//! so: its report is byte-identical on every host, which makes a diff across the cluster a proof
+//! that they hold the same file. The host-specific part — who this box is, and whether it can
+//! carry the rows it declares — is a separate section the CALLER prints after this report, so a
+//! bad bridge can never suppress the file's verdict.
 
 use std::collections::BTreeSet;
 
-use crate::derive::View;
+use crate::derive::{View, class_rows_of, fallback_rows_of, gw_rows_of};
 use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
 use crate::sys::Sys;
 use crate::workload::uplink;
 
 /// Host facts a `[[workload]]` row needs that the declaration cannot state, read where the
-/// member actually runs: `check` calls it before it prints, and `apply`'s pass 1 calls it
-/// again, so the refusal has one spelling and an operator meets it before `up` touches a
-/// netdev.
+/// member actually runs: `check` calls it AFTER printing the file report, and `apply`'s pass 1
+/// calls it again, so the refusal has one spelling and an operator meets it before the
+/// supervisor's apply touches a netdev. After, not before, because a host that cannot carry a
+/// row must not also cost the operator the verdict on the file — the two are separate questions
+/// and only one of them is about this box.
 ///
 /// The one condition today is the uplink bridge's `vlan_filtering`: cfab's leg only receives
 /// its tag while the bridge carries that vid on itself (`bridge vlan ... self`), which a bridge
@@ -106,31 +115,40 @@ fn reaches(fabric: &Fabric, wl: &crate::model::Workload, server: std::net::Ipv4A
 /// vid, the leg cfab creates, prefix, gw, the relay's server if the row declares one, allow, and
 /// the members that carry it). The VLAN is host-local, so there is no aggregate and no DHCP
 /// option-121 snippet to paste: a VM's default route is `gw`, which is option 3.
-pub fn report(fabric: &Fabric, view: &View) -> String {
-    let kind = match view.kind() {
-        MemberKind::Host => "host",
-        MemberKind::Leaf => "leaf",
-    };
+pub fn report(fabric: &Fabric) -> String {
     let fallback_legs = fabric
         .segments
         .iter()
         .filter(|r| r.scope.is_universal())
         .count();
     let mut out = format!(
-        "fabric.toml OK: {} zones, {} segments, {} fallback legs, {} members\n\
-         this member: {} (node {}, {kind}); {} segment sub-ifs on wires [{}], {} fallback leg(s), \
-         {} ingress leg(s)\n",
+        "fabric.toml OK: {} zones, {} segments, {} fallback legs, {} members\n",
         fabric.zones.len(),
         fabric.segments.len() - fallback_legs,
         fallback_legs,
         fabric.members.len(),
-        view.member.name,
-        view.node(),
-        view.class_rows().len(),
-        view.wires().join(" "),
-        view.fallback_rows().len(),
-        view.gw_rows().len(),
     );
+    // Every declared member, in declaration order — not just the one running this. The
+    // per-member derivation is taken from the free functions rather than through `View`, which
+    // exists to answer "who am I": there is no identity in play here, only rows in a file.
+    for m in &fabric.members {
+        let kind = match m.kind {
+            MemberKind::Host => "host",
+            MemberKind::Leaf => "leaf",
+        };
+        let class_rows = class_rows_of(fabric, m);
+        let wires: BTreeSet<&str> = class_rows.iter().map(|r| r.wire.as_str()).collect();
+        out.push_str(&format!(
+            "member {} (node {}, {kind}): {} segment sub-ifs on wires [{}], {} fallback leg(s), \
+             {} ingress leg(s)\n",
+            m.name,
+            m.node,
+            class_rows.len(),
+            wires.into_iter().collect::<Vec<_>>().join(" "),
+            fallback_rows_of(fabric, m).len(),
+            gw_rows_of(fabric, m).len(),
+        ));
+    }
     if !fabric.workloads.is_empty() {
         for wl in &fabric.workloads {
             let carried_by = fabric
@@ -199,6 +217,51 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
     out
 }
 
+/// This host's line: which declared member it is, or that it is none of them.
+///
+/// A box that declares no member of this fabric — a laptop, a CI runner, a host renamed out of
+/// its row — is NOT an error here. The file's correctness has nothing to do with who is reading
+/// it, so such a box still gets the full report above this line; what it cannot get is the host
+/// section below it, and it is told so in those words rather than left to read a clean-looking
+/// report as a clean bill of health.
+pub fn host_line(fabric: &Fabric, member: &str) -> String {
+    match fabric.member(member) {
+        Ok(_) => format!("this host: {member}\n"),
+        Err(_) => format!(
+            "this host: {member} is not a declared member of this fabric; host checks skipped\n"
+        ),
+    }
+}
+
+/// The whole `cfab check`: the file's report and this host's line, then — only if this host is
+/// a declared member — the live host checks.
+///
+/// The order is the point. `host_preflight` REFUSES, and it is about this box; the report is
+/// about the file. Writing the report first means a host that cannot carry a row never costs
+/// the operator the verdict on the declaration they came to check. `out` is the sink so a test
+/// can hold both halves of that at once: the refusal returned, and the report already written.
+pub fn run_cli(
+    sys: &mut dyn Sys,
+    fabric: &Fabric,
+    member: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let w = |out: &mut dyn std::io::Write, s: &str| -> Result<()> {
+        out.write_all(s.as_bytes())
+            .map_err(|e| Error::fatal(format!("cannot write the report: {e}")))
+    };
+    w(out, &report(fabric))?;
+    w(out, &host_line(fabric, member))?;
+    let Ok(view) = View::new(fabric, member) else {
+        return Ok(());
+    };
+    host_preflight(&*sys, &view)?;
+    for warning in host_warnings(sys, &view) {
+        w(out, &format!("{warning}\n"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +285,42 @@ mod tests {
             sys = sys.file("/sys/class/net/primary/bridge/vlan_filtering", v);
         }
         sys
+    }
+
+    /// The refusal is about this BOX; the report is about the FILE. An operator who runs
+    /// `check` on a host with a bridge that cannot carry the leg still gets the file's verdict —
+    /// the report is already written by the time the refusal can fire. Regress by moving
+    /// `host_preflight` above the two writes in `run_cli` and this goes red.
+    #[test]
+    fn a_host_that_cannot_carry_a_row_still_gets_the_files_verdict() {
+        let f = wl_fabric();
+        let mut sys = bridge_sys(Some("0\n"));
+        let mut out: Vec<u8> = Vec::new();
+        let err = run_cli(&mut sys, &f, "pve1-tb", &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("bridge primary is not vlan-aware"),
+            "{err}"
+        );
+        let written = String::from_utf8(out).unwrap();
+        assert_eq!(written, format!("{}this host: pve1-tb\n", report(&f)));
+    }
+
+    /// A box that is no declared member is not an error: the file is still validated and still
+    /// reported, and the host section says why it is absent instead of being silently empty.
+    #[test]
+    fn a_box_that_is_no_member_gets_the_report_and_is_told_what_was_skipped() {
+        let f = wl_fabric();
+        let mut sys = bridge_sys(Some("0\n"));
+        let mut out: Vec<u8> = Vec::new();
+        run_cli(&mut sys, &f, "build01", &mut out).expect("no member is not an error");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{}this host: build01 is not a declared member of this fabric; host checks \
+                 skipped\n",
+                report(&f)
+            )
+        );
     }
 
     #[test]
@@ -342,39 +441,37 @@ mod tests {
             )
         );
         let f = Fabric::from_decl(&Declaration::parse(&two).unwrap()).unwrap();
-        let view = View::new(&f, "pve1-tb").unwrap();
         let want = "warning: workload rows vms, dmz declare different allow sets; every allowed \
                     zone's OSPF instance advertises the per-VM routes of ALL rows (holo \
                     redistributes static routes per instance, not per route) — reach is decided \
                     by the forward policy, not by which routes exist\n";
-        assert!(report(&f, &view).contains(want), "{}", report(&f, &view));
+        assert!(report(&f).contains(want), "{}", report(&f));
         // One row, or two that agree: nothing to warn about, and the line is absent.
         let one = wl_fabric();
-        assert!(!report(&one, &View::new(&one, "pve1-tb").unwrap()).contains("warning:"));
+        assert!(!report(&one).contains("warning:"));
         let agree = two.replace("allow = [\"storage\", \"mgmt\"]", "allow = [\"storage\"]");
         let f2 = Fabric::from_decl(&Declaration::parse(&agree).unwrap()).unwrap();
-        assert!(!report(&f2, &View::new(&f2, "pve1-tb").unwrap()).contains("warning:"));
+        assert!(!report(&f2).contains("warning:"));
         // ...and the same two zones in the other order is the SAME set: `allow` is a set of
         // zones, so declaration order must not decide whether an operator is warned.
         // vms becomes ["mgmt", "storage"] beside dmz's ["storage", "mgmt"]: one set, two orders.
         let reordered = two.replace("allow = [\"storage\"]", "allow = [\"mgmt\", \"storage\"]");
         let f3 = Fabric::from_decl(&Declaration::parse(&reordered).unwrap()).unwrap();
-        assert!(
-            !report(&f3, &View::new(&f3, "pve1-tb").unwrap()).contains("warning:"),
-            "{}",
-            report(&f3, &View::new(&f3, "pve1-tb").unwrap())
-        );
+        assert!(!report(&f3).contains("warning:"), "{}", report(&f3));
     }
 
     #[test]
     fn report_lists_workloads() {
         let f = wl_fabric();
-        let view = View::new(&f, "pve1-tb").unwrap();
         assert_eq!(
-            report(&f, &view),
+            report(&f),
             "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
-             this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             member pve1-tb (node 1, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n\
+             member pve2-tb (node 2, host): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 1 ingress leg(s)\n\
+             member pve3-tb (node 3, leaf): 9 segment sub-ifs on wires [eth0 eth1 eth9], \
+             3 fallback leg(s), 0 ingress leg(s)\n\
              workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 \
              host-local, no dhcp_server (no relay), allow storage; carried by pve1-tb, pve2-tb\n"
         );
@@ -389,8 +486,7 @@ mod tests {
             "gw = \"192.168.20.254\"\ndhcp_server = \"192.168.10.11\"",
         );
         let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
-        let view = View::new(&f, "pve1-tb").unwrap();
-        let out = report(&f, &view);
+        let out = report(&f);
         assert!(
             out.contains("host-local, dhcp_server 192.168.10.11, allow storage;"),
             "{out}"
@@ -413,24 +509,22 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
-        let view = View::new(&f, "pve1-tb").unwrap();
         assert!(
-            report(&f, &view).contains(
+            report(&f).contains(
                 "warning: workload vms: dhcp_server 192.168.10.11 is in no zone this row is \
                  allowed into (storage) and no zone declares a gw, so the relay has no route to \
                  it\n"
             ),
             "{}",
-            report(&f, &view)
+            report(&f)
         );
         // A server INSIDE an allowed zone's own block needs no gw zone and draws no warning.
         let inside = text.replace("192.168.10.11", "10.99.5.11");
         let f2 = Fabric::from_decl(&Declaration::parse(&inside).unwrap()).unwrap();
-        let v2 = View::new(&f2, "pve1-tb").unwrap();
         assert!(
-            !report(&f2, &v2).contains("has no route to it"),
+            !report(&f2).contains("has no route to it"),
             "{}",
-            report(&f2, &v2)
+            report(&f2)
         );
     }
 }
