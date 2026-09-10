@@ -152,9 +152,8 @@ pub fn run(
     let delta = after_bytes.saturating_sub(before_bytes);
     let mbps = (delta * 8) / 1_000_000 / secs;
 
-    let cap_dir = crate::caps::cap_dir(&f.run_dir);
-    sys.mkdir_p(&cap_dir)?;
-    let cap_file = format!("{cap_dir}/cap-{dev}");
+    sys.mkdir_p(&f.run_dir)?;
+    let cap_file = format!("{}/cap-{dev}", f.run_dir);
     let content = format!("{mbps}\n");
     sys.write(&cap_file, &content)?;
     out.push_str(&format!(
