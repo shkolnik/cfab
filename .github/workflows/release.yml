@@ -249,7 +249,7 @@ jobs:
       - name: Build the runtime image
         if: steps.meta.outputs.channel == 'formal'
         id: image_build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: packaging/docker
           platforms: linux/amd64
@@ -297,7 +297,7 @@ jobs:
       - name: Push the runtime image
         if: steps.meta.outputs.channel == 'formal'
         id: image_push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: packaging/docker
           platforms: linux/amd64
