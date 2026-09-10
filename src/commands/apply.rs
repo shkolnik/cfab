@@ -456,11 +456,27 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
             continue;
         }
         // The kernel allows one 802.1Q device per (parent, vid). A host stanza that already
-        // declares `<bridge>.<vid>` (the pre-0.5.3 shape) owns the pair, and building the leg
-        // would fail with `8021q: VLAN device already exists` — which used to take the WHOLE
-        // member down (VERIFIED on the rack 2026-09-10). Fourth deferral, same ruling, with the
-        // holder and the remedy named.
-        if let Some(dev) = leg::foreign_holder(sys, bridge, row.wl.vid, &leg)? {
+        // declares `<bridge>.<vid>`, or any other tool that took the pair, owns it — building
+        // the leg would fail with `8021q: VLAN device already exists`, which used to take the
+        // WHOLE member down (VERIFIED on the rack 2026-09-10). Fourth deferral under James's
+        // availability ruling of 2026-09-09, with the holder and the remedy named.
+        //
+        // A probe that cannot RUN (no `ip`, an iproute2 too old for `-j`/`type vlan`) defers the
+        // row too, exactly as the identify/STP probes above do with their own failures: turning
+        // an unanswerable question into a fatal would reintroduce the dark member this branch
+        // exists to prevent.
+        let holder = match leg::foreign_holder(sys, bridge, row.wl.vid, &leg) {
+            Ok(holder) => holder,
+            Err(e) => {
+                warnings.push(format!(
+                    "workload {name}: vid holder probe failed: {e}; row deferred to the watchdog"
+                ));
+                deferred_names.push(name.clone());
+                workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
+                continue;
+            }
+        };
+        if let Some(dev) = holder {
             warnings.push(format!(
                 "workload {name}: vid {} on {bridge} is held by {dev} (a host stanza?): remove \
                  it; row deferred to the watchdog",
@@ -1764,6 +1780,44 @@ pub(crate) mod tests {
             held.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
             vec!["1"]
         );
+    }
+
+    // The probe is a command, and a command can fail to run at all (no `ip`, an iproute2 too
+    // old for `-j`/`type vlan`, a transient exec error). Propagating that out of `run` would
+    // exit 3 and take the member dark — the exact class this whole fix removes — so a failed
+    // probe defers the row like every other workload precondition.
+    //
+    // Driven by a nonzero exit rather than `MockSys::fail_exec`: `fail_exec` matches its needle
+    // against each argv ELEMENT, so the full command line never matches, and the only elements
+    // that would (`ip`, `vlan`) also poison every class leg later in the same apply.
+    #[test]
+    fn up_defers_a_row_when_the_vid_holder_probe_fails() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut broken = sys.on_fail(
+            &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+            255,
+            "Command \"vlan\" is unknown, try \"ip link help\".",
+        );
+        let warnings = run(&mut broken, &view, &opts()).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.starts_with("workload vms: vid holder probe failed: "))
+            .unwrap_or_else(|| panic!("{warnings:#?}"));
+        assert!(
+            warning.ends_with("; row deferred to the watchdog"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("ip -d -j link show type vlan: exit 255"),
+            "the failure names the command that failed: {warning}"
+        );
+        assert!(!broken.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!broken.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            broken.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        assert!(broken.ran("nft -f /run/cfab/policy.nft"));
     }
 
     #[test]
