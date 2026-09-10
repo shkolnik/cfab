@@ -75,12 +75,12 @@ pub fn generate(view: &View) -> Result<String> {
         for z in &row.wl.allow {
             out.push_str(&format!(
                 "    iifname \"{ifn}\" oifname @{z} counter accept comment \"allow-{wl}-{z}\"\n",
-                ifn = row.wl.ifname,
+                ifn = row.wl.leg_ifname(),
                 wl = row.wl.name
             ));
             out.push_str(&format!(
                 "    iifname @{z} oifname \"{ifn}\" counter accept comment \"allow-{z}-{wl}\"\n",
-                ifn = row.wl.ifname,
+                ifn = row.wl.leg_ifname(),
                 wl = row.wl.name
             ));
         }
@@ -123,19 +123,19 @@ mod tests {
         let t = generate(&v).unwrap();
         assert!(
             t.contains(
-                "iifname \"primary.3\" oifname @storage counter accept comment \"allow-vms-storage\""
+                "iifname \"cfab-work-vms\" oifname @storage counter accept comment \"allow-vms-storage\""
             ),
             "{t}"
         );
         assert!(
             t.contains(
-                "iifname @storage oifname \"primary.3\" counter accept comment \"allow-storage-vms\""
+                "iifname @storage oifname \"cfab-work-vms\" counter accept comment \"allow-storage-vms\""
             ),
             "{t}"
         );
         let cfab_set = t.split("set cfab {").nth(1).unwrap();
         assert!(
-            cfab_set.contains("primary.3"),
+            cfab_set.contains("cfab-work-vms"),
             "owned set must carry the workload ifname so undeclared pairs hit default-deny, \
              not foreign-transit: {cfab_set}"
         );

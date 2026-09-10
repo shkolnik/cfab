@@ -164,7 +164,7 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
             }
         }
         for row in view.workload_rows() {
-            let ifname = &row.wl.ifname;
+            let ifname = &row.wl.leg_ifname();
             let gw_cidr = row.wl.gw_cidr();
             let addr = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
             if has_ip_addr(&addr.stdout, &gw_cidr) {
@@ -411,17 +411,17 @@ mod tests {
     fn wl_down_sys() -> MockSys {
         MockSys::default()
             .on_fail(&["ip", "link", "show"], 1, "no")
-            // `primary.3` is a real conf entry left by `up`'s `enable_forwarding` (the interface
+            // `cfab-work-vms` is a real conf entry left by `up`'s `enable_forwarding` (the interface
             // is not cfab's own creation, but the kernel already has a conf/<ifname>/ dir for
             // it) — `forwarding_off`'s `conf_interfaces` scan needs it present to find it.
-            .file("/proc/sys/net/ipv4/conf/primary.3/forwarding", "1\n")
+            .file("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding", "1\n")
             .on_stdout(
                 &["nft", "list", "table", "bridge", "cfab"],
                 "table bridge cfab {\n}\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
@@ -438,15 +438,15 @@ mod tests {
         let mut sys = wl_down_sys();
         run(&mut sys, &view).unwrap();
         assert!(sys.ran("nft delete table bridge cfab"));
-        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"0")
         );
-        assert!(!sys.ran("ip link del primary.3"));
-        assert!(!sys.ran("ip link set primary.3 down"));
+        assert!(!sys.ran("ip link del cfab-work-vms"));
+        assert!(!sys.ran("ip link set cfab-work-vms down"));
         assert!(
             sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
                 .is_empty(),
@@ -465,8 +465,8 @@ mod tests {
                 "Error: No such file or directory",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24\n",
             )
             .on_stdout(
                 &["ip", "rule", "show", "pref", "2000"],
@@ -485,11 +485,11 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_down_sys().on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.2/24 1192.168.20.254/24\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.2/24 1192.168.20.254/24\n",
         );
         run(&mut sys, &view).unwrap();
-        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
     }
 
     // M2 (whole-branch review): the bridge-guard presence read used a bare `?`, unlike the
@@ -504,10 +504,10 @@ mod tests {
         run(&mut sys, &view).unwrap();
         assert!(!sys.ran("nft list table bridge cfab"));
         assert!(!sys.ran("nft delete table bridge cfab"));
-        assert!(sys.ran("ip addr del 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr del 192.168.20.254/24 dev cfab-work-vms"));
         assert!(sys.ran("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"));
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"0")
         );

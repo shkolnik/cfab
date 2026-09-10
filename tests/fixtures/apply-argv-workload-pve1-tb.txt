@@ -21,8 +21,8 @@ write /proc/sys/net/ipv4/conf/all/ignore_routes_with_linkdown
 write /proc/sys/net/ipv4/conf/all/send_redirects
 write /proc/sys/net/ipv4/conf/default/send_redirects
 write /proc/sys/net/ipv4/conf/default/forwarding
-ip -br link show dev primary.3
-ip -4 -br addr show dev primary.3
+ip -br link show dev cfab-work-vms
+ip -4 -br addr show dev cfab-work-vms
 ip link show cfab-id99
 ip link show cfab-id99
 ip link add cfab-id99 type veth peer name cfab-id99-peer
@@ -288,14 +288,14 @@ write /proc/sys/net/ipv4/conf/cfab-mg-fb/forwarding
 write /proc/sys/net/ipv4/conf/eth9/forwarding
 write /proc/sys/net/ipv4/conf/eth1/forwarding
 write /proc/sys/net/ipv4/conf/eth0/forwarding
-write /proc/sys/net/ipv4/conf/primary.3/forwarding
+write /proc/sys/net/ipv4/conf/cfab-work-vms/forwarding
 iptables -S DOCKER-USER
 write /run/cfab/workload-bridge.nft
 nft -f /run/cfab/workload-bridge.nft
 nft -s list table bridge cfab
 write /run/cfab/workload-bridge.applied
 write /run/cfab/workload-deferred
-ip addr replace 192.168.20.254/24 dev primary.3
+ip addr replace 192.168.20.254/24 dev cfab-work-vms
 write /proc/sys/net/ipv4/conf/all/arp_ignore
 write /run/cfab/mark.backend
 /usr/bin/env sh -c command -v iptables-legacy

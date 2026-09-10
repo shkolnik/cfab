@@ -506,7 +506,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
             .unwrap();
         let (trees, state) = state
             .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
@@ -534,7 +534,7 @@ mod tests {
             .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
             .unwrap();
         let (trees, state) = state
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(seg_cost(trees.last().unwrap()), offset);
         assert_eq!(static_routes(trees.last().unwrap()), ["192.168.20.103/32"]);
@@ -553,12 +553,12 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (trees, state) = EngineState::new()
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(trees.len(), 1, "the first sighting is one commit");
 
         let (trees, state) = state
-            .apply_trees(&v, &routes_req("primary.3", 43, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(trees.len(), 2);
         assert!(static_routes(&trees[0]).is_empty(), "{:?}", trees[0]);
@@ -567,7 +567,7 @@ mod tests {
             "the withdraw tree deleted the instance; holo would leave the route installed"
         );
         assert_eq!(static_routes(&trees[1]), ["192.168.20.103/32"]);
-        assert_eq!(state.routes["primary.3"].0, 43);
+        assert_eq!(state.routes["cfab-work-vms"].0, 43);
     }
 
     /// Everything else is one commit: an unchanged ifindex, and a withdrawal (which needs no
@@ -577,21 +577,21 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
             .unwrap();
 
         let (trees, _) = state
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.104/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.104/32"]))
             .unwrap();
         assert_eq!(trees.len(), 1);
         assert_eq!(static_routes(&trees[0]), ["192.168.20.104/32"]);
 
         let (trees, withdrawn) = state
-            .apply_trees(&v, &routes_req("primary.3", 43, &[]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 43, &[]))
             .unwrap();
         assert_eq!(trees.len(), 1);
         assert!(static_routes(&trees[0]).is_empty());
-        assert!(withdrawn.wanted()["primary.3"].is_empty());
+        assert!(withdrawn.wanted()["cfab-work-vms"].is_empty());
     }
 
     /// A request the generator refuses leaves the state exactly as it was: a typo in one
@@ -601,7 +601,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
             .unwrap();
         // Both spellings of the typo: an install on an unknown leg, and a WITHDRAWAL on one.
         // The withdrawal refuses in the same words, before any tree is generated, and — like
@@ -646,15 +646,15 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut state = EngineState::new();
 
-        let req = routes_req("primary.3", 42, &["192.168.20.103/32"]);
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
         let steps = state.apply(&v, &req).unwrap();
         commit_steps(&mut state, &req, steps, async |_| Ok(true))
             .await
             .unwrap();
-        assert_eq!(state.routes["primary.3"].0, 42);
+        assert_eq!(state.routes["cfab-work-vms"].0, 42);
 
         // The ifindex moved: withdraw, then install. Fail the install.
-        let req = routes_req("primary.3", 43, &["192.168.20.103/32"]);
+        let req = routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]);
         let steps = state.apply(&v, &req).unwrap();
         assert_eq!(steps.len(), 2);
         let mut n = 0;
@@ -672,7 +672,7 @@ mod tests {
 
         assert!(e.contains("the provider refused the install"), "{e}");
         assert_eq!(
-            state.routes["primary.3"],
+            state.routes["cfab-work-vms"],
             (43, BTreeSet::new()),
             "the tracked state ran ahead of what the engine committed"
         );
@@ -685,12 +685,12 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut state = EngineState::new();
-        let req = routes_req("primary.3", 42, &["192.168.20.103/32"]);
+        let req = routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]);
         let steps = state.apply(&v, &req).unwrap();
         commit_steps(&mut state, &req, steps, async |_| Ok(false))
             .await
             .unwrap();
-        assert_eq!(state.wanted()["primary.3"].len(), 1);
+        assert_eq!(state.wanted()["cfab-work-vms"].len(), 1);
     }
 
     /// The two commits of an ifindex move are one journal line each and must be told apart:
@@ -707,18 +707,20 @@ mod tests {
         let (state, one) = {
             let s = EngineState::new();
             let steps = s
-                .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+                .apply(&v, &routes_req("cfab-work-vms", 42, &["192.168.20.103/32"]))
                 .unwrap();
             (steps.last().unwrap().2.clone(), labels(&steps))
         };
         assert_eq!(one, ["install"]);
 
         let moved = state
-            .apply(&v, &routes_req("primary.3", 43, &["192.168.20.103/32"]))
+            .apply(&v, &routes_req("cfab-work-vms", 43, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(labels(&moved), ["withdraw", "install"]);
 
-        let withdrawn = state.apply(&v, &routes_req("primary.3", 42, &[])).unwrap();
+        let withdrawn = state
+            .apply(&v, &routes_req("cfab-work-vms", 42, &[]))
+            .unwrap();
         assert_eq!(labels(&withdrawn), ["install"]);
 
         let cost = state
@@ -736,8 +738,13 @@ mod tests {
             "transit-cost leaf"
         );
         assert_eq!(
-            routes_req("primary.3", 42, &["192.168.20.103/32", "192.168.20.104/32"]).summary(),
-            "workload-routes primary.3 42 (2 routes)"
+            routes_req(
+                "cfab-work-vms",
+                42,
+                &["192.168.20.103/32", "192.168.20.104/32"]
+            )
+            .summary(),
+            "workload-routes cfab-work-vms 42 (2 routes)"
         );
     }
 

@@ -7,8 +7,9 @@ use crate::model::{Fabric, MemberKind};
 /// The lines `cfab check` prints. The per-member line is the last thing an operator sees before
 /// `up` creates the netdevs, so it names every leg `up` will build — the fallback legs included:
 /// their ports fan out per wire, so their count is member-dependent and not derivable from the
-/// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, ifname,
-/// prefix, gw, router, allow, and the members that carry it), then the fabric aggregate — the
+/// fabric-wide line. With `[[workload]]` rows declared, one line per row follows (name, uplink,
+/// vid, the leg cfab creates, prefix, gw, router, allow, and the members that carry it), then
+/// the fabric aggregate — the
 /// smallest set of prefixes covering every declared zone block — followed by one RFC 3442
 /// option-121 dhcpd.conf snippet per row (the aggregate is fabric-wide and shared; `gw`, `router`,
 /// and the row's own `prefix` differ per row): each snippet is a comment naming the EXISTING
@@ -50,9 +51,11 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
-                "workload {}: {} {} gw {} router {} allow {}; carried by {}\n",
+                "workload {}: {} vid {} ({}) {} gw {} router {} allow {}; carried by {}\n",
                 wl.name,
-                wl.ifname,
+                wl.uplink,
+                wl.vid,
+                wl.leg_ifname(),
                 wl.prefix,
                 wl.gw,
                 wl.router,
@@ -103,7 +106,8 @@ mod tests {
             "fabric.toml OK: 3 zones, 9 segments, 3 fallback legs, 3 members\n\
              this member: pve1-tb (node 1, host); 9 segment sub-ifs on wires [eth0 eth1 eth9], \
              3 fallback leg(s), 1 ingress leg(s)\n\
-             workload vms: primary.3 192.168.20.0/24 gw 192.168.20.254 router 192.168.20.1 \
+             workload vms: primary vid 3 (cfab-work-vms) 192.168.20.0/24 gw 192.168.20.254 \
+             router 192.168.20.1 \
              allow storage; carried by pve1-tb, pve2-tb\n\
              fabric aggregate (for DHCP option 121): 10.99.0.0/16, 10.199.0.0/16, \
              10.249.0.0/16\n\

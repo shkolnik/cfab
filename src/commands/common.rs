@@ -776,16 +776,22 @@ mod tests {
     #[test]
     fn has_ip_addr_is_token_exact_not_substring() {
         assert!(has_ip_addr(
-            "primary.3 UP 192.168.20.2/24\n",
+            "cfab-work-vms UP 192.168.20.2/24\n",
             "192.168.20.2/24"
         ));
         assert!(has_ip_addr(
-            "primary.3 UP 10.0.0.1/24 192.168.20.2/24\n",
+            "cfab-work-vms UP 10.0.0.1/24 192.168.20.2/24\n",
             "192.168.20.2/24"
         ));
         // A substring collision must not false-positive: 10.0.0.1/24 is a substring of
         // 110.0.0.1/24, and the reverse.
-        assert!(!has_ip_addr("primary.3 UP 110.0.0.1/24\n", "10.0.0.1/24"));
-        assert!(!has_ip_addr("primary.3 UP 10.0.0.1/24\n", "110.0.0.1/24"));
+        assert!(!has_ip_addr(
+            "cfab-work-vms UP 110.0.0.1/24\n",
+            "10.0.0.1/24"
+        ));
+        assert!(!has_ip_addr(
+            "cfab-work-vms UP 10.0.0.1/24\n",
+            "110.0.0.1/24"
+        ));
     }
 }

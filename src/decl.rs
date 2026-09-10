@@ -187,7 +187,11 @@ pub struct GwDecl {
 #[serde(deny_unknown_fields)]
 pub struct WorkloadDecl {
     pub name: String,
-    pub ifname: String,
+    /// The vlan-aware bridge the VMs attach to (Proxmox `bridge=`). Host-provided: cfab never
+    /// creates it, and adds only its own leg (`cfab-work-<name>`) and the bridge's own vid.
+    pub uplink: String,
+    /// The 802.1Q tag the VMs use on that bridge (Proxmox `tag=`).
+    pub vid: u16,
     pub prefix: String,
     pub gw: String,
     /// The VLAN's existing default router, listed inside DHCP option 121 (a client with 121
@@ -662,19 +666,20 @@ mod tests {
         assert_eq!(
             (
                 wl.name.as_str(),
-                wl.ifname.as_str(),
+                wl.uplink.as_str(),
                 wl.prefix.as_str(),
                 wl.gw.as_str(),
                 wl.router.as_str()
             ),
             (
                 "vms",
-                "primary.3",
+                "primary",
                 "192.168.20.0/24",
                 "192.168.20.254",
                 "192.168.20.1"
             )
         );
+        assert_eq!(wl.vid, 3);
         assert_eq!(wl.allow, vec!["storage".to_string()]);
         assert_eq!(wl.span, None);
         let m = d.members.iter().find(|m| m.name == "pve1-tb").unwrap();
@@ -687,6 +692,27 @@ mod tests {
                 .unwrap()
                 .workloads
                 .is_empty()
+        );
+    }
+
+    /// `ifname` was the host-provided VLAN sub-interface a `[[workload]]` row pointed at.
+    /// cfab creates the leg itself now (`uplink` + `vid`), so the key is gone; prerelease, so
+    /// it goes without a tombstone and the parser's own "unknown field" answer — which names
+    /// the two keys that replace it — is the message.
+    #[test]
+    fn the_removed_ifname_key_is_an_unknown_field_that_names_uplink_and_vid() {
+        let block = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \
+                     \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\n\
+                     allow = [\"storage\"]\n";
+        let err = Declaration::parse(&format!("{}{block}", fixtures::example()))
+            .expect_err("ifname is not a key any more")
+            .to_string();
+        assert!(
+            err.contains(
+                "unknown field `ifname`, expected one of `name`, `uplink`, `vid`, `prefix`, \
+                 `gw`, `router`, `allow`, `span`"
+            ),
+            "{err}"
         );
     }
 
@@ -704,10 +730,10 @@ mod tests {
     fn a_workload_row_rejects_unknown_keys() {
         let text = fixtures::with_workload(&fixtures::example()).replace(
             "gw = \"192.168.20.254\"",
-            "gw = \"192.168.20.254\"\nvid = 3",
+            "gw = \"192.168.20.254\"\nmtu = 1500",
         );
         let err = Declaration::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("unknown field `vid`"), "{err}");
+        assert!(err.contains("unknown field `mtu`"), "{err}");
     }
 
     /// The retired shell format is not a declaration: it fails at parse, loudly.
@@ -867,14 +893,15 @@ pub mod fixtures {
         )
     }
 
-    /// The `[[workload]]` block the tests share (`vms` on `primary.3`), appended as a top-level
-    /// array table, and the member rows on the two hosts (inserted after their `wires` arrays).
-    pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\"]\n";
+    /// The `[[workload]]` block the tests share (`vms` on bridge `primary`, vid 3), appended as
+    /// a top-level array table, and the member rows on the two hosts (inserted after their
+    /// `wires` arrays).
+    pub const WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\"]\n";
 
     /// `WORKLOAD_BLOCK` allowed into a second zone (`mgmt`, alongside `storage`): the fixture
     /// that exercises "one sibling / passive OSPF entry / forward-policy pair per allowed zone",
     /// not just the single-zone case `WORKLOAD_BLOCK` covers.
-    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nifname = \"primary.3\"\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\", \"mgmt\"]\n";
+    pub const MULTI_ZONE_ALLOW_WORKLOAD_BLOCK: &str = "\n[[workload]]\nname = \"vms\"\nuplink = \"primary\"\nvid = 3\nprefix = \"192.168.20.0/24\"\ngw = \"192.168.20.254\"\nrouter = \"192.168.20.1\"\nallow = [\"storage\", \"mgmt\"]\n";
 
     fn with_workload_block(text: &str, block: &str) -> String {
         let t = with_prefs(

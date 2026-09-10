@@ -106,7 +106,7 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
         add_if(r.ifname.clone());
     }
     for r in &workload_rows {
-        add_if(r.wl.ifname.clone());
+        add_if(r.wl.leg_ifname());
     }
     let interfaces: Vec<Value> = if_names
         .iter()
@@ -162,7 +162,7 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
             .iter()
             .filter(|r| r.wl.allow.contains(&z.name))
         {
-            ospf_ifs.push(json!({ "name": r.wl.ifname, "passive": true }));
+            ospf_ifs.push(json!({ "name": r.wl.leg_ifname(), "passive": true }));
         }
         let mut ospf = json!({
             "explicit-router-id": view.identity_addr(z),
@@ -206,7 +206,7 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
         // driver either way, and letting the empty set through (nothing to emit, so nothing
         // visibly goes wrong) would make the same mistake loud or silent depending only on
         // how many VMs happened to be up at the time.
-        if !workload_rows.iter().any(|r| r.wl.ifname == *leg) {
+        if !workload_rows.iter().any(|r| r.wl.leg_ifname() == *leg) {
             return Err(Error::config(format!(
                 "no workload interface {leg} on this member"
             )));
@@ -511,7 +511,7 @@ mod tests {
         Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
     }
 
-    /// The example fabric plus the shared `[[workload]]` fixture (`vms` on `primary.3`,
+    /// The example fabric plus the shared `[[workload]]` fixture (`vms` on `cfab-work-vms`,
     /// `allow = ["storage"]`, carried by pve1-tb and pve2-tb).
     fn wl_fabric() -> Fabric {
         let text = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
@@ -654,27 +654,29 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let cfg = generate(&v).unwrap();
         let storage = instance(&cfg, "storage");
-        let p = ospf_if(storage, "primary.3");
+        let p = ospf_if(storage, "cfab-work-vms");
         assert_eq!(p["passive"], true, "{p}");
-        assert!(p.get("cost").is_none(), "primary.3 carries a cost");
-        assert!(p.get("bfd").is_none(), "primary.3 carries bfd");
+        assert!(p.get("cost").is_none(), "cfab-work-vms carries a cost");
+        assert!(p.get("bfd").is_none(), "cfab-work-vms carries bfd");
         let cluster = instance(&cfg, "cluster");
         assert!(
-            !ospf_ifs(cluster).iter().any(|i| i["name"] == "primary.3"),
-            "primary.3 in an instance not in allow: {cluster}"
+            !ospf_ifs(cluster)
+                .iter()
+                .any(|i| i["name"] == "cfab-work-vms"),
+            "cfab-work-vms in an instance not in allow: {cluster}"
         );
-        assert!(if_names(&cfg).contains(&"primary.3".to_string()));
+        assert!(if_names(&cfg).contains(&"cfab-work-vms".to_string()));
         // A member that carries no row (the leaf pve3-tb) emits nothing for the ifname.
         let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
         assert!(
-            !if_names(&leaf).contains(&"primary.3".to_string()),
+            !if_names(&leaf).contains(&"cfab-work-vms".to_string()),
             "{leaf}"
         );
         assert!(
             !ospf_ifs(instance(&leaf, "storage"))
                 .iter()
-                .any(|i| i["name"] == "primary.3"),
-            "primary.3 passive on a non-carrier"
+                .any(|i| i["name"] == "cfab-work-vms"),
+            "cfab-work-vms passive on a non-carrier"
         );
     }
 
@@ -1275,7 +1277,7 @@ mod tests {
     fn workload_routes_emit_one_static_instance_and_redistribution_on_the_allowed_zones() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("primary.3", &["192.168.20.104/32", "192.168.20.103/32"])]);
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.104/32", "192.168.20.103/32"])]);
         let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
 
         let stat = static_instance(&t).expect("no static instance");
@@ -1284,9 +1286,9 @@ mod tests {
             stat["static-routes"]["ietf-ipv4-unicast-routing:ipv4"]["route"],
             json!([
                 { "destination-prefix": "192.168.20.103/32",
-                  "next-hop": { "outgoing-interface": "primary.3" } },
+                  "next-hop": { "outgoing-interface": "cfab-work-vms" } },
                 { "destination-prefix": "192.168.20.104/32",
-                  "next-hop": { "outgoing-interface": "primary.3" } },
+                  "next-hop": { "outgoing-interface": "cfab-work-vms" } },
             ])
         );
 
@@ -1309,7 +1311,7 @@ mod tests {
         );
         let f = Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("primary.3", &["192.168.20.103/32"])]);
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
         let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
         let got: Vec<&str> = ospf_instances(&t)
             .iter()
@@ -1329,7 +1331,7 @@ mod tests {
     /// holo-routing's `ControlPlaneProtocolChange::Delete`
     /// (`holo-routing/src/northbound/configuration.rs:180-188`) only drops the instance entry
     /// — it never touches `master.static_routes`. Deleting the instance therefore left the
-    /// route in holo's RIB and in the kernel (`192.168.20.103 dev primary.3 proto cfab-static
+    /// route in holo's RIB and in the kernel (`192.168.20.103 dev cfab-work-vms proto cfab-static
     /// metric 1` survived the withdraw) and the next request re-advertised the stale /32.
     /// Keeping the instance makes the withdrawal a per-route `Delete`
     /// (`configuration.rs:211-213`), which does uninstall.
@@ -1338,7 +1340,7 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let base = generate(&v).unwrap();
-        for routes in [WorkloadRoutes::new(), wl_routes(&[("primary.3", &[])])] {
+        for routes in [WorkloadRoutes::new(), wl_routes(&[("cfab-work-vms", &[])])] {
             let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
             assert_eq!(t, base, "the empty set is exactly what `generate` emits");
             let stat = static_instance(&t).expect("no static instance");
@@ -1387,11 +1389,15 @@ mod tests {
         let live = generate_with(
             &v,
             TransitCost::Declared,
-            &wl_routes(&[("primary.3", &["192.168.20.103/32"])]),
+            &wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]),
         )
         .unwrap();
-        let withdrawn =
-            generate_with(&v, TransitCost::Declared, &wl_routes(&[("primary.3", &[])])).unwrap();
+        let withdrawn = generate_with(
+            &v,
+            TransitCost::Declared,
+            &wl_routes(&[("cfab-work-vms", &[])]),
+        )
+        .unwrap();
 
         for t in [&live, &withdrawn] {
             let stat = static_instance(t).expect("the instance was deleted by the withdraw");
@@ -1452,7 +1458,7 @@ mod tests {
     fn the_leaf_offset_and_the_route_set_are_independent() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("primary.3", &["192.168.20.103/32"])]);
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
         let offset = f.leaf_cost_offset;
         let declared = generate_at(&v, TransitCost::Declared).unwrap();
         for (transit, want_cost) in [
@@ -1493,7 +1499,7 @@ mod tests {
     fn the_workload_route_tree_is_accepted_by_libyang_and_refused_without_the_leg() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("primary.3", &["192.168.20.103/32"])]);
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
         let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
         crate::engine::northbound::parse_candidate(&t).unwrap();
 
@@ -1511,7 +1517,7 @@ mod tests {
             .as_array_mut()
             .unwrap();
         let before = ifs.len();
-        ifs.retain(|i| i["name"] != "primary.3");
+        ifs.retain(|i| i["name"] != "cfab-work-vms");
         assert_eq!(
             ifs.len(),
             before - 1,
@@ -1569,7 +1575,7 @@ mod tests {
     fn a_redistributed_vm_route_is_accepted_by_no_bgp_statement_and_the_default_rejects_it() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("primary.3", &["192.168.20.103/32"])]);
+        let routes = wl_routes(&[("cfab-work-vms", &["192.168.20.103/32"])]);
         let t = generate_with(&v, TransitCost::Declared, &routes).unwrap();
         let text = serde_json::to_string(&t).unwrap();
         assert!(

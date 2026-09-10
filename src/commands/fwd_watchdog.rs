@@ -389,7 +389,7 @@ fn identify_all_uplinks(
 ) -> std::result::Result<Vec<(std::net::Ipv4Addr, uplink::Uplink)>, (String, String)> {
     let mut guards = Vec::new();
     for row in rows {
-        match uplink::identify(sys, &row.wl.ifname) {
+        match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
             Ok(up) => guards.push((row.wl.gw, up)),
             Err(e) => return Err((row.wl.name.clone(), e)),
         }
@@ -453,7 +453,7 @@ fn install_ready_rows(
                 "replace",
                 &row.wl.gw_cidr(),
                 "dev",
-                &row.wl.ifname,
+                &row.wl.leg_ifname(),
             ],
         ) {
             Ok(_) => restored.push(format!("installed workload {name}")),
@@ -518,7 +518,7 @@ fn reconcile_workload_guard(
             still_pending.push(name.clone());
             continue;
         };
-        let ready = match uplink::identify(sys, &row.wl.ifname) {
+        let ready = match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
             Ok(up) => up
                 .ports
                 .iter()
@@ -1000,10 +1000,11 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// pve1-tb with TWO workload rows on the same "primary" bridge/eth0 uplink: "vms" on
-    /// primary.3 and "vms2" on primary.4 — for the guard-rebuild-on-install-tick tests, where
-    /// one row's `identify()` failing this tick must never cost a DIFFERENT row its guard entry
-    /// or its progress out of `workload-deferred`.
+    /// pve1-tb with TWO workload rows on TWO bridges: "vms" (bridge `primary`, vid 3) and
+    /// "vms2" (bridge `primary2`, vid 4) — for the guard-rebuild-on-install-tick tests, where
+    /// one row's identify failing this tick must never cost a DIFFERENT row its guard entry or
+    /// its progress out of `workload-deferred`. Two bridges, because identification is per
+    /// declared bridge now: two rows on ONE bridge can only ever identify alike.
     fn two_row_wl_fabric() -> Fabric {
         let t = crate::decl::fixtures::with_prefs(
             &crate::decl::fixtures::example(),
@@ -1011,7 +1012,7 @@ pub(crate) mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
         );
         let blocks = format!(
-            "{}\n[[workload]]\nname = \"vms2\"\nifname = \"primary.4\"\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
             crate::decl::fixtures::WORKLOAD_BLOCK
         );
         Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
@@ -1178,15 +1179,10 @@ pub(crate) mod tests {
         )]);
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-bridge.nft", &one_port)
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/primary/brif/eth1/state", "1\n")
-            .link("/sys/class/net/eth1/device", "../../../0000:01:00.1")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth1/device", "../../../0000:01:00.1");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(sys.ran("nft -f /run/cfab/workload-bridge.nft.new"));
         assert!(sys.ran("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft"));
@@ -1214,10 +1210,11 @@ pub(crate) mod tests {
         let f = two_row_wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         // Both rows already live, nothing pending in workload-deferred — the drift check must
-        // still run every tick. "vms" (primary.3) has a transient identify() failure (no
-        // `lower_primary` this tick, unset here); "vms2" (primary.4) identifies fine. The whole
-        // rebuild must abort rather than silently drop "vms2"'s protection into a
-        // "vms"-failed-so-only-vms2-appears table, or worse, a table missing vms2 entirely.
+        // still run every tick. "vms"'s bridge `primary` has lost its only off-host port this
+        // tick (a NIC mid-re-enumeration), so that row cannot identify; "vms2"'s bridge
+        // `primary2` identifies fine. The whole rebuild must abort rather than silently drop
+        // "vms2"'s protection into a "vms"-failed-so-only-vms2-appears table, or worse, a
+        // table missing vms2 entirely.
         let two_ports = emit::workload::bridge_table(&[
             (
                 "192.168.20.254".parse().unwrap(),
@@ -1230,21 +1227,17 @@ pub(crate) mod tests {
             (
                 "192.168.30.254".parse().unwrap(),
                 uplink::Uplink {
-                    bridge: "primary".into(),
+                    bridge: "primary2".into(),
                     vid: 4,
-                    ports: vec!["eth0".into()],
+                    ports: vec!["eth1".into()],
                 },
             ),
         ]);
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-bridge.nft", &two_ports)
-            .link("/sys/class/net/primary.4/lower_primary", "../../primary")
-            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.4",
-                "primary.4  VID: 4\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .file("/sys/class/net/primary2/brif/eth1/state", "3\n")
+            .link("/sys/class/net/eth1/device", "../../../0000:02:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(!sys.ran("write /run/cfab/workload-bridge.nft.new"));
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft.new"));
@@ -1278,13 +1271,8 @@ pub(crate) mod tests {
         )]);
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-bridge.nft", &current)
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft.new"));
         assert_eq!(
@@ -1388,15 +1376,10 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert_eq!(
             report
                 .restored
@@ -1420,15 +1403,10 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms\nretired")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(
             report.unrestored.iter().any(|l| l.contains("retired")),
             "an unmatched deferred name must be journaled, not silently dropped: {:?}",
@@ -1459,15 +1437,10 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(
             report
                 .restored
@@ -1482,15 +1455,10 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "1\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(
             sys.writes_of("/run/cfab/workload-deferred").is_empty(),
             "still pending: unchanged, no rewrite"
@@ -1510,13 +1478,8 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         let pos = |needle: &str| {
             sys.calls
@@ -1526,16 +1489,16 @@ pub(crate) mod tests {
         };
         assert!(
             pos("write /run/cfab/workload-bridge.nft.new")
-                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+                < pos("ip addr replace 192.168.20.254/24 dev cfab-work-vms"),
             "the guard must be reloaded before the address goes live"
         );
         assert!(
             pos("nft -f /run/cfab/workload-bridge.nft.new")
-                < pos("ip addr replace 192.168.20.254/24 dev primary.3")
+                < pos("ip addr replace 192.168.20.254/24 dev cfab-work-vms")
         );
         assert!(
             pos("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft")
-                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+                < pos("ip addr replace 192.168.20.254/24 dev cfab-work-vms"),
             "only a successfully loaded table is promoted to the canonical name"
         );
         let written = sys.writes_of("/run/cfab/workload-bridge.nft.new");
@@ -1561,20 +1524,15 @@ pub(crate) mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms")
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .on_fail(
                 &["nft", "-f", "/run/cfab/workload-bridge.nft.new"],
                 1,
                 "Error: syntax error",
             );
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
-        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(!sys.ran("mv /run/cfab/workload-bridge.nft.new /run/cfab/workload-bridge.nft"));
         assert!(
             report.unrestored.iter().any(|l| l
@@ -1609,27 +1567,23 @@ pub(crate) mod tests {
     {
         let f = two_row_wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
-        // "vms" (primary.3) is NOT in workload-deferred — it is already live from an earlier
-        // tick — but it has no `lower_primary` link this tick: a transient identify() failure.
-        // "vms2" (primary.4) IS in workload-deferred and is ready to install this tick.
+        // "vms" is NOT in workload-deferred — it is already live from an earlier tick — but
+        // its bridge `primary` has no off-host port this tick: a transient identify failure.
+        // "vms2" IS in workload-deferred and its own bridge `primary2` is ready to install.
         let mut sys = wl_healthy_sys(&view)
             .file("/run/cfab/workload-deferred", "vms2")
-            .link("/sys/class/net/primary.4/lower_primary", "../../primary")
-            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
-            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.4",
-                "primary.4  VID: 4\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            );
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .file("/sys/class/net/primary2/brif/eth1/state", "3\n")
+            .link("/sys/class/net/eth1/device", "../../../0000:02:00.0");
         let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
         assert!(!sys.ran("write /run/cfab/workload-bridge.nft.new"));
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft.new"));
-        assert!(!sys.ran("ip addr replace 192.168.30.254/24 dev primary.4"));
+        assert!(!sys.ran("ip addr replace 192.168.30.254/24 dev cfab-work-vms2"));
         assert!(
             sys.writes_of("/run/cfab/workload-deferred").is_empty(),
             "vms2 stays deferred; nothing changed, so no rewrite of an unchanged pending set"
         );
-        let expected = "unrestored workload vms: uplink not identified: workload interface primary.3 is not a VLAN sub-interface of a bridge (no lower link in /sys/class/net/primary.3); deferred rows kept";
+        let expected = "unrestored workload vms: uplink not identified: bridge primary has no uplink port (no port has a /sys/class/net/<port>/device, directly or through lower links); ports: tap100i0; deferred rows kept";
         assert!(
             report.unrestored.iter().any(|l| l == expected),
             "expected {expected:?} in {:#?}",
@@ -1641,7 +1595,7 @@ pub(crate) mod tests {
     fn fabric_legs_never_include_the_workload_interface() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        assert!(!fabric_legs(&v).contains(&"primary.3".to_string()));
+        assert!(!fabric_legs(&v).contains(&"cfab-work-vms".to_string()));
     }
 
     /// Every declared leg of every declared wire present and of the kind cfab created it with —

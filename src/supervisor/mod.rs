@@ -1884,29 +1884,24 @@ mod tests {
 
     /// `fresh_sys` plus the host facts a workload row needs (the same shape as
     /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and one
-    /// VM tap, and `primary.3` up, addressed, with its own MAC.
+    /// VM tap, and `cfab-work-vms` up, addressed, with its own MAC.
     fn wl_fresh_sys(view: &View, run_dir: &Path) -> MockSys {
         fresh_sys(view, run_dir)
             .file(CONFIG, &wl_decl_text(run_dir))
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/eth0/ifindex", "2\n")
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "primary.3"],
-                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24\n",
             )
     }
 
@@ -1964,7 +1959,7 @@ mod tests {
                 c.workloads[0].ifname.as_str(),
                 c.workloads[0].trigger.as_str()
             ),
-            ("vms", "primary.3", "neigh events")
+            ("vms", "cfab-work-vms", "neigh events")
         );
         assert!(
             said.contains(&"cfab: workload vms: announcer trigger neigh events".to_string()),
@@ -2072,7 +2067,7 @@ mod tests {
         assert!(burst, "a neigh event on a VM port must start a burst");
         assert!(frames, "and the burst's first frame must reach the socket");
         assert!(
-            sent.iter().all(|(port, frame)| port == "primary.3"
+            sent.iter().all(|(port, frame)| port == "cfab-work-vms"
                 && frame[..]
                     == crate::workload::announce::gratuitous(
                         [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],

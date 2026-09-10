@@ -1142,7 +1142,7 @@ mod tests {
             fallback: Vec::new(),
             workloads: vec![WorkloadAnnounce {
                 name: "vms".to_string(),
-                ifname: "primary.3".to_string(),
+                ifname: "cfab-work-vms".to_string(),
                 trigger: "neigh events".to_string(),
                 announces: 42,
                 bursts: 1,
@@ -1294,7 +1294,7 @@ mod tests {
             workloads: if full {
                 vec![WorkloadStatus {
                     name: "vms".to_string(),
-                    ifname: "primary.3".to_string(),
+                    ifname: "cfab-work-vms".to_string(),
                     address: "192.168.20.2/24".to_string(),
                     gw: "192.168.20.254/24".to_string(),
                     up: true,

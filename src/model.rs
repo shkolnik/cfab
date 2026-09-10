@@ -377,7 +377,10 @@ impl fmt::Display for Ipv4Prefix {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workload {
     pub name: String,
-    pub ifname: String,
+    /// The vlan-aware bridge the VMs attach to. Host-provided; cfab adds only its own leg.
+    pub uplink: String,
+    /// The 802.1Q tag the VMs use on `uplink`.
+    pub vid: u16,
     pub prefix: Ipv4Prefix,
     /// The anycast gateway every host answers (bare address; the prefix's mask applies).
     pub gw: Ipv4Addr,
@@ -390,6 +393,12 @@ pub struct Workload {
 }
 
 impl Workload {
+    /// The leg cfab creates for this row: `cfab-work-<name>` on `uplink`, tagged `vid`
+    /// (ruling 1). Derived, never declared — one row, one leg, one name everywhere.
+    pub fn leg_ifname(&self) -> String {
+        format!("cfab-work-{}", self.name)
+    }
+
     /// `gw` with the prefix's mask, e.g. `192.168.20.254/24`.
     pub fn gw_cidr(&self) -> String {
         format!("{}/{}", self.gw, self.prefix.len)
@@ -533,7 +542,8 @@ fn resolve_workload(w: &crate::decl::WorkloadDecl) -> Result<Workload> {
     };
     Ok(Workload {
         name: w.name.clone(),
-        ifname: w.ifname.clone(),
+        uplink: w.uplink.clone(),
+        vid: w.vid,
         prefix,
         gw,
         router,
@@ -908,8 +918,8 @@ impl Fabric {
         }
         // ---- workloads ----
         let mut seen = BTreeSet::new();
-        let mut seen_ifnames: BTreeMap<String, String> = BTreeMap::new();
         for wl in &self.workloads {
+            let leg = wl.leg_ifname();
             if self.zone(&wl.name).is_ok() {
                 return Err(Error::config(format!(
                     "workload {}: name is also a zone (workload and zone names share one \
@@ -921,15 +931,6 @@ impl Fabric {
                 return Err(Error::config(format!(
                     "workload {}: declared twice",
                     wl.name
-                )));
-            }
-            // I2 (whole-branch review): two rows sharing an ifname is a plausible "two subnets
-            // on one VLAN" declaration nothing else refuses — `emit::engine` would push two
-            // OSPF passive entries for the same interface into one instance.
-            if let Some(other) = seen_ifnames.insert(wl.ifname.clone(), wl.name.clone()) {
-                return Err(Error::config(format!(
-                    "workload {}: ifname '{}' is also used by workload {other}",
-                    wl.name, wl.ifname
                 )));
             }
             // Every bond ifname that fans out into per-domain ports (a universal/fallback
@@ -946,23 +947,24 @@ impl Fabric {
                 .collect::<Vec<_>>();
             // An ifname cfab already creates or owns by declaration: a declared wire, a
             // declared segment/universal sub-if, a bond port, or a zone's generated
-            // ingress/identity leg.
+            // ingress/identity leg. The leg name is derived now, so the collision is checked
+            // the other way round — `cfab-work-<name>` against everything else on the member.
             let collides = self
                 .members
                 .iter()
-                .any(|m| m.wires.iter().any(|w| w.name == wl.ifname))
-                || self.segments.iter().any(|s| s.ifname == wl.ifname)
+                .any(|m| m.wires.iter().any(|w| w.name == leg))
+                || self.segments.iter().any(|s| s.ifname == leg)
                 || bond_ifnames
                     .iter()
-                    .any(|b| self.domains.iter().any(|d| wl.ifname == format!("{b}-{d}")))
+                    .any(|b| self.domains.iter().any(|d| leg == format!("{b}-{d}")))
                 || self.zones.iter().any(|z| {
                     let (id, peer) = identity_ifnames(z.id);
-                    wl.ifname == gw_ifname(z.id) || wl.ifname == id || wl.ifname == peer
+                    leg == gw_ifname(z.id) || leg == id || leg == peer
                 });
             if collides {
                 return Err(Error::config(format!(
-                    "workload {}: ifname '{}' collides with an interface cfab creates",
-                    wl.name, wl.ifname
+                    "workload {}: leg '{leg}' collides with an interface cfab creates",
+                    wl.name
                 )));
             }
             if !wl.prefix.contains(wl.gw) {
@@ -1984,31 +1986,6 @@ mod tests {
         );
     }
 
-    // I2: two `[[workload]]` rows sharing an `ifname` is a plausible "two subnets on one VLAN"
-    // declaration that nothing refused — `emit::engine` would push two OSPF passive entries for
-    // the same interface into one instance, which most likely fails at engine start rather than
-    // at `check` (fail-loud, but too late).
-    #[test]
-    fn check_refuses_two_workload_rows_sharing_an_ifname() {
-        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
-        let base = base.replace(
-            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
-            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
-             { name = \"vms2\", address = \"192.168.30.2/24\" }]",
-        );
-        let second_block = "\n[[workload]]\nname = \"vms2\"\nifname = \"primary.3\"\n\
-             prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\n\
-             allow = [\"storage\"]\n";
-        let text = format!("{base}{second_block}");
-        let e = Fabric::from_decl(&Declaration::parse(&text).unwrap())
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms2: ifname 'primary.3' is also used by workload vms"
-        );
-    }
-
     // I2: a workload `prefix` overlapping a zone block would make the sibling return-path rule
     // and the option-121 aggregate self-contradictory (spec's own `10.<id>.0.0/16` reservation).
     #[test]
@@ -2027,42 +2004,21 @@ mod tests {
         );
     }
 
+    /// The leg name is cfab's now, so the collision runs the other way: a declaration whose
+    /// own wire, segment, bond port or generated leg is already called `cfab-work-<name>`.
     #[test]
-    fn check_refuses_a_workload_ifname_colliding_with_an_interface_cfab_creates() {
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"eth9\""));
+    fn check_refuses_a_workload_leg_colliding_with_an_interface_cfab_creates() {
+        let e = wl_err(|t| t.replace("ifname = \"cfab-st\"", "ifname = \"cfab-work-vms\""));
         assert_eq!(
             e,
-            "fabric.toml: workload vms: ifname 'eth9' collides with an interface cfab creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-st\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-st' collides with an interface cfab \
+            "fabric.toml: workload vms: leg 'cfab-work-vms' collides with an interface cfab \
              creates"
         );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249\""));
+        let e = wl_err(|t| t.replace("nic = \"eth9\"", "nic = \"cfab-work-vms\""));
         assert_eq!(
             e,
-            "fabric.toml: workload vms: ifname 'cfab-gw249' collides with an interface cfab \
+            "fabric.toml: workload vms: leg 'cfab-work-vms' collides with an interface cfab \
              creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-gw249-a\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-gw249-a' collides with an interface cfab \
-             creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-id249' collides with an interface cfab \
-             creates"
-        );
-        let e = wl_err(|t| t.replace("ifname = \"primary.3\"", "ifname = \"cfab-id249-peer\""));
-        assert_eq!(
-            e,
-            "fabric.toml: workload vms: ifname 'cfab-id249-peer' collides with an interface \
-             cfab creates"
         );
     }
 

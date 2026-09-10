@@ -403,7 +403,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     let mut ready: Vec<ReadyWorkload> = Vec::new();
     let mut deferred_names: Vec<String> = Vec::new();
     for row in view.workload_rows() {
-        let ifname = row.wl.ifname.as_str();
+        let leg = row.wl.leg_ifname();
+        let ifname = leg.as_str();
         let name = &row.wl.name;
         let out = sys.run(&["ip", "-br", "link", "show", "dev", ifname])?;
         if !out.ok() {
@@ -449,7 +450,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
                 row.address
             )));
         }
-        let up = match uplink::identify(sys, ifname) {
+        let up = match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
             Ok(up) => up,
             Err(e) => {
                 warnings.push(format!(
@@ -1218,7 +1219,7 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Re
     }
     // A workload VLAN's whole point is routing VM traffic to its allowed zones.
     for r in view.workload_rows() {
-        proc_sysctl(sys, &r.wl.ifname, "forwarding", "1")?;
+        proc_sysctl(sys, &r.wl.leg_ifname(), "forwarding", "1")?;
     }
     // A foreign stack's forward-hook policy drop kills transit that cfab accepts, and cfab
     // cannot out-accept it. Where the stack offers a user hook (Docker's DOCKER-USER), ask it
@@ -1275,7 +1276,7 @@ pub(crate) mod tests {
     }
 
     /// pve1-tb with TWO workload rows on the same "primary" bridge/eth0 uplink: "vms" on
-    /// primary.3 (row 1, healthy per `wl_sys`) and "vms2" on primary.4 (row 2, its interface is
+    /// cfab-work-vms (row 1, healthy per `wl_sys`) and "vms2" on cfab-work-vms2 (row 2, its interface is
     /// refused as missing) — for proving pass 1 is pure reads: a hard refusal partway through
     /// must leave no write from an earlier row applied.
     fn two_row_wl_fabric() -> Fabric {
@@ -1285,7 +1286,7 @@ pub(crate) mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
         );
         let blocks = format!(
-            "{}\n[[workload]]\nname = \"vms2\"\nifname = \"primary.4\"\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
             crate::decl::fixtures::WORKLOAD_BLOCK
         );
         Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
@@ -1448,25 +1449,20 @@ pub(crate) mod tests {
     /// interface facts the precondition reads.
     fn wl_sys(view: &View) -> MockSys {
         up_sys(view)
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/eth0/ifindex", "2\n")
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "primary.3"],
-                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24\n",
             )
     }
 
@@ -1482,13 +1478,13 @@ pub(crate) mod tests {
     {
         let (mut sys, view) = wl_sys_and_view("pve1-tb");
         run(&mut sys, &view, &opts()).unwrap();
-        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert_eq!(
             sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore"),
             vec!["1"]
         );
         assert_eq!(
-            sys.writes_of("/proc/sys/net/ipv4/conf/primary.3/forwarding")
+            sys.writes_of("/proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                 .last(),
             Some(&"1")
         );
@@ -1505,7 +1501,7 @@ pub(crate) mod tests {
                 < sys
                     .calls
                     .iter()
-                    .rposition(|c| c == "write /proc/sys/net/ipv4/conf/primary.3/forwarding")
+                    .rposition(|c| c == "write /proc/sys/net/ipv4/conf/cfab-work-vms/forwarding")
                     .unwrap(),
             "forwarding=1 follows the policy load (enable_forwarding)"
         );
@@ -1515,10 +1511,10 @@ pub(crate) mod tests {
         );
         assert!(
             pos("nft -f /run/cfab/workload-bridge.nft")
-                < pos("ip addr replace 192.168.20.254/24 dev primary.3"),
+                < pos("ip addr replace 192.168.20.254/24 dev cfab-work-vms"),
             "review item 1: the ARP guard is loaded before the gw address goes live, never after"
         );
-        assert!(!sys.ran("ip link del primary.3"));
+        assert!(!sys.ran("ip link del cfab-work-vms"));
     }
 
     #[test]
@@ -1526,20 +1522,20 @@ pub(crate) mod tests {
         let f: &'static Fabric = Box::leak(Box::new(two_row_wl_fabric()));
         let view = View::new(f, "pve1-tb").unwrap();
         let mut sys = wl_sys(&view).on_fail(
-            &["ip", "-br", "link", "show", "dev", "primary.4"],
+            &["ip", "-br", "link", "show", "dev", "cfab-work-vms2"],
             1,
-            "Device \"primary.4\" does not exist.",
+            "Device \"cfab-work-vms2\" does not exist.",
         );
         let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
         assert_eq!(
             err,
-            "FATAL: workload vms2: interface primary.4 does not exist (declare it in \
+            "FATAL: workload vms2: interface cfab-work-vms2 does not exist (declare it in \
              /etc/network/interfaces with address 192.168.30.2/24 on the VLAN)"
         );
         // Pass 1 is pure reads: row 1 ("vms") was fully valid, but nothing workload-shaped was
         // written for it — the hard refusal on row 2 happens before pass 2 (bridge table) or
         // pass 3 (the gw address + arp_ignore writes) ever starts.
-        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
         assert!(
             sys.writes_of("/proc/sys/net/ipv4/conf/all/arp_ignore")
@@ -1555,29 +1551,29 @@ pub(crate) mod tests {
     fn up_refuses_when_the_workload_interface_is_missing_down_or_lacks_the_member_address() {
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut missing = sys.on_fail(
-            &["ip", "-br", "link", "show", "dev", "primary.3"],
+            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
             1,
-            "Device \"primary.3\" does not exist.",
+            "Device \"cfab-work-vms\" does not exist.",
         );
         assert_eq!(
             run(&mut missing, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 does not exist (declare it in /etc/network/interfaces with address 192.168.20.2/24 on the VLAN)"
+            "FATAL: workload vms: interface cfab-work-vms does not exist (declare it in /etc/network/interfaces with address 192.168.20.2/24 on the VLAN)"
         );
         let mut down = wl_sys(&view).on_stdout(
-            &["ip", "-br", "link", "show", "dev", "primary.3"],
-            "primary.3@primary DOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
+            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms@primary DOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
         );
         assert_eq!(
             run(&mut down, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 is DOWN (ip link set primary.3 up, or fix its stanza)"
+            "FATAL: workload vms: interface cfab-work-vms is DOWN (ip link set cfab-work-vms up, or fix its stanza)"
         );
         let mut noaddr = wl_sys(&view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP\n",
         );
         assert_eq!(
             run(&mut noaddr, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
+            "FATAL: workload vms: interface cfab-work-vms lacks 192.168.20.2/24 (the member address from the declaration)"
         );
     }
 
@@ -1587,12 +1583,12 @@ pub(crate) mod tests {
         // wrongly accept it as "the address is present".
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut collision = sys.on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 1192.168.20.2/24\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 1192.168.20.2/24\n",
         );
         assert_eq!(
             run(&mut collision, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 lacks 192.168.20.2/24 (the member address from the declaration)"
+            "FATAL: workload vms: interface cfab-work-vms lacks 192.168.20.2/24 (the member address from the declaration)"
         );
     }
 
@@ -1606,17 +1602,17 @@ pub(crate) mod tests {
         // clears itself.
         let (sys, view) = wl_sys_and_view("pve1-tb");
         let mut lowerdown = sys.on_stdout(
-            &["ip", "-br", "link", "show", "dev", "primary.3"],
-            "primary.3@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
+            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
         );
         let warnings = run(&mut lowerdown, &view, &opts()).unwrap();
         assert!(
             warnings.iter().any(|w| w
-                == "workload vms: interface primary.3 is LOWERLAYERDOWN (fix the carrier of \
+                == "workload vms: interface cfab-work-vms is LOWERLAYERDOWN (fix the carrier of \
                     its lower device); row deferred to the watchdog"),
             "{warnings:#?}"
         );
-        assert!(!lowerdown.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!lowerdown.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert_eq!(
             lowerdown.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
             vec!["vms"]
@@ -1630,12 +1626,12 @@ pub(crate) mod tests {
         let (sys, view) = wl_sys_and_view("pve1-tb");
         // no second whitespace-separated field at all
         let mut blank = sys.on_stdout(
-            &["ip", "-br", "link", "show", "dev", "primary.3"],
-            "primary.3\n",
+            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms\n",
         );
         assert_eq!(
             run(&mut blank, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface primary.3 is unknown state (ip link set primary.3 up, or fix its stanza)"
+            "FATAL: workload vms: interface cfab-work-vms is unknown state (ip link set cfab-work-vms up, or fix its stanza)"
         );
     }
 
@@ -1653,7 +1649,7 @@ pub(crate) mod tests {
                     the watchdog"),
             "{warnings:#?}"
         );
-        assert!(!listening.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!listening.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         // MINOR 1 (re-review): arp_ignore matches the watchdog's own restore condition — set
         // whenever ANY workload row is declared, ready or not, never gated on this row alone.
         // Every row on this member is deferred here (there is only the one, "vms"), so this is
@@ -1688,7 +1684,7 @@ pub(crate) mod tests {
             warning.ends_with("; row deferred to the watchdog"),
             "{warning}"
         );
-        assert!(!no_uplink.ran("ip addr replace 192.168.20.254/24 dev primary.3"));
+        assert!(!no_uplink.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(
             !no_uplink.ran("nft -f /run/cfab/workload-bridge.nft"),
             "no uplink to guard"

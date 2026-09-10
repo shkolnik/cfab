@@ -1744,6 +1744,7 @@ fn workload_posture(
     for row in rows {
         let wl = row.wl;
         let name = wl.name.as_str();
+        let leg = wl.leg_ifname();
         let gw_cidr = wl.gw_cidr();
 
         if deferred.contains(name) {
@@ -1753,7 +1754,7 @@ fn workload_posture(
             ));
             c.workload(WorkloadStatus {
                 name: name.to_string(),
-                ifname: wl.ifname.clone(),
+                ifname: leg.clone(),
                 address: row.address.clone(),
                 gw: gw_cidr,
                 up: WorkloadState::Deferred.is_up(),
@@ -1774,35 +1775,29 @@ fn workload_posture(
         // apart so precedence (`Broken` over `AnnouncerNotStarted`) is a fact of the code, not
         // an accident of evaluation order.
         let mut broken = false;
-        let link = sys.run(&["ip", "-br", "link", "show", "dev", &wl.ifname])?;
+        let link = sys.run(&["ip", "-br", "link", "show", "dev", &leg])?;
         let mut uplinks = Vec::new();
         if !link.ok() {
             // Standing: `ifname` is baseline-owned (cfab never creates or deletes it), so its
             // disappearance is an external fact the fabric itself never clears.
-            c.standing(format!(
-                "workload {name}: interface {} does not exist",
-                wl.ifname
-            ));
+            c.standing(format!("workload {name}: interface {leg} does not exist"));
             broken = true;
         } else {
             let addr = sys
-                .run(&["ip", "-4", "-br", "addr", "show", "dev", &wl.ifname])?
+                .run(&["ip", "-4", "-br", "addr", "show", "dev", &leg])?
                 .stdout;
             if !has_ip_addr(&addr, &row.address) {
                 c.settling(format!(
-                    "workload {name}: address {} missing on {}",
-                    row.address, wl.ifname
+                    "workload {name}: address {} missing on {leg}",
+                    row.address
                 ));
                 broken = true;
             }
             if !has_ip_addr(&addr, &gw_cidr) {
-                c.settling(format!(
-                    "workload {name}: gw {gw_cidr} missing on {}",
-                    wl.ifname
-                ));
+                c.settling(format!("workload {name}: gw {gw_cidr} missing on {leg}"));
                 broken = true;
             }
-            match crate::workload::uplink::identify(&*sys, &wl.ifname) {
+            match crate::workload::uplink::identify_declared(&*sys, &wl.uplink, wl.vid) {
                 Ok(u) => uplinks = u.ports,
                 Err(e) => {
                     c.standing(format!("workload {name}: {e}"));
@@ -1868,19 +1863,19 @@ fn workload_posture(
             } else {
                 None
             };
-        let bytes = sysfs_bytes(sys, &wl.ifname);
+        let bytes = sysfs_bytes(sys, &leg);
         let vms_seen = if up {
             let mut exclude = workload_member_addresses(view.fabric, name);
             exclude.push(wl.gw);
             exclude.push(wl.router);
-            neighbors_seen(sys, &wl.ifname, &wl.prefix, &exclude)
+            neighbors_seen(sys, &leg, &wl.prefix, &exclude)
         } else {
             None
         };
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
-            ifname: wl.ifname.clone(),
+            ifname: leg.clone(),
             address: row.address.clone(),
             gw: gw_cidr,
             up,
@@ -2773,7 +2768,7 @@ mod tests {
             .workload_rows()
             .into_iter()
             .map(|r| {
-                serde_json::json!({"name": r.wl.name, "ifname": r.wl.ifname,
+                serde_json::json!({"name": r.wl.name, "ifname": r.wl.leg_ifname(),
                     "trigger": "neigh events", "announces": 12, "bursts": 1})
             })
             .collect();
@@ -3270,7 +3265,7 @@ mod tests {
             .socket("/run/cfab/cfab.sock", &healthy_components(view))
     }
 
-    /// The example fabric plus one `[[workload]]` row (`vms` on `primary.3`, allowed into
+    /// The example fabric plus one `[[workload]]` row (`vms` on `cfab-work-vms`, allowed into
     /// `storage`), carried by pve1-tb and pve2-tb; pve3-tb (a leaf) carries none, but still
     /// needs the sibling rule and the route-get proof (spec §5.1 item 5, R4).
     fn wl_fabric() -> Fabric {
@@ -3295,21 +3290,16 @@ mod tests {
     fn wl_status_sys(f: &Fabric, view: &View) -> MockSys {
         let identity = identity_of(f, view);
         healthy_host(f, view)
-            .link("/sys/class/net/primary.3/lower_primary", "../../primary")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
-            .file(
-                "/proc/net/vlan/primary.3",
-                "primary.3  VID: 3\t REORDER_HDR: 1  dev->priv_flags: 1021\n",
-            )
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "primary.3"],
-                "primary.3@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
             )
             .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                "primary.3 UP 192.168.20.2/24 192.168.20.254/24\n",
+                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                "cfab-work-vms UP 192.168.20.2/24 192.168.20.254/24\n",
             )
             .on_stdout(
                 &["nft", "list", "table", "bridge", "cfab"],
@@ -3322,7 +3312,7 @@ mod tests {
             )
             .on_stdout(
                 &["ip", "route", "get", "192.168.20.1", "from", &identity],
-                "192.168.20.1 from 10.99.0.1 dev primary.3 uid 0\n    cache\n",
+                "192.168.20.1 from 10.99.0.1 dev cfab-work-vms uid 0\n    cache\n",
             )
     }
 
@@ -3341,7 +3331,7 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
+                "  workload vms: cfab-work-vms 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
                  to storage, uplink eth0, announce trigger neigh events\n"
             ),
             "{text}"
@@ -3369,11 +3359,11 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "state": ["REACHABLE"]},
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3382,7 +3372,7 @@ mod tests {
         let text = render_text(&m, false, true).output;
         assert!(
             text.contains(
-                "  workload vms: primary.3 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
+                "  workload vms: cfab-work-vms 192.168.20.2/24 gw 192.168.20.254/24 up, advertised \
                  to storage, uplink eth0, announce trigger neigh events, 1 vms seen\n"
             ),
             "{text}"
@@ -3396,7 +3386,7 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([]).to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3418,8 +3408,8 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.2/2400 192.168.20.254/2400\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.2/2400 192.168.20.254/2400\n",
         );
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
@@ -3467,7 +3457,7 @@ mod tests {
         let blank_trigger = components_doc(
             true,
             serde_json::json!([
-                {"name": "vms", "ifname": "primary.3", "trigger": "", "announces": 0, "bursts": 0}
+                {"name": "vms", "ifname": "cfab-work-vms", "trigger": "", "announces": 0, "bursts": 0}
             ]),
         );
         let mut sys = wl_status_sys(&f, &view).socket("/run/cfab/cfab.sock", &blank_trigger);
@@ -3490,19 +3480,19 @@ mod tests {
         let cases: Vec<(MockSys, String, Class)> = vec![
             (
                 wl_status_sys(&f, &view).on_fail(
-                    &["ip", "-br", "link", "show", "dev", "primary.3"],
+                    &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
                     1,
-                    "Device \"primary.3\" does not exist.",
+                    "Device \"cfab-work-vms\" does not exist.",
                 ),
-                "workload vms: interface primary.3 does not exist".into(),
+                "workload vms: interface cfab-work-vms does not exist".into(),
                 Class::Standing,
             ),
             (
                 wl_status_sys(&f, &view).on_stdout(
-                    &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-                    "primary.3 UP 192.168.20.2/24\n",
+                    &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+                    "cfab-work-vms UP 192.168.20.2/24\n",
                 ),
-                "workload vms: gw 192.168.20.254/24 missing on primary.3".into(),
+                "workload vms: gw 192.168.20.254/24 missing on cfab-work-vms".into(),
                 Class::Settling,
             ),
             (
@@ -3573,15 +3563,15 @@ mod tests {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "primary.3"],
-            "primary.3 UP 192.168.20.254/24\n",
+            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
+            "cfab-work-vms UP 192.168.20.254/24\n",
         );
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
         assert!(
             m.conditions
                 .iter()
-                .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on primary.3")
+                .any(|c| c.text == "workload vms: address 192.168.20.2/24 missing on cfab-work-vms")
         );
         assert!(!m.workloads[0].up);
         assert_eq!(m.workloads[0].state, WorkloadState::Broken);
@@ -3766,7 +3756,7 @@ mod tests {
         assert!(
             !render_text(&m, false, true)
                 .output
-                .contains("  workload vms: primary.3 ")
+                .contains("  workload vms: cfab-work-vms ")
         );
     }
 
@@ -3788,19 +3778,19 @@ mod tests {
 
     /// The uplink's own failure text (`workload::uplink::identify`) is reported verbatim, never
     /// reworded here — one spelling shared with `apply` and the watchdog. Same MockSys shape the
-    /// watchdog's own test for this fault uses: the lower link torn out from under a running
-    /// bridge (`an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer`
-    /// in `src/supervisor/workload.rs`).
+    /// watchdog's own test for this fault uses: the bridge's only off-host port loses the
+    /// `device` link that made it one (`an_uplink_that_cannot_be_identified_journals_the_reason
+    /// _and_starts_no_announcer` in `src/supervisor/workload.rs`).
     #[test]
     fn an_unidentifiable_uplink_reports_its_own_message() {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let mut sys = wl_status_sys(&f, &view);
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         let expected = expected_links(&view).unwrap();
         let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
-        let want = "workload vms: workload interface primary.3 is not a VLAN sub-interface of a \
-                    bridge (no lower link in /sys/class/net/primary.3)";
+        let want = "workload vms: bridge primary has no uplink port (no port has a \
+                    /sys/class/net/<port>/device, directly or through lower links); ports: eth0";
         let hit = m
             .conditions
             .iter()
@@ -4382,20 +4372,21 @@ table bridge cfab {
     #[test]
     fn sysfs_bytes_is_none_unless_both_counters_read_and_parse() {
         let sys = MockSys::default()
-            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1000\n")
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
-        assert_eq!(sysfs_bytes(&sys, "primary.3"), Some((1000, 2000)));
+            .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1000\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&sys, "cfab-work-vms"), Some((1000, 2000)));
         // tx missing entirely.
-        let half = MockSys::default().file("/sys/class/net/primary.3/statistics/rx_bytes", "1\n");
-        assert_eq!(sysfs_bytes(&half, "primary.3"), None);
+        let half =
+            MockSys::default().file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1\n");
+        assert_eq!(sysfs_bytes(&half, "cfab-work-vms"), None);
         // Present but unparseable.
         let garbage = MockSys::default()
             .file(
-                "/sys/class/net/primary.3/statistics/rx_bytes",
+                "/sys/class/net/cfab-work-vms/statistics/rx_bytes",
                 "not-a-number\n",
             )
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "2000\n");
-        assert_eq!(sysfs_bytes(&garbage, "primary.3"), None);
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "2000\n");
+        assert_eq!(sysfs_bytes(&garbage, "cfab-work-vms"), None);
     }
 
     /// `neighbors_seen`: excludes every member address, `gw` and `router`, excludes
@@ -4412,20 +4403,20 @@ table bridge cfab {
             "192.168.20.254".parse().unwrap(), // gw
         ];
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.2", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.3", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
-            {"dst": "192.168.20.1", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.254", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:06", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.50", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
-            {"dst": "192.168.21.5", "dev": "primary.3", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.2", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:01", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.3", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:02", "state": ["STALE"]},
+            {"dst": "192.168.20.1", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:03", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:06", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:04", "state": ["REACHABLE"]},
+            {"dst": "192.168.21.5", "dev": "cfab-work-vms", "lladdr": "aa:aa:aa:aa:aa:05", "state": ["REACHABLE"]},
         ])
         .to_string();
         let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
         assert_eq!(
-            neighbors_seen(&mut sys, "primary.3", &prefix, &exclude),
+            neighbors_seen(&mut sys, "cfab-work-vms", &prefix, &exclude),
             Some(1)
         );
     }
@@ -4435,18 +4426,21 @@ table bridge cfab {
     fn neighbors_seen_does_not_count_an_unresolved_entry() {
         let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["FAILED"]},
-            {"dst": "192.168.20.51", "dev": "primary.3", "state": ["INCOMPLETE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "state": ["FAILED"]},
+            {"dst": "192.168.20.51", "dev": "cfab-work-vms", "state": ["INCOMPLETE"]},
             // NOARP never carries a resolved lladdr either (RULED, gate M1 review I1): a
             // no-ARP interface entry, not a host that answered.
-            {"dst": "192.168.20.52", "dev": "primary.3", "state": ["NOARP"]},
+            {"dst": "192.168.20.52", "dev": "cfab-work-vms", "state": ["NOARP"]},
         ])
         .to_string();
         let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(0));
+        assert_eq!(
+            neighbors_seen(&mut sys, "cfab-work-vms", &prefix, &[]),
+            Some(0)
+        );
     }
 
     /// A `PERMANENT` (statically pinned) neighbor counts (RULED, gate M1 review I1, research
@@ -4456,14 +4450,17 @@ table bridge cfab {
     fn neighbors_seen_counts_a_permanent_entry() {
         let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["PERMANENT"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "state": ["PERMANENT"]},
         ])
         .to_string();
         let mut sys = MockSys::default().on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             &neigh_json,
         );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), Some(1));
+        assert_eq!(
+            neighbors_seen(&mut sys, "cfab-work-vms", &prefix, &[]),
+            Some(1)
+        );
     }
 
     /// A read or parse failure is `None`, never a fault and never a fabricated zero.
@@ -4471,16 +4468,19 @@ table bridge cfab {
     fn neighbors_seen_is_none_on_a_read_failure() {
         let prefix = Ipv4Prefix::parse("192.168.20.0/24").unwrap();
         let mut sys = MockSys::default().on_fail(
-            &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
             1,
-            "Device \"primary.3\" does not exist.",
+            "Device \"cfab-work-vms\" does not exist.",
         );
-        assert_eq!(neighbors_seen(&mut sys, "primary.3", &prefix, &[]), None);
-
-        let mut garbled =
-            MockSys::default().on_stdout(&["ip", "-j", "neigh", "show", "dev", "primary.3"], "{");
         assert_eq!(
-            neighbors_seen(&mut garbled, "primary.3", &prefix, &[]),
+            neighbors_seen(&mut sys, "cfab-work-vms", &prefix, &[]),
+            None
+        );
+
+        let mut garbled = MockSys::default()
+            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], "{");
+        assert_eq!(
+            neighbors_seen(&mut garbled, "cfab-work-vms", &prefix, &[]),
             None
         );
     }
@@ -4498,10 +4498,10 @@ table bridge cfab {
         let f = wl_fabric();
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([
-            {"dst": "192.168.20.2", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.254", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.1", "dev": "primary.3", "state": ["REACHABLE"]},
-            {"dst": "192.168.20.50", "dev": "primary.3", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.2", "dev": "cfab-work-vms", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.254", "dev": "cfab-work-vms", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.1", "dev": "cfab-work-vms", "state": ["REACHABLE"]},
+            {"dst": "192.168.20.50", "dev": "cfab-work-vms", "state": ["REACHABLE"]},
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view)
@@ -4513,10 +4513,10 @@ table bridge cfab {
                  daddr ip 192.168.20.254 counter packets 5 bytes 210 drop comment \
                  \"gw-request-from-uplink\"\n    }\n}\n",
             )
-            .file("/sys/class/net/primary.3/statistics/rx_bytes", "1234\n")
-            .file("/sys/class/net/primary.3/statistics/tx_bytes", "5678\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1234\n")
+            .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "5678\n")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "primary.3"],
+                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
                 &neigh_json,
             );
         let expected = expected_links(&view).unwrap();
@@ -4589,8 +4589,8 @@ table bridge cfab {
     /// write) is still refused.
     #[test]
     fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
-        assert!(is_read_only("ip -j neigh show dev primary.3"));
-        assert!(!is_read_only("ip neigh flush dev primary.3"));
+        assert!(is_read_only("ip -j neigh show dev cfab-work-vms"));
+        assert!(!is_read_only("ip neigh flush dev cfab-work-vms"));
     }
 
     /// Spec §12 (b), the reporting half. A host whose forward policy is gone has failed closed:

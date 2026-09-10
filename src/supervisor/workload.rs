@@ -218,7 +218,7 @@ impl Workloads {
     /// double-report it.
     fn refresh_uplinks(&mut self, sys: &mut dyn Sys, view: &View) {
         for row in view.workload_rows() {
-            let Ok(up) = uplink::identify(sys, &row.wl.ifname) else {
+            let Ok(up) = uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) else {
                 continue;
             };
             let Some(r) = self.rows.iter_mut().find(|r| r.name == row.wl.name) else {
@@ -271,8 +271,9 @@ impl Workloads {
                 }
                 continue;
             }
-            let ifname = &row.wl.ifname;
-            let started = uplink::identify(sys, ifname)
+            let leg = row.wl.leg_ifname();
+            let ifname = leg.as_str();
+            let started = uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid)
                 .and_then(|up| read_mac(io, ifname).map(|mac| (up, mac)));
             match started {
                 Ok((up, mac)) => {
@@ -533,7 +534,7 @@ mod tests {
                 rows[0].ifname.as_str(),
                 rows[0].trigger.as_str()
             ),
-            ("vms", "primary.3", "neigh events")
+            ("vms", "cfab-work-vms", "neigh events")
         );
         assert_eq!(w.next_due(), Some(t), "the first beacon is immediate");
         assert_eq!(
@@ -550,12 +551,12 @@ mod tests {
         assert_eq!(w.rows_for_status().len(), 1);
     }
 
-    /// An uplink that cannot be identified after a successful apply (the bridge was torn down
-    /// under us): journal the reason, start nothing, never panic.
+    /// An uplink that cannot be identified after a successful apply (the bridge's last
+    /// off-host port went away under us): journal the reason, start nothing, never panic.
     #[test]
     fn an_uplink_that_cannot_be_identified_journals_the_reason_and_starts_no_announcer() {
         let (mut sys, view) = wl(None);
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         let trace = rec();
         let w = Workloads::start(
             &mut sys,
@@ -569,8 +570,9 @@ mod tests {
         assert_eq!(
             said(&trace),
             vec![
-                "cfab: workload vms: workload interface primary.3 is not a VLAN sub-interface \
-                 of a bridge (no lower link in /sys/class/net/primary.3); announcer not started"
+                "cfab: workload vms: bridge primary has no uplink port (no port has a \
+                 /sys/class/net/<port>/device, directly or through lower links); ports: eth0, \
+                 tap100i0; announcer not started"
             ]
         );
     }
@@ -596,7 +598,7 @@ mod tests {
         assert_eq!(
             said(&trace),
             vec![
-                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                "cfab: workload vms: cannot read the MAC of cfab-work-vms: FATAL: cfab-work-vms: no \
                  link-layer address (no netdev?); announcer not started"
             ]
         );
@@ -634,7 +636,7 @@ mod tests {
                 .filter(|l| l.contains("MAC changed"))
                 .collect::<Vec<_>>(),
             vec![
-                "cfab: workload vms: primary.3 MAC changed 00:11:22:33:44:55 -> 02:cf:ab:00:00:09"
+                "cfab: workload vms: cfab-work-vms MAC changed 00:11:22:33:44:55 -> 02:cf:ab:00:00:09"
             ]
         );
         // Unchanged from here on: the line is said once per change, not once per beacon.
@@ -674,7 +676,7 @@ mod tests {
                 .filter(|l| l.contains("cannot read the MAC"))
                 .collect::<Vec<_>>(),
             vec![
-                "cfab: workload vms: cannot read the MAC of primary.3: FATAL: primary.3: no \
+                "cfab: workload vms: cannot read the MAC of cfab-work-vms: FATAL: cfab-work-vms: no \
                  link-layer address (no netdev?); announcing the last known MAC"
             ]
         );
@@ -900,7 +902,7 @@ mod tests {
             opens,
             t0,
         );
-        sys.links.remove("/sys/class/net/primary.3/lower_primary");
+        sys.links.remove("/sys/class/net/eth0/device");
         w.tick(&mut sys, &view, &mut RecordingIo::default(), t0);
         w.on_neigh(
             &mut sys,
@@ -953,7 +955,7 @@ mod tests {
             t0,
         );
         let mut io = RecordingIo {
-            fail: Some("primary.3: cannot send probe: ENODEV".into()),
+            fail: Some("cfab-work-vms: cannot send probe: ENODEV".into()),
             ..Default::default()
         };
         w.fire_due(&mut io, t0);
@@ -965,7 +967,7 @@ mod tests {
         assert_eq!(
             failures,
             vec![
-                "cfab: workload vms: announce on primary.3 failed: FATAL: primary.3: cannot \
+                "cfab: workload vms: announce on cfab-work-vms failed: FATAL: cfab-work-vms: cannot \
                  send probe: ENODEV"
             ],
             "the same error twice is one line"
@@ -976,7 +978,7 @@ mod tests {
             "the schedule advances whether or not the socket takes the frame"
         );
 
-        io.fail = Some("primary.3: cannot send probe: ENETDOWN".into());
+        io.fail = Some("cfab-work-vms: cannot send probe: ENETDOWN".into());
         w.fire_due(&mut io, t0 + 2 * PERIOD);
         assert_eq!(
             said(&trace)
@@ -1093,7 +1095,7 @@ mod tests {
         let mut io = RecordingIo::default();
         w.fire_due(&mut io, t0);
         assert_eq!(io.sent.len(), 1);
-        assert_eq!(io.sent[0].0, "primary.3");
+        assert_eq!(io.sent[0].0, "cfab-work-vms");
         assert_eq!(
             io.sent[0].1,
             crate::workload::announce::gratuitous(
