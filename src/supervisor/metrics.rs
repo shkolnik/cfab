@@ -741,6 +741,46 @@ impl FabricCollector {
              (MAC churn, watch deaths); absent under the same condition as \
              cfab_workload_announces.",
             &bursts,
+        )?;
+
+        // The DHCP relay (spec §5.4/§6): sourced from `components.relays`, keyed by name, the
+        // same join `announces`/`bursts` use above — a row this member does not carry gets no
+        // series, and a row that carries one but declares no `dhcp_server` gets none either,
+        // since it has no entry in `components.relays` at all.
+        let mut relayed: Vec<(Labels, u64)> = Vec::new();
+        let mut discovered: Vec<(Labels, u64)> = Vec::new();
+        if let Some(c) = &self.snap.model.components {
+            for r in &c.relays {
+                relayed.push((
+                    lbl(&[("name", r.name.as_str()), ("direction", "request")]),
+                    r.requests,
+                ));
+                relayed.push((
+                    lbl(&[("name", r.name.as_str()), ("direction", "reply")]),
+                    r.replies,
+                ));
+                discovered.push((
+                    lbl(&[("name", r.name.as_str()), ("source", "dhcp")]),
+                    r.discovered,
+                ));
+            }
+        }
+        counter_family(
+            enc,
+            "cfab_workload_dhcp_relayed",
+            "DHCP packets this row's relay has forwarded since it last bound (spec §5.4): \
+             `direction=\"request\"` toward dhcp_server, `direction=\"reply\"` back to the leg; \
+             absent when the row declares no dhcp_server or no supervisor answered.",
+            &relayed,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_vms_discovered",
+            "VMs this member has registered a neighbor entry for since the supervisor started, \
+             by how it learned the address: a relayed DHCPACK (source=\"dhcp\") today; a \
+             non-DHCP first packet (source=\"neigh\") is a later gate's. Absent under the same \
+             condition as cfab_workload_dhcp_relayed.",
+            &discovered,
         )
     }
 
