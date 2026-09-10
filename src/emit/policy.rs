@@ -115,6 +115,58 @@ pub fn generate(view: &View) -> Result<String> {
     Ok(out)
 }
 
+/// The elements of every `<leg>-local` set, removed, leaving the set declared and empty.
+///
+/// `status` compares the generated policy against the file `up` wrote, and the live ruleset
+/// against the baseline `up` captured. The reconcile (`workload::hostroutes`) moves the
+/// elements of these sets between those two moments, every time a VM appears or leaves — so
+/// without this, every host with one live VM reports "re-run cfab up" forever, for a
+/// difference `up` does not repair. Everything else in the text still counts as drift.
+///
+/// Both renderings pass through here: this emitter writes a set on one line, `nft -s list
+/// table` writes a block and wraps a long element list over several lines. Each comparison is
+/// one producer against itself, so the two forms never have to normalize to each other.
+pub fn without_local_elements(text: &str) -> String {
+    let mut out = String::new();
+    let mut skip_to_depth: Option<i32> = None;
+    let mut depth = 0i32;
+    for line in text.lines() {
+        let t = line.trim();
+        let before = depth;
+        depth += balance(t);
+        if let Some(d) = skip_to_depth {
+            if depth <= d {
+                skip_to_depth = None;
+            }
+            continue;
+        }
+        if is_local_set_open(t) {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let name = t.split_whitespace().nth(1).unwrap_or_default();
+            out.push_str(&format!("{indent}set {name} {{ }}\n"));
+            if depth > before {
+                skip_to_depth = Some(before); // a block: drop it through its closing brace
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The opening of a set whose name is a workload row's local set (`Workload::local_set`).
+fn is_local_set_open(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("set ")
+        .and_then(|r| r.split_whitespace().next())
+        .is_some_and(|n| n.ends_with("-local"))
+}
+
+fn balance(s: &str) -> i32 {
+    s.chars().filter(|c| *c == '{').count() as i32 - s.chars().filter(|c| *c == '}').count() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +381,45 @@ mod tests {
         for rule in ["iifname @admin counter drop", "oifname @admin counter drop"] {
             assert!(leaf_out.contains(rule), "leaf lost {rule}");
         }
+    }
+
+    /// The reconcile moves the elements of every `<leg>-local` set as VMs appear and leave
+    /// (spec §5.2), so `status`'s two drift comparisons must not read a live VM as
+    /// "re-run cfab up" — the very thing `up` would not repair. Both renderings, because one
+    /// comparison is this emitter against its own file and the other is nft against its own.
+    #[test]
+    fn a_local_sets_elements_are_not_drift_in_either_rendering() {
+        let empty = "table inet cfab-fwd {\n  \
+                     set cfab-work-vms-local { type ipv4_addr; }\n}\n";
+        let filled = "table inet cfab-fwd {\n  \
+                      set cfab-work-vms-local { type ipv4_addr; elements = { 192.168.20.103 } }\n}\n";
+        assert_eq!(
+            without_local_elements(empty),
+            without_local_elements(filled)
+        );
+
+        let nft_empty =
+            "table inet cfab-fwd {\n\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t}\n}\n";
+        let nft_filled = "table inet cfab-fwd {\n\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t\telements = { 192.168.20.103,\n\t\t\t     192.168.20.104 }\n\t}\n}\n";
+        assert_eq!(
+            without_local_elements(nft_empty),
+            without_local_elements(nft_filled),
+            "a wrapped element list is still one element list"
+        );
+
+        // Everything else still drifts: another set's elements, and any rule at all.
+        let zone_a = "  set storage { type ifname; elements = { \"eth9\" } }\n";
+        let zone_b = "  set storage { type ifname; }\n";
+        assert_ne!(
+            without_local_elements(zone_a),
+            without_local_elements(zone_b)
+        );
+        let rule_a = "    iifname @storage counter drop comment \"stray-vms\"\n";
+        assert_ne!(without_local_elements(rule_a), without_local_elements(""));
+        // ...and so does the set going missing altogether.
+        assert_ne!(
+            without_local_elements(empty),
+            without_local_elements("table inet cfab-fwd {\n}\n")
+        );
     }
 }

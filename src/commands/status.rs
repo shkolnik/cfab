@@ -953,7 +953,7 @@ fn posture(
             let loaded = sys
                 .read(&format!("{}/policy.nft", f.run_dir))
                 .unwrap_or_default();
-            if want_policy != loaded {
+            if drifted(&want_policy, &loaded) {
                 // Standing: a mismatch against generated state, repaired by `up` alone.
                 c.standing("policy drift — re-run cfab up");
             }
@@ -961,7 +961,7 @@ fn posture(
             let applied = sys
                 .read(&format!("{}/policy.applied", f.run_dir))
                 .unwrap_or_default();
-            if !live.ok() || live.stdout != applied {
+            if !live.ok() || drifted(&live.stdout, &applied) {
                 c.standing("ruleset drift — re-run cfab up");
             }
             let chain = sys
@@ -1949,6 +1949,33 @@ fn sysfs_bytes(sys: &dyn Sys, ifname: &str) -> Option<(u64, u64)> {
 /// neighbors and the uplink bridge's FDB.
 ///
 /// `None` when either read fails or does not parse — observability, never a health condition.
+/// Whether two renderings of the forward policy differ in anything `cfab up` would repair.
+/// The elements of each `<leg>-local` set are excluded: the reconcile moves them as VMs come
+/// and go, so counting them would report every host with a live VM as drifted forever.
+fn drifted(want: &str, have: &str) -> bool {
+    emit::policy::without_local_elements(want) != emit::policy::without_local_elements(have)
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::drifted;
+
+    /// A VM appearing on a leg fills the row's local set at runtime. `up` does not put it
+    /// there and re-running `up` would not repair it, so it must never be reported as drift —
+    /// before this, `nft -s list table` carried the element and the `up`-time baseline did
+    /// not, and every host with one live VM stood at "ruleset drift" forever.
+    #[test]
+    fn a_live_vm_in_a_local_set_is_never_drift_but_everything_else_is() {
+        let base = "\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t}\n\t\
+                    chain forward {\n\t\tct state invalid counter\n\t}\n";
+        let with_vm = "\tset cfab-work-vms-local {\n\t\ttype ipv4_addr\n\t\t\
+                       elements = { 192.168.20.103 }\n\t}\n\t\
+                       chain forward {\n\t\tct state invalid counter\n\t}\n";
+        assert!(!drifted(base, with_vm));
+        assert!(drifted(base, &base.replace("ct state invalid counter", "")));
+    }
+}
+
 fn local_vms_seen(
     sys: &mut dyn Sys,
     view: &View,
