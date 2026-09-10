@@ -297,6 +297,13 @@ impl Shared {
         self.relays.get(name).map_or(0, |r| r.drops)
     }
 
+    /// Test/S-B support: how many `DHCPACK`s this row's relay has decided to register a
+    /// neighbor entry for (`RelayEvent::Discovered`; see its own doc for what "decided" means).
+    #[cfg(test)]
+    pub(crate) fn relay_discovered(&self, name: &str) -> u64 {
+        self.relays.get(name).map_or(0, |r| r.discovered)
+    }
+
     /// The `components` document's relay rows (spec §6), in name order (`BTreeMap` iteration).
     fn relay_infos(&self) -> Vec<report::RelayInfo> {
         self.relays
