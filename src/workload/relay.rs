@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::model::Ipv4Prefix;
 use crate::supervisor::child::BACKOFF;
+use crate::supervisor::metrics::BIND_RETRY;
 use crate::supervisor::{Cmd, RelayEvent, Shared};
 
 /// BOOTP opcodes (RFC 2131 §2).
@@ -367,18 +368,38 @@ fn bind_pair(row: &RelayRow) -> io::Result<(UdpSocket, UdpSocket)> {
 /// makes a larger UDP payload vanishingly rare on this wire (fold-in, opus review).
 const BUF_LEN: usize = 1500;
 
-/// The relay task (spec §5.4): bind, serve until a socket errors, then retry forever on the same
-/// backoff a supervised child restarts on. A bind failure is loud (one journal line) and never
-/// fatal to the member — this loop simply tries again, so a leg that does not exist yet (a
-/// deferred row, a watchdog rebuild in progress) is indistinguishable in kind from a port
-/// transiently held by something else: both clear themselves the moment the precondition does.
+/// Whether a bind failure's journal line should print (S1): only when the error text differs
+/// from what `Shared` already holds for this row. A deferred row, or a leg the watchdog has not
+/// built yet, hits the same failure on every retry until its precondition clears — this is what
+/// keeps that from restating the same line once per `BIND_RETRY` forever (relay.rs's own doc
+/// comment above names this hazard for drops; a bind failure was the one place it went
+/// unthrottled).
+fn should_log_bind_failure(previous: Option<&str>, msg: &str) -> bool {
+    previous != Some(msg)
+}
+
+/// The relay task (spec §5.4): bind, serve until a socket errors, then retry. A task death (a
+/// live relay whose socket later failed) retries on the same `BACKOFF` a supervised child
+/// restarts on; a bind failure (the leg does not exist yet, or the address is not local) is a
+/// standing condition rather than a transient hiccup, so it retries every `BIND_RETRY` instead
+/// and is loud only when the reason changes (S1). Neither is ever fatal to the member — a leg
+/// that does not exist yet (a deferred row, a watchdog rebuild in progress) is indistinguishable
+/// in kind from a port transiently held by something else: both clear themselves the moment the
+/// precondition does.
 pub(crate) async fn run(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
 ) {
     loop {
-        match bind_pair(&row) {
+        // S1: which cadence retries this pass, and whether the journal line prints, depend on
+        // which branch below runs. A task death (the `Ok` arm: bind succeeded, `serve` later
+        // ended it) keeps the spec's own 2 s `BACKOFF` and always logs once, exactly as before.
+        // A bind failure (the `Err` arm) is the one a deferred row, or a leg the watchdog has
+        // not built yet, hits every pass until its precondition clears — that follows
+        // `metrics::BIND_RETRY`'s 60 s cadence instead, and logs only when the standing error
+        // actually changes.
+        let retry = match bind_pair(&row) {
             Ok((client, server)) => {
                 shared
                     .lock()
@@ -399,22 +420,28 @@ pub(crate) async fn run(
                     row.dhcp_server,
                     RelayEvent::BindError(why),
                 );
+                BACKOFF
             }
             Err(e) => {
                 let msg = format!("cannot bind: {e}");
+                let previous = shared.lock().unwrap().relay_last_error(&row.name);
+                let is_new = should_log_bind_failure(previous.as_deref(), &msg);
                 shared.lock().unwrap().relay_event(
                     &row.name,
                     row.dhcp_server,
                     RelayEvent::BindError(msg.clone()),
                 );
-                eprintln!(
-                    "cfab: workload {}: dhcp relay {msg}; retrying in {}s",
-                    row.name,
-                    BACKOFF.as_secs()
-                );
+                if is_new {
+                    eprintln!(
+                        "cfab: workload {}: dhcp relay {msg}; retrying every {}s while it stands",
+                        row.name,
+                        BIND_RETRY.as_secs()
+                    );
+                }
+                BIND_RETRY
             }
-        }
-        tokio::time::sleep(BACKOFF).await;
+        };
+        tokio::time::sleep(retry).await;
     }
 }
 
@@ -930,6 +957,30 @@ mod tests {
             recorded.as_deref(),
             Some(result.as_str()),
             "the same failure must land in Shared's last_error (S1/status/metrics read it back)"
+        );
+    }
+
+    // ---- should_log_bind_failure: a bind-failure line prints once per streak (S1) ----------
+
+    #[test]
+    fn a_bind_failure_line_prints_once_per_streak_not_once_per_retry() {
+        assert!(
+            should_log_bind_failure(None, "cannot bind: address not available"),
+            "the first failure in a streak must print"
+        );
+        assert!(
+            !should_log_bind_failure(
+                Some("cannot bind: address not available"),
+                "cannot bind: address not available"
+            ),
+            "the same standing error must not print again"
+        );
+        assert!(
+            should_log_bind_failure(
+                Some("cannot bind: address not available"),
+                "cannot bind: address in use"
+            ),
+            "a different reason is a new streak and must print"
         );
     }
 

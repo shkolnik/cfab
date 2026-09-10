@@ -258,9 +258,7 @@ impl Shared {
     /// before printing a bind-failure line, so a repeat of the same error stays silent instead
     /// of restating it every retry (spec's self-inflicted-DoS-on-the-journal hazard, §5.4).
     /// Also `workload::relay`'s own test module's window into `Shared` — a sibling, not a
-    /// descendant, of this one, so `relays` stays field-private otherwise. `#[cfg(test)]` here
-    /// until S1 gives `run()` its own production caller of this same accessor.
-    #[cfg(test)]
+    /// descendant, of this one, so `relays` stays field-private otherwise.
     pub(crate) fn relay_last_error(&self, name: &str) -> Option<String> {
         self.relays.get(name).and_then(|r| r.last_error.clone())
     }
