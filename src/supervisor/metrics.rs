@@ -1198,6 +1198,7 @@ mod tests {
                 announces: 42,
                 bursts: 1,
             }],
+            relays: Vec::new(),
             metrics_error: None,
         }
     }

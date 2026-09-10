@@ -33,6 +33,28 @@ pub struct Components {
     /// bound, or never asked for. `#[serde(default)]` so an older supervisor's document parses.
     #[serde(default)]
     pub metrics_error: Option<String>,
+    /// One row per `[[workload]]` DHCP relay this member runs (spec §5.4/§6). A row with no
+    /// `dhcp_server` has none; a row that has one but whose task has not bound yet has an entry
+    /// with zero counters and no error — the same "started but nothing to show yet" shape
+    /// `WorkloadAnnounce` uses. `#[serde(default)]` so an older supervisor's document parses.
+    #[serde(default)]
+    pub relays: Vec<RelayInfo>,
+}
+
+/// One row's DHCP relay counters and last error, as the supervisor publishes it (spec §5.4/§6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayInfo {
+    pub name: String,
+    /// The `dhcp_server` this row's relay forwards to.
+    pub server: std::net::Ipv4Addr,
+    /// Client→server packets forwarded since the task last bound.
+    pub requests: u64,
+    /// Server→client packets forwarded since the task last bound.
+    pub replies: u64,
+    /// Relayed `DHCPACK`s that earned a neighbor write (spec §5.4, call 5 caveat).
+    pub discovered: u64,
+    /// The relay's last bind or socket error, for as long as it stands; `None` while healthy.
+    pub last_error: Option<String>,
 }
 
 /// What the prober knows about one zone's leg: where the bond sits, and whether the far end —

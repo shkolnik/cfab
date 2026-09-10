@@ -34,6 +34,8 @@ pub mod report;
 pub mod sock;
 mod workload;
 
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -110,6 +112,16 @@ pub(crate) enum Cmd {
     /// working must never keep claiming it is the live one (ruling 12: `status` says which
     /// path is active).
     NeighWatchDied(String),
+    /// A DHCP relay task relayed a `DHCPACK` (spec §5.4, r3 review N2c): the actual `ip neigh
+    /// replace` cannot happen in the relay task itself, because `Sys` is owned by this main
+    /// loop and is not `Send`. `leg` and `name` travel with it so the loop needs no lookup by
+    /// name to build the argv or to journal which row.
+    DhcpAck {
+        name: String,
+        leg: String,
+        yiaddr: Ipv4Addr,
+        chaddr: [u8; 6],
+    },
 }
 
 /// A child's exit, reported by its `wait` task to the main loop.
@@ -151,6 +163,51 @@ pub(crate) struct Shared {
     /// Set while a run of consecutive metrics-gather failures is ongoing, so the journal line
     /// is printed once per streak rather than once per `metrics::REFRESH` tick.
     metrics_gather_failing: bool,
+    /// One row per `[[workload]]` DHCP relay this member runs (spec §5.4/§6), keyed by workload
+    /// name. The relay task writes this directly through the mutex — plain counters, never a
+    /// `Sys` action, so unlike the neighbor write (`Cmd::DhcpAck`) it needs no round trip through
+    /// the main loop. A row with no `dhcp_server` never gets an entry; a row that has one but
+    /// whose task has not bound yet is absent until its first `RelayEvent`, exactly like
+    /// `workloads` before the first announcer trigger fires.
+    relays: BTreeMap<String, RelayReport>,
+}
+
+/// One relay's counters and last error, as `Shared` holds them.
+struct RelayReport {
+    server: Ipv4Addr,
+    requests: u64,
+    replies: u64,
+    discovered: u64,
+    last_error: Option<String>,
+}
+
+impl RelayReport {
+    fn new(server: Ipv4Addr) -> Self {
+        RelayReport {
+            server,
+            requests: 0,
+            replies: 0,
+            discovered: 0,
+            last_error: None,
+        }
+    }
+}
+
+/// A fact the relay task reports about one row (spec §5.4). Kept as an enum rather than letting
+/// the task poke `Shared`'s fields directly: `relay.rs` never needs to know the report's shape,
+/// only that these five things can happen.
+pub(crate) enum RelayEvent {
+    /// The two sockets bound: clears any standing bind error.
+    Bound,
+    /// A bind, or later a socket read, failed. Carries the message `status`/`/metrics` show.
+    BindError(String),
+    /// A client→server packet was forwarded.
+    Request,
+    /// A server→client packet was forwarded.
+    Reply,
+    /// A relayed `DHCPACK` earned a neighbor write (posted separately as `Cmd::DhcpAck`; this is
+    /// the counter half, credited when the task decides to register, not when the write lands).
+    Discovered,
 }
 
 impl Shared {
@@ -176,7 +233,40 @@ impl Shared {
             metrics_error: None,
             metrics_collect_failures: 0,
             metrics_gather_failing: false,
+            relays: BTreeMap::new(),
         }
+    }
+
+    /// Record one relay fact for `name` (spec §5.4/§6). Initializes the row's entry with
+    /// `server` on first use, so a row with `dhcp_server` set appears in `components`/`status`
+    /// from the task's first tick, before any packet has crossed it.
+    pub(crate) fn relay_event(&mut self, name: &str, server: Ipv4Addr, ev: RelayEvent) {
+        let r = self
+            .relays
+            .entry(name.to_string())
+            .or_insert_with(|| RelayReport::new(server));
+        match ev {
+            RelayEvent::Bound => r.last_error = None,
+            RelayEvent::BindError(e) => r.last_error = Some(e),
+            RelayEvent::Request => r.requests += 1,
+            RelayEvent::Reply => r.replies += 1,
+            RelayEvent::Discovered => r.discovered += 1,
+        }
+    }
+
+    /// The `components` document's relay rows (spec §6), in name order (`BTreeMap` iteration).
+    fn relay_infos(&self) -> Vec<report::RelayInfo> {
+        self.relays
+            .iter()
+            .map(|(name, r)| report::RelayInfo {
+                name: name.clone(),
+                server: r.server,
+                requests: r.requests,
+                replies: r.replies,
+                discovered: r.discovered,
+                last_error: r.last_error.clone(),
+            })
+            .collect()
     }
 
     fn child(&self, name: &str) -> &Child {
@@ -236,6 +326,7 @@ impl Shared {
             fallback: self.probed.fallback.clone(),
             workloads: self.workloads.clone(),
             metrics_error: self.metrics_error.clone(),
+            relays: self.relay_infos(),
         }
     }
 
@@ -767,6 +858,39 @@ pub(crate) async fn run_with(
     );
     workloads.publish(&shared);
 
+    // 5c-bis. The DHCP relay (spec §5.4, call 2 RULED `dhcp_server`): one task per row that
+    // declares it, spawned once at start (never re-spawned per apply/reload, since a row's
+    // `dhcp_server` cannot change without a new fabric this process exits to pick up). A row
+    // `apply` left deferred, or whose leg the watchdog has not built yet, is not special-cased
+    // here: its own bind simply fails (the leg's address is not yet local) and retries on the
+    // same schedule as any other bind failure, so no second "is this row ready" check needs to
+    // agree with the announcer's — one fewer place for that fact to drift (spec §3.1,
+    // availability first: a relay that cannot bind is a degraded row, never a dead member).
+    for row in view.workload_rows() {
+        let Some(dhcp_server) = row.wl.dhcp_server else {
+            continue;
+        };
+        let Some(leg_addr) = row.address.split('/').next().and_then(|a| a.parse().ok()) else {
+            eprintln!(
+                "cfab: workload {}: cannot parse this member's own address {} as IPv4; dhcp \
+                 relay not started",
+                row.wl.name, row.address
+            );
+            continue;
+        };
+        let relay_row = crate::workload::relay::RelayRow {
+            name: row.wl.name.clone(),
+            leg: row.wl.leg_ifname(),
+            leg_addr,
+            dhcp_server,
+        };
+        tokio::spawn(crate::workload::relay::run(
+            relay_row,
+            shared.clone(),
+            cmd_tx.clone(),
+        ));
+    }
+
     // 5d. The additive host default (spec §6). `apply` installed it optimistically; from here
     // the prober's router-reachability fact drives it — the prober tick on an edge, the
     // forwarding-watchdog tick at level.
@@ -915,6 +1039,29 @@ pub(crate) async fn run_with(
                     Cmd::NeighWatchDied(why) => {
                         workloads.watch_died(&why);
                         workloads.publish(&shared);
+                        continue;
+                    }
+                    // A relayed DHCPACK (spec §5.4, r3 review N2c): the write happens here,
+                    // where `&mut sys` lives, never in the relay task itself. Never fatal — a
+                    // failed write costs one journal line and the VM is discovered on its next
+                    // non-DHCP packet instead (spec §5.6), same as any silent VM.
+                    Cmd::DhcpAck { name, leg, yiaddr, chaddr } => {
+                        let mac = crate::workload::relay::mac_str(chaddr);
+                        let yiaddr = yiaddr.to_string();
+                        let argv = [
+                            "ip", "neigh", "replace", &yiaddr, "lladdr", &mac, "dev", &leg,
+                            "nud", "stale",
+                        ];
+                        match sys.run(&argv) {
+                            Ok(o) if o.ok() => {}
+                            Ok(o) => eprintln!(
+                                "cfab: workload {name}: dhcp ack neighbor write failed: {}",
+                                o.stderr
+                            ),
+                            Err(e) => eprintln!(
+                                "cfab: workload {name}: dhcp ack neighbor write failed: {e}"
+                            ),
+                        }
                         continue;
                     }
                 };
