@@ -32,12 +32,15 @@ table inet cfab-fwd {
   set cluster { type ifname; elements = { "cfab-cl","cfab-cl-bk","cfab-cl-b2","cfab-cl-fb" } }
   set mgmt { type ifname; elements = { "cfab-mg","cfab-mg-bk","cfab-mg-b2","cfab-mg-fb","cfab-gw249" } }
   set cfab { type ifname; elements = { "cfab-cl","cfab-cl-b2","cfab-cl-bk","cfab-cl-fb","cfab-cl-fb-a","cfab-cl-fb-b","cfab-cl-fb-c","cfab-gw249","cfab-gw249-a","cfab-gw249-b","cfab-gw249-c","cfab-id199","cfab-id199-peer","cfab-id249","cfab-id249-peer","cfab-id99","cfab-id99-peer","cfab-mg","cfab-mg-b2","cfab-mg-bk","cfab-mg-fb","cfab-mg-fb-a","cfab-mg-fb-b","cfab-mg-fb-c","cfab-st","cfab-st-b2","cfab-st-bk","cfab-st-fb","cfab-st-fb-a","cfab-st-fb-b","cfab-st-fb-c","cfab-work-vms","eth0","eth1","eth9" } }
+  set cfab-work-vms-local { type ipv4_addr; }
   chain forward {
     type filter hook forward priority filter; policy drop;
     iifname @admin counter drop comment "admin-in"
     oifname @admin counter drop comment "admin-out"
     iifname != @cfab oifname != @cfab counter accept comment "foreign-transit"
     ct state invalid counter comment "ct-invalid-seen"
+    iifname @storage oifname "cfab-work-vms" ip daddr != @cfab-work-vms-local counter drop comment "stray-vms"
+    iifname @mgmt oifname "cfab-work-vms" ip daddr != @cfab-work-vms-local counter drop comment "stray-vms"
     ct state established,related accept comment "return-of-allowed"
     iifname @storage oifname @storage counter accept comment "allow-storage-storage"
     iifname @cluster oifname @cluster counter accept comment "allow-cluster-cluster"

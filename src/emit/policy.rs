@@ -53,15 +53,41 @@ pub fn generate(view: &View) -> Result<String> {
         "  set cfab {{ type ifname; elements = {{ {} }} }}\n",
         owned.join(",")
     ));
+    // Spec §5.2, ruling 6: the VMs this member currently knows on each workload leg. Declared
+    // empty and filled at runtime by `workload::hostroutes` — an empty set means "no VM is
+    // local", which is the safe reading of "cfab is not running the reconcile".
+    for row in view.workload_rows() {
+        out.push_str(&format!(
+            "  set {} {{ type ipv4_addr; }}\n",
+            row.wl.local_set()
+        ));
+    }
     out.push_str(
         "  chain forward {\n\
          \x20   type filter hook forward priority filter; policy drop;\n\
          \x20   iifname @admin counter drop comment \"admin-in\"\n\
          \x20   oifname @admin counter drop comment \"admin-out\"\n\
          \x20   iifname != @cfab oifname != @cfab counter accept comment \"foreign-transit\"\n\
-         \x20   ct state invalid counter comment \"ct-invalid-seen\"\n\
-         \x20   ct state established,related accept comment \"return-of-allowed\"\n",
+         \x20   ct state invalid counter comment \"ct-invalid-seen\"\n",
     );
+    // Ruling 6 (drop and count), and the reason it sits HERE: a stray forward is a reply to a
+    // VM that has left this host, so it is an ESTABLISHED packet and the `return-of-allowed`
+    // accept below would take it first (r2 review N5). Above it, and above the per-zone
+    // accepts, the drop is the only verdict a packet for an unknown VM can reach. The
+    // aggregate /24 is what brings the packet to a host at all; this is what stops the host
+    // that does not own the VM from putting it back on VLAN 3.
+    for row in view.workload_rows() {
+        for z in &row.wl.allow {
+            out.push_str(&format!(
+                "    iifname @{z} oifname \"{ifn}\" ip daddr != @{set} counter drop \
+                 comment \"stray-{wl}\"\n",
+                ifn = row.wl.leg_ifname(),
+                set = row.wl.local_set(),
+                wl = row.wl.name
+            ));
+        }
+    }
+    out.push_str("    ct state established,related accept comment \"return-of-allowed\"\n");
     for (from, to) in &f.forward_allow {
         // Zone existence is already validated at parse; emit in declaration order.
         out.push_str(&format!(
@@ -144,6 +170,78 @@ mod tests {
             pos("allow-vms-storage") > pos("return-of-allowed")
                 && pos("allow-vms-storage") < pos("default-deny")
         );
+    }
+
+    /// The rule lines of the forward chain, trimmed, in order — the only honest way to assert
+    /// a rule's POSITION, which is what decides whether it can match at all.
+    fn chain_rules(text: &str) -> Vec<String> {
+        text.lines()
+            .skip_while(|l| !l.trim_start().starts_with("chain forward {"))
+            .skip(1)
+            .take_while(|l| l.trim() != "}")
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// Ruling 6 (drop and count): a host forwards fabric traffic onto its leg only for the VMs
+    /// it currently knows, and the rule sits between `ct state invalid` and the
+    /// `return-of-allowed` accept. Position is the whole substance: a reply to a VM that left
+    /// is an ESTABLISHED packet, so below that accept this rule would never match (r2 review
+    /// N5), and below the per-zone accepts it would never match either.
+    #[test]
+    fn a_stray_forward_onto_a_workload_leg_is_dropped_between_ct_invalid_and_the_return_accept() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        assert!(
+            t.contains("  set cfab-work-vms-local { type ipv4_addr; }\n"),
+            "the set the drop reads must be declared: {t}"
+        );
+        let rules = chain_rules(&t);
+        let at = |needle: &str| {
+            rules
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no rule matching {needle}: {rules:#?}"))
+        };
+        assert_eq!(
+            rules[at("stray-vms")],
+            "iifname @storage oifname \"cfab-work-vms\" ip daddr != @cfab-work-vms-local \
+             counter drop comment \"stray-vms\""
+        );
+        assert_eq!(at("stray-vms"), at("ct-invalid-seen") + 1);
+        assert_eq!(at("return-of-allowed"), at("stray-vms") + 1);
+        assert!(at("stray-vms") < at("allow-storage-vms"));
+        // A member with no workload row declares no set and writes no drop.
+        let leaf = generate(&View::new(&f, "pve3-tb").unwrap()).unwrap();
+        assert!(!leaf.contains("-local"), "{leaf}");
+        assert!(!leaf.contains("stray-"), "{leaf}");
+    }
+
+    /// One rule per allowed zone, in declaration order, all of them still above the accept —
+    /// the packet arrives on whichever zone reaches this workload, and each has to be told.
+    #[test]
+    fn a_multi_zone_workload_gets_one_stray_drop_per_allowed_zone() {
+        let f = Fabric::from_decl(
+            &Declaration::parse(&crate::decl::fixtures::with_multi_zone_allow_workload(
+                &crate::decl::fixtures::example(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let rules = chain_rules(&generate(&v).unwrap());
+        let strays: Vec<&String> = rules.iter().filter(|l| l.contains("stray-vms")).collect();
+        assert_eq!(strays.len(), 2, "{rules:#?}");
+        assert!(strays[0].starts_with("iifname @storage "), "{strays:?}");
+        assert!(strays[1].starts_with("iifname @mgmt "), "{strays:?}");
+        let accept = rules
+            .iter()
+            .position(|l| l.contains("return-of-allowed"))
+            .unwrap();
+        for s in &strays {
+            assert!(rules.iter().position(|l| &l == s).unwrap() < accept);
+        }
     }
 
     /// PROVING existing behavior, not new logic: `zone_ifs()` (Task 2) already returns the
