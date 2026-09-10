@@ -372,6 +372,12 @@ impl fmt::Display for Ipv4Prefix {
     }
 }
 
+/// The usable bytes of a netdev name (IFNAMSIZ 16, less the NUL).
+const IFNAME_MAX: usize = 15;
+
+/// Every workload leg's name starts with this; the row name fills what is left.
+const LEG_PREFIX: &str = "cfab-work-";
+
 /// One `[[workload]]` row, typed (spec §4): a VM workload VLAN, its anycast gateway, and the
 /// zones it may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -395,8 +401,21 @@ pub struct Workload {
 impl Workload {
     /// The leg cfab creates for this row: `cfab-work-<name>` on `uplink`, tagged `vid`
     /// (ruling 1). Derived, never declared — one row, one leg, one name everywhere.
+    ///
+    /// IFNAMSIZ is 16 with the NUL, so a netdev name has 15 usable bytes and the kernel
+    /// refuses a longer one outright; `cfab-work-` takes 10, leaving 5 for the row name. The
+    /// cut lands on a char boundary (a name is arbitrary UTF-8 as far as TOML is concerned),
+    /// and `Fabric::validate` refuses two rows whose names cut to one leg.
     pub fn leg_ifname(&self) -> String {
-        format!("cfab-work-{}", self.name)
+        let room = IFNAME_MAX - LEG_PREFIX.len();
+        let cut = self
+            .name
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|end| *end <= room)
+            .last()
+            .unwrap_or(0);
+        format!("{LEG_PREFIX}{}", &self.name[..cut])
     }
 
     /// `gw` with the prefix's mask, e.g. `192.168.20.254/24`.
@@ -918,6 +937,7 @@ impl Fabric {
         }
         // ---- workloads ----
         let mut seen = BTreeSet::new();
+        let mut seen_legs: BTreeMap<String, String> = BTreeMap::new();
         for wl in &self.workloads {
             let leg = wl.leg_ifname();
             if self.zone(&wl.name).is_ok() {
@@ -930,6 +950,15 @@ impl Fabric {
             if !seen.insert(wl.name.clone()) {
                 return Err(Error::config(format!(
                     "workload {}: declared twice",
+                    wl.name
+                )));
+            }
+            // Two names that differ only past the fifth byte cut to ONE leg name — one
+            // interface each row would create, address and advertise on top of the other's.
+            if let Some(other) = seen_legs.insert(leg.clone(), wl.name.clone()) {
+                return Err(Error::config(format!(
+                    "workload {}: leg '{leg}' is also used by workload {other} \
+                     ({LEG_PREFIX}<name>, cut to {IFNAME_MAX} bytes)",
                     wl.name
                 )));
             }
@@ -2001,6 +2030,52 @@ mod tests {
             e,
             "fabric.toml: workload vms: prefix 10.99.20.0/24 overlaps zone storage block \
              10.99.0.0/16"
+        );
+    }
+
+    /// IFNAMSIZ leaves 15 usable bytes and `cfab-work-` eats 10 of them, so the row name is
+    /// cut to its first 5 — the kernel would refuse a longer name outright.
+    #[test]
+    fn the_leg_name_is_cfab_work_plus_the_row_name_cut_to_fifteen_bytes() {
+        let leg = |name: &str| {
+            wl_fabric_edit(|t| t.replace("name = \"vms\"", &format!("name = \"{name}\"")))
+                .unwrap()
+                .workload(name)
+                .unwrap()
+                .leg_ifname()
+        };
+        assert_eq!(leg("vms"), "cfab-work-vms");
+        assert_eq!(leg("vmstore"), "cfab-work-vmsto");
+        assert_eq!(leg("v"), "cfab-work-v");
+        assert!(leg("vmstore").len() <= 15);
+    }
+
+    /// Two rows whose names differ only past the fifth byte truncate to ONE leg name — an
+    /// interface each row would then create, address and advertise on top of the other's.
+    #[test]
+    fn check_refuses_two_workload_rows_whose_leg_names_truncate_alike() {
+        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example());
+        let base = base
+            .replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+                "workloads = [{ name = \"vmstorage-a\", address = \"192.168.20.2/24\" }, \
+                 { name = \"vmstorage-b\", address = \"192.168.30.2/24\" }]",
+            )
+            .replace(
+                "workloads = [{ name = \"vms\", address = \"192.168.20.3/24\" }]",
+                "workloads = [{ name = \"vmstorage-a\", address = \"192.168.20.3/24\" }]",
+            )
+            .replace("name = \"vms\"", "name = \"vmstorage-a\"");
+        let second = "\n[[workload]]\nname = \"vmstorage-b\"\nuplink = \"primary\"\nvid = 4\n\
+                      prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
+                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+        let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "fabric.toml: workload vmstorage-b: leg 'cfab-work-vmsto' is also used by workload \
+             vmstorage-a (cfab-work-<name>, cut to 15 bytes)"
         );
     }
 
