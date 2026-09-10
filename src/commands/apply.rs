@@ -6,10 +6,10 @@
 
 use std::collections::BTreeSet;
 
+use crate::commands::check;
 use crate::commands::common;
 use crate::commands::common::{
-    conf_interfaces, ensure_foreign_transit_accept, has_ip_addr, link_exists, link_kind_is,
-    proc_sysctl,
+    conf_interfaces, ensure_foreign_transit_accept, link_exists, link_kind_is, proc_sysctl,
 };
 use crate::commands::teardown;
 use crate::derive::{GwRow, Port, View};
@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::model::MemberKind;
 use crate::sys::{Sys, have_tool, run_ignore, run_ok};
 use crate::wire_drivers;
-use crate::workload::uplink;
+use crate::workload::{leg, uplink};
 
 pub struct ApplyOpts {
     /// pmxcfs mount root probed to decide whether to start conf-sync (/etc/pve in
@@ -382,20 +382,25 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         }
     }
 
-    // ---- workload preconditions (spec §5.1 pass 1 — pure reads, no state change): the VM VLAN
-    // sub-interface must already exist, be admin-up and carry this member's address (declared in
-    // /etc/network/interfaces — cfab never creates it). Those are facts about the declaration and
-    // still refuse the whole apply on failure.
+    // ---- workload preconditions (spec §5.1 pass 1 — pure reads, no state change) ------------
+    // cfab creates the leg now, so nothing here is about an interface the operator was
+    // supposed to declare. What is left is (a) a host fact no amount of creating fixes — an
+    // uplink bridge that is not vlan-aware, refused in `check`'s words so an operator meets
+    // one spelling wherever they meet it — and (b) three availability deferrals: no bridge
+    // yet, no identifiable uplink, an uplink not yet STP-forwarding. Each defers that ONE row
+    // to the watchdog and lets every other row's apply through (James's ruling 2026-09-09,
+    // "bias towards availability"), which deviates from spec §5.1 item 1 by that ruling.
     //
-    // An uplink that cannot yet be identified, or is not STP-forwarding, is NOT a declaration
-    // fault (James's ruling 2026-09-09, "bias towards availability"): it DEFERS that one row to
-    // the watchdog instead of refusing every other row's apply. This deviates from spec §5.1
-    // item 1 by that ruling. `ready` collects what pass 3 (below the bridge table load) applies;
-    // `workload_uplinks` also gets an entry for a row whose uplink WAS identified but is not yet
-    // forwarding — the guard rule is harmless to install before the address exists — but not for
-    // one whose uplink could not be identified at all (there is no bridge/port to guard).
+    // `ready` collects what the netdev pass builds and pass 3 addresses; `workload_uplinks`
+    // also gets an entry for a row whose uplink WAS identified but is not yet forwarding — the
+    // guard rule is harmless to install before the address exists — but not for one whose
+    // uplink could not be identified at all (there is no bridge/port to guard).
+    check::host_preflight(&*sys, view)?;
     struct ReadyWorkload {
-        ifname: String,
+        leg: String,
+        uplink: String,
+        vid: u16,
+        address: String,
         gw_cidr: String,
     }
     let mut workload_uplinks: Vec<(std::net::Ipv4Addr, uplink::Uplink)> = Vec::new();
@@ -404,53 +409,17 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     let mut deferred_names: Vec<String> = Vec::new();
     for row in view.workload_rows() {
         let leg = row.wl.leg_ifname();
-        let ifname = leg.as_str();
         let name = &row.wl.name;
-        let out = sys.run(&["ip", "-br", "link", "show", "dev", ifname])?;
-        if !out.ok() {
-            return Err(Error::fatal(format!(
-                "workload {name}: interface {ifname} does not exist (declare it in \
-                 /etc/network/interfaces with address {} on the VLAN)",
-                row.address
-            )));
-        }
-        let state = out.stdout.split_whitespace().nth(1).unwrap_or("");
-        if state == "LOWERLAYERDOWN" {
-            // James's ruling 2026-09-09 ("bias towards availability", C1 whole-branch review):
-            // a lower-layer carrier fault is not an admin-down or a missing stanza — it is the
-            // same class as an uplink that cannot yet be identified or is not yet forwarding,
-            // and joins the deferral path instead of refusing every other row's apply. A site
-            // power cut brings the switch up tens of seconds after the hosts; without this, the
-            // whole member would exit fatal for a condition that clears itself.
-            warnings.push(format!(
-                "workload {name}: interface {ifname} is LOWERLAYERDOWN (fix the carrier of its \
-                 lower device); row deferred to the watchdog"
-            ));
+        let bridge = row.wl.uplink.as_str();
+        if !uplink::bridge_present(sys, bridge) {
+            // The bridge is the host's: it may be seconds behind cfab at boot, or renamed by
+            // an operator mid-flight. Either way this row waits and the rest of the member
+            // comes up (branch-review C1's class of fault, same ruling).
+            warnings.push(format!("workload {name}: waiting for bridge {bridge}"));
             deferred_names.push(name.clone());
             continue;
         }
-        if state != "UP" {
-            let remedy = format!("ip link set {ifname} up, or fix its stanza");
-            // A blank field (unparsable `ip -br link show` output) must never surface as an
-            // empty word between "is" and the parenthesized remedy.
-            let label = if state.is_empty() {
-                "unknown state"
-            } else {
-                state
-            };
-            return Err(Error::fatal(format!(
-                "workload {name}: interface {ifname} is {label} ({remedy})"
-            )));
-        }
-        let addr_out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", ifname])?;
-        if !has_ip_addr(&addr_out.stdout, &row.address) {
-            return Err(Error::fatal(format!(
-                "workload {name}: interface {ifname} lacks {} (the member address from the \
-                 declaration)",
-                row.address
-            )));
-        }
-        let up = match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
+        let up = match uplink::identify_declared(sys, bridge, row.wl.vid) {
             Ok(up) => up,
             Err(e) => {
                 warnings.push(format!(
@@ -483,16 +452,19 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         if let Some(warning) = not_forwarding {
             warnings.push(warning);
             deferred_names.push(name.clone());
-            workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the address exists
+            workload_uplinks.push((row.wl.gw, up)); // guard is harmless before the leg exists
             continue;
         }
         workload_descs.push(format!(
-            "{name} on {ifname} ({} {})",
+            "{name} on {leg} ({} {})",
             uplink_word(&up.ports),
             up.ports.join(", ")
         ));
         ready.push(ReadyWorkload {
-            ifname: ifname.to_string(),
+            leg,
+            uplink: bridge.to_string(),
+            vid: row.wl.vid,
+            address: row.address.clone(),
             gw_cidr: row.wl.gw_cidr(),
         });
         workload_uplinks.push((row.wl.gw, up));
@@ -588,6 +560,20 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         )?;
     }
 
+    // The workload leg: `cfab-work-<name>` on the declared bridge, tagged `vid`, carrying this
+    // member's own address — plus the vid on the bridge itself, without which the leg receives
+    // nothing (VERIFIED 2026-09-08 22:38 UTC). A deferred row builds nothing: the watchdog
+    // creates its leg when the condition that deferred it clears. The qos map is the fabric's,
+    // not a zone's: a workload belongs to no zone, so unmarked traffic keeps pcp 0 and only
+    // control-marked traffic keeps its pcp.
+    let wl_qos = ["0:0".to_string(), format!("{p}:{p}", p = f.pcp_ctrl)];
+    let wl_qos: Vec<&str> = wl_qos.iter().map(String::as_str).collect();
+    for r in &ready {
+        leg::install(
+            sys, &f.run_dir, &r.leg, &r.uplink, r.vid, &r.address, &wl_qos,
+        )?;
+    }
+
     // ---- return path (`[[zone]]` gw): identity-sourced traffic never leaves untagged ---------
     for r in common::return_path_rules(view) {
         common::ensure_fabric_rule(sys, &r)?;
@@ -597,7 +583,8 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     if kind == MemberKind::Leaf {
         leaf_guard(sys, view)?;
     } else if f.host_forward {
-        enable_forwarding(sys, view, &absent)?;
+        let built: Vec<&str> = ready.iter().map(|r| r.leg.as_str()).collect();
+        enable_forwarding(sys, view, &absent, &built)?;
     } else {
         run_ignore(sys, &["nft", "delete", "table", "inet", "cfab-fwd"])?;
         sys.remove(&format!("{}/policy.nft", f.run_dir))?;
@@ -635,7 +622,7 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
     for plan in &ready {
         run_ok(
             sys,
-            &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.ifname],
+            &["ip", "addr", "replace", &plan.gw_cidr, "dev", &plan.leg],
         )?;
     }
     // Matches the watchdog's own restore condition (`restore_workloads`): arp_ignore is
@@ -1171,9 +1158,14 @@ fn leg_was_built(migrates: bool, ports: &[Port], home: &str, absent: &AbsentWire
 }
 
 /// Load the policy atomically, read it back, and only then enable forwarding — on exactly the
-/// class-table interfaces that were actually built, never an absent wire's segment, never a
-/// wire itself, never the untagged admin NIC.
-fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Result<()> {
+/// class-table interfaces and workload `legs` that were actually built, never an absent wire's
+/// segment, never a wire itself, never the untagged admin NIC.
+fn enable_forwarding(
+    sys: &mut dyn Sys,
+    view: &View,
+    absent: &AbsentWires,
+    legs: &[&str],
+) -> Result<()> {
     let f = view.fabric;
     let policy = emit::policy::generate(view)?;
     let path = format!("{}/policy.nft", f.run_dir);
@@ -1217,9 +1209,13 @@ fn enable_forwarding(sys: &mut dyn Sys, view: &View, absent: &AbsentWires) -> Re
     for admin in view.admin_ifs() {
         proc_sysctl(sys, admin, "forwarding", "0")?; // belt (the policy's admin rules = braces)
     }
-    // A workload VLAN's whole point is routing VM traffic to its allowed zones.
-    for r in view.workload_rows() {
-        proc_sysctl(sys, &r.wl.leg_ifname(), "forwarding", "1")?;
+    // A workload VLAN's whole point is routing VM traffic to its allowed zones. Only the legs
+    // this apply actually built: a deferred row has no netdev, and a per-interface sysctl on a
+    // netdev that does not exist fails loud on real Linux (`RealSys::write` maps ENOENT to
+    // `Error::fatal`) even though the mock accepts any path. The watchdog sets it with the leg
+    // it creates.
+    for l in legs {
+        proc_sysctl(sys, l, "forwarding", "1")?;
     }
     // A foreign stack's forward-hook policy drop kills transit that cfab accepts, and cfab
     // cannot out-accept it. Where the stack offers a user hook (Docker's DOCKER-USER), ask it
@@ -1275,10 +1271,10 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// pve1-tb with TWO workload rows on the same "primary" bridge/eth0 uplink: "vms" on
-    /// cfab-work-vms (row 1, healthy per `wl_sys`) and "vms2" on cfab-work-vms2 (row 2, its interface is
-    /// refused as missing) — for proving pass 1 is pure reads: a hard refusal partway through
-    /// must leave no write from an earlier row applied.
+    /// pve1-tb with TWO workload rows on TWO bridges: "vms" on `primary` (row 1, healthy per
+    /// `wl_sys`) and "vms2" on `primary2` (row 2, refusable on its own) — for proving pass 1
+    /// is pure reads: a hard refusal partway through must leave no write from an earlier row
+    /// applied.
     fn two_row_wl_fabric() -> Fabric {
         let t = crate::decl::fixtures::with_prefs(
             &crate::decl::fixtures::example(),
@@ -1286,7 +1282,7 @@ pub(crate) mod tests {
             "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, { name = \"vms2\", address = \"192.168.30.2/24\" }]",
         );
         let blocks = format!(
-            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
+            "{}\n[[workload]]\nname = \"vms2\"\nuplink = \"primary2\"\nvid = 4\nprefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\nrouter = \"192.168.30.1\"\nallow = [\"storage\"]\n",
             crate::decl::fixtures::WORKLOAD_BLOCK
         );
         Fabric::from_decl(&Declaration::parse(&format!("{t}{blocks}")).unwrap()).unwrap()
@@ -1445,11 +1441,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// pve1-tb with the workload row: `up_sys` plus the pve1 sysfs tree of Task 5 and the two
-    /// interface facts the precondition reads.
+    /// pve1-tb with the workload row: `up_sys` plus the pve1 bridge — vlan-aware, one uplink
+    /// port, one tap, and no self vid yet (cfab adds it). The leg itself does not exist: every
+    /// `ip link show` fails in `up_sys`, which is what a first `up` finds.
     fn wl_sys(view: &View) -> MockSys {
         up_sys(view)
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/bridge/vlan_filtering", "1\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
@@ -1457,12 +1455,8 @@ pub(crate) mod tests {
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
-            )
-            .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
-                "cfab-work-vms UP 192.168.20.2/24\n",
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
             )
     }
 
@@ -1517,24 +1511,92 @@ pub(crate) mod tests {
         assert!(!sys.ran("ip link del cfab-work-vms"));
     }
 
+    /// The leg is cfab's now: `up` builds it on the declared bridge, gives the bridge the vid
+    /// it lacks, and puts BOTH addresses on it — the member's own and the anycast `gw`.
     #[test]
-    fn a_refusal_on_the_second_workload_row_leaves_no_address_from_the_first_applied() {
+    fn up_creates_the_leg_the_self_vid_and_both_addresses() {
+        let (mut sys, view) = wl_sys_and_view("pve1-tb");
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran(
+            "ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:6"
+        ));
+        assert!(sys.ran("ip addr replace 192.168.20.2/24 dev cfab-work-vms"));
+        assert!(sys.ran("ip link set cfab-work-vms up"));
+        assert!(sys.ran("bridge vlan add dev primary vid 3 self"));
+        assert_eq!(
+            sys.writes_to("/run/cfab/workload-self-vid"),
+            Some("primary 3")
+        );
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        // The uplink bridge is the host's: cfab never creates or deletes it.
+        assert!(!sys.ran("ip link del primary"));
+        assert!(!sys.ran("ip link add link  name primary"));
+    }
+
+    /// The bridge is the host's and may be seconds behind cfab at boot (or renamed): that row
+    /// waits, every other row and everything else on the member still applies.
+    #[test]
+    fn up_defers_a_row_whose_bridge_is_not_there_yet() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut nobridge = MockSys {
+            files: sys
+                .files
+                .iter()
+                .filter(|(k, _)| !k.starts_with("/sys/class/net/primary/"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ..sys
+        };
+        let warnings = run(&mut nobridge, &view, &opts()).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "workload vms: waiting for bridge primary"),
+            "{warnings:#?}"
+        );
+        assert!(!nobridge.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!nobridge.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert_eq!(
+            nobridge.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
+            vec!["vms"]
+        );
+        // Everything else still applies: the policy loaded, forwarding still went on.
+        assert!(nobridge.ran("nft -f /run/cfab/policy.nft"));
+    }
+
+    /// A bridge that is not vlan-aware cannot carry the leg's tag, and no amount of waiting
+    /// fixes it: `apply` refuses in `check::host_preflight`'s words, one spelling for both.
+    #[test]
+    fn up_refuses_an_uplink_bridge_that_is_not_vlan_aware() {
+        let (sys, view) = wl_sys_and_view("pve1-tb");
+        let mut flat = sys.file("/sys/class/net/primary/bridge/vlan_filtering", "0\n");
+        assert_eq!(
+            run(&mut flat, &view, &opts()).unwrap_err().to_string(),
+            "FATAL: workload vms: bridge primary is not vlan-aware (bridge-vlan-aware yes in \
+             /etc/network/interfaces)"
+        );
+    }
+
+    #[test]
+    fn a_refusal_on_the_second_workload_row_leaves_nothing_from_the_first_applied() {
         let f: &'static Fabric = Box::leak(Box::new(two_row_wl_fabric()));
         let view = View::new(f, "pve1-tb").unwrap();
-        let mut sys = wl_sys(&view).on_fail(
-            &["ip", "-br", "link", "show", "dev", "cfab-work-vms2"],
-            1,
-            "Device \"cfab-work-vms2\" does not exist.",
-        );
+        // Row 2's bridge exists but is not vlan-aware: a refusal, not a deferral.
+        let mut sys = wl_sys(&view)
+            .file("/sys/class/net/primary2/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary2/bridge/vlan_filtering", "0\n")
+            .file("/sys/class/net/primary2/brif/eth1/state", "3\n")
+            .link("/sys/class/net/eth1/device", "../../../0000:01:00.1");
         let err = run(&mut sys, &view, &opts()).unwrap_err().to_string();
         assert_eq!(
             err,
-            "FATAL: workload vms2: interface cfab-work-vms2 does not exist (declare it in \
-             /etc/network/interfaces with address 192.168.30.2/24 on the VLAN)"
+            "FATAL: workload vms2: bridge primary2 is not vlan-aware (bridge-vlan-aware yes in \
+             /etc/network/interfaces)"
         );
         // Pass 1 is pure reads: row 1 ("vms") was fully valid, but nothing workload-shaped was
-        // written for it — the hard refusal on row 2 happens before pass 2 (bridge table) or
-        // pass 3 (the gw address + arp_ignore writes) ever starts.
+        // written for it — the hard refusal on row 2 happens before the leg is built, before
+        // pass 2 (bridge table) and before pass 3 (the gw address + arp_ignore writes).
+        assert!(!sys.ran("ip link add link primary name cfab-work-vms"));
         assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
         assert!(!sys.ran("nft -f /run/cfab/workload-bridge.nft"));
         assert!(
@@ -1544,94 +1606,6 @@ pub(crate) mod tests {
         assert!(
             sys.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir))
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn up_refuses_when_the_workload_interface_is_missing_down_or_lacks_the_member_address() {
-        let (sys, view) = wl_sys_and_view("pve1-tb");
-        let mut missing = sys.on_fail(
-            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-            1,
-            "Device \"cfab-work-vms\" does not exist.",
-        );
-        assert_eq!(
-            run(&mut missing, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface cfab-work-vms does not exist (declare it in /etc/network/interfaces with address 192.168.20.2/24 on the VLAN)"
-        );
-        let mut down = wl_sys(&view).on_stdout(
-            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-            "cfab-work-vms@primary DOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
-        );
-        assert_eq!(
-            run(&mut down, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface cfab-work-vms is DOWN (ip link set cfab-work-vms up, or fix its stanza)"
-        );
-        let mut noaddr = wl_sys(&view).on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
-            "cfab-work-vms UP\n",
-        );
-        assert_eq!(
-            run(&mut noaddr, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface cfab-work-vms lacks 192.168.20.2/24 (the member address from the declaration)"
-        );
-    }
-
-    #[test]
-    fn up_refuses_a_substring_collision_on_the_declared_address() {
-        // 192.168.20.2/24 is a SUBSTRING of 1192.168.20.2/24; a `.contains()` check would
-        // wrongly accept it as "the address is present".
-        let (sys, view) = wl_sys_and_view("pve1-tb");
-        let mut collision = sys.on_stdout(
-            &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
-            "cfab-work-vms UP 1192.168.20.2/24\n",
-        );
-        assert_eq!(
-            run(&mut collision, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface cfab-work-vms lacks 192.168.20.2/24 (the member address from the declaration)"
-        );
-    }
-
-    #[test]
-    fn up_defers_a_lower_layer_carrier_fault_instead_of_refusing_the_whole_apply() {
-        // James's ruling 2026-09-09 ("bias towards availability"): LOWERLAYERDOWN is not an
-        // admin-down or a missing stanza — it is the same class as an uplink that is not yet
-        // identified or not yet forwarding, and joins the deferral path (C1, whole-branch
-        // review). A site power cut brings the switch up ~40 s after the hosts; without this,
-        // every member with a workload row would exit 3 and stay down for a condition that
-        // clears itself.
-        let (sys, view) = wl_sys_and_view("pve1-tb");
-        let mut lowerdown = sys.on_stdout(
-            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-            "cfab-work-vms@primary LOWERLAYERDOWN 00:11:22:33:44:55 <BROADCAST,MULTICAST>\n",
-        );
-        let warnings = run(&mut lowerdown, &view, &opts()).unwrap();
-        assert!(
-            warnings.iter().any(|w| w
-                == "workload vms: interface cfab-work-vms is LOWERLAYERDOWN (fix the carrier of \
-                    its lower device); row deferred to the watchdog"),
-            "{warnings:#?}"
-        );
-        assert!(!lowerdown.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
-        assert_eq!(
-            lowerdown.writes_of(&format!("{}/workload-deferred", view.fabric.run_dir)),
-            vec!["vms"]
-        );
-        // Everything else still applies: the policy loaded, forwarding still went on.
-        assert!(lowerdown.ran("nft -f /run/cfab/policy.nft"));
-    }
-
-    #[test]
-    fn up_names_an_unparseable_link_state_without_printing_an_empty_word() {
-        let (sys, view) = wl_sys_and_view("pve1-tb");
-        // no second whitespace-separated field at all
-        let mut blank = sys.on_stdout(
-            &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-            "cfab-work-vms\n",
-        );
-        assert_eq!(
-            run(&mut blank, &view, &opts()).unwrap_err().to_string(),
-            "FATAL: workload vms: interface cfab-work-vms is unknown state (ip link set cfab-work-vms up, or fix its stanza)"
         );
     }
 

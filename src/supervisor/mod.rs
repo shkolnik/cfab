@@ -1883,12 +1883,13 @@ mod tests {
     }
 
     /// `fresh_sys` plus the host facts a workload row needs (the same shape as
-    /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and one
-    /// VM tap, and `cfab-work-vms` up, addressed, with its own MAC.
+    /// `apply::tests::wl_sys`): the vlan-aware bridge `primary` with a forwarding uplink and
+    /// one VM tap, and no self vid yet — `up` builds the leg on it.
     fn wl_fresh_sys(view: &View, run_dir: &Path) -> MockSys {
         fresh_sys(view, run_dir)
             .file(CONFIG, &wl_decl_text(run_dir))
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/bridge/vlan_filtering", "1\n")
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
@@ -1896,12 +1897,8 @@ mod tests {
             .file("/sys/class/net/tap100i0/ifindex", "10\n")
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "0\n")
             .on_stdout(
-                &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
-                "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
-            )
-            .on_stdout(
-                &["ip", "-4", "-br", "addr", "show", "dev", "cfab-work-vms"],
-                "cfab-work-vms UP 192.168.20.2/24\n",
+                &["bridge", "-j", "vlan", "show", "dev", "primary"],
+                r#"[{"ifname":"primary","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
             )
     }
 
