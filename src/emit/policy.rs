@@ -28,6 +28,7 @@ pub fn generate_seeded(
     locals: &BTreeMap<String, BTreeSet<Ipv4Addr>>,
 ) -> Result<String> {
     let f = view.fabric;
+    let gw_rows = view.gw_rows();
     let mut out = String::new();
     out.push_str("table inet cfab-fwd\n");
     out.push_str("delete table inet cfab-fwd\n");
@@ -139,6 +140,32 @@ pub fn generate_seeded(
             out.push_str(&format!(
                 "    iifname @{z} oifname \"{ifn}\" counter accept comment \"allow-{z}-{wl}\"\n",
                 ifn = row.wl.leg_ifname(),
+                wl = row.wl.name
+            ));
+        }
+    }
+    // Spec §5.5, call 7 RULED (b): phase 2 makes cfab the VMs' default, so every north-south
+    // packet must be forwarded from the leg to the gw zone's ingress leg — which `allow` cannot
+    // express, because it names ZONES and granting the gw zone would hand VMs that zone's
+    // fabric segments too. MEASURED at G0: without this pair a VM's `ping 1.1.1.1` loses 5 of 5
+    // on `default-deny` (`@admin` holds the physical wires, so it is not the rule that drops
+    // it). The pair names the INTERFACE, so a VM gets the router and nothing else — no wider
+    // than what a switch-spanned VLAN-3 VM has today.
+    for row in view.workload_rows() {
+        for r in &gw_rows {
+            let id = view.fabric.zone(&r.zone)?.id;
+            out.push_str(&format!(
+                "    iifname \"{ifn}\" oifname \"{gw}\" counter accept \
+                 comment \"allow-{wl}-gw{id}\"\n",
+                ifn = row.wl.leg_ifname(),
+                gw = r.ifname,
+                wl = row.wl.name
+            ));
+            out.push_str(&format!(
+                "    iifname \"{gw}\" oifname \"{ifn}\" counter accept \
+                 comment \"allow-gw{id}-{wl}\"\n",
+                ifn = row.wl.leg_ifname(),
+                gw = r.ifname,
                 wl = row.wl.name
             ));
         }
@@ -288,6 +315,40 @@ mod tests {
             pos("allow-vms-storage") > pos("return-of-allowed")
                 && pos("allow-vms-storage") < pos("default-deny")
         );
+    }
+
+    /// Spec §5.5, call 7: the VM leg reaches the gw zone's ingress LEG and nothing else of that
+    /// zone. Without the pair a VM's north-south packet reaches no accept and dies on
+    /// `default-deny` (G0: 5 of 5). The narrowness is the point of the ruling, so it is asserted
+    /// as well: the accept names `cfab-gw249` by interface, never `@mgmt`, which would hand VMs
+    /// that zone's fabric segments too.
+    #[test]
+    fn a_workload_reaches_the_gw_leg_by_interface_and_not_by_zone() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let t = generate(&v).unwrap();
+        for line in [
+            "iifname \"cfab-work-vms\" oifname \"cfab-gw249\" counter accept comment \"allow-vms-gw249\"",
+            "iifname \"cfab-gw249\" oifname \"cfab-work-vms\" counter accept comment \"allow-gw249-vms\"",
+        ] {
+            assert!(t.contains(line), "{t}");
+        }
+        let gw_zone = v.gw_rows()[0].zone.clone();
+        assert!(
+            !t.contains(&format!(
+                "iifname \"cfab-work-vms\" oifname @{gw_zone} counter accept"
+            )),
+            "the accept must name the gw leg, not the whole zone: {t}"
+        );
+        let pos = |s: &str| t.find(s).unwrap();
+        assert!(
+            pos("allow-vms-gw249") > pos("stray-vms")
+                && pos("allow-vms-gw249") < pos("default-deny"),
+            "{t}"
+        );
+        // A member with no ingress leg emits neither half.
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        assert!(!generate(&leaf).unwrap().contains("gw249-"), "{t}");
     }
 
     /// The rule lines of the forward chain, trimmed, in order — the only honest way to assert
