@@ -421,7 +421,7 @@ impl HostDefault {
     }
 }
 
-/// Which member this gather describes./// Which member this gather describes.
+/// Which member this gather describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberInfo {
     pub name: String,
