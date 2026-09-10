@@ -3143,12 +3143,18 @@ pub(crate) mod tests {
     }
 
     /// The kernel as it is right after `up`: the floor, its address, the three rules in place
-    /// and the 250 default absent.
+    /// and the 250 default absent. The host-wide address read is registered BEFORE the
+    /// device-scoped one — `MockSys` matches on argv prefix and the last match wins, so the
+    /// order is what keeps `… addr show dev eth0` answering the device's own line.
     fn host_default_sys() -> MockSys {
         MockSys::default()
             .on_stdout(
                 &["ip", "route", "show", "table", "main", "default"],
                 "default via 192.168.10.254 dev eth0 onlink\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "lo UNKNOWN 127.0.0.1/8\neth0 UP 192.168.10.1/24\n",
             )
             .on_stdout(
                 &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
@@ -3236,6 +3242,55 @@ pub(crate) mod tests {
             "{lines:?}"
         );
         assert!(sys.ran("ip rule add pref 2099 from 192.168.10.60 iif lo lookup main"));
+    }
+
+    /// One pass that reads no floor default at all — `ifreload` of the admin bridge, a
+    /// `bridge-vids` change on a real host — must not unpin an address the bridge still
+    /// carries: table 250 and rule 2101 stay live through that tick, so the next packet of an
+    /// open off-subnet ssh whose cached route was invalidated would leave over the fabric
+    /// gateway. Asymmetric at a zone-based firewall = the session the pins exist to protect.
+    #[test]
+    fn a_pass_that_reads_no_floor_default_keeps_the_pins_of_addresses_the_host_still_carries() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys =
+            host_default_sys().on_stdout(&["ip", "route", "show", "table", "main", "default"], "");
+        let lines = HostDefaultState::default().reconcile(&mut sys, &view, true);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip rule del")),
+            "{:?}",
+            sys.calls
+        );
+        // And the rest of the pass still ran: the pin is kept, nothing else is skipped.
+        assert_eq!(
+            lines,
+            ["cfab: host default: installed via 192.168.249.254 dev cfab-gw249 (table 250)"]
+        );
+    }
+
+    /// The other half, at the reconcile: once the address is gone from the host the pin goes,
+    /// on the same pass, with a line saying so.
+    #[test]
+    fn a_pass_drops_the_pin_of_an_address_the_host_no_longer_carries() {
+        let f = view_fixture();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = host_default_sys()
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "lo UNKNOWN 127.0.0.1/8\n",
+            )
+            .on_stdout(&["ip", "-4", "-br", "addr", "show", "dev", "eth0"], "")
+            .on_stdout(&["ip", "route", "show", "table", "main", "default"], "");
+        let lines = HostDefaultState::default().reconcile(&mut sys, &view, true);
+        assert!(
+            lines.contains(
+                &"cfab: host default: dropped ip rule pref 2099 from 192.168.10.1 iif lo lookup \
+                   main"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        assert!(sys.ran("ip rule del pref 2099 from 192.168.10.1 iif lo lookup main"));
     }
 
     /// The rules are restored like every other object cfab owns: the operator who flushed them

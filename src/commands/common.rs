@@ -450,13 +450,44 @@ pub fn floor_addresses(sys: &mut dyn Sys, dev: &str) -> Result<Vec<String>> {
             out.stderr.trim()
         )));
     }
-    Ok(out
-        .stdout
+    Ok(parse_br_addresses(&out.stdout))
+}
+
+/// Every IPv4 address configured ANYWHERE on this host right now, without its prefix length —
+/// `floor_addresses` is the same read scoped to one device.
+///
+/// This, not the floor read, is what a pref-2099 pin is removed against. The floor default can
+/// be absent for a single pass while the addresses it pinned are still configured: an
+/// `ifreload` of the admin bridge (a `bridge-vids` change on a real host) takes main's default
+/// away for a tick. Table 250 and rule 2101 stay live through that tick, so dropping the pins
+/// would send the next packet of an open off-subnet ssh — one whose cached route the reload
+/// invalidated — over the fabric gateway, asymmetric at a zone-based firewall. That is the
+/// self-lock the pins exist to prevent, so a pin goes on proof its address is GONE and on
+/// nothing else. The cost of the other direction is bounded and known: an address pinned to
+/// main while main has no default reaches nothing — but neither does the asymmetric path, and
+/// this one cannot hijack an established session.
+pub fn host_addresses(sys: &mut dyn Sys) -> Result<Vec<String>> {
+    let out = sys.run(&["ip", "-4", "-br", "addr", "show"])?;
+    if !out.ok() {
+        return Err(Error::fatal(format!(
+            "cannot read this host's addresses: `ip -4 -br addr show` exited {} ({}) — a \
+             pref-2099 floor pin is never dropped without proof its address is gone",
+            out.status,
+            out.stderr.trim()
+        )));
+    }
+    Ok(parse_br_addresses(&out.stdout))
+}
+
+/// The IPv4 addresses in `ip -4 -br addr show` output, device-scoped or not: every token that
+/// is `<v4>/<len>`. Device names, states and flags carry no `/`.
+fn parse_br_addresses(stdout: &str) -> Vec<String> {
+    stdout
         .split_whitespace()
         .filter_map(|t| t.split_once('/'))
         .filter(|(a, len)| a.parse::<std::net::Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok())
         .map(|(a, _)| a.to_string())
-        .collect())
+        .collect()
 }
 
 /// The addresses pref 2099 currently carries, read back from the kernel — what is there, never
@@ -482,12 +513,16 @@ pub fn installed_floor_addresses(sys: &mut dyn Sys) -> Result<Vec<String>> {
     ))
 }
 
-/// Bring pref 2099 level with the floor device's current addresses: add what is missing, drop
-/// what the device no longer carries. Returns one line per change, in the order it was made,
-/// for the caller's journal.
+/// Bring pref 2099 level with the floor device's current addresses: add a rule for every
+/// `wanted` address that has none, and drop a rule whose address this host no longer carries
+/// **on any device**. Returns one line per change, in the order it was made, for the caller's
+/// journal.
 ///
-/// Level-triggered, like every other restore: an address added to the admin bridge between two
-/// ticks gets its rule on the next one without anything having to notice it appeared.
+/// The two halves are deliberately asymmetric. Additions are level-triggered off the floor
+/// device, so an address added to the admin bridge between two ticks gets its rule on the next
+/// one without anything having to notice it appeared. Removals are level-triggered off
+/// `host_addresses` instead — read the reason there — so a floor default that is absent for one
+/// pass unpins nothing, and no pin outlives its address either.
 pub fn sync_floor_rules(sys: &mut dyn Sys, wanted: &[String]) -> Result<Vec<String>> {
     let installed = installed_floor_addresses(sys)?;
     let mut out = Vec::new();
@@ -496,7 +531,12 @@ pub fn sync_floor_rules(sys: &mut dyn Sys, wanted: &[String]) -> Result<Vec<Stri
         ensure_fabric_rule(sys, &r)?;
         out.push(format!("added ip rule pref {} {}", r.pref, r.needle));
     }
-    for a in installed.iter().filter(|a| !wanted.contains(a)) {
+    let stale: Vec<&String> = installed.iter().filter(|a| !wanted.contains(a)).collect();
+    if stale.is_empty() {
+        return Ok(out); // the common tick: no candidate removal, no second read
+    }
+    let configured = host_addresses(sys)?;
+    for a in stale.into_iter().filter(|a| !configured.contains(a)) {
         let r = floor_rule(a);
         drop_fabric_rule(sys, &r)?;
         out.push(format!("dropped ip rule pref {} {}", r.pref, r.needle));
@@ -1397,16 +1437,165 @@ default via 192.168.1.1 dev eth3 proto 110
         );
     }
 
+    /// A `dead linkdown` floor is still the floor: a cable pull leaves the ifupdown default in
+    /// main flagged, and the device still carries the host's admin addresses, which is what the
+    /// pins are about. VERIFIED on pve1 2026-09-10: `ip route show table main default` prints
+    /// `default via 192.168.10.1 dev primary dead linkdown` with the floor wire down.
+    #[test]
+    fn a_dead_linkdown_floor_is_still_the_floor() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "route", "show", "table", "main", "default"],
+            "default via 192.168.10.1 dev primary dead linkdown\n",
+        );
+        assert_eq!(
+            floor_default(&mut sys).unwrap(),
+            Some(FloorDefault {
+                via: "192.168.10.1".to_string(),
+                dev: "primary".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn host_addresses_are_every_ipv4_address_on_the_host() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-4", "-br", "addr", "show"],
+            "lo               UNKNOWN        127.0.0.1/8\n\
+             primary          UP             192.168.10.3/24 192.168.10.60/24\n\
+             cfab-gw249       UP             192.168.249.3/24\n",
+        );
+        assert_eq!(
+            host_addresses(&mut sys).unwrap(),
+            vec![
+                "127.0.0.1".to_string(),
+                "192.168.10.3".to_string(),
+                "192.168.10.60".to_string(),
+                "192.168.249.3".to_string(),
+            ]
+        );
+    }
+
+    /// Fail loud: a read of the host's addresses that did not run is not "it carries none",
+    /// because that answer would drop every pin.
+    #[test]
+    fn a_failed_read_of_the_hosts_addresses_is_a_named_error() {
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.3 iif lo lookup main\n",
+            )
+            .on_fail(
+                &["ip", "-4", "-br", "addr", "show"],
+                2,
+                "Cannot open netlink socket",
+            );
+        let e = sync_floor_rules(&mut sys, &[]).unwrap_err().to_string();
+        assert!(e.contains("ip -4 -br addr show"), "{e}");
+        assert!(e.contains("Cannot open netlink socket"), "{e}");
+        assert_no_double_space(&e);
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip rule del")),
+            "an unreadable host keeps every pin: {:?}",
+            sys.calls
+        );
+    }
+
+    /// The hysteresis (branch review, 2026-09-10): a pin is dropped on proof its address is
+    /// GONE from the host, never on one reading of "no floor default". `ifreload` of the admin
+    /// bridge takes main's default away for a tick while the bridge still carries its
+    /// addresses; dropping the pins for that tick would send the replies of an open off-subnet
+    /// ssh over the fabric gateway — the asymmetric self-lock the pins exist to prevent.
+    #[test]
+    fn a_pin_survives_a_floor_default_that_read_empty_while_its_address_is_configured() {
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
+                 2099:\tfrom 192.168.10.60 iif lo lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "primary          UP             192.168.10.3/24 192.168.10.60/24\n",
+            );
+        // `wanted` empty = what `floor_default(...) == None` computes for this pass.
+        let lines = sync_floor_rules(&mut sys, &[]).unwrap();
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip rule del")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// The other half: the pin does go, once the address itself is gone from the host.
+    #[test]
+    fn a_pin_goes_once_its_address_is_gone_from_the_host() {
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
+                 2099:\tfrom 192.168.10.60 iif lo lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "primary          UP             192.168.10.3/24\n",
+            );
+        let lines = sync_floor_rules(&mut sys, &["192.168.10.3".to_string()]).unwrap();
+        assert_eq!(
+            lines,
+            vec!["dropped ip rule pref 2099 from 192.168.10.60 iif lo lookup main"]
+        );
+        let dels: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip rule del"))
+            .collect();
+        assert_eq!(
+            dels,
+            vec!["ip rule del pref 2099 from 192.168.10.60 iif lo lookup main"]
+        );
+    }
+
+    /// An address that moved to another device keeps its pin: the pin says "traffic sourced
+    /// from here takes main", which is true wherever on the host the address lives.
+    #[test]
+    fn a_pin_follows_the_address_not_the_device_it_sits_on() {
+        let mut sys = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.60 iif lo lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "primary          UP             192.168.10.3/24\n\
+                 vmbr1            UP             192.168.10.60/24\n",
+            );
+        assert_eq!(
+            sync_floor_rules(&mut sys, &["192.168.10.3".to_string()]).unwrap(),
+            vec!["added ip rule pref 2099 from 192.168.10.3 iif lo lookup main"]
+        );
+        assert!(
+            !sys.calls.iter().any(|c| c.starts_with("ip rule del")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
     /// The refresh is level-triggered off the kernel's own readback: an address the floor device
-    /// gained gets a rule, one it lost loses its rule, and an address that is in both sets is
-    /// touched neither way.
+    /// gained gets a rule, one the HOST lost loses its rule, and an address that is in both sets
+    /// is touched neither way.
     #[test]
     fn syncing_the_floor_rules_adds_the_missing_and_drops_the_stale() {
-        let mut sys2 = MockSys::default().on_stdout(
-            &["ip", "rule", "show", "pref", "2099"],
-            "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
-             2099:\tfrom 192.168.10.99 iif lo lookup main\n",
-        );
+        let mut sys2 = MockSys::default()
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
+                 2099:\tfrom 192.168.10.99 iif lo lookup main\n",
+            )
+            .on_stdout(
+                &["ip", "-4", "-br", "addr", "show"],
+                "primary          UP             192.168.10.3/24 192.168.10.60/24\n",
+            );
         let lines = sync_floor_rules(
             &mut sys2,
             &["192.168.10.3".to_string(), "192.168.10.60".to_string()],

@@ -752,7 +752,8 @@ fn host_default_unit(
 ) -> Result<()> {
     common::sync_floor_rules(sys, addrs)?;
     // `&[]`: the pref-2099 pins are the line above, level-triggered off the kernel's readback
-    // so a stale pin from a previous apply goes away; this leaves 2100 and 2101.
+    // so a pin from a previous apply goes away once its address is gone from the host (never
+    // merely because this apply read no floor default); this leaves 2100 and 2101.
     for r in common::host_default_rules(view, &[]) {
         common::ensure_fabric_rule(sys, &r)?;
     }
