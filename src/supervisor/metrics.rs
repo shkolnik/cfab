@@ -612,13 +612,16 @@ impl FabricCollector {
         family(
             enc,
             "cfab_workload_vms_seen",
-            "IPv4 neighbor entries inside this row's prefix, on its ifname, in a resolved \
-             state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), other than a declared \
-             member address, gw or router (one `ip -j neigh show dev` read per gather); a \
-             departed VM lingers as STALE until the kernel garbage-collects the entry \
-             (rack-measured: minutes), so this counts neighbors known, not VMs alive — 0 is \
-             the alert (\"gateway up, nobody home\"), a nonzero value is an upper bound; \
-             absent when the row is not up or the read failed.",
+            "VMs this member currently knows on this row's leg: neighbor entries inside the \
+             row's prefix in a resolved state (REACHABLE, STALE, DELAY, PROBE, PERMANENT), \
+             other than a declared member address, gw or router, whose MAC the uplink bridge \
+             has on a NON-uplink port — the same derivation that decides which /32s this \
+             member originates, so the two can never disagree. A VM on a peer host is learned \
+             through the uplink and counted there, not here; a departed VM lingers as STALE \
+             until the kernel garbage-collects the entry (rack-measured: minutes), so this \
+             counts neighbors known, not VMs alive — 0 is the alert (\"gateway up, nobody \
+             home\"), a nonzero value is an upper bound; absent when the row is not up or \
+             either read failed.",
             &vms_seen,
         )?;
 
@@ -642,6 +645,24 @@ impl FabricCollector {
              ports; reset to 0 when apply re-renders the table or the watchdog restores it; \
              absent when the guard table or the row's uplink ports are unknown.",
             &guard_drops,
+        )?;
+
+        let stray: Vec<(Labels, u64)> = ws
+            .iter()
+            .filter_map(|w| {
+                w.stray_forwards
+                    .map(|n| (lbl(&[("name", w.name.as_str())]), n))
+            })
+            .collect();
+        counter_family(
+            enc,
+            "cfab_workload_stray_forwards",
+            "Fabric packets this member refused to put on this row's leg because their \
+             destination is not a VM it currently knows (spec 5.2, ruling 6), summed over the \
+             row's one drop rule per allowed zone; reset to 0 when apply re-renders inet \
+             cfab-fwd or the row's VM set is empty for a moment after it; absent when the \
+             forward chain carries no such rule.",
+            &stray,
         )?;
 
         let mut rx_bytes: Vec<(Labels, u64)> = Vec::new();
@@ -1437,16 +1458,17 @@ mod tests {
     }
 
     /// A deferred row (metrics addendum 2026-09-09): `state{deferred}` is 1, `up` is 0, and
-    /// none of the three observability fields render — a `None` is absent, never a fabricated
+    /// none of the observability fields render — a `None` is absent, never a fabricated
     /// zero (Task 1's own rule, carried into the collector).
     #[test]
-    fn a_deferred_row_reports_state_and_no_vms_seen_guard_or_bytes() {
+    fn a_deferred_row_reports_state_and_no_vms_seen_guard_bytes_or_strays() {
         let mut s = fixture_up();
         s.model.workloads[0].up = false;
         s.model.workloads[0].state = WorkloadState::Deferred;
         s.model.workloads[0].vms_seen = None;
         s.model.workloads[0].guard_drops = None;
         s.model.workloads[0].bytes = None;
+        s.model.workloads[0].stray_forwards = None;
         // A deferred row has no rendered announcer either (Task 1: `apply` never gave it a gw
         // address), so `Components.workloads` carries no entry for it — realistic, not just
         // "faithful to a fixture that happens to omit it" (review M2).
@@ -1474,6 +1496,7 @@ mod tests {
         );
         assert!(!text.contains("cfab_workload_vms_seen"), "{text}");
         assert!(!text.contains("cfab_workload_guard_drops"), "{text}");
+        assert!(!text.contains("cfab_workload_stray_forwards"), "{text}");
         assert!(!text.contains("cfab_workload_rx_bytes"), "{text}");
         assert!(!text.contains("cfab_workload_tx_bytes"), "{text}");
         assert!(!text.contains("cfab_workload_announces"), "{text}");
