@@ -104,8 +104,13 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
         // differ, each zone advertises both rows' /32s. Said once, naming the rows, because an
         // operator would otherwise read `allow` as a route filter — it is a forward-policy
         // filter, which is what actually decides reach.
-        let allow_sets: BTreeSet<&Vec<String>> =
-            fabric.workloads.iter().map(|w| &w.allow).collect();
+        // As SETS, not as declared: `allow` names zones, so ["storage", "mgmt"] and
+        // ["mgmt", "storage"] are one policy and must not read as a conflict.
+        let allow_sets: BTreeSet<BTreeSet<&str>> = fabric
+            .workloads
+            .iter()
+            .map(|w| w.allow.iter().map(String::as_str).collect())
+            .collect();
         if allow_sets.len() > 1 {
             out.push_str(&format!(
                 "warning: workload rows {} declare different allow sets; every allowed zone's \
@@ -229,6 +234,16 @@ mod tests {
         let agree = two.replace("allow = [\"storage\", \"mgmt\"]", "allow = [\"storage\"]");
         let f2 = Fabric::from_decl(&Declaration::parse(&agree).unwrap()).unwrap();
         assert!(!report(&f2, &View::new(&f2, "pve1-tb").unwrap()).contains("warning:"));
+        // ...and the same two zones in the other order is the SAME set: `allow` is a set of
+        // zones, so declaration order must not decide whether an operator is warned.
+        // vms becomes ["mgmt", "storage"] beside dmz's ["storage", "mgmt"]: one set, two orders.
+        let reordered = two.replace("allow = [\"storage\"]", "allow = [\"mgmt\", \"storage\"]");
+        let f3 = Fabric::from_decl(&Declaration::parse(&reordered).unwrap()).unwrap();
+        assert!(
+            !report(&f3, &View::new(&f3, "pve1-tb").unwrap()).contains("warning:"),
+            "{}",
+            report(&f3, &View::new(&f3, "pve1-tb").unwrap())
+        );
     }
 
     #[test]
