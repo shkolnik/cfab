@@ -55,6 +55,58 @@ fn parse_vid(text: &str) -> Option<u16> {
     after.split_whitespace().next()?.parse().ok()
 }
 
+/// Is `bridge` a bridge on this host right now? A bridge has a `brif/` directory (its ports)
+/// and a `bridge/` directory of its own settings; a netdev that is not a bridge, and a netdev
+/// that does not exist at all, both answer false.
+///
+/// The deferral gate: a `[[workload]]` row whose declared `uplink` is not (yet) a bridge is
+/// deferred by its caller, in the caller's own words, rather than refused here — which is why
+/// `identify_declared` below does not repeat the check.
+pub fn bridge_present(sys: &dyn Sys, bridge: &str) -> bool {
+    !ports_of(sys, bridge).is_empty()
+        || sys.exists(&format!("/sys/class/net/{bridge}/bridge/stp_state"))
+}
+
+/// The bridge port names of `bridge` (`/sys/class/net/<bridge>/brif/`). A netdev that is not a
+/// bridge, or is not there at all, has none.
+fn ports_of(sys: &dyn Sys, bridge: &str) -> Vec<String> {
+    sys.list_dir(&format!("/sys/class/net/{bridge}/brif/"))
+        .unwrap_or_default()
+}
+
+/// The uplink ports of the DECLARED bridge, for the DECLARED vid. cfab creates the leg itself
+/// (`cfab-work-<name>` on `uplink`), so nothing here reads the leg: no `/proc/net/vlan` entry
+/// (the leg may not exist yet) and no `lower_*` walk from it (the declaration already says
+/// which bridge it sits on). The `lower_*` walk survives one level down, deciding whether a
+/// bridge PORT reaches off-host.
+///
+/// Callers gate on `bridge_present` first (an absent bridge is a deferral, not a refusal); a
+/// bridge that is absent anyway reaches the "no uplink port" refusal with an empty port list.
+pub fn identify_declared(sys: &dyn Sys, bridge: &str, vid: u16) -> Result<Uplink, String> {
+    let ports = ports_of(sys, bridge);
+    let uplink_ports: Vec<String> = ports
+        .iter()
+        .filter(|p| is_uplink_port(sys, p, 0))
+        .cloned()
+        .collect();
+    if uplink_ports.is_empty() {
+        let listed = if ports.is_empty() {
+            "(none)".to_string()
+        } else {
+            ports.join(", ")
+        };
+        return Err(format!(
+            "bridge {bridge} has no uplink port (no port has a /sys/class/net/<port>/device, \
+             directly or through lower links); ports: {listed}"
+        ));
+    }
+    Ok(Uplink {
+        bridge: bridge.to_string(),
+        vid,
+        ports: uplink_ports,
+    })
+}
+
 /// Identify the uplink of the bridge that `ifname` (a workload VLAN sub-interface, e.g.
 /// `primary.3`) sits on. Every failure names the object and the remedy (fail loud, never
 /// degrade): a missing or ambiguous lower link, a lower link that is not a bridge, a bridge with
@@ -197,6 +249,76 @@ mod tests {
             non_uplink_ifindexes(&pve1(), &up).unwrap(),
             [10, 11, 12].into_iter().collect()
         );
+    }
+
+    /// The declared shape: `uplink = "primary"`, `vid = 3`. cfab has not created the leg yet,
+    /// so the fixture carries NO `/proc/net/vlan` entry and no `lower_primary` link on any
+    /// leg — identification must still answer, from the declaration and the bridge alone.
+    #[test]
+    fn the_declared_uplink_is_read_from_the_bridge_alone() {
+        let sys = MockSys::default()
+            .file("/sys/class/net/primary/bridge/stp_state", "0\n")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .file("/sys/class/net/eth0/ifindex", "2\n")
+            .file("/sys/class/net/tap100i0/ifindex", "10\n");
+        assert_eq!(
+            identify_declared(&sys, "primary", 3).unwrap(),
+            Uplink {
+                bridge: "primary".into(),
+                vid: 3,
+                ports: vec!["eth0".into()]
+            }
+        );
+        // The vid is the declaration's, carried through untouched — nothing reads it back off
+        // a netdev, so a bridge that has not been given the vid yet identifies the same way.
+        assert_eq!(identify_declared(&sys, "primary", 7).unwrap().vid, 7);
+    }
+
+    #[test]
+    fn a_bond_port_is_an_uplink_of_the_declared_bridge_through_its_lower_links() {
+        let sys = MockSys::default() // bond0 is the port; eth0/eth1 are its lower links
+            .file("/sys/class/net/primary/brif/bond0/state", "3\n")
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .link("/sys/class/net/bond0/lower_eth0", "../../eth0")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0");
+        assert_eq!(
+            identify_declared(&sys, "primary", 3).unwrap().ports,
+            vec!["bond0"]
+        );
+    }
+
+    #[test]
+    fn a_declared_uplink_with_no_off_host_port_is_refused_by_name() {
+        let no_uplink = MockSys::default()
+            .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
+            .file("/sys/class/net/tap100i0/ifindex", "10\n");
+        assert_eq!(
+            identify_declared(&no_uplink, "primary", 3).unwrap_err(),
+            "bridge primary has no uplink port (no port has a /sys/class/net/<port>/device, \
+             directly or through lower links); ports: tap100i0"
+        );
+        // A bridge that is not there at all reaches the same refusal (its caller gated on
+        // `bridge_present` and deferred instead) — with no port list to name.
+        assert_eq!(
+            identify_declared(&MockSys::default(), "primary", 3).unwrap_err(),
+            "bridge primary has no uplink port (no port has a /sys/class/net/<port>/device, \
+             directly or through lower links); ports: (none)"
+        );
+    }
+
+    #[test]
+    fn a_bridge_is_present_by_its_ports_or_its_own_settings_directory() {
+        let with_ports = MockSys::default().file("/sys/class/net/primary/brif/eth0/state", "3\n");
+        assert!(bridge_present(&with_ports, "primary"));
+        // A vlan-aware bridge with no port yet is still a bridge.
+        let no_ports = MockSys::default().file("/sys/class/net/primary/bridge/stp_state", "0\n");
+        assert!(bridge_present(&no_ports, "primary"));
+        // A plain NIC named `primary`, and a `primary` that does not exist: neither is one.
+        let nic = MockSys::default().link("/sys/class/net/primary/device", "../../../0000:01:00.0");
+        assert!(!bridge_present(&nic, "primary"));
+        assert!(!bridge_present(&MockSys::default(), "primary"));
     }
 
     #[test]
