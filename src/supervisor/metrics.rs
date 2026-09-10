@@ -1174,7 +1174,8 @@ mod tests {
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
     use crate::supervisor::report::{
-        Component, Components, ProbedPort, SupervisorInfo, WatchdogInfo, WorkloadAnnounce,
+        Component, Components, ProbedPort, RelayInfo, SupervisorInfo, WatchdogInfo,
+        WorkloadAnnounce,
     };
 
     fn component(
@@ -1462,6 +1463,25 @@ mod tests {
         snapshot(model(State::Up, Some(h), true), probe_rows())
     }
 
+    /// `fixture_up` plus one DHCP relay row on `vms` (S4): requests, replies and discovered all
+    /// nonzero, so a rendering bug that silently drops a family cannot hide behind absence. Not
+    /// folded into `components()` itself: `fixture_down`/`fixture_degraded` share that fixture
+    /// through `model()` regardless of `full`, and a "down" member's `components` document
+    /// carrying a relay row that has no matching entry in `model.workloads` is not a state any
+    /// real supervisor publishes (a row's relay only spawns once the row applies).
+    fn fixture_up_with_relay() -> Snapshot {
+        let mut s = fixture_up();
+        s.model.components.as_mut().unwrap().relays = vec![RelayInfo {
+            name: "vms".to_string(),
+            server: "192.168.10.11".parse().unwrap(),
+            requests: 7,
+            replies: 5,
+            discovered: 3,
+            last_error: None,
+        }];
+        s
+    }
+
     /// Nothing applied: no supervisor asked for a headline, no legs, no adjacencies.
     fn fixture_down() -> Snapshot {
         snapshot(model(State::Down, None, false), ProbeRows::default())
@@ -1727,16 +1747,28 @@ mod tests {
                 .collect()
         }
 
-        let base = render(&fixture_up());
+        let base = render(&fixture_up_with_relay());
 
-        let mut s = fixture_up();
+        // S4: the fixture's one relay row renders both directions and the discovered count —
+        // proven with real data, not merely that the rendering code compiles absent-only.
+        assert!(
+            base.contains("cfab_workload_dhcp_relayed_total{name=\"vms\",direction=\"request\"} 7")
+        );
+        assert!(
+            base.contains("cfab_workload_dhcp_relayed_total{name=\"vms\",direction=\"reply\"} 5")
+        );
+        assert!(
+            base.contains("cfab_workload_vms_discovered_total{name=\"vms\",source=\"dhcp\"} 3")
+        );
+
+        let mut s = fixture_up_with_relay();
         s.model.workloads[0].vms_seen = Some(9);
         assert_eq!(
             changed_lines(&base, &render(&s)),
             vec!["cfab_workload_vms_seen{name=\"vms\"} 9"]
         );
 
-        let mut s = fixture_up();
+        let mut s = fixture_up_with_relay();
         s.model.workloads[0].guard_drops = Some(GuardDrops {
             claim: 99,
             request: 7,
@@ -1746,23 +1778,39 @@ mod tests {
             vec!["cfab_workload_guard_drops_total{name=\"vms\",kind=\"claim\"} 99"]
         );
 
-        let mut s = fixture_up();
+        let mut s = fixture_up_with_relay();
         s.model.workloads[0].bytes = Some((10_000, 99_999));
         assert_eq!(
             changed_lines(&base, &render(&s)),
             vec!["cfab_workload_tx_bytes_total{name=\"vms\"} 99999"]
         );
 
-        let mut s = fixture_up();
+        let mut s = fixture_up_with_relay();
         s.model.components.as_mut().unwrap().workloads[0].announces = 100;
         assert_eq!(
             changed_lines(&base, &render(&s)),
             vec!["cfab_workload_announces_total{name=\"vms\"} 100"]
         );
 
+        // S4: the relay counters move independently of every other workload source, exactly
+        // like `announces`/`bursts` above (both are sourced from `components`, keyed by name).
+        let mut s = fixture_up_with_relay();
+        s.model.components.as_mut().unwrap().relays[0].requests = 12;
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_dhcp_relayed_total{name=\"vms\",direction=\"request\"} 12"]
+        );
+
+        let mut s = fixture_up_with_relay();
+        s.model.components.as_mut().unwrap().relays[0].discovered = 4;
+        assert_eq!(
+            changed_lines(&base, &render(&s)),
+            vec!["cfab_workload_vms_discovered_total{name=\"vms\",source=\"dhcp\"} 4"]
+        );
+
         // `state` and `up` are structurally coupled (`WorkloadState::is_up`), so mutating state
         // moves both families — this is the one source expected to touch two lines, not a leak.
-        let mut s = fixture_up();
+        let mut s = fixture_up_with_relay();
         s.model.workloads[0].state = WorkloadState::Broken;
         s.model.workloads[0].up = false;
         assert_eq!(
@@ -1793,7 +1841,7 @@ mod tests {
 
     #[test]
     fn every_family_parses_and_is_present_once() {
-        let text = render(&fixture_up());
+        let text = render(&fixture_up_with_relay());
         let scrape = parse(&text);
         for name in [
             "cfab_build_info",
@@ -1827,6 +1875,8 @@ mod tests {
             "cfab_workload_tx_bytes_total",
             "cfab_workload_announces_total",
             "cfab_workload_bursts_total",
+            "cfab_workload_dhcp_relayed_total",
+            "cfab_workload_vms_discovered_total",
             "cfab_wire_present",
             "cfab_bond_home_carrier",
             "cfab_component_state",
