@@ -603,11 +603,20 @@ mod tests {
         let (_, state) = EngineState::new()
             .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
-        let e = state
-            .apply_trees(&v, &routes_req("cfab-work-nope", 9, &["192.168.20.104/32"]))
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("no workload interface cfab-work-nope"), "{e}");
+        // Both spellings of the typo: an install on an unknown leg, and a WITHDRAWAL on one.
+        // The withdrawal refuses in the same words, before any tree is generated, and — like
+        // the install — leaves no entry for the unknown leg behind in the state.
+        for cidrs in [&["192.168.20.104/32"][..], &[][..]] {
+            let e = state
+                .apply_trees(&v, &routes_req("cfab-work-nope", 9, cidrs))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no workload interface cfab-work-nope on this member"),
+                "{cidrs:?}: {e}"
+            );
+            assert!(!state.routes.contains_key("cfab-work-nope"), "{cidrs:?}");
+        }
         let (trees, _) = state
             .apply_trees(&v, &sock::Request::TransitCost(TransitCost::Declared))
             .unwrap();

@@ -201,9 +201,11 @@ pub fn generate_with(view: &View, transit: TransitCost, routes: &WorkloadRoutes)
     // ifindex and the engine withdraws before re-installing when it moves.
     let mut static_routes: Vec<Value> = Vec::new();
     for (leg, cidrs) in routes {
-        if cidrs.is_empty() {
-            continue;
-        }
+        // The leg is checked before its cidrs are read, so a WITHDRAWAL on an unknown leg is
+        // refused in the same words as an install on one. An unknown leg is a typo or a stale
+        // driver either way, and letting the empty set through (nothing to emit, so nothing
+        // visibly goes wrong) would make the same mistake loud or silent depending only on
+        // how many VMs happened to be up at the time.
         if !workload_rows.iter().any(|r| r.wl.ifname == *leg) {
             return Err(Error::config(format!(
                 "no workload interface {leg} on this member"
@@ -1423,18 +1425,25 @@ mod tests {
     /// A leg no `[[workload]]` row on this member names is refused, loudly: it would emit a
     /// route out an interface the tree never declares, which libyang rejects with a leafref
     /// error naming nothing useful.
+    ///
+    /// The EMPTY set is refused the same way and in the same words. A withdrawal is not a
+    /// weaker request than an install: an unknown leg is a typo or a stale driver either way,
+    /// and accepting it quietly (there is nothing to emit, so nothing goes wrong) would make
+    /// the same mistake fail loudly or silently depending on how many VMs happened to be up.
     #[test]
-    fn a_route_on_an_undeclared_leg_is_refused_by_name() {
+    fn a_route_on_an_undeclared_leg_is_refused_by_name_whether_or_not_it_has_cidrs() {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
-        let routes = wl_routes(&[("cfab-work-nope", &["192.168.20.103/32"])]);
-        let e = generate_with(&v, TransitCost::Declared, &routes)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            e.contains("no workload interface cfab-work-nope on this member"),
-            "{e}"
-        );
+        for cidrs in [&["192.168.20.103/32"][..], &[][..]] {
+            let routes = wl_routes(&[("cfab-work-nope", cidrs)]);
+            let e = generate_with(&v, TransitCost::Declared, &routes)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("no workload interface cfab-work-nope on this member"),
+                "{cidrs:?}: {e}"
+            );
+        }
     }
 
     /// The route set never disturbs the costs, and the leaf offset never disturbs the routes:
