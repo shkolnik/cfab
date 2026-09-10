@@ -97,16 +97,21 @@ pub fn generate_seeded(
          \x20   iifname != @cfab oifname != @cfab counter accept comment \"foreign-transit\"\n\
          \x20   ct state invalid counter comment \"ct-invalid-seen\"\n",
     );
-    // Ruling 6 (drop and count), and the reason it sits HERE: a stray forward is a reply to a
-    // VM that has left this host, so it is an ESTABLISHED packet and the `return-of-allowed`
-    // accept below would take it first (r2 review N5). Above it, and above the per-zone
-    // accepts, the drop is the only verdict a packet for an unknown VM can reach. The
-    // aggregate /24 is what brings the packet to a host at all; this is what stops the host
-    // that does not own the VM from putting it back on VLAN 3.
+    // Phase 2, spec 5.6: COUNTER ONLY, no drop. The drop existed to stop a host leaking fabric
+    // traffic onto the SWITCH's VLAN 3; with a host-local VLAN there is no switch to leak onto,
+    // and letting the packet through is what discovers a silent VM (the kernel ARPs on the
+    // host-local VLAN, a local VM answers, and the /32 follows; a non-local one fails on the
+    // kernel's own ARP timeout). The rule keeps its name and gains its true meaning: forwards
+    // for VMs this host did not know.
+    //
+    // Position is still the whole substance, for counting rather than for dropping: below the
+    // `return-of-allowed` accept a reply to a departed VM (an ESTABLISHED packet) would be
+    // taken first and never counted (r2 review N5), and below the per-zone accepts nothing
+    // would be counted at all.
     for row in view.workload_rows() {
         for z in &row.wl.allow {
             out.push_str(&format!(
-                "    iifname @{z} oifname \"{ifn}\" ip daddr != @{set} counter drop \
+                "    iifname @{z} oifname \"{ifn}\" ip daddr != @{set} counter \
                  comment \"stray-{wl}\"\n",
                 ifn = row.wl.leg_ifname(),
                 set = row.wl.local_set(),
@@ -296,13 +301,15 @@ mod tests {
             .collect()
     }
 
-    /// Ruling 6 (drop and count): a host forwards fabric traffic onto its leg only for the VMs
-    /// it currently knows, and the rule sits between `ct state invalid` and the
-    /// `return-of-allowed` accept. Position is the whole substance: a reply to a VM that left
-    /// is an ESTABLISHED packet, so below that accept this rule would never match (r2 review
-    /// N5), and below the per-zone accepts it would never match either.
+    /// Spec 5.6: the rule COUNTS and does not drop — a forward for an unknown VM proceeds to
+    /// the leg, where the kernel's ARP discovers a local VM (and a non-local one times out).
+    /// It still sits between `ct state invalid` and the `return-of-allowed` accept, because
+    /// position decides what it can COUNT: a reply to a VM that left is an ESTABLISHED packet,
+    /// so below that accept this rule would never match (r2 review N5), and below the per-zone
+    /// accepts it would never match either.
     #[test]
-    fn a_stray_forward_onto_a_workload_leg_is_dropped_between_ct_invalid_and_the_return_accept() {
+    fn a_stray_forward_onto_a_workload_leg_is_counted_not_dropped_between_ct_invalid_and_the_return_accept()
+     {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let t = generate(&v).unwrap();
@@ -320,7 +327,14 @@ mod tests {
         assert_eq!(
             rules[at("stray-vms")],
             "iifname @storage oifname \"cfab-work-vms\" ip daddr != @cfab-work-vms-local \
-             counter drop comment \"stray-vms\""
+             counter comment \"stray-vms\""
+        );
+        // The teeth of "counter, not drop": no verdict on this rule at all. The whole point of
+        // spec 5.6 is that the packet continues to the leg and discovers the VM.
+        assert!(
+            !rules[at("stray-vms")].contains("drop"),
+            "spec 5.6: the stray rule counts and lets the packet through: {:?}",
+            rules[at("stray-vms")]
         );
         assert_eq!(at("stray-vms"), at("ct-invalid-seen") + 1);
         assert_eq!(at("return-of-allowed"), at("stray-vms") + 1);
