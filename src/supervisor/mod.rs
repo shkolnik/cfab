@@ -1101,8 +1101,11 @@ pub(crate) async fn run_with(
             signal_pid(*p, nix::sys::signal::Signal::SIGKILL);
         }
     }
-    // 5. The rest of the teardown (route sweep, rules, run dir, netdevs, qdiscs).
-    match teardown::run(sys, view) {
+    // 5. The rest of the teardown (route sweep, rules, run dir, netdevs, qdiscs). `Stop`, not
+    // `Down`: a stop is usually half a restart, and deleting the workload leg would flush the
+    // neighbor entries that are this member's only record of which VMs are here (see
+    // `teardown::Teardown`).
+    match teardown::run(sys, view, teardown::Teardown::Stop) {
         Ok(msg) => print!("{msg}"),
         Err(e) => eprintln!("{e}"),
     }
