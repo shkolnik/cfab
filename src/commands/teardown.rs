@@ -246,6 +246,11 @@ pub fn run(sys: &mut dyn Sys, view: &View) -> Result<String> {
         )?;
     }
 
+    // The additive host default (spec §6): the 250 route by its exact key, then the pref
+    // 2099-2101 rules that reach it — the same function the unwind of a half-installed `up`
+    // uses, and idempotent, so a member that never carried one tears down clean.
+    crate::commands::common::remove_host_default(sys)?;
+
     // Review finding 11 (2026-09-05, escalated to blocking — B3): refuse before destroying
     // the run_dir if `engine.lock` is still held. `stop_and_sweep` above only signals a
     // systemd-managed engine; a detached (non-systemd) one has no stop mechanism in this
@@ -1160,5 +1165,54 @@ mod tests {
         assert!(!sys.ran("ip rule show pref 1000"), "{:?}", sys.calls);
         assert!(!sys.ran("ip rule show pref 1001"), "{:?}", sys.calls);
         assert!(!sys.ran("ip rule del"), "{:?}", sys.calls);
+    }
+
+    /// Spec §6: `down` removes the additive host default whole — the 250 route by prefix +
+    /// table + proto (never a flush of the table), and the three rule prefs, idempotently.
+    #[test]
+    fn down_removes_the_host_default_route_and_all_three_rule_prefs() {
+        let f = fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = MockSys::default()
+            .on_fail(&["ip", "link", "show"], 1, "no")
+            .on_stdout(
+                &["ip", "rule", "show", "pref", "2099"],
+                "2099:\tfrom 192.168.10.1 iif lo lookup main\n",
+            )
+            // ...and empty from the second read on, so `drop_rules`'s loop terminates the way a
+            // real kernel's does once the rule is gone.
+            .on_stdout(&["ip", "rule", "show", "pref", "2099"], "");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("ip route del default table 250 proto 206"));
+        for pref in ["2099", "2100", "2101"] {
+            assert!(
+                sys.ran(&format!("ip rule show pref {pref}")),
+                "pref {pref} was never examined: {:?}",
+                sys.calls
+            );
+        }
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("ip route flush")),
+            "the table is never flushed: {:?}",
+            sys.calls
+        );
+    }
+
+    /// A leaf never installed one; `down` still asks, because the objects are cfab's whether or
+    /// not the current declaration would install them (a gw zone removed since `up`).
+    #[test]
+    fn down_on_a_leaf_still_asks_for_the_host_default_objects_and_finds_none() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = MockSys::default().on_fail(&["ip", "link", "show"], 1, "no");
+        run(&mut sys, &view).unwrap();
+        assert!(sys.ran("ip route del default table 250 proto 206"));
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c.starts_with("ip rule del pref 21")),
+            "nothing to delete: {:?}",
+            sys.calls
+        );
     }
 }

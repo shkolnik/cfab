@@ -325,31 +325,39 @@ pub fn host_default_rules(view: &View, floor_addrs: &[String]) -> Vec<FabricRule
         return Vec::new();
     }
     let mut out: Vec<FabricRule> = floor_addrs.iter().map(|a| floor_rule(a)).collect();
-    out.push(FabricRule::new(
-        "2100",
-        "from all iif lo lookup main suppress_prefixlength 0".to_string(),
-        &[
-            "from",
-            "all",
-            "iif",
-            "lo",
-            "lookup",
-            "main",
-            "suppress_prefixlength",
-            "0",
-        ],
-    ));
-    // The needle stops before the table on purpose: `ip rule show` renders a table by its
-    // rt_tables name where one exists, so this rule reads `lookup cfab-default` on a host
-    // carrying the package's fragment and `lookup 250` on one without it. The selector alone is
-    // unique within pref 2099..2101, which cfab is the only writer of, and the `del` argv below
-    // is still the exact rule.
-    out.push(FabricRule::new(
-        "2101",
-        "from all iif lo".to_string(),
-        &["from", "all", "iif", "lo", "lookup", HOST_DEFAULT_TABLE],
-    ));
+    out.extend(lookup_rules());
     out
+}
+
+/// The two rules that reach table 250, in install order. They depend on nothing this host has
+/// read, which is why the teardown can drop them without a declaration.
+fn lookup_rules() -> [FabricRule; 2] {
+    [
+        FabricRule::new(
+            "2100",
+            "from all iif lo lookup main suppress_prefixlength 0".to_string(),
+            &[
+                "from",
+                "all",
+                "iif",
+                "lo",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ],
+        ),
+        // The needle stops before the table on purpose: `ip rule show` renders a table by its
+        // rt_tables name where one exists, so this rule reads `lookup cfab-default` on a host
+        // carrying the package's fragment and `lookup 250` on one without it. The selector
+        // alone is unique within pref 2101, which cfab is the only writer of, and the `del`
+        // argv is still the exact rule.
+        FabricRule::new(
+            "2101",
+            "from all iif lo".to_string(),
+            &["from", "all", "iif", "lo", "lookup", HOST_DEFAULT_TABLE],
+        ),
+    ]
 }
 
 /// The host's own default route — the floor cfab adds to and never removes (spec §6).
@@ -487,11 +495,48 @@ pub fn sync_floor_rules(sys: &mut dyn Sys, wanted: &[String]) -> Result<Vec<Stri
     }
     for a in installed.iter().filter(|a| !wanted.contains(a)) {
         let r = floor_rule(a);
-        let del: Vec<&str> = r.add.iter().map(String::as_str).collect();
-        drop_rules(sys, &r.pref, &r.needle, &del)?;
+        drop_fabric_rule(sys, &r)?;
         out.push(format!("dropped ip rule pref {} {}", r.pref, r.needle));
     }
     Ok(out)
+}
+
+/// Take the additive host default back out: the 250 route, then every rule that reaches it.
+///
+/// One function, two callers — `down`, and the unwind of a half-installed `up` — and both are
+/// idempotent, so a member that never installed it tears down clean. Nothing here consults the
+/// declaration: a member whose gw zone was removed since `up` still has these objects in the
+/// kernel, and they are cfab's whether or not the current declaration would install them. The
+/// route goes by its exact key (prefix + table + proto, the shape `down` already deletes the
+/// per-zone return-path defaults by), and the 2099 rules from the kernel's own readback, one
+/// exact rule at a time.
+pub fn remove_host_default(sys: &mut dyn Sys) -> Result<()> {
+    run_ignore(
+        sys,
+        &[
+            "ip",
+            "route",
+            "del",
+            "default",
+            "table",
+            HOST_DEFAULT_TABLE,
+            "proto",
+            &crate::emit::engine::CFAB_DEFAULT_PROTO.to_string(),
+        ],
+    )?;
+    for a in installed_floor_addresses(sys)? {
+        drop_fabric_rule(sys, &floor_rule(&a))?;
+    }
+    for r in lookup_rules() {
+        drop_fabric_rule(sys, &r)?;
+    }
+    Ok(())
+}
+
+/// `drop_rules` for a `FabricRule`, the mirror of `ensure_fabric_rule`.
+pub fn drop_fabric_rule(sys: &mut dyn Sys, r: &FabricRule) -> Result<()> {
+    let del: Vec<&str> = r.add.iter().map(String::as_str).collect();
+    drop_rules(sys, &r.pref, &r.needle, &del)
 }
 
 pub fn fabric_rule_present(sys: &mut dyn Sys, r: &FabricRule) -> Result<bool> {

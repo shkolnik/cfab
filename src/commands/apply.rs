@@ -577,6 +577,9 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         common::ensure_fabric_rule(sys, &r)?;
     }
 
+    // ---- the additive host default (spec §6): table 250 + rules 2099-2101 -------------------
+    warnings.extend(install_host_default(sys, view)?);
+
     // ---- forward policy + per-interface forwarding ------------------------------
     if kind == MemberKind::Leaf {
         leaf_guard(sys, view)?;
@@ -698,6 +701,62 @@ pub fn run(sys: &mut dyn Sys, view: &View, _opts: &ApplyOpts) -> Result<Vec<Stri
         last.push_str(&format!("; workloads: {}", workload_descs.join(", ")));
     }
     Ok(warnings)
+}
+
+/// The additive host default (spec §6): rules 2099-2101 and the one route in table 250, on a
+/// member whose gw zone declares a router. A member with no gw zone installs nothing at all.
+///
+/// Optimistic at apply: the ingress prober does not exist yet when `up` runs, and its own
+/// hysteresis starts reachable, so the route goes in and the supervisor's reconcile withdraws
+/// it if the router turns out to be dark.
+///
+/// Order is a safety property, not a style: the pref-2099 floor pins go in FIRST, so there is
+/// no instant in which 2101 is sending an admin-sourced reply over the fabric gateway with
+/// nothing pinning it back to main — the self-locking case (spec §8 test 7). The route goes in
+/// LAST, so between 2101 and it, table 250 is empty and every lookup falls through to the
+/// kernel's own final `32766 from all lookup main`.
+fn install_host_default(sys: &mut dyn Sys, view: &View) -> Result<Vec<String>> {
+    let Some(hd) = common::host_default(view) else {
+        return Ok(Vec::new());
+    };
+    let mut warnings = Vec::new();
+    let addrs = match common::floor_default(sys)? {
+        Some(floor) => common::floor_addresses(sys, &floor.dev)?,
+        None => {
+            warnings.push(format!(
+                "no floor default route on this host: the fabric default (table {} via {}) is \
+                 installed with no pref-2099 pins, so a reply sourced from an admin address \
+                 leaves over {} — restore the host's own `gateway` line in \
+                 /etc/network/interfaces",
+                hd.table, hd.via, hd.dev
+            ));
+            Vec::new()
+        }
+    };
+    // §6's "no half-installed default": rules and route are one unit, so a failure anywhere
+    // takes back everything this call put in. A member left with 2100 and no route still
+    // reaches the floor through the kernel's final rule; one left with a route and no 2099
+    // sends admin-sourced replies out the fabric gateway.
+    if let Err(e) = host_default_unit(sys, view, &hd, &addrs) {
+        let _ = common::remove_host_default(sys);
+        return Err(e);
+    }
+    Ok(warnings)
+}
+
+fn host_default_unit(
+    sys: &mut dyn Sys,
+    view: &View,
+    hd: &common::HostDefault,
+    addrs: &[String],
+) -> Result<()> {
+    common::sync_floor_rules(sys, addrs)?;
+    // `&[]`: the pref-2099 pins are the line above, level-triggered off the kernel's readback
+    // so a stale pin from a previous apply goes away; this leaves 2100 and 2101.
+    for r in common::host_default_rules(view, &[]) {
+        common::ensure_fabric_rule(sys, &r)?;
+    }
+    hd.install(sys)
 }
 
 /// An always-up netdev holding a /32: a veth pair (on every kernel that runs Docker; `dummy` is
@@ -1416,6 +1475,11 @@ pub(crate) mod tests {
             .on_stdout(
                 &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
                 "eth0 UP 192.168.10.1/24\n",
+            )
+            // The floor (spec §6): ifupdown's own default, written with no `proto` word at all.
+            .on_stdout(
+                &["ip", "route", "show", "table", "main", "default"],
+                "default via 192.168.10.254 dev eth0 onlink\n",
             )
             .on_stdout(
                 &["nft", "list", "chain", "inet", "cfab-fwd", "forward"],
@@ -2164,6 +2228,9 @@ pub(crate) mod tests {
                 "ip link set cfab-gw249 up",
                 // The per-zone return-path default lands as part of building the leg (E2.2).
                 "ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205",
+                // The additive host default (spec §6) names this leg too.
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+                 table 250 proto 206",
                 "write /proc/sys/net/ipv4/conf/cfab-gw249/forwarding",
             ]
         );
@@ -2432,6 +2499,8 @@ pub(crate) mod tests {
                 "ip link set cfab-gw249 up",
                 // The per-zone return-path default lands as part of building the leg (E2.2).
                 "ip route replace default via 192.168.249.254 dev cfab-gw249 table 249 proto 205",
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+                 table 250 proto 206",
             ]
         );
     }
@@ -2936,5 +3005,148 @@ pub(crate) mod tests {
             "refused after applying: {:?}",
             sys.calls
         );
+    }
+
+    /// Spec §6: on a member whose gw zone declares a router, `up` adds the 250 default sourced
+    /// from this member's own leg address and the three rules that reach it — pref 2099 first,
+    /// so an admin-sourced reply is pinned to the floor before 2101 can send anything at all
+    /// over the fabric gateway.
+    #[test]
+    fn up_installs_the_host_default_and_its_three_rules_floor_pins_first() {
+        let (sys, view) = up_sys_and_view();
+        let mut sys = absent_fallback_netdevs(sys, &view);
+        run(&mut sys, &view, &opts()).unwrap();
+        let ours: Vec<&String> = sys
+            .calls
+            .iter()
+            .filter(|c| {
+                c.starts_with("ip rule add pref 209")
+                    || c.starts_with("ip rule add pref 210")
+                    || c.contains("table 250")
+            })
+            .collect();
+        assert_eq!(
+            ours,
+            [
+                "ip rule add pref 2099 from 192.168.10.1 iif lo lookup main",
+                "ip rule add pref 2100 from all iif lo lookup main suppress_prefixlength 0",
+                "ip rule add pref 2101 from all iif lo lookup 250",
+                "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+                 table 250 proto 206",
+            ]
+        );
+    }
+
+    /// A leaf declares no gw zone: no route, no rules, and nothing read about the floor either.
+    #[test]
+    fn up_on_a_member_with_no_gw_zone_installs_no_host_default() {
+        let f = fabric();
+        let view = View::new(&f, "pve3-tb").unwrap();
+        let mut sys = absent_fallback_netdevs(up_sys(&view), &view);
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(
+            !sys.calls.iter().any(|c| c.contains("table 250")
+                || c.starts_with("ip rule add pref 209")
+                || c.starts_with("ip rule add pref 210")),
+            "{:?}",
+            sys.calls
+        );
+    }
+
+    /// No floor default: 2100, 2101 and the route still go in — §6 is additive and removes
+    /// nothing — but the missing floor pins are named, because an admin-sourced reply then
+    /// leaves over the fabric gateway.
+    #[test]
+    fn no_floor_default_installs_the_route_without_2099_and_says_so() {
+        let (sys, view) = up_sys_and_view();
+        let mut sys = absent_fallback_netdevs(
+            sys.on_stdout(&["ip", "route", "show", "table", "main", "default"], ""),
+            &view,
+        );
+        let warnings = run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran(
+            "ip route replace default via 192.168.249.254 dev cfab-gw249 src 192.168.249.1 \
+             table 250 proto 206"
+        ));
+        assert!(sys.ran("ip rule add pref 2101 from all iif lo lookup 250"));
+        assert!(
+            !sys.calls
+                .iter()
+                .any(|c| c.starts_with("ip rule add pref 2099")),
+            "{:?}",
+            sys.calls
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("no floor default route on this host:")),
+            "{warnings:?}"
+        );
+    }
+
+    /// One pref-2099 rule per address the floor device carries.
+    #[test]
+    fn every_address_of_the_floor_device_gets_its_own_pin() {
+        let (sys, view) = up_sys_and_view();
+        let mut sys = absent_fallback_netdevs(
+            sys.on_stdout(
+                &["ip", "-4", "-br", "addr", "show", "dev", "eth0"],
+                "eth0 UP 192.168.10.1/24 192.168.10.60/24\n",
+            ),
+            &view,
+        );
+        run(&mut sys, &view, &opts()).unwrap();
+        assert!(sys.ran("ip rule add pref 2099 from 192.168.10.1 iif lo lookup main"));
+        assert!(sys.ran("ip rule add pref 2099 from 192.168.10.60 iif lo lookup main"));
+    }
+
+    /// §6's "no half-installed default": a rule that cannot be added takes the whole unit back
+    /// out, route included, rather than leaving a member whose admin-sourced replies leave over
+    /// the fabric gateway with nothing pinning them to the floor.
+    #[test]
+    fn a_host_default_that_cannot_be_fully_installed_is_unwound() {
+        let (sys, view) = up_sys_and_view();
+        let mut sys = absent_fallback_netdevs(
+            sys.on_fail(
+                &["ip", "rule", "add", "pref", "2101"],
+                2,
+                "RTNETLINK answers: Operation not permitted",
+            ),
+            &view,
+        );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert!(e.contains("ip rule add pref 2101"), "{e}");
+        // The unwind, exactly: the route by its key, then every pref re-examined for removal.
+        // This mock answers each `show` empty, so no `del` follows — the kernel's own readback
+        // is what `remove_host_default` deletes from on a live host.
+        assert_eq!(
+            sys.calls[sys.calls.len() - 4..],
+            [
+                "ip route del default table 250 proto 206",
+                "ip rule show pref 2099",
+                "ip rule show pref 2100",
+                "ip rule show pref 2101",
+            ]
+        );
+    }
+
+    /// Fail loud: main's own routes are the one thing this cannot guess at.
+    #[test]
+    fn a_host_whose_main_routes_cannot_be_read_refuses_to_install_a_default() {
+        let (sys, view) = up_sys_and_view();
+        let mut sys = absent_fallback_netdevs(
+            sys.on_fail(
+                &["ip", "route", "show", "table", "main", "default"],
+                2,
+                "Cannot open netlink socket",
+            ),
+            &view,
+        );
+        let e = run(&mut sys, &view, &opts()).unwrap_err().to_string();
+        assert!(
+            e.contains("cannot read this host's own default route"),
+            "{e}"
+        );
+        assert!(!sys.calls.iter().any(|c| c.contains("table 250")), "{e}");
     }
 }
