@@ -819,7 +819,7 @@ fn probe_interval(sys: &dyn Sys, bridge: &str) -> (Duration, Option<String>) {
         .and_then(|s| s.trim().parse::<u64>().ok())
     {
         Some(centisecs) => (
-            (Duration::from_millis(centisecs * 10) / 3).max(PERIOD),
+            (Duration::from_millis(centisecs.saturating_mul(10)) / 3).max(PERIOD),
             None,
         ),
         None => (
