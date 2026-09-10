@@ -810,12 +810,21 @@ const DEFAULT_AGEING: Duration = Duration::from_secs(300);
 /// `DEFAULT_AGEING`, named once in the returned fault text; the probe keeps running either way
 /// (availability first) rather than stopping because one fact about the host could not be
 /// confirmed.
+///
+/// Zero is its own case because dividing it inverts the probe's meaning: `0/3` floors to
+/// `PERIOD`, so the setting under which the probe is least necessary would make it fire
+/// fastest — one fan-out per VM every 5 s, forever. On a bridge `0` conventionally disables
+/// ageing (INFERRED, not measured here), which would mean no FDB entry ever expires and no
+/// probe is needed at all; treating it as unknown is the safe reading under either meaning,
+/// since probing a bridge that never ages is merely redundant while not probing one that does
+/// lets every idle VM decay silently.
 fn probe_interval(sys: &dyn Sys, bridge: &str) -> (Duration, Option<String>) {
     let path = format!("/sys/class/net/{bridge}/bridge/ageing_time");
     match sys
         .read(&path)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&c| c > 0)
     {
         Some(centisecs) => (
             (Duration::from_millis(centisecs.saturating_mul(10)) / 3).max(PERIOD),
@@ -1674,6 +1683,46 @@ mod tests {
             shared.sent().len(),
             2,
             "due at exactly PERIOD (5s), the floor"
+        );
+    }
+
+    /// `ageing_time` 0 must not be divided. On a bridge it conventionally means ageing is
+    /// disabled, so the FDB never expires and the probe is unnecessary — but `0/3` floors to
+    /// `PERIOD`, which would make the probe fire FASTEST exactly there: one fan-out per VM
+    /// every 5 s, forever. It is read as unknown instead, which is the safe reading whichever
+    /// way the kernel means it, and it takes the same fallback interval as an unreadable file.
+    #[test]
+    fn probe_interval_reads_a_zero_ageing_time_as_unknown_not_as_zero() {
+        use crate::workload::announce::mock::SharedIo;
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = tick_sys("");
+        sys.files.insert(
+            "/sys/class/net/primary/bridge/ageing_time".into(),
+            "0\n".into(),
+        );
+        let shared = SharedIo::default();
+        let mut io = shared.clone();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+
+        hr.tick(&mut sys, &v, &mut io, t0);
+        assert_eq!(shared.sent().len(), 1, "one probe, due immediately");
+
+        // The whole point: at PERIOD a floored-zero interval would already be due again.
+        hr.tick(&mut sys, &v, &mut io, t0 + PERIOD);
+        assert_eq!(
+            shared.sent().len(),
+            1,
+            "zero must not floor to PERIOD and turn the probe into a 5s beacon"
+        );
+
+        // It takes the unreadable-file fallback: DEFAULT_AGEING / 3.
+        hr.tick(&mut sys, &v, &mut io, t0 + (DEFAULT_AGEING / 3));
+        assert_eq!(
+            shared.sent().len(),
+            2,
+            "due at the DEFAULT_AGEING fallback interval, as an unreadable file would be"
         );
     }
 
