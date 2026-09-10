@@ -428,7 +428,9 @@ pub fn floor_default(sys: &mut dyn Sys) -> Result<Option<FloorDefault>> {
     let out = sys.run(&["ip", "route", "show", "table", "main", "default"])?;
     if !out.ok() {
         return Err(Error::fatal(format!(
-            "cannot read this host's own default route: `ip route show table main default`              exited {} ({}) — the additive host default (table {HOST_DEFAULT_TABLE}) is not              installed without it",
+            "cannot read this host's own default route: `ip route show table main default` \
+             exited {} ({}) — the additive host default (table {HOST_DEFAULT_TABLE}) is not \
+             installed without it",
             out.status,
             out.stderr.trim()
         )));
@@ -442,7 +444,8 @@ pub fn floor_addresses(sys: &mut dyn Sys, dev: &str) -> Result<Vec<String>> {
     let out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", dev])?;
     if !out.ok() {
         return Err(Error::fatal(format!(
-            "cannot read the addresses of the floor device {dev}: `ip -4 -br addr show dev              {dev}` exited {} ({}) — this host's own default route names it",
+            "cannot read the addresses of the floor device {dev}: `ip -4 -br addr show dev \
+             {dev}` exited {} ({}) — this host's own default route names it",
             out.status,
             out.stderr.trim()
         )));
@@ -1335,6 +1338,35 @@ default via 192.168.1.1 dev eth3 proto 110
         let e = floor_default(&mut sys).unwrap_err().to_string();
         assert!(e.contains("ip route show table main default"), "{e}");
         assert!(e.contains("Cannot open netlink socket"), "{e}");
+        assert_no_double_space(&e);
+    }
+
+    /// Fail loud: a read of the floor device's addresses that did not run is not "it carries
+    /// none", because that answer would drop every pref-2099 pin.
+    #[test]
+    fn a_failed_read_of_the_floor_devices_addresses_is_a_named_error() {
+        let mut sys = MockSys::default().on_fail(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary"],
+            1,
+            "Device \"primary\" does not exist.",
+        );
+        let e = floor_addresses(&mut sys, "primary")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ip -4 -br addr show dev primary"), "{e}");
+        assert!(e.contains("does not exist"), "{e}");
+        assert_no_double_space(&e);
+    }
+
+    /// A wrapped string literal that loses its `\` continuation keeps the source indentation as
+    /// a run of literal spaces in the middle of the sentence — invisible in the source, glaring
+    /// in the journal, and it breaks a grep for the phrase. Every message this file builds is
+    /// asserted against it at the point it is built.
+    fn assert_no_double_space(msg: &str) {
+        assert!(
+            !msg.contains("  "),
+            "message carries a run of spaces (a lost `\\` continuation?): {msg:?}"
+        );
     }
 
     #[test]
