@@ -188,7 +188,7 @@ jobs:
           echo "deb=$base debrev=$debrev"
       - name: Log in to ghcr.io
         if: steps.meta.outputs.channel == 'formal'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
