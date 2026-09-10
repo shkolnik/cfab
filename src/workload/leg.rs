@@ -111,6 +111,7 @@ pub fn install(sys: &mut dyn Sys, run_dir: &str, spec: &LegSpec, qos_map: &[&str
     } = *spec;
     mk_vlan(sys, leg, uplink, vid, Some(address), true, qos_map)?;
     prune_addresses(sys, leg, &[address, gw_cidr])?;
+    proxy_arp(sys, leg, true)?;
     // Address-then-vid on purpose, and momentarily: until the bridge carries the vid the leg
     // receives nothing, so the window is one where no traffic can arrive at the address anyway
     // (unlike the anycast `gw`, which apply/the watchdog deliberately install only after the
@@ -118,6 +119,28 @@ pub fn install(sys: &mut dyn Sys, run_dir: &str, spec: &LegSpec, qos_map: &[&str
     // `install` rather than leaving a half-built leg that has to be unwound.
     ensure_self_vid(sys, run_dir, uplink, vid)?;
     Ok(())
+}
+
+/// The leg's `proxy_arp` sysctl (spec 5.2). With it on, the host answers a VM's ARP for any
+/// address it routes by a DIFFERENT device — which, for a host-local VLAN, is exactly the set
+/// of remote VM /32s the fabric gave it, and nothing local (the kernel never proxies a target
+/// whose route leaves by the device the request arrived on, so a host never answers for its own
+/// VM and there is no duplicate reply). Without it, VM-to-VM across hosts does not work at all,
+/// and a host with it OFF while its peers have it ON breaks the pair in one direction only —
+/// which is why `status` reports it and the teardown clears it explicitly.
+///
+/// RACK-MEASURED 2026-09-10 (gate G0): `proxy_arp = 1` coexists with the member-wide
+/// `arp_ignore = 1` `apply` writes; the two answer different questions and neither suppresses
+/// the other.
+///
+/// Cleared by BOTH teardown modes: a stopped cfab has no fabric routes, so an answer it had
+/// gone on giving would black-hole the VM's traffic — and `Stop` keeps the netdev, so the
+/// sysctl does not go away with it.
+pub fn proxy_arp(sys: &mut dyn Sys, leg: &str, on: bool) -> Result<()> {
+    sys.write(
+        &format!("/proc/sys/net/ipv4/conf/{leg}/proxy_arp"),
+        if on { "1" } else { "0" },
+    )
 }
 
 /// Delete every IPv4 address on the leg other than the ones cfab means it to carry.
@@ -365,10 +388,17 @@ mod tests {
                 "ip addr replace 192.168.20.2/24 dev cfab-work-vms",
                 "ip link set cfab-work-vms up",
                 "ip -4 -br addr show dev cfab-work-vms",
+                "write /proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp",
                 "bridge -j vlan show dev primary",
                 "bridge vlan add dev primary vid 3 self",
                 "write /run/cfab/workload-self-vid",
             ]
+        );
+        // Spec 5.2: every host's leg answers proxy ARP, or VM-to-VM across hosts is broken in
+        // one direction (G0 measured exactly that with the sysctl on one host only).
+        assert_eq!(
+            sys.writes_to("/proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp"),
+            Some("1")
         );
         assert_eq!(
             sys.writes_to("/run/cfab/workload-self-vid"),

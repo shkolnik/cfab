@@ -445,9 +445,17 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         };
         // The declaration's own words first (`uplink` + `vid`), then the leg cfab derives from
         // them in parentheses: an operator reading this line is looking for what they wrote.
+        // `host-local` is a statement of the design, not a reading (there is no other shape
+        // since phase 2 retired `span`); `proxy-arp` IS a reading, so it says what the kernel
+        // holds — including `unreadable`, which is not the same fact as `off`.
+        let proxy = match w.proxy_arp {
+            Some(true) => "proxy-arp on",
+            Some(false) => "proxy-arp off",
+            None => "proxy-arp unreadable",
+        };
         let mut line = format!(
-            "  workload {}: {} vid {} ({}) {} gw {} {word}, advertised to {}, uplink {uplinks}, \
-             announce trigger {trigger}",
+            "  workload {}: {} vid {} ({}) {} gw {} {word}, host-local, {proxy}, advertised to \
+             {}, uplink {uplinks}, announce trigger {trigger}",
             w.name,
             w.uplink,
             w.vid,
@@ -1859,6 +1867,7 @@ fn workload_posture(
                 zones: wl.allow.clone(),
                 uplink_ports: Vec::new(),
                 trigger: None,
+                proxy_arp: None,
                 vms_seen: None,
                 guard_drops: None,
                 bytes: None,
@@ -1909,6 +1918,27 @@ fn workload_posture(
         if arp != "1" {
             c.settling(format!(
                 "workload {name}: net.ipv4.conf.all.arp_ignore is {arp} (want 1)"
+            ));
+            broken = true;
+        }
+        // Spec 5.2. Read per row (it is a per-leg sysctl, unlike the member-wide arp_ignore
+        // above) and reported as a fault by the same rule: with it off, this host answers for
+        // none of the remote VMs it routes, so VM-to-VM across hosts is broken in one
+        // direction — a real, invisible outage that nothing else in `status` would show. A leg
+        // that does not exist has its own line already, so an unreadable file only counts when
+        // the leg is otherwise healthy.
+        let proxy_arp = sys
+            .read(&format!("/proc/sys/net/ipv4/conf/{leg}/proxy_arp"))
+            .ok()
+            .map(|v| v.trim() == "1");
+        if link.ok() && proxy_arp != Some(true) {
+            c.settling(format!(
+                "workload {name}: net.ipv4.conf.{leg}.proxy_arp is {} (want 1; every host's leg \
+                 answers for the remote VMs it routes)",
+                match proxy_arp {
+                    Some(_) => "0".to_string(),
+                    None => "unreadable".to_string(),
+                }
             ));
             broken = true;
         }
@@ -1986,6 +2016,7 @@ fn workload_posture(
             zones: wl.allow.clone(),
             uplink_ports: uplinks,
             trigger,
+            proxy_arp,
             vms_seen,
             guard_drops,
             bytes,
@@ -3413,6 +3444,7 @@ mod tests {
             .file("/sys/class/net/primary/brif/eth0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/proc/sys/net/ipv4/conf/all/arp_ignore", "1\n")
+            .file("/proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp", "1\n")
             .on_stdout(
                 &["ip", "-br", "link", "show", "dev", "cfab-work-vms"],
                 "cfab-work-vms@primary UP 00:11:22:33:44:55 <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
@@ -3478,8 +3510,8 @@ mod tests {
         assert!(
             text.contains(
                 "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
-                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
-                 neigh events, 7 stray forwards\n"
+                 192.168.20.254/24 up, host-local, proxy-arp on, advertised to storage, uplink \
+                 eth0, announce trigger neigh events, 7 stray forwards\n"
             ),
             "{text}"
         );
@@ -3520,8 +3552,8 @@ mod tests {
         assert!(
             text.contains(
                 "  workload vms: primary vid 3 (cfab-work-vms) 192.168.20.2/24 gw \
-                 192.168.20.254/24 up, advertised to storage, uplink eth0, announce trigger \
-                 neigh events, 1 vms seen, 7 stray forwards\n"
+                 192.168.20.254/24 up, host-local, proxy-arp on, advertised to storage, uplink \
+                 eth0, announce trigger neigh events, 1 vms seen, 7 stray forwards\n"
             ),
             "{text}"
         );
@@ -3658,6 +3690,16 @@ mod tests {
                     "Error: No such file or directory",
                 ),
                 "workload vms: bridge table cfab missing (uplink ARP guard down)".into(),
+                Class::Settling,
+            ),
+            // Spec 5.2: proxy ARP off on a live leg is a real one-way outage between VMs on
+            // different hosts, and nothing else in `status` would show it.
+            (
+                wl_status_sys(&f, &view)
+                    .file("/proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp", "0\n"),
+                "workload vms: net.ipv4.conf.cfab-work-vms.proxy_arp is 0 (want 1; every host's \
+                 leg answers for the remote VMs it routes)"
+                    .into(),
                 Class::Settling,
             ),
             (

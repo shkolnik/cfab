@@ -253,6 +253,7 @@ ip link add link primary name cfab-work-vms type vlan id 3 egress-qos-map 0:0 6:
 ip addr replace 192.168.20.2/24 dev cfab-work-vms
 ip link set cfab-work-vms up
 ip -4 -br addr show dev cfab-work-vms
+write /proc/sys/net/ipv4/conf/cfab-work-vms/proxy_arp
 bridge -j vlan show dev primary
 bridge vlan add dev primary vid 3 self
 write /run/cfab/workload-self-vid

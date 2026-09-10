@@ -1353,6 +1353,7 @@ mod tests {
                     zones: vec!["storage".to_string()],
                     uplink_ports: vec!["eth0".to_string()],
                     trigger: Some("neigh events".to_string()),
+                    proxy_arp: Some(true),
                     vms_seen: Some(3),
                     guard_drops: Some(GuardDrops {
                         claim: 2,
