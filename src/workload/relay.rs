@@ -29,6 +29,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use crate::model::Ipv4Prefix;
 use crate::supervisor::child::BACKOFF;
 use crate::supervisor::{Cmd, RelayEvent, Shared};
 
@@ -209,6 +210,13 @@ pub enum DropReason {
     /// A server-facing `BOOTREPLY` whose `giaddr` is not this row's own leg address — not a
     /// reply to a request this relay made.
     ForeignReplyGiaddr(Ipv4Addr),
+    /// A trusted reply's `ciaddr` is outside the row's own `prefix` (S3, defense in depth): the
+    /// server-facing socket is not device-bound, so anything routable can reach it, and
+    /// `rp_filter = 2` (loose) admits a spoofed source. Bounded blast radius even so —
+    /// `hostroutes::local_vms` already filters to `prefix`, excludes `fabric_addresses`, and
+    /// requires the MAC on a non-uplink FDB port — but this also catches a misconfigured dhcpd
+    /// serving the wrong subnet, so it is worth the three lines.
+    OutOfPrefix(Ipv4Addr),
 }
 
 /// The client→server half (spec §5.4): drop when `hops >= 16` or `giaddr` is someone else's;
@@ -241,8 +249,17 @@ pub fn forward_client(pkt: &[u8], leg: Ipv4Addr, dhcp_server: Ipv4Addr) -> Actio
 /// The server→client half (spec §5.4): trust only a `BOOTREPLY` whose UDP source is
 /// `dhcp_server` and whose `giaddr` is this row's own leg address; then `ciaddr != 0` unicasts
 /// to it, else broadcasts to the leg (a unicast to `yiaddr` cannot work before the client owns
-/// the address — finding 9).
-pub fn forward_server(pkt: &[u8], src: Ipv4Addr, leg: Ipv4Addr, dhcp_server: Ipv4Addr) -> Action {
+/// the address — finding 9). A nonzero `ciaddr` outside `prefix` is refused (S3): the
+/// server-facing socket is not device-bound and cfab sets `rp_filter = 2` (loose), so a spoofed
+/// `BOOTREPLY` that otherwise passes the two trust checks above must not teach the host a
+/// neighbor entry for an address this row has no business claiming.
+pub fn forward_server(
+    pkt: &[u8],
+    src: Ipv4Addr,
+    leg: Ipv4Addr,
+    dhcp_server: Ipv4Addr,
+    prefix: Ipv4Prefix,
+) -> Action {
     let p = match Bootp::parse(pkt) {
         Ok(p) => p,
         Err(_) => return Action::Drop(DropReason::Malformed),
@@ -257,6 +274,9 @@ pub fn forward_server(pkt: &[u8], src: Ipv4Addr, leg: Ipv4Addr, dhcp_server: Ipv
         return Action::Drop(DropReason::ForeignReplyGiaddr(p.giaddr()));
     }
     let ciaddr = p.ciaddr();
+    if !ciaddr.is_unspecified() && !prefix.contains(ciaddr) {
+        return Action::Drop(DropReason::OutOfPrefix(ciaddr));
+    }
     let dest = if ciaddr.is_unspecified() {
         Ipv4Addr::BROADCAST
     } else {
@@ -270,17 +290,19 @@ pub fn forward_server(pkt: &[u8], src: Ipv4Addr, leg: Ipv4Addr, dhcp_server: Ipv
 
 /// Whether an already-trusted server→client reply should register a VM (spec §5.4, call 5
 /// caveat): only a DHCPACK whose `chaddr` is a 6-byte Ethernet address and whose `yiaddr` is
-/// set. A DHCPNAK never registers — no lease was granted. Re-parses the raw buffer rather than
+/// set and inside `prefix` (S3, same defense in depth as `forward_server`'s `ciaddr` check — a
+/// spoofed ACK must not earn a neighbor write for an address outside this row's own subnet). A
+/// DHCPNAK never registers — no lease was granted. Re-parses the raw buffer rather than
 /// threading the already-parsed `Bootp` through `forward_server`, so "is this reply trustworthy
 /// enough to relay" and "does it teach us a VM's address" stay two functions a reviewer can
 /// read, and mistrust, independently.
-pub fn ack_discovery(pkt: &[u8]) -> Option<(Ipv4Addr, [u8; 6])> {
+pub fn ack_discovery(pkt: &[u8], prefix: Ipv4Prefix) -> Option<(Ipv4Addr, [u8; 6])> {
     let p = Bootp::parse(pkt).ok()?;
     if p.message_type() != Some(DHCPACK) {
         return None;
     }
     let yiaddr = p.yiaddr();
-    if yiaddr.is_unspecified() {
+    if yiaddr.is_unspecified() || !prefix.contains(yiaddr) {
         return None;
     }
     let chaddr = p.chaddr6()?;
@@ -297,6 +319,9 @@ pub struct RelayRow {
     /// the server-facing socket binds to.
     pub leg_addr: Ipv4Addr,
     pub dhcp_server: Ipv4Addr,
+    /// This row's own subnet (S3): a trusted reply's `ciaddr`/`yiaddr` must fall inside it, or
+    /// it is refused rather than acted on.
+    pub prefix: Ipv4Prefix,
 }
 
 /// Bind the client-facing socket: `0.0.0.0:<port>`, restricted to `device` when given (several
@@ -336,7 +361,10 @@ fn bind_pair(row: &RelayRow) -> io::Result<(UdpSocket, UdpSocket)> {
 }
 
 /// DHCP messages this relay forwards fit in far less; 1500 gives headroom for a heavily
-/// option-laden client (PXE, vendor options) without ever growing unbounded.
+/// option-laden client (PXE, vendor options) without ever growing unbounded. A datagram larger
+/// than this is silently truncated by `recv_from` (no error), and the truncated body is what
+/// gets forwarded — accepted rather than guarded against, since Ethernet's own 1500-byte MTU
+/// makes a larger UDP payload vanishingly rare on this wire (fold-in, opus review).
 const BUF_LEN: usize = 1500;
 
 /// The relay task (spec §5.4): bind, serve until a socket errors, then retry forever on the same
@@ -426,9 +454,9 @@ async fn serve(
                             continue; // this relay never binds a v6 socket; not ours
                         };
                         if let Action::Forward { to, bytes } =
-                            forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server)
+                            forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server, row.prefix)
                         {
-                            if let Some((yiaddr, chaddr)) = ack_discovery(&sbuf[..n]) {
+                            if let Some((yiaddr, chaddr)) = ack_discovery(&sbuf[..n], row.prefix) {
                                 shared.lock().unwrap().relay_event(
                                     &row.name, row.dhcp_server, RelayEvent::Discovered,
                                 );
@@ -474,6 +502,12 @@ mod tests {
     const LEG: Ipv4Addr = Ipv4Addr::new(192, 168, 22, 2);
     const SERVER: Ipv4Addr = Ipv4Addr::new(192, 168, 10, 11);
     const CHADDR: [u8; 6] = [0x4e, 0x48, 0xe9, 0x89, 0x2e, 0xe5];
+    /// This row's own subnet (S3): covers `LEG` and every fixture's `yiaddr`
+    /// (192.168.22.150), the way a real `[[workload]]` row's `prefix` would.
+    const PREFIX: Ipv4Prefix = Ipv4Prefix {
+        net: Ipv4Addr::new(192, 168, 22, 0),
+        len: 24,
+    };
 
     // ---- Bootp parse, over the real captured packets --------------------------------------
 
@@ -622,7 +656,7 @@ mod tests {
     fn an_offer_from_the_real_server_with_our_giaddr_broadcasts_to_the_client_port() {
         let mut p = Bootp::parse(OFFER).unwrap();
         p.set_giaddr(LEG);
-        match forward_server(p.as_bytes(), SERVER, LEG, SERVER) {
+        match forward_server(p.as_bytes(), SERVER, LEG, SERVER, PREFIX) {
             Action::Forward { to, .. } => {
                 assert_eq!(to, SocketAddrV4::new(Ipv4Addr::BROADCAST, CLIENT_PORT))
             }
@@ -636,9 +670,26 @@ mod tests {
         p.set_giaddr(LEG);
         let renewing = Ipv4Addr::new(192, 168, 22, 150);
         p.0[CIADDR_OFF..CIADDR_OFF + 4].copy_from_slice(&renewing.octets());
-        match forward_server(p.as_bytes(), SERVER, LEG, SERVER) {
+        match forward_server(p.as_bytes(), SERVER, LEG, SERVER, PREFIX) {
             Action::Forward { to, .. } => assert_eq!(to, SocketAddrV4::new(renewing, CLIENT_PORT)),
             other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    /// Teeth (S3): a nonzero `ciaddr` outside the row's own `prefix` is refused even from the
+    /// real server with the right `giaddr` — the two trust checks above establish WHO sent it,
+    /// not that the address it names is one this row has any business claiming.
+    #[test]
+    fn a_reply_with_a_ciaddr_outside_the_prefix_is_dropped() {
+        let mut p = Bootp::parse(ACK).unwrap();
+        p.set_giaddr(LEG);
+        let outsider = Ipv4Addr::new(10, 0, 0, 9);
+        p.0[CIADDR_OFF..CIADDR_OFF + 4].copy_from_slice(&outsider.octets());
+        match forward_server(p.as_bytes(), SERVER, LEG, SERVER, PREFIX) {
+            Action::Drop(DropReason::OutOfPrefix(a)) => assert_eq!(a, outsider),
+            other @ (Action::Forward { .. } | Action::Drop(_)) => {
+                panic!("expected OutOfPrefix, got {other:?}")
+            }
         }
     }
 
@@ -647,7 +698,7 @@ mod tests {
     #[test]
     fn a_bootrequest_on_the_server_socket_is_dropped_not_forwarded() {
         assert_eq!(
-            forward_server(DISCOVER, SERVER, LEG, SERVER),
+            forward_server(DISCOVER, SERVER, LEG, SERVER, PREFIX),
             Action::Drop(DropReason::NotABootreply)
         );
     }
@@ -659,7 +710,7 @@ mod tests {
         let mut p = Bootp::parse(OFFER).unwrap();
         p.set_giaddr(LEG);
         let forger = Ipv4Addr::new(6, 6, 6, 6);
-        match forward_server(p.as_bytes(), forger, LEG, SERVER) {
+        match forward_server(p.as_bytes(), forger, LEG, SERVER, PREFIX) {
             Action::Drop(DropReason::UntrustedServer(s)) => assert_eq!(s, forger),
             other @ (Action::Forward { .. } | Action::Drop(_)) => {
                 panic!("expected UntrustedServer, got {other:?}")
@@ -672,7 +723,7 @@ mod tests {
     #[test]
     fn a_reply_with_a_foreign_giaddr_is_dropped_even_from_the_real_server() {
         let p = Bootp::parse(OFFER).unwrap(); // giaddr is 0.0.0.0 in the raw capture
-        match forward_server(p.as_bytes(), SERVER, LEG, SERVER) {
+        match forward_server(p.as_bytes(), SERVER, LEG, SERVER, PREFIX) {
             Action::Drop(DropReason::ForeignReplyGiaddr(g)) => assert!(g.is_unspecified()),
             other @ (Action::Forward { .. } | Action::Drop(_)) => {
                 panic!("expected ForeignReplyGiaddr, got {other:?}")
@@ -683,7 +734,7 @@ mod tests {
     #[test]
     fn a_malformed_server_packet_is_dropped() {
         assert_eq!(
-            forward_server(&[9, 9, 9], SERVER, LEG, SERVER),
+            forward_server(&[9, 9, 9], SERVER, LEG, SERVER, PREFIX),
             Action::Drop(DropReason::Malformed)
         );
     }
@@ -693,26 +744,43 @@ mod tests {
     #[test]
     fn an_ack_yields_the_leased_address_and_the_clients_mac() {
         assert_eq!(
-            ack_discovery(ACK),
+            ack_discovery(ACK, PREFIX),
             Some((Ipv4Addr::new(192, 168, 22, 150), CHADDR))
         );
     }
 
+    /// A copy of the NAK with a `yiaddr` planted: the raw capture's own `yiaddr` is already
+    /// 0.0.0.0, so without this the message-type gate this test's name claims to cover is never
+    /// reached — `an_ack_with_no_yiaddr_does_not_register` would have made it pass regardless
+    /// (fold-in, opus review). Message type 6 (DHCPNAK) is still what actually refuses it.
     #[test]
     fn a_nak_never_registers() {
-        assert_eq!(ack_discovery(NAK), None);
+        let mut p = Bootp::parse(NAK).unwrap();
+        p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&Ipv4Addr::new(192, 168, 22, 150).octets());
+        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
     }
 
     #[test]
     fn an_offer_never_registers_only_an_ack_does() {
-        assert_eq!(ack_discovery(OFFER), None);
+        assert_eq!(ack_discovery(OFFER, PREFIX), None);
     }
 
     #[test]
     fn an_ack_with_no_yiaddr_does_not_register() {
         let mut p = Bootp::parse(ACK).unwrap();
         p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(ack_discovery(p.as_bytes()), None);
+        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
+    }
+
+    /// Teeth (S3): the same defense in depth on `ack_discovery` — an otherwise-trusted DHCPACK
+    /// (right server, right giaddr, message type 5) whose `yiaddr` claims an address outside
+    /// this row's own `prefix` must not earn a neighbor write.
+    #[test]
+    fn an_ack_with_a_yiaddr_outside_the_prefix_does_not_register() {
+        let mut p = Bootp::parse(ACK).unwrap();
+        let outsider = Ipv4Addr::new(10, 0, 0, 9);
+        p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&outsider.octets());
+        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
     }
 
     // ---- sockets: SO_REUSEADDR on both, proven by binding both to the same port -----------

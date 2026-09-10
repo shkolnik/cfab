@@ -883,6 +883,7 @@ pub(crate) async fn run_with(
             leg: row.wl.leg_ifname(),
             leg_addr,
             dhcp_server,
+            prefix: row.wl.prefix,
         };
         tokio::spawn(crate::workload::relay::run(
             relay_row,
