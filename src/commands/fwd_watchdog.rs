@@ -714,11 +714,19 @@ fn reconcile_workload_guard(
             still_pending.push(name.clone());
             continue;
         };
+        // Ready = the uplink is identifiable, every port of it is STP-forwarding, and nothing
+        // foreign holds the kernel's one 802.1Q device for this (parent, vid). Without the last
+        // clause a row deferred for a host stanza's `<bridge>.<vid>` would be called ready on
+        // the very next tick and `install` would fail on every tick thereafter.
         let ready = match uplink::identify_declared(sys, &row.wl.uplink, row.wl.vid) {
-            Ok(up) => up
-                .ports
-                .iter()
-                .all(|port| matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _)))),
+            Ok(up) => {
+                up.ports.iter().all(|port| {
+                    matches!(uplink::stp_forwarding(sys, &up.bridge, port), Ok((true, _)))
+                }) && matches!(
+                    leg::foreign_holder(sys, &row.wl.uplink, row.wl.vid, &row.wl.leg_ifname()),
+                    Ok(None)
+                )
+            }
             Err(_) => false,
         };
         if ready {
@@ -1830,6 +1838,57 @@ pub(crate) mod tests {
             sys.writes_of("/run/cfab/workload-deferred").is_empty(),
             "still pending: unchanged, no rewrite"
         );
+    }
+
+    // A row deferred because a host stanza's `<bridge>.<vid>` holds the kernel's one 802.1Q
+    // device for that (parent, vid): the uplink is perfectly healthy, so the STP/identify pair
+    // alone would call it ready and `install` would fail on every tick. It waits for the device
+    // to go, then installs with no restart.
+    #[test]
+    fn the_watchdog_leaves_a_row_deferred_while_a_foreign_device_holds_its_vid() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_stdout(
+                &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+                r#"[{"ifname":"primary.3","link":"primary","linkinfo":{"info_kind":"vlan","info_data":{"id":3}}}]"#,
+            );
+        run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(!sys.ran("ip link add link primary name cfab-work-vms"));
+        assert!(!sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert!(
+            sys.writes_of("/run/cfab/workload-deferred").is_empty(),
+            "still pending: unchanged, no rewrite"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_installs_a_row_once_the_foreign_device_holding_its_vid_is_gone() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        // The operator removed `primary.3`; what is left on that parent is nothing (the leg
+        // itself does not exist yet — this tick is what builds it).
+        let mut sys = wl_healthy_sys(&view)
+            .file("/run/cfab/workload-deferred", "vms")
+            .file("/sys/class/net/primary/brif/eth0/state", "3\n")
+            .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
+            .on_stdout(
+                &["ip", "-d", "-j", "link", "show", "type", "vlan"],
+                r#"[{"ifname":"cfab-st","link":"eth9","linkinfo":{"info_kind":"vlan","info_data":{"id":100}}}]"#,
+            );
+        let report = run(&mut sys, &view, &HeldPrimaries::default()).unwrap();
+        assert!(sys.ran("ip addr replace 192.168.20.254/24 dev cfab-work-vms"));
+        assert!(
+            report
+                .restored
+                .contains(&"installed workload vms".to_string()),
+            "{:?}",
+            report.restored
+        );
+        assert_eq!(sys.writes_of("/run/cfab/workload-deferred"), vec![""]);
     }
 
     // CRITICAL (re-review): a row whose uplink was never identified at apply time has no entry
