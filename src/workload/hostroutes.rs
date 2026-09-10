@@ -729,12 +729,23 @@ impl HostRoutes {
     }
 
     /// One spelling for every fault of one condition: what went wrong, then what it costs.
+    ///
+    /// Only `Cond::Read` and `Cond::Nft` are ever handed to this function — every other
+    /// condition's cost text depends on which of several call sites raised it (an engine
+    /// refusal vs. an engine withdraw, a MAC read vs. a send), so it is computed at the call
+    /// site and passed straight to `fail_costing` instead. The other three arms are
+    /// `unreachable!()`, not prose, so a spelling that can never print never gets invented —
+    /// and a future call site that DOES route one of them through `fail()` panics under test
+    /// immediately, rather than silently adopting whatever guess is sitting here unused.
     fn fail(&mut self, name: &str, cond: Cond, why: String, out: &mut Vec<String>) {
         let cost = match cond {
-            Cond::Read | Cond::Engine => ENGINE_COST,
+            Cond::Read => ENGINE_COST,
             Cond::Nft => "the local set is unchanged",
-            Cond::Probe => "no probe sent this cycle",
-            Cond::AgeingTime => "probing at the fallback interval",
+            Cond::Engine => unreachable!("Cond::Engine's cost is per-refusal; see ask_engine"),
+            Cond::Probe => unreachable!("Cond::Probe's cost is per-fault; see maybe_probe"),
+            Cond::AgeingTime => {
+                unreachable!("Cond::AgeingTime's cost is fixed at its one call site; see maybe_probe")
+            }
         };
         self.fail_costing(name, cond, why, cost, out);
     }
