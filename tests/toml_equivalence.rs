@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use cfab::decl::Declaration;
+use cfab::derive::View;
 use cfab::model::Fabric;
 use serde_json::Value;
 
@@ -76,26 +77,51 @@ fn artifacts() -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// Run the built binary against a declaration file, as the capture did.
+/// Render one artifact for a named member, through the same library entry points the CLI
+/// dispatches to.
+///
+/// This used to spawn the binary with `--host <member>`. That flag is gone: identity is the
+/// kernel hostname and nothing else, so a binary cannot be told to be three different members
+/// from one process. Rendering a NAMED row is not an identity claim, though — it is what `gen`
+/// has always meant — so the library still does it, and `cfab_prints_exactly_what_the_library_
+/// renders` below pins the CLI plumbing this no longer covers.
+///
+/// One deliberate difference from the CLI: `check` here is the declaration report alone, where
+/// the CLI also prints `host_preflight`/`host_warnings` from the REAL machine first. Those were
+/// silently empty on the machines this test runs on (no declared bridge exists, so both loops
+/// `continue`) — which is to say the old spawning version would have failed here, for reasons
+/// having nothing to do with TOML equivalence, on any host that happened to own a bridge with a
+/// declared name. Dropping them makes what this test pins independent of the box it runs on.
 fn run(config: &std::path::Path, member: &str, argv: &[String]) -> (String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_cfab"))
-        .arg("--config")
-        .arg(config)
-        .arg("--host")
-        .arg(member)
-        .args(argv)
-        .output()
-        .expect("the cfab binary runs");
-    assert!(
-        out.status.success(),
-        "{member} {argv:?}: exit {:?}\n{}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (
-        String::from_utf8(out.stdout).expect("utf-8 stdout"),
-        String::from_utf8(out.stderr).expect("utf-8 stderr"),
-    )
+    let (fabric, _) = cfab::load_fabric_text(config).expect("the declaration loads");
+    let view = View::new(&fabric, member).expect("the member is declared");
+    render(&fabric, &view, argv)
+}
+
+fn render(fabric: &Fabric, view: &View<'_>, argv: &[String]) -> (String, String) {
+    let a: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let plain = |s: String| (s, String::new());
+    match a.as_slice() {
+        ["check"] => plain(cfab::commands::check::report(fabric, view)),
+        ["gen", "policy"] => plain(cfab::emit::policy::generate(view).expect("gen policy")),
+        ["gen", "mark"] => plain(cfab::emit::mark::generate(view).expect("gen mark")),
+        ["gen", "mark", "--backend", "iptables-legacy"] => {
+            plain(cfab::emit::ceiling_ipt::generate(view).expect("gen mark --backend"))
+        }
+        ["gen", "prefs"] => plain(cfab::derive::render_prefs(fabric)),
+        ["gen", "engine"] => {
+            plain(cfab::commands::render::engine_json(view).expect("gen engine"))
+        }
+        ["gen", "shape", dev, rest @ ..] => cfab::commands::render::shape_output(
+            view,
+            fabric,
+            dev,
+            rest.contains(&"--tc"),
+            rest.contains(&"--expect"),
+        )
+        .expect("gen shape"),
+        other => panic!("argv not mapped to a library call: {other:?}"),
+    }
 }
 
 fn fixture(member: &str, file: &str) -> String {
@@ -205,6 +231,64 @@ fn every_artifact_matches_the_shell_format_capture() {
                 panic!("{d}");
             }
         }
+    }
+}
+
+/// What `run` above stopped covering when it left the binary behind: argv parsing, the `Gen`
+/// dispatch arms, and the exact bytes `print!`/`eprintln!` put on each stream.
+///
+/// Identity is the kernel hostname now, so this does not name a member — it hands the binary a
+/// declaration in which THIS box IS a member, by copying the example and renaming one row (the
+/// name appears exactly once in the file). Then it asserts the binary's two streams equal what
+/// the library renders for the same row of the same file. No override, and the test works on any
+/// host under any hostname.
+#[test]
+fn cfab_prints_exactly_what_the_library_renders() {
+    let me = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .expect("a kernel hostname")
+        .trim()
+        .to_string();
+    let renamed_decl = example().replacen(
+        &format!("name = \"{}\"", MEMBERS[0]),
+        &format!("name = \"{me}\""),
+        1,
+    );
+    assert!(
+        renamed_decl.contains(&format!("name = \"{me}\"")),
+        "the rename must land: {} appears once in the example",
+        MEMBERS[0]
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fabric.toml");
+    std::fs::write(&path, &renamed_decl).unwrap();
+
+    for (file, argv) in artifacts() {
+        let out = Command::new(env!("CARGO_BIN_EXE_cfab"))
+            .arg("--config")
+            .arg(&path)
+            .args(&argv)
+            .output()
+            .expect("the cfab binary runs");
+        assert!(
+            out.status.success(),
+            "{file}: exit {:?}\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (want, want_err) = run(&path, &me, &argv);
+        // `check` is the one artifact whose CLI form prints live host facts before the report,
+        // so compare only the tail the library owns; every other artifact is compared whole.
+        let got = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        if file == "check.txt" {
+            assert!(
+                got.ends_with(&want),
+                "{file}: the binary's report tail differs from the library's\n--- want tail ---\n{want}\n--- got ---\n{got}"
+            );
+        } else if let Some(d) = diff(&format!("{file} (binary vs library)"), &want, &got) {
+            panic!("{d}");
+        }
+        let got_err = String::from_utf8(out.stderr).expect("utf-8 stderr");
+        assert_eq!(want_err, got_err, "{file} (stderr)");
     }
 }
 

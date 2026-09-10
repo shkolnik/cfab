@@ -357,24 +357,13 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 },
                 GenArtifact::Prefs => print!("{}", cfab::derive::render_prefs(&fabric)),
                 GenArtifact::Engine => {
-                    let tree = emit::engine::generate(&view)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&tree).map_err(Error::fatal)?
-                    )
+                    print!("{}", commands::render::engine_json(&view)?)
                 }
                 GenArtifact::Shape { dev, tc, expect } => {
-                    let d = shape_for(&view, &fabric, &dev)?;
-                    for w in &d.warnings {
-                        eprintln!("{w}");
-                    }
-                    if tc {
-                        print!("{}", d.render_tc());
-                    } else if expect {
-                        print!("{}", d.render_expect());
-                    } else {
-                        print!("{}", d.render_derive(&view));
-                    }
+                    let (out, err) =
+                        commands::render::shape_output(&view, &fabric, &dev, tc, expect)?;
+                    eprint!("{err}");
+                    print!("{out}");
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -497,34 +486,6 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
-/// The manual `gen shape` path: `[runtime] run_dir` cap files with the cluster-published cap as
-/// the absent-local fallback, and CFAB_UP_IFS as the authoritative up-set, else sysfs carrier,
-/// else assume up (never demote on missing information).
-fn shape_for<'a>(
-    view: &View<'a>,
-    fabric: &cfab::model::Fabric,
-    dev: &str,
-) -> Result<emit::shape::Derivation, Error> {
-    let mut sys = RealSys::default();
-    let measured = cfab::caps::read_cap(
-        &mut sys,
-        &cfab::cluster::Pmxcfs::new(),
-        &view.member.name,
-        &fabric.run_dir,
-        dev,
-    );
-    let up_env = std::env::var("CFAB_UP_IFS").ok();
-    let up = move |w: &str| -> bool {
-        if let Some(set) = &up_env {
-            return set.split_whitespace().any(|u| u == w);
-        }
-        match std::fs::read_to_string(format!("/sys/class/net/{w}/carrier")) {
-            Ok(s) => s.trim() == "1",
-            Err(_) => true,
-        }
-    };
-    emit::shape::derive(view, dev, measured, &up)
-}
 
 #[cfg(test)]
 mod tests {
