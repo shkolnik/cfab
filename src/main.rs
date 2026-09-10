@@ -342,6 +342,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Check => {
+            // Host facts before the report: an operator running `check` on the member is
+            // meant to meet a bridge that cannot carry the leg here, not at `up`.
+            commands::check::host_preflight(&RealSys::default(), &view)?;
             print!("{}", commands::check::report(&fabric, &view));
             Ok(ExitCode::SUCCESS)
         }

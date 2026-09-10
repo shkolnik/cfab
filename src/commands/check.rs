@@ -2,7 +2,40 @@
 //! gets, and (with `[[workload]]` rows) each row and the fabric aggregate.
 
 use crate::derive::View;
+use crate::error::{Error, Result};
 use crate::model::{Fabric, MemberKind};
+use crate::sys::Sys;
+use crate::workload::uplink;
+
+/// Host facts a `[[workload]]` row needs that the declaration cannot state, read where the
+/// member actually runs: `check` calls it before it prints, and `apply`'s pass 1 calls it
+/// again, so the refusal has one spelling and an operator meets it before `up` touches a
+/// netdev.
+///
+/// The one condition today is the uplink bridge's `vlan_filtering`: cfab's leg only receives
+/// its tag while the bridge carries that vid on itself (`bridge vlan ... self`), which a bridge
+/// that is not vlan-aware has no notion of — the leg would come up and silently see nothing.
+/// A bridge that is not there at all is NOT a refusal: that row defers (spec 5.1), on this host
+/// and at `up` alike. A present bridge whose `vlan_filtering` cannot be read is refused with the
+/// rest: cfab cannot prove the leg would work, and this is the gate that exists to say so.
+pub fn host_preflight(sys: &dyn Sys, view: &View) -> Result<()> {
+    for row in view.workload_rows() {
+        let bridge = &row.wl.uplink;
+        if !uplink::bridge_present(sys, bridge) {
+            continue;
+        }
+        let path = format!("/sys/class/net/{bridge}/bridge/vlan_filtering");
+        let vlan_aware = sys.read(&path).is_ok_and(|v| v.trim() == "1");
+        if !vlan_aware {
+            return Err(Error::fatal(format!(
+                "workload {}: bridge {bridge} is not vlan-aware (bridge-vlan-aware yes in \
+                 /etc/network/interfaces)",
+                row.wl.name
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The lines `cfab check` prints. The per-member line is the last thing an operator sees before
 /// `up` creates the netdevs, so it names every leg `up` will build — the fallback legs included:
@@ -86,6 +119,7 @@ pub fn report(fabric: &Fabric, view: &View) -> String {
 mod tests {
     use super::*;
     use crate::decl::Declaration;
+    use crate::sys::mock::MockSys;
 
     fn wl_fabric() -> Fabric {
         Fabric::from_decl(
@@ -95,6 +129,50 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    /// A vlan-aware bridge, its `vlan_filtering` off, and no bridge at all.
+    fn bridge_sys(vlan_filtering: Option<&str>) -> MockSys {
+        let mut sys = MockSys::default().file("/sys/class/net/primary/brif/eth0/state", "3\n");
+        if let Some(v) = vlan_filtering {
+            sys = sys.file("/sys/class/net/primary/bridge/vlan_filtering", v);
+        }
+        sys
+    }
+
+    #[test]
+    fn host_preflight_refuses_an_uplink_bridge_that_is_not_vlan_aware() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let want = "FATAL: workload vms: bridge primary is not vlan-aware (bridge-vlan-aware \
+                    yes in /etc/network/interfaces)";
+        assert_eq!(
+            host_preflight(&bridge_sys(Some("0\n")), &view)
+                .unwrap_err()
+                .to_string(),
+            want
+        );
+        // Present but unreadable: cfab cannot prove the leg would receive its tag, and this is
+        // the gate that exists to say so — same condition, same words.
+        assert_eq!(
+            host_preflight(&bridge_sys(None), &view)
+                .unwrap_err()
+                .to_string(),
+            want
+        );
+        host_preflight(&bridge_sys(Some("1\n")), &view).expect("vlan-aware passes");
+    }
+
+    /// An uplink that is not there yet defers (spec 5.1) — `check` on a host whose bridge is
+    /// still coming up, or on any other machine, must not refuse the declaration for it.
+    #[test]
+    fn host_preflight_passes_when_the_uplink_bridge_is_absent() {
+        let f = wl_fabric();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        host_preflight(&MockSys::default(), &view).expect("an absent bridge is a deferral");
+        // ...and a member with no workload row reads nothing at all.
+        let leaf = View::new(&f, "pve3-tb").unwrap();
+        host_preflight(&MockSys::default(), &leaf).expect("no rows, no host facts");
     }
 
     #[test]
