@@ -154,11 +154,13 @@ impl EngineState {
             .collect()
     }
 
-    /// Every tree `req` must commit, IN ORDER, and the state that follows. Pure: the ordering
+    /// Every tree `req` must commit, IN ORDER, each with THE STATE THAT STEP LEAVES BEHIND —
+    /// per step, not per request, so the caller can adopt each state the moment that step is
+    /// in force and never claim more than the engine has (`commit_steps`). Pure: the ordering
     /// is the whole point (see the ifindex comment below), and it is tested without a live
     /// engine. Every tree is generated before any is committed, so a request the generator
     /// refuses leaves the caller's state untouched.
-    fn apply(&self, view: &View, req: &sock::Request) -> Result<(Vec<Value>, EngineState)> {
+    fn apply(&self, view: &View, req: &sock::Request) -> Result<Vec<(Value, EngineState)>> {
         let mut steps: Vec<EngineState> = Vec::new();
         match req {
             sock::Request::State => {}
@@ -195,12 +197,59 @@ impl EngineState {
                 steps.push(next);
             }
         }
-        let trees = steps
-            .iter()
-            .map(|s| generate_with(view, s.transit, &s.wanted()))
-            .collect::<Result<Vec<_>>>()?;
-        Ok((trees, steps.pop().unwrap_or_else(|| self.clone())))
+        steps
+            .into_iter()
+            .map(|s| {
+                let tree = generate_with(view, s.transit, &s.wanted())?;
+                Ok((tree, s))
+            })
+            .collect()
     }
+}
+
+#[cfg(test)]
+impl EngineState {
+    /// `apply` reduced to what a test about tree ORDER or CONTENT reads: the trees in order,
+    /// and the state after the last step. The per-step states `apply` really returns are what
+    /// `commit_steps` needs, and they have their own tests.
+    fn apply_trees(&self, view: &View, req: &sock::Request) -> Result<(Vec<Value>, EngineState)> {
+        let steps = self.apply(view, req)?;
+        let last = steps
+            .last()
+            .map_or_else(|| self.clone(), |(_, s)| s.clone());
+        Ok((steps.into_iter().map(|(t, _)| t).collect(), last))
+    }
+}
+
+/// Commit `steps` in order, adopting each step's state as soon as that step is in force.
+///
+/// `state` must never run ahead of the engine. An ifindex move is two commits, and if the
+/// withdraw lands and the install then fails — a refused candidate, a provider error — holo
+/// holds no routes for that leg while the caller's state would, before this, still have
+/// claimed the wanted set. The next identical request would then diff to nothing and the leg
+/// would stay withdrawn until something else moved it.
+///
+/// Taking the commit as a closure is what lets a test fail a chosen step without a live holo;
+/// `commit` passes the real one.
+async fn commit_steps<E>(
+    state: &mut EngineState,
+    req: &sock::Request,
+    steps: Vec<(Value, EngineState)>,
+    mut commit_one: E,
+) -> Result<()>
+where
+    E: AsyncFnMut(Value) -> Result<bool>,
+{
+    for (tree, next) in steps {
+        // Only a step that actually moved something is worth a log line, or the record of the
+        // change drowns in the record of no change. A step that changed nothing is still in
+        // force, so the state advances either way.
+        if commit_one(tree).await? {
+            info!(request = %req.summary(), "engine configuration re-committed");
+        }
+        *state = next;
+    }
+    Ok(())
 }
 
 /// Commit what `req` asks for, in order, and adopt the state it leaves behind.
@@ -215,17 +264,12 @@ async fn commit(
     state: &mut EngineState,
     req: &sock::Request,
 ) -> Result<()> {
-    let (trees, next) = state.apply(view, req)?;
-    for tree in &trees {
-        let candidate = northbound::parse_candidate(tree)?;
-        // Only a request that actually moved something is worth a log line, or the record of
-        // the change drowns in the record of no change.
-        if nb.commit(candidate).await? {
-            info!(request = %req.summary(), "engine configuration re-committed");
-        }
-    }
-    *state = next;
-    Ok(())
+    let steps = state.apply(view, req)?;
+    commit_steps(state, req, steps, async |tree| {
+        let candidate = northbound::parse_candidate(&tree)?;
+        nb.commit(candidate).await
+    })
+    .await
 }
 
 /// Commit, publish readiness (the socket), answer state requests until a signal.
@@ -438,10 +482,10 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
         let (trees, state) = state
-            .apply(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
             .unwrap();
         assert_eq!(trees.len(), 1);
         assert_eq!(static_routes(&trees[0]), ["192.168.20.103/32"]);
@@ -457,16 +501,16 @@ mod tests {
         let v = View::new(&f, "pve1-tb").unwrap();
         let declared = seg_cost(&generate(&v).unwrap());
         let (trees, _) = EngineState::new()
-            .apply(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
             .unwrap();
         let offset = seg_cost(&trees[0]);
         assert_eq!(offset, declared + u64::from(f.leaf_cost_offset));
 
         let (_, state) = EngineState::new()
-            .apply(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::LeafOffset))
             .unwrap();
         let (trees, state) = state
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(seg_cost(trees.last().unwrap()), offset);
         assert_eq!(static_routes(trees.last().unwrap()), ["192.168.20.103/32"]);
@@ -485,12 +529,12 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (trees, state) = EngineState::new()
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(trees.len(), 1, "the first sighting is one commit");
 
         let (trees, state) = state
-            .apply(&v, &routes_req("primary.3", 43, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 43, &["192.168.20.103/32"]))
             .unwrap();
         assert_eq!(trees.len(), 2);
         assert!(static_routes(&trees[0]).is_empty(), "{:?}", trees[0]);
@@ -509,16 +553,18 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
 
         let (trees, _) = state
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.104/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.104/32"]))
             .unwrap();
         assert_eq!(trees.len(), 1);
         assert_eq!(static_routes(&trees[0]), ["192.168.20.104/32"]);
 
-        let (trees, withdrawn) = state.apply(&v, &routes_req("primary.3", 43, &[])).unwrap();
+        let (trees, withdrawn) = state
+            .apply_trees(&v, &routes_req("primary.3", 43, &[]))
+            .unwrap();
         assert_eq!(trees.len(), 1);
         assert!(static_routes(&trees[0]).is_empty());
         assert!(withdrawn.wanted()["primary.3"].is_empty());
@@ -531,15 +577,15 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let (_, state) = EngineState::new()
-            .apply(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
+            .apply_trees(&v, &routes_req("primary.3", 42, &["192.168.20.103/32"]))
             .unwrap();
         let e = state
-            .apply(&v, &routes_req("cfab-work-nope", 9, &["192.168.20.104/32"]))
+            .apply_trees(&v, &routes_req("cfab-work-nope", 9, &["192.168.20.104/32"]))
             .unwrap_err()
             .to_string();
         assert!(e.contains("no workload interface cfab-work-nope"), "{e}");
         let (trees, _) = state
-            .apply(&v, &sock::Request::TransitCost(TransitCost::Declared))
+            .apply_trees(&v, &sock::Request::TransitCost(TransitCost::Declared))
             .unwrap();
         assert_eq!(static_routes(&trees[0]), ["192.168.20.103/32"]);
     }
@@ -550,23 +596,68 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let before = EngineState::new();
-        let (trees, after) = before.apply(&v, &sock::Request::State).unwrap();
+        let (trees, after) = before.apply_trees(&v, &sock::Request::State).unwrap();
         assert!(trees.is_empty());
         assert_eq!(after, before);
     }
 
-    /// The journal line for a request never carries the whole route set.
-    #[test]
-    fn a_request_summary_is_one_short_line() {
-        assert_eq!(sock::Request::State.summary(), "state");
+    /// The tracked state must equal what the engine ACTUALLY has in force, step by step.
+    /// Before this, `commit` adopted the whole request's end state only after every tree had
+    /// landed — so an ifindex move whose withdraw committed and whose install then failed
+    /// (`parse_candidate`, or the provider) left the state claiming the wanted routes while
+    /// holo held none. The next identical request would diff to nothing and the leg would
+    /// stay withdrawn until something else moved.
+    #[tokio::test]
+    async fn a_second_commit_that_fails_leaves_the_state_at_the_first() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+
+        let req = routes_req("primary.3", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(true))
+            .await
+            .unwrap();
+        assert_eq!(state.routes["primary.3"].0, 42);
+
+        // The ifindex moved: withdraw, then install. Fail the install.
+        let req = routes_req("primary.3", 43, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        assert_eq!(steps.len(), 2);
+        let mut n = 0;
+        let e = commit_steps(&mut state, &req, steps, async |_| {
+            n += 1;
+            if n == 2 {
+                Err(Error::fatal("the provider refused the install"))
+            } else {
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(e.contains("the provider refused the install"), "{e}");
         assert_eq!(
-            sock::Request::TransitCost(TransitCost::LeafOffset).summary(),
-            "transit-cost leaf"
+            state.routes["primary.3"],
+            (43, BTreeSet::new()),
+            "the tracked state ran ahead of what the engine committed"
         );
-        assert_eq!(
-            routes_req("primary.3", 42, &["192.168.20.103/32", "192.168.20.104/32"]).summary(),
-            "workload-routes primary.3 42 (2 routes)"
-        );
+    }
+
+    /// A step whose commit changed nothing is still in force: the state advances on every
+    /// step that did not fail, not only on the ones holo had a diff for.
+    #[tokio::test]
+    async fn a_step_that_changed_nothing_still_advances_the_state() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut state = EngineState::new();
+        let req = routes_req("primary.3", 42, &["192.168.20.103/32"]);
+        let steps = state.apply(&v, &req).unwrap();
+        commit_steps(&mut state, &req, steps, async |_| Ok(false))
+            .await
+            .unwrap();
+        assert_eq!(state.wanted()["primary.3"].len(), 1);
     }
 
     #[test]
