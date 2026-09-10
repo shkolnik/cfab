@@ -158,6 +158,33 @@ impl Announcer {
     }
 }
 
+/// Unicast ARP *request* to one already-known VM (spec §5.2 (a), gate B): destination MAC is
+/// the VM's OWN already-learned MAC (never broadcast — refreshing N idle VMs costs N unicast
+/// frames on the wire, not N broadcasts the whole VLAN has to process), sender = this host's own
+/// `gw` identity, target = the VM's address. A host always answers an ARP request for its own
+/// address addressed directly to it (RFC 826; this is the same shape `arping <target>` sends
+/// once it already knows the MAC). The reply is the point: a frame this host SENDS is never
+/// learned from, so only the VM answering back refreshes the bridge FDB entry the beacon alone
+/// cannot touch (G0 1b measured the FDB, not the neighbor table, as what ages out at 300 s).
+pub fn unicast_probe(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    sender_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    f[0..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&src_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    // htype Ethernet, ptype IPv4, hlen 6, plen 4, op request
+    f[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
+    f[22..28].copy_from_slice(&src_mac);
+    f[28..32].copy_from_slice(&sender_ip.octets());
+    // target MAC stays zero: ignored on a request (RFC 826), same as the gratuitous frame below.
+    f[38..42].copy_from_slice(&target_ip.octets());
+    f
+}
+
 /// Gratuitous ARP *request*: sender IP == target IP == gw, broadcast destination, our MAC as
 /// sender, target MAC zero. No reply is ever sent to it and none is expected.
 ///
@@ -360,6 +387,36 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
                 192, 168, 20, 254,
             ]
+        );
+    }
+
+    /// The idle-VM probe (gate B, spec §5.2 (a)): unicast to the VM's own MAC, request op,
+    /// sender = the host's `gw` identity, target = the VM's own address — everything a
+    /// gratuitous frame is not, which is the whole point: this one is addressed, so only the
+    /// named VM has to answer it.
+    #[test]
+    fn the_unicast_probe_targets_one_vm_and_asks_for_its_own_address() {
+        let src = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x01]; // this host's leg MAC
+        let dst = [0x02, 0xcf, 0xab, 0x00, 0x00, 0x02]; // the VM's already-learned MAC
+        let gw: Ipv4Addr = "192.168.20.254".parse().unwrap();
+        let vm: Ipv4Addr = "192.168.20.103".parse().unwrap();
+        let f = unicast_probe(src, dst, gw, vm);
+        assert_eq!(&f[0..6], &dst, "unicast to the VM, never broadcast");
+        assert_eq!(&f[6..12], &src);
+        assert_eq!(&f[12..14], &[0x08, 0x06]);
+        assert_eq!(&f[20..22], &[0x00, 0x01], "op request");
+        assert_eq!(&f[22..28], &src, "sender MAC");
+        assert_eq!(
+            &f[28..32],
+            &gw.octets(),
+            "sender IP is this host's own gw identity"
+        );
+        assert_eq!(&f[32..38], &[0; 6], "target MAC zero: ignored on a request");
+        assert_eq!(&f[38..42], &vm.octets(), "target IP is the VM being probed");
+        assert_ne!(
+            f[0..6],
+            [0xff; 6],
+            "never the broadcast destination the gratuitous beacon uses"
         );
     }
 
