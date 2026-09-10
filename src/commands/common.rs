@@ -1,7 +1,7 @@
 //! Helpers shared by the imperative commands (up/down/status/daemons).
 
 use crate::derive::View;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::sys::{Sys, have_tool, run_ignore, run_ok, run_optional};
 
 /// The kernel routing table holding cfab's additive host default (spec §6). One route lives
@@ -206,6 +206,292 @@ pub fn gw_return_defaults(view: &View) -> Vec<GwReturnDefault> {
             })
         })
         .collect()
+}
+
+/// cfab's additive host default (spec §6): `default via <the gw zone's router> dev <the gw leg>
+/// src <this member's own address on that leg> table 250 proto 206`.
+///
+/// Locally originated traffic with no more specific route in main reaches it through the rules
+/// `host_default_rules` builds; everything else is untouched. That is what "additive" means
+/// here: the ifupdown default in main is never modified or removed, and with cfab gone — table
+/// 250 empty, the rules dropped — the kernel's own final `32766 from all lookup main` finds it
+/// exactly as it did before cfab ran.
+///
+/// One definition, four consumers (`up` installs it, the reconcile installs and withdraws it,
+/// `down` deletes it, `status` reads it), so the spellings cannot drift — the same reason
+/// `GwReturnDefault` next door is a type and not four `format!` sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDefault {
+    pub table: String,
+    pub via: String,
+    pub dev: String,
+    pub src: String,
+}
+
+impl HostDefault {
+    fn argv(&self, verb: &str) -> Vec<String> {
+        [
+            "ip",
+            "route",
+            verb,
+            "default",
+            "via",
+            &self.via,
+            "dev",
+            &self.dev,
+            "src",
+            &self.src,
+            "table",
+            &self.table,
+            "proto",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(
+            crate::emit::engine::CFAB_DEFAULT_PROTO.to_string(),
+        ))
+        .collect()
+    }
+
+    /// Whether table 250 already holds our default.
+    pub fn present(&self, sys: &mut dyn Sys) -> Result<bool> {
+        Ok(sys
+            .run(&["ip", "route", "show", "table", &self.table, "default"])?
+            .stdout
+            .contains(&format!("default via {}", self.via)))
+    }
+
+    /// Install it. `ip route replace` is idempotent by itself.
+    pub fn install(&self, sys: &mut dyn Sys) -> Result<()> {
+        let owned = self.argv("replace");
+        let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+        run_ok(sys, &argv)?;
+        Ok(())
+    }
+
+    /// Delete it by its exact key — prefix, via, dev, src, table and proto, never a flush of
+    /// table 250 — and say nothing when it is not there. Idempotent AND loud: a delete that
+    /// runs and fails is an error, a delete of a route that is already gone is not.
+    pub fn withdraw(&self, sys: &mut dyn Sys) -> Result<()> {
+        if !self.present(sys)? {
+            return Ok(());
+        }
+        let owned = self.argv("del");
+        let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+        run_ok(sys, &argv)?;
+        Ok(())
+    }
+}
+
+/// This member's additive host default, or `None` on a member with no gw zone (every leaf, and
+/// any host whose zones declare no `gw`) — which installs nothing at all, route or rules.
+///
+/// Table 250 holds exactly one route, so with more than one gw zone the FIRST in `[[zone]]`
+/// order owns it; the same total order `gw_rows` already publishes.
+pub fn host_default(view: &View) -> Option<HostDefault> {
+    let r = view.gw_rows().into_iter().next()?;
+    let z = view.fabric.zone(&r.zone).ok()?;
+    let gw = z.gw.as_ref()?;
+    let cidr = gw.leg_cidr(view.node());
+    Some(HostDefault {
+        table: HOST_DEFAULT_TABLE.to_string(),
+        via: gw.router.clone(),
+        dev: r.ifname,
+        src: cidr.split('/').next()?.to_string(),
+    })
+}
+
+/// One pref-2099 rule: an address of the floor device keeps its own locally originated traffic
+/// on main. Replies of an admin-sourced session (ssh from off-subnet, the Proxmox UI) would
+/// otherwise leave over the fabric gateway and read as asymmetric at a zone-based firewall.
+fn floor_rule(addr: &str) -> FabricRule {
+    FabricRule::new(
+        "2099",
+        format!("from {addr} iif lo lookup main"),
+        &["from", addr, "iif", "lo", "lookup", "main"],
+    )
+}
+
+/// The three rules the host default rides on (spec §6, ruling 4), in install order: 2099 per
+/// floor address, then 2100, then 2101. Empty on a member with no gw zone.
+///
+/// 2100 and 2101 are the wg-quick pattern: `suppress_prefixlength 0` makes the main lookup skip
+/// its own default (and only its default — every connected and more specific route still wins),
+/// and 2101 then finds ours. `iif lo` scopes both to locally originated traffic, so a VM's
+/// packet to an undeclared destination still meets the forward chain instead of taking the
+/// host's fabric default, and a leaf's reply to a VM does too.
+pub fn host_default_rules(view: &View, floor_addrs: &[String]) -> Vec<FabricRule> {
+    if host_default(view).is_none() {
+        return Vec::new();
+    }
+    let mut out: Vec<FabricRule> = floor_addrs.iter().map(|a| floor_rule(a)).collect();
+    out.push(FabricRule::new(
+        "2100",
+        "from all iif lo lookup main suppress_prefixlength 0".to_string(),
+        &[
+            "from",
+            "all",
+            "iif",
+            "lo",
+            "lookup",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ],
+    ));
+    // The needle stops before the table on purpose: `ip rule show` renders a table by its
+    // rt_tables name where one exists, so this rule reads `lookup cfab-default` on a host
+    // carrying the package's fragment and `lookup 250` on one without it. The selector alone is
+    // unique within pref 2099..2101, which cfab is the only writer of, and the `del` argv below
+    // is still the exact rule.
+    out.push(FabricRule::new(
+        "2101",
+        "from all iif lo".to_string(),
+        &["from", "all", "iif", "lo", "lookup", HOST_DEFAULT_TABLE],
+    ));
+    out
+}
+
+/// The host's own default route — the floor cfab adds to and never removes (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorDefault {
+    pub via: String,
+    /// The device it leaves by: on the homelab a host-owned bridge cfab never names, which is
+    /// why this is read from the kernel rather than derived from the declaration.
+    pub dev: String,
+}
+
+/// Route protocols that are cfab's own or its engine's, by name and by number. A default
+/// carrying one of them is never the floor: 201..206 is the engine's range plus cfab's two own
+/// ids, and 110 / `ospf` covers a host running someone else's OSPF at the conventional id.
+fn is_fabric_proto(tok: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "ospf",
+        "cfab-ospf",
+        "cfab-static",
+        "cfab-bgp",
+        "cfab-other",
+        "cfab-return",
+        "cfab-default",
+    ];
+    if NAMES.contains(&tok) {
+        return true;
+    }
+    match tok.parse::<u16>() {
+        Ok(110) => true,
+        Ok(n) => (u16::from(crate::emit::engine::PROTO_BASE)
+            ..=u16::from(crate::emit::engine::CFAB_DEFAULT_PROTO))
+            .contains(&n),
+        Err(_) => false,
+    }
+}
+
+/// The floor default in `ip route show table main default`, or `None` when every default there
+/// is one cfab or its engine installed (and when there is none at all).
+///
+/// ifupdown's `gateway` line writes `RTPROT_BOOT`, which iproute2 renders by printing no `proto`
+/// word at all; a DHCP client writes `proto dhcp`. Both are floors. A `dead linkdown` floor is
+/// still the floor — its device still carries the host's admin addresses, which is what pref
+/// 2099 is about. With more than one floor default the first line wins.
+fn parse_floor_default(stdout: &str) -> Option<FloorDefault> {
+    for line in stdout.lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        if w.first() != Some(&"default") {
+            continue;
+        }
+        let after = |key: &str| {
+            w.iter()
+                .position(|t| *t == key)
+                .and_then(|i| w.get(i + 1))
+                .map(|s| (*s).to_string())
+        };
+        if after("proto").is_some_and(|p| is_fabric_proto(&p)) {
+            continue;
+        }
+        let (Some(via), Some(dev)) = (after("via"), after("dev")) else {
+            continue;
+        };
+        return Some(FloorDefault { via, dev });
+    }
+    None
+}
+
+pub fn floor_default(sys: &mut dyn Sys) -> Result<Option<FloorDefault>> {
+    let out = sys.run(&["ip", "route", "show", "table", "main", "default"])?;
+    if !out.ok() {
+        return Err(Error::fatal(format!(
+            "cannot read this host's own default route: `ip route show table main default`              exited {} ({}) — the additive host default (table {HOST_DEFAULT_TABLE}) is not              installed without it",
+            out.status,
+            out.stderr.trim()
+        )));
+    }
+    Ok(parse_floor_default(&out.stdout))
+}
+
+/// Every IPv4 address the floor device carries, without its prefix length: one pref-2099 rule
+/// each. Empty is a real answer (a device with no address); a read that did not run is not.
+pub fn floor_addresses(sys: &mut dyn Sys, dev: &str) -> Result<Vec<String>> {
+    let out = sys.run(&["ip", "-4", "-br", "addr", "show", "dev", dev])?;
+    if !out.ok() {
+        return Err(Error::fatal(format!(
+            "cannot read the addresses of the floor device {dev}: `ip -4 -br addr show dev              {dev}` exited {} ({}) — this host's own default route names it",
+            out.status,
+            out.stderr.trim()
+        )));
+    }
+    Ok(out
+        .stdout
+        .split_whitespace()
+        .filter_map(|t| t.split_once('/'))
+        .filter(|(a, len)| a.parse::<std::net::Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok())
+        .map(|(a, _)| a.to_string())
+        .collect())
+}
+
+/// The addresses pref 2099 currently carries, read back from the kernel — what is there, never
+/// what we last wrote. Only lines of cfab's own shape count: a rule parked at the same pref by
+/// something else is neither refreshed nor deleted (prove ownership before destroy).
+fn parse_installed_floor_addresses(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter_map(|(_, rest)| {
+            let w: Vec<&str> = rest.split_whitespace().collect();
+            match w.as_slice() {
+                ["from", addr, "iif", "lo", "lookup", "main"] => Some((*addr).to_string()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+pub fn installed_floor_addresses(sys: &mut dyn Sys) -> Result<Vec<String>> {
+    Ok(parse_installed_floor_addresses(
+        &sys.run(&["ip", "rule", "show", "pref", "2099"])?.stdout,
+    ))
+}
+
+/// Bring pref 2099 level with the floor device's current addresses: add what is missing, drop
+/// what the device no longer carries. Returns one line per change, in the order it was made,
+/// for the caller's journal.
+///
+/// Level-triggered, like every other restore: an address added to the admin bridge between two
+/// ticks gets its rule on the next one without anything having to notice it appeared.
+pub fn sync_floor_rules(sys: &mut dyn Sys, wanted: &[String]) -> Result<Vec<String>> {
+    let installed = installed_floor_addresses(sys)?;
+    let mut out = Vec::new();
+    for a in wanted.iter().filter(|a| !installed.contains(a)) {
+        let r = floor_rule(a);
+        ensure_fabric_rule(sys, &r)?;
+        out.push(format!("added ip rule pref {} {}", r.pref, r.needle));
+    }
+    for a in installed.iter().filter(|a| !wanted.contains(a)) {
+        let r = floor_rule(a);
+        let del: Vec<&str> = r.add.iter().map(String::as_str).collect();
+        drop_rules(sys, &r.pref, &r.needle, &del)?;
+        out.push(format!("dropped ip rule pref {} {}", r.pref, r.needle));
+    }
+    Ok(out)
 }
 
 pub fn fabric_rule_present(sys: &mut dyn Sys, r: &FabricRule) -> Result<bool> {
@@ -803,5 +1089,276 @@ mod tests {
             "cfab-work-vms UP 10.0.0.1/24\n",
             "110.0.0.1/24"
         ));
+    }
+}
+
+#[cfg(test)]
+mod host_default_tests {
+    use super::*;
+    use crate::decl::Declaration;
+    use crate::model::Fabric;
+    use crate::sys::mock::MockSys;
+
+    fn fabric() -> Fabric {
+        Fabric::from_decl(&Declaration::parse(&crate::decl::fixtures::example()).unwrap()).unwrap()
+    }
+
+    /// The one gw zone in the example fabric is `mgmt`: router 192.168.249.254 on the migrating
+    /// leg `cfab-gw249`, so pve1-tb (node 1) sources from 192.168.249.1.
+    #[test]
+    fn the_host_default_is_the_gw_zones_leg_sourced_from_this_members_own_address() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        assert_eq!(
+            host_default(&v),
+            Some(HostDefault {
+                table: "250".to_string(),
+                via: "192.168.249.254".to_string(),
+                dev: "cfab-gw249".to_string(),
+                src: "192.168.249.1".to_string(),
+            })
+        );
+    }
+
+    /// A leaf carries no ingress leg at all, so it has no fabric gateway to prefer and installs
+    /// nothing: no route, and no rules either.
+    #[test]
+    fn a_member_with_no_gw_zone_has_no_host_default_and_no_rules() {
+        let f = fabric();
+        let v = View::new(&f, "pve3-tb").unwrap();
+        assert_eq!(host_default(&v), None);
+        assert!(host_default_rules(&v, &["192.168.10.3".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn the_host_default_argv_names_the_table_and_proto_206_both_ways() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let d = host_default(&v).unwrap();
+        for verb in ["replace", "del"] {
+            assert_eq!(
+                d.argv(verb),
+                vec![
+                    "ip",
+                    "route",
+                    verb,
+                    "default",
+                    "via",
+                    "192.168.249.254",
+                    "dev",
+                    "cfab-gw249",
+                    "src",
+                    "192.168.249.1",
+                    "table",
+                    "250",
+                    "proto",
+                    "206"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn the_rules_are_one_2099_per_floor_address_then_2100_then_2101() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let addrs = ["192.168.10.1".to_string(), "192.168.10.11".to_string()];
+        let rules = host_default_rules(&v, &addrs);
+        let prefs: Vec<&str> = rules.iter().map(|r| r.pref.as_str()).collect();
+        assert_eq!(prefs, ["2099", "2099", "2100", "2101"]);
+        assert_eq!(rules[0].needle, "from 192.168.10.1 iif lo lookup main");
+        assert_eq!(
+            rules[0].add,
+            vec!["from", "192.168.10.1", "iif", "lo", "lookup", "main"]
+        );
+        assert_eq!(rules[1].needle, "from 192.168.10.11 iif lo lookup main");
+        assert_eq!(
+            rules[2].add,
+            vec![
+                "from",
+                "all",
+                "iif",
+                "lo",
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0"
+            ]
+        );
+        assert_eq!(
+            rules[3].add,
+            vec!["from", "all", "iif", "lo", "lookup", "250"]
+        );
+    }
+
+    /// No floor default on the host means no 2099 rules — and the other two, and the 250
+    /// default, still go in: §6 is additive, and nothing was removed to make room for it.
+    #[test]
+    fn no_floor_address_leaves_2100_and_2101_installed() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let prefs: Vec<String> = host_default_rules(&v, &[])
+            .iter()
+            .map(|r| r.pref.clone())
+            .collect();
+        assert_eq!(prefs, ["2100", "2101"]);
+    }
+
+    /// `ip rule show` renders a table by its rt_tables name where one exists, so pref 2101 reads
+    /// `lookup cfab-default` on a host with the package's fragment installed and `lookup 250` on
+    /// one without it. The presence test must find the rule either way.
+    #[test]
+    fn the_2101_rule_is_found_under_both_renderings_of_table_250() {
+        let f = fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let r = host_default_rules(&v, &[]).pop().unwrap();
+        assert_eq!(r.pref, "2101");
+        for shown in [
+            "2101:\tfrom all iif lo lookup 250\n",
+            "2101:\tfrom all iif lo lookup cfab-default\n",
+        ] {
+            let mut sys =
+                MockSys::default().on_stdout(&["ip", "rule", "show", "pref", "2101"], shown);
+            assert!(
+                fabric_rule_present(&mut sys, &r).unwrap(),
+                "not found in {shown:?}"
+            );
+        }
+        let mut empty = MockSys::default().on_stdout(&["ip", "rule", "show", "pref", "2101"], "");
+        assert!(!fabric_rule_present(&mut empty, &r).unwrap());
+    }
+
+    const MAIN_DEFAULTS: &str = "\
+default via 192.168.10.1 dev primary onlink
+default via 10.99.0.4 dev cfab-st proto cfab-ospf metric 20
+default via 192.168.249.254 dev cfab-gw249 proto cfab-default
+";
+
+    #[test]
+    fn the_floor_is_the_default_no_cfab_protocol_installed() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "route", "show", "table", "main", "default"],
+            MAIN_DEFAULTS,
+        );
+        assert_eq!(
+            floor_default(&mut sys).unwrap(),
+            Some(FloorDefault {
+                via: "192.168.10.1".to_string(),
+                dev: "primary".to_string(),
+            })
+        );
+    }
+
+    /// Every default is one cfab or its engine installed: there is no floor, which is a real
+    /// answer (no 2099 rules) and never "the fabric's own default is the floor".
+    #[test]
+    fn a_table_of_only_cfab_defaults_has_no_floor() {
+        let only_ours = "\
+default via 10.99.0.4 dev cfab-st proto cfab-ospf metric 20
+default via 10.99.0.4 dev cfab-st proto 201 metric 20
+default via 192.168.249.254 dev cfab-gw249 proto 205
+default via 192.168.1.1 dev eth3 proto 110
+";
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "route", "show", "table", "main", "default"],
+            only_ours,
+        );
+        assert_eq!(floor_default(&mut sys).unwrap(), None);
+    }
+
+    /// A DHCP-written default is a floor exactly as ifupdown's protoless one is.
+    #[test]
+    fn a_dhcp_default_is_a_floor() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "route", "show", "table", "main", "default"],
+            "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 100\n",
+        );
+        assert_eq!(
+            floor_default(&mut sys).unwrap().unwrap().dev,
+            "eth0".to_string()
+        );
+    }
+
+    /// Fail loud: a read of main's routes that did not run is not "this host has no floor".
+    #[test]
+    fn a_failed_read_of_mains_defaults_is_a_named_error() {
+        let mut sys = MockSys::default().on_fail(
+            &["ip", "route", "show", "table", "main", "default"],
+            2,
+            "Cannot open netlink socket",
+        );
+        let e = floor_default(&mut sys).unwrap_err().to_string();
+        assert!(e.contains("ip route show table main default"), "{e}");
+        assert!(e.contains("Cannot open netlink socket"), "{e}");
+    }
+
+    #[test]
+    fn floor_addresses_are_the_ipv4_addresses_that_device_carries() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "-4", "-br", "addr", "show", "dev", "primary"],
+            "primary          UP             192.168.10.3/24 192.168.10.60/24\n",
+        );
+        assert_eq!(
+            floor_addresses(&mut sys, "primary").unwrap(),
+            vec!["192.168.10.3".to_string(), "192.168.10.60".to_string()]
+        );
+    }
+
+    /// Only rules of cfab's own shape are read back as ours; a foreign rule parked at the same
+    /// pref is neither refreshed nor deleted.
+    #[test]
+    fn only_our_own_shape_is_read_back_from_pref_2099() {
+        let mut sys = MockSys::default().on_stdout(
+            &["ip", "rule", "show", "pref", "2099"],
+            "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
+             2099:\tfrom 172.16.0.1 lookup 42\n\
+             2099:\tfrom 192.168.10.60 iif lo lookup main\n",
+        );
+        assert_eq!(
+            installed_floor_addresses(&mut sys).unwrap(),
+            vec!["192.168.10.3".to_string(), "192.168.10.60".to_string()]
+        );
+    }
+
+    /// The refresh is level-triggered off the kernel's own readback: an address the floor device
+    /// gained gets a rule, one it lost loses its rule, and an address that is in both sets is
+    /// touched neither way.
+    #[test]
+    fn syncing_the_floor_rules_adds_the_missing_and_drops_the_stale() {
+        let mut sys2 = MockSys::default().on_stdout(
+            &["ip", "rule", "show", "pref", "2099"],
+            "2099:\tfrom 192.168.10.3 iif lo lookup main\n\
+             2099:\tfrom 192.168.10.99 iif lo lookup main\n",
+        );
+        let lines = sync_floor_rules(
+            &mut sys2,
+            &["192.168.10.3".to_string(), "192.168.10.60".to_string()],
+        )
+        .unwrap();
+        let adds: Vec<&String> = sys2
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip rule add"))
+            .collect();
+        let dels: Vec<&String> = sys2
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("ip rule del"))
+            .collect();
+        assert_eq!(
+            adds,
+            vec!["ip rule add pref 2099 from 192.168.10.60 iif lo lookup main"]
+        );
+        assert_eq!(
+            dels,
+            vec!["ip rule del pref 2099 from 192.168.10.99 iif lo lookup main"]
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "added ip rule pref 2099 from 192.168.10.60 iif lo lookup main",
+                "dropped ip rule pref 2099 from 192.168.10.99 iif lo lookup main",
+            ]
+        );
     }
 }
