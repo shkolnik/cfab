@@ -422,6 +422,16 @@ impl Workload {
     pub fn gw_cidr(&self) -> String {
         format!("{}/{}", self.gw, self.prefix.len)
     }
+
+    /// The nft set of the VMs this member currently knows on this row's leg (spec §5.2,
+    /// ruling 6), named off the leg: `cfab-work-vms-local`. Derived in one place because two
+    /// unrelated pieces of code must agree on it exactly — `emit::policy` declares the set and
+    /// writes the drop rule that reads it, and `workload::hostroutes` fills it at runtime — and
+    /// a typo in either would silently mean "no VM is local" (every fabric packet for a VM
+    /// dropped) or "the rule matches nothing".
+    pub fn local_set(&self) -> String {
+        format!("{}-local", self.leg_ifname())
+    }
 }
 
 /// One member's address on a `[[workload]]` interface it carries.

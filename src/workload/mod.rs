@@ -9,6 +9,7 @@ use crate::derive::View;
 use crate::sys::Sys;
 
 pub mod announce;
+pub mod hostroutes;
 pub mod leg;
 pub mod neigh;
 pub mod uplink;
