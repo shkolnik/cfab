@@ -94,8 +94,19 @@ mod workload_lifecycle {
             count("ip rule del pref 2000 from 10.99.0.0/16 to 192.168.20.0/24 lookup main"),
             1
         );
-        assert_eq!(count("ip link del cfab-work-vms"), 0);
-        assert_eq!(count("ip link set cfab-work-vms down"), 0);
+        assert_eq!(
+            count("ip link add link primary name cfab-work-vms"),
+            1,
+            "apply built it once; the watchdog found it present"
+        );
+        assert_eq!(count("bridge vlan add dev primary vid 3 self"), 1);
+        assert_eq!(
+            count("ip link del cfab-work-vms"),
+            1,
+            "down removes the leg cfab built"
+        );
+        assert_eq!(count("bridge vlan del dev primary vid 3 self"), 1);
+        assert_eq!(count("ip link del primary"), 0, "never the host's bridge");
         let down_at = calls
             .iter()
             .position(|c| c.contains("nft delete table bridge cfab"))
