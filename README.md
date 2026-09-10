@@ -226,7 +226,8 @@ mask — `prefix`'s mask is applied to both); a member address without the prefi
 row; an empty `allow`; an `allow` naming an unknown zone; a `vid` outside 2–4094 (1 is the bridge's
 untagged default; 0 and 4095 are reserved); a derived leg name colliding with a declared wire, a
 declared segment, or a cfab-generated bond/identity interface; two `[[workload]]` rows sharing a
-name, or whose names cut to the same 15-byte leg; a workload name that is also a zone name (workload and zone names
+name, whose names cut to the same 15-byte leg, or declaring the same `uplink` and `vid` (one leg
+per bridge and vid); a workload name that is also a zone name (workload and zone names
 share one vocabulary); a workload `prefix` overlapping a zone's own `10.<id>.0.0/16` block; a
 workload row no member carries; a member declaring the same workload row twice; a member workload
 naming an unknown row; `span = "host"` (phase 2, not built yet — omit `span` or write `"switch"`);

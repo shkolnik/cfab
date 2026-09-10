@@ -947,6 +947,7 @@ impl Fabric {
         // ---- workloads ----
         let mut seen = BTreeSet::new();
         let mut seen_legs: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen_vlans: BTreeMap<(String, u16), String> = BTreeMap::new();
         for wl in &self.workloads {
             let leg = wl.leg_ifname();
             if self.zone(&wl.name).is_ok() {
@@ -969,6 +970,17 @@ impl Fabric {
                     "workload {}: leg '{leg}' is also used by workload {other} \
                      ({LEG_PREFIX}<name>, cut to {IFNAME_MAX} bytes)",
                     wl.name
+                )));
+            }
+            // cfab creates the vlan device, and a bridge carries one device per vid: two rows
+            // on the same (uplink, vid) are two rows trying to create the same interface. The
+            // second `ip link add` would fail at `up` with a raw RTNETLINK error, on every
+            // member, after the first row was already applied.
+            if let Some(other) = seen_vlans.insert((wl.uplink.clone(), wl.vid), wl.name.clone()) {
+                return Err(Error::config(format!(
+                    "workload {}: uplink '{}' vid {} is also used by workload {other} (one leg \
+                     per bridge and vid)",
+                    wl.name, wl.uplink, wl.vid
                 )));
             }
             // Every bond ifname that fans out into per-domain ports (a universal/fallback
@@ -2103,6 +2115,30 @@ mod tests {
             e,
             "fabric.toml: workload vmstorage-b: leg 'cfab-work-vmsto' is also used by workload \
              vmstorage-a (cfab-work-<name>, cut to 15 bytes)"
+        );
+    }
+
+    /// cfab creates the vlan device now, so two rows on the same bridge and the same vid are
+    /// two rows trying to create one interface: the second `ip link add` would fail at `up`
+    /// with a raw RTNETLINK error, on every member, after the first row was already applied.
+    /// Refuse it where every other declaration fault is caught.
+    #[test]
+    fn check_refuses_two_workload_rows_on_the_same_uplink_and_vid() {
+        let base = crate::decl::fixtures::with_workload(&crate::decl::fixtures::example()).replace(
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }]",
+            "workloads = [{ name = \"vms\", address = \"192.168.20.2/24\" }, \
+                 { name = \"vms2\", address = \"192.168.30.2/24\" }]",
+        );
+        let second = "\n[[workload]]\nname = \"vms2\"\nuplink = \"primary\"\nvid = 3\n\
+                      prefix = \"192.168.30.0/24\"\ngw = \"192.168.30.254\"\n\
+                      router = \"192.168.30.1\"\nallow = [\"storage\"]\n";
+        let e = Fabric::from_decl(&Declaration::parse(&format!("{base}{second}")).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "fabric.toml: workload vms2: uplink 'primary' vid 3 is also used by workload vms \
+             (one leg per bridge and vid)"
         );
     }
 
