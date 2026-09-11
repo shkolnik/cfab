@@ -2552,12 +2552,25 @@ mod tests {
             sh.neighbor_cap().gc_thresh3 != crate::workload::table::GC_THRESH3_DEFAULT
         })
         .await;
-        let offenders: Vec<_> = sys
+        // Both ways a process can set a sysctl, because the rule is "cfab writes no
+        // gc_thresh", not "cfab does not write this file": a `sysctl -w` fork sets it just as
+        // host-globally and would otherwise pass this test.
+        let written: Vec<_> = sys
             .writes
             .iter()
             .filter(|(p, _)| p.contains("gc_thresh"))
+            .map(|(p, _)| p.clone())
             .collect();
-        assert!(offenders.is_empty(), "{offenders:?}");
+        let forked: Vec<_> = sys
+            .calls
+            .iter()
+            .filter(|c| c.contains("gc_thresh"))
+            .cloned()
+            .collect();
+        assert!(
+            written.is_empty() && forked.is_empty(),
+            "wrote {written:?}, ran {forked:?}"
+        );
     }
 
     /// Poll `ready` until it holds or the deadline passes; the answer is whether it holds.
