@@ -2177,6 +2177,7 @@ mod tests {
         // The actor drains the first claim, clearing `dirty` — see this test's own doc.
         let taken = table
             .take_next_dirty(Instant::now())
+            .taken
             .expect("the first claim must be queued for the actor");
         assert_eq!(taken.addr, yiaddr);
         assert!(

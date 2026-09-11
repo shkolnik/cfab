@@ -308,6 +308,10 @@ pub struct FlushActor {
     /// The same, per row, for write failures. There is no backoff anywhere here — the bucket is
     /// the bound, which is what let call 10's fix close the read-failure spin for free.
     write_failing: std::collections::BTreeSet<String>,
+    /// The same, for entries dropped because their lease ran out before the actor reached them.
+    /// `MIN_LEASE` is derived so this cannot happen on a table within `Sigma C_i`, so it is
+    /// loud — and loud once per streak, because the trigger is attacker-reachable.
+    expiring: bool,
     /// When the next coherence sweep is due. Measured from the end of the last one, so a sweep
     /// that had to wait for a token cannot make the next one due the instant it finishes.
     next_sweep: Instant,
@@ -341,6 +345,7 @@ impl FlushActor {
             bucket: Bucket::new(now),
             read_failing: false,
             write_failing: std::collections::BTreeSet::new(),
+            expiring: false,
             next_sweep: now + SWEEP,
             counts: Counts::default(),
             per_row: std::collections::BTreeMap::new(),
@@ -466,15 +471,12 @@ impl FlushActor {
         // Expiry is cfab's own clock, not the kernel's: it is reaped before the read and
         // therefore even when the read fails. A row whose lease ran out must not hold its slot
         // against the cap for as long as the kernel happens to be unreadable.
-        let expired_rows = self.table.remove_expired(Instant::now().into_std());
-        let expired = expired_rows.len();
-        self.counts.expiries += expired as u64;
-        for row in &expired_rows {
-            self.per_row.entry(row.clone()).or_default().expiries += 1;
-        }
+        let mut dropped = self.table.remove_expired(Instant::now().into_std());
+        let expired = dropped.len();
 
         self.wait_and_spend(1).await;
         let Some(doc) = self.read_kernel() else {
+            self.note_expiries(&dropped);
             return Sweep::ReadFailed;
         };
 
@@ -488,12 +490,49 @@ impl FlushActor {
                 Class::Add | Class::Replace => {
                     // The verb is not decided here. The drain re-reads and classifies at write
                     // time; all the sweep says is "this one needs looking at".
-                    self.table.re_dirty(&row, addr, now_std);
+                    // A `None` here means the entry expired between this sweep's own
+                    // `remove_expired` and now, and was dropped rather than queued.
+                    dropped.extend(self.table.re_dirty(&row, addr, now_std));
                     dirtied += 1;
                 }
             }
         }
+        self.note_expiries(&dropped);
         Sweep::Diffed { dirtied, expired }
+    }
+
+    /// Credit every entry that left the table because its lease ran out, and say so **once per
+    /// streak**. Both places an entry can expire report here: the sweep's `remove_expired`, and
+    /// the drain's own take and put-back — a drop on the drain path used to be credited nowhere
+    /// at all, so `cfab_workload_neighbor_expiries` was blind to exactly the path a flood
+    /// travels and a row could vanish with no counter and no line.
+    ///
+    /// `MIN_LEASE` is derived so that an entry inside `Sigma C_i` cannot expire before the
+    /// actor reaches it, which makes this loud by construction: if it moves on the drain path,
+    /// a premise of that derivation is wrong. Once per streak, not once per entry, because the
+    /// trigger is attacker-reachable.
+    fn note_expiries(&mut self, rows: &[String]) {
+        if rows.is_empty() {
+            self.expiring = false;
+            return;
+        }
+        self.counts.expiries += rows.len() as u64;
+        for row in rows {
+            self.per_row.entry(row.clone()).or_default().expiries += 1;
+        }
+        if !self.expiring {
+            self.expiring = true;
+            self.obs.journal(&format!(
+                "cfab: dhcp neighbor actor: {} table entry/entries expired before the write;                  the workload row(s): {}",
+                rows.len(),
+                {
+                    let mut names: Vec<&str> = rows.iter().map(String::as_str).collect();
+                    names.sort_unstable();
+                    names.dedup();
+                    names.join(", ")
+                }
+            ));
+        }
     }
 
     /// Wait until the bucket holds `want` tokens, then spend one of them for the fork that is
@@ -582,9 +621,14 @@ impl FlushActor {
         let mut seen: std::collections::HashSet<(String, Ipv4Addr)> =
             std::collections::HashSet::new();
         let mut put_back: Vec<(String, Ipv4Addr)> = Vec::new();
+        // Entries the take and the put-back below DROPPED because their lease ran out. Both
+        // arms report rather than discard; `note_expiries` credits them once, at the end.
+        let mut dropped: Vec<String> = Vec::new();
         while handled < BURST - 1 {
             let now_std = Instant::now().into_std();
-            let Some(t) = self.table.take_next_dirty(now_std) else {
+            let next = self.table.take_next_dirty(now_std);
+            dropped.extend(next.expired);
+            let Some(t) = next.taken else {
                 break;
             };
             handled += 1;
@@ -650,8 +694,9 @@ impl FlushActor {
         // that upsert gave it.
         let now_std = Instant::now().into_std();
         for (row, addr) in put_back {
-            self.table.re_dirty(&row, addr, now_std);
+            dropped.extend(self.table.re_dirty(&row, addr, now_std));
         }
+        self.note_expiries(&dropped);
         Batch::Drained
     }
 }
@@ -1613,7 +1658,7 @@ mod tests {
 
         let now = Instant::now().into_std();
         let order: Vec<Ipv4Addr> =
-            std::iter::from_fn(|| t.take_next_dirty(now).map(|x| x.addr)).collect();
+            std::iter::from_fn(|| t.take_next_dirty(now).taken.map(|x| x.addr)).collect();
         assert_eq!(
             order,
             (0..N).map(addr).collect::<Vec<_>>(),
@@ -2736,6 +2781,187 @@ mod tests {
             "the admitted claim stays; the refused one never entered the table"
         );
         assert!(!sizes.contains_key("exprow"), "the expired row is gone");
+    }
+
+    /// **Expiry on the DRAIN path is counted and said.** The test above drives every expiry
+    /// through `sweep`, and `counts.expiries` was credited there and only there — so an entry
+    /// whose lease ran out while it sat in the queue left the table with **no counter and no
+    /// journal line**. Two arms did it silently: `take_next_dirty`'s, when the actor reaches an
+    /// entry late, and `re_dirty`'s, when a failed write is put back after its lease ended.
+    /// `cfab_workload_neighbor_expiries` must move on the drain, not only on the sweep: the
+    /// drain is the path a flood travels, and a row vanishing with no signal at all is the
+    /// shape of the hole `MIN_LEASE` is derived to make impossible.
+    ///
+    /// This drives `run_batch` only — never `sweep` — so a credit that comes from the sweep
+    /// cannot make it pass.
+    ///
+    /// Regression: drop the `expired` field from `NextDirty` (or stop extending `dropped` with
+    /// it) and both expiry assertions go red while every write assertion stays green.
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_that_expires_in_the_queue_is_counted_and_journaled() {
+        let t = Arc::new(NeighborTable::new());
+        let now = Instant::now().into_std();
+        t.upsert(
+            "exprow",
+            "leg-exp",
+            addr(0),
+            MAC_A,
+            now + Duration::from_secs(30),
+            &cap(10),
+            now,
+        );
+        t.upsert("liverow", "leg-live", addr(1), MAC_A, long(), &cap(10), now);
+
+        let io = MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: None,
+                woke: None,
+            }),
+        );
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        let w = writes(&calls.lock().unwrap());
+        assert_eq!(w.len(), 1, "only the live entry is written: {w:?}");
+        assert_eq!(w[0][3], addr(1).to_string());
+
+        assert_eq!(
+            a.counts.expiries, 1,
+            "the entry that expired in the queue is counted on the drain path, not only in a              sweep that may not have run yet"
+        );
+        let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
+        assert_eq!(row("exprow").expiries, 1);
+        assert_eq!(row("exprow").writes, 0);
+        assert_eq!(row("liverow").expiries, 0, "a live row is credited nothing");
+        assert_eq!(row("liverow").writes, 1);
+        assert!(
+            !t.row_sizes().contains_key("exprow"),
+            "and it left the table"
+        );
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line, and the drop is not silent: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("exprow"),
+            "the line names the workload row that lost an entry: {}",
+            lines[0]
+        );
+
+        // Once per streak, not once per batch: the trigger is attacker-reachable.
+        t.upsert(
+            "exprow",
+            "leg-exp",
+            addr(2),
+            MAC_A,
+            Instant::now().into_std() + Duration::from_secs(30),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        assert_eq!(a.counts.expiries, 2, "every drop is counted");
+        assert_eq!(
+            said.lock().unwrap().len(),
+            1,
+            "but a second drop in the same streak says nothing new"
+        );
+
+        // A batch that drops nothing ends the streak, so a later drop is loud again.
+        t.upsert(
+            "liverow",
+            "leg-live",
+            addr(3),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        t.upsert(
+            "exprow",
+            "leg-exp",
+            addr(4),
+            MAC_A,
+            Instant::now().into_std() + Duration::from_secs(30),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        assert_eq!(a.counts.expiries, 3);
+        assert_eq!(
+            said.lock().unwrap().len(),
+            2,
+            "the streak reset, so it is loud again"
+        );
+    }
+
+    /// The **other** unaccounted arm: an entry whose lease ends between the take and the
+    /// put-back. `re_dirty` drops it rather than resurrecting it (T5a), and that drop was
+    /// credited nowhere either. Reachable in production because a batch of 31 writes each
+    /// wedged to `WRITE_DEADLINE` = 2 s spans 62 s, past `MIN_LEASE`.
+    ///
+    /// **Real time, not the paused clock**: tokio's paused clock only advances when the runtime
+    /// is idle on a timer, and there is no await between the take and the put-back — the write
+    /// is a synchronous fork. So the write mock sleeps on the thread and the lease is set in
+    /// milliseconds, with a 2x margin either side of it.
+    ///
+    /// Regression: stop extending `dropped` with `re_dirty`'s return in the put-back loop. The
+    /// write-failure assertions stay green and only the expiry ones go red.
+    #[tokio::test]
+    async fn a_lease_that_ends_during_a_failed_write_is_counted_as_an_expiry() {
+        let t = Arc::new(NeighborTable::new());
+        let now = Instant::now().into_std();
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            now + Duration::from_millis(300),
+            &cap(10),
+            now,
+        );
+
+        let io = MockNeighborIo::new(|argv, _| {
+            if argv.contains(&"show") {
+                return Ok(crate::sys::Output {
+                    status: 0,
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(crate::sys::Output {
+                status: 1,
+                stdout: String::new(),
+                stderr: "RTNETLINK answers: Network is down".to_string(),
+            })
+        });
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        assert_eq!(a.counts.write_failures, 1, "the write failed");
+        assert_eq!(
+            a.counts.expiries, 1,
+            "the lease ran out before the put-back, so the entry was dropped rather than              re-queued — and that drop is counted, not silent"
+        );
+        assert_eq!(
+            a.per_row.get(ROW).copied().unwrap_or_default().expiries,
+            1,
+            "credited to the row that lost it"
+        );
+        assert_eq!(t.len(), 0, "and it is gone, not resurrected");
     }
 
     /// **`read_failures` above all (plan §4 task 5)** — the counter spec §4.5 says would have

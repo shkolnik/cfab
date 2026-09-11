@@ -220,6 +220,22 @@ pub struct Taken {
     pub mac: [u8; 6],
 }
 
+/// What one `take_next_dirty` did: the entry the actor got, if any, plus the workload rows of
+/// every entry that call **dropped** because its lease had run out.
+///
+/// The drops are returned rather than swallowed because an entry that expires in the queue is a
+/// table row leaving cfab in exactly the sense the sweep's expiries are, and the actor is the
+/// only place that can credit it: crediting expiry in the sweep alone left
+/// `cfab_workload_neighbor_expiries` blind to the drain, which is the path a flood travels.
+/// Reported and not credited here, because the table holds no counters and acquires nothing:
+/// the lock is a leaf.
+#[derive(Debug, Default)]
+pub struct NextDirty {
+    pub taken: Option<Taken>,
+    /// One name per entry dropped, so `.len()` is the count and the names are the breakdown.
+    pub expired: Vec<String>,
+}
+
 type Key = (String, Ipv4Addr);
 
 #[derive(Default)]
@@ -339,28 +355,33 @@ impl NeighborTable {
     /// - An entry whose lease ran out between take and completion is **not resurrected**;
     ///   expiry wins over the retry.
     /// - Anything else goes to the **back**, so one failing address cannot hold the queue.
-    pub fn re_dirty(&self, row: &str, addr: Ipv4Addr, now: Instant) {
+    ///
+    /// Returns the workload row when the entry was **dropped** here because its lease had run
+    /// out, so the caller can credit the expiry. See `NextDirty` for why that is reported
+    /// rather than discarded.
+    pub fn re_dirty(&self, row: &str, addr: Ipv4Addr, now: Instant) -> Option<String> {
         let key = (row.to_string(), addr);
-        let woke = {
+        let (woke, expired) = {
             let mut g = self.inner.lock().unwrap();
             let Inner { entries, queue, .. } = &mut *g;
             match entries.get_mut(&key) {
-                None => false,
+                None => (false, None),
                 Some(e) if e.expires_at <= now => {
                     entries.remove(&key);
-                    false
+                    (false, Some(key.0.clone()))
                 }
-                Some(e) if e.dirty => false,
+                Some(e) if e.dirty => (false, None),
                 Some(e) => {
                     e.dirty = true;
                     queue.push_back((key, now));
-                    true
+                    (true, None)
                 }
             }
         };
         if woke {
             self.dirty.notify_one();
         }
+        expired
     }
 
     /// Sleep until something is dirty. The actor's only idle path: a quiet host runs no timer
@@ -383,7 +404,9 @@ impl NeighborTable {
     /// late is exactly the case `MIN_LEASE` bounds and never the case where a stale claim
     /// should still be installed. Stale queue keys (an entry removed while queued) are walked
     /// past.
-    pub fn take_next_dirty(&self, now: Instant) -> Option<Taken> {
+    /// Entries dropped on the way are **reported**, not discarded (see `NextDirty`).
+    pub fn take_next_dirty(&self, now: Instant) -> NextDirty {
+        let mut out = NextDirty::default();
         let mut g = self.inner.lock().unwrap();
         let Inner { entries, queue, .. } = &mut *g;
         while let Some((key, _enqueued_at)) = queue.pop_front() {
@@ -394,19 +417,20 @@ impl NeighborTable {
                 continue;
             }
             if e.expires_at <= now {
+                out.expired.push(key.0.clone());
                 entries.remove(&key);
                 continue;
             }
             e.dirty = false;
-            let taken = Taken {
+            out.taken = Some(Taken {
                 row: key.0.clone(),
                 leg: e.leg.clone(),
                 addr: key.1,
                 mac: e.mac,
-            };
-            return Some(taken);
+            });
+            return out;
         }
-        None
+        out
     }
 
     /// Drop every entry whose lease has run out, freeing its slot against the cap. Nothing in
@@ -569,12 +593,13 @@ mod tests {
 
         let taken = t
             .take_next_dirty(Instant::now())
+            .taken
             .expect("one entry to write");
         assert_eq!(taken.mac, MAC_B, "the LAST claim is the one written");
         assert_eq!(taken.addr, addr(1));
         assert_eq!(taken.leg, LEG, "the entry carries the leg the write needs");
         assert!(
-            t.take_next_dirty(Instant::now()).is_none(),
+            t.take_next_dirty(Instant::now()).taken.is_none(),
             "two claims for one address are one write, not two"
         );
     }
@@ -631,7 +656,9 @@ mod tests {
         let t = NeighborTable::new();
         t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
         assert!(
-            t.take_next_dirty(t0 + Duration::from_secs(31)).is_none(),
+            t.take_next_dirty(t0 + Duration::from_secs(31))
+                .taken
+                .is_none(),
             "an entry that expired in the queue is dropped at take, not written"
         );
         assert_eq!(t.len(), 0, "and it frees its slot against the cap");
@@ -674,7 +701,7 @@ mod tests {
 
         let t = NeighborTable::new();
         t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
-        let taken = t.take_next_dirty(t0).expect("taken while still live");
+        let taken = t.take_next_dirty(t0).taken.expect("taken while still live");
         assert_eq!(taken.addr, addr(1));
         assert_eq!(
             t.entry(ROW, addr(1)).unwrap().expires_at,
@@ -689,7 +716,10 @@ mod tests {
 
         let t = NeighborTable::new();
         t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
-        assert!(t.take_next_dirty(t0).is_some(), "taken while still live");
+        assert!(
+            t.take_next_dirty(t0).taken.is_some(),
+            "taken while still live"
+        );
         t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(1));
         assert!(t.entry(ROW, addr(1)).unwrap().dirty, "it went back on");
         assert_eq!(
@@ -1051,10 +1081,34 @@ mod tests {
             &cap(10),
             t0,
         );
-        assert!(t.take_next_dirty(t0).is_some());
-        t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(61));
+        assert!(t.take_next_dirty(t0).taken.is_some());
+        assert_eq!(
+            t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(61)),
+            Some(ROW.to_string()),
+            "and the drop is REPORTED, not swallowed: the actor credits the expiry off this              return value, so a silent drop here is a row leaving the table with no counter              and no journal line"
+        );
         assert_eq!(t.len(), 0, "expiry wins over the retry");
-        assert!(t.take_next_dirty(t0 + Duration::from_secs(61)).is_none());
+        assert!(
+            t.take_next_dirty(t0 + Duration::from_secs(61))
+                .taken
+                .is_none()
+        );
+
+        // And the report is not "every put-back": a live entry going back reports nothing, or
+        // the counter measures retries instead of expiries.
+        let t = NeighborTable::new();
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            t0 + Duration::from_secs(60),
+            &cap(10),
+            t0,
+        );
+        assert!(t.take_next_dirty(t0).taken.is_some());
+        assert_eq!(t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(1)), None);
+        assert_eq!(t.len(), 1);
     }
 
     /// `re_dirty` on an entry an upsert already re-queued adds no second key — the same
@@ -1065,7 +1119,7 @@ mod tests {
         let t0 = Instant::now();
         let exp = t0 + Duration::from_secs(600);
         t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10), t0);
-        assert!(t.take_next_dirty(t0).is_some());
+        assert!(t.take_next_dirty(t0).taken.is_some());
         t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10), t0);
         assert_eq!(t.queued_len(), 1);
         t.re_dirty(ROW, addr(1), t0);
