@@ -333,6 +333,9 @@ pub struct FlushActor {
     /// trigger is attacker-reachable. **Per row, not host-wide, for the same reason
     /// `write_failing` is:** one row in a continuous streak must not swallow another row's first
     /// line, which is the whole signal that a second row started losing entries.
+    /// **Only the KEYING is shared. `write_failing` clears on a completed write because that is
+    /// positive evidence about that row; nothing on the expiry path carries equivalent news, and
+    /// copying its clear-on-success shape here is exactly the defect that failed twice.**
     ///
     /// Maps row -> the time its line was last journaled. A time window, not a streak flag or a
     /// set cleared on absence: see `EXPIRY_LOG_WINDOW` for why every absence-based shape tried
@@ -3227,7 +3230,8 @@ mod tests {
             lines[0]
         );
 
-        // Once per streak, not once per batch: the trigger is attacker-reachable.
+        // Once per row per `EXPIRY_LOG_WINDOW`, not once per batch: the trigger is
+        // attacker-reachable. Nothing here infers that a row recovered.
         t.upsert(
             "exprow",
             "leg-exp",
@@ -3243,20 +3247,13 @@ mod tests {
         assert_eq!(
             said.lock().unwrap().len(),
             1,
-            "but a second drop in the same streak says nothing new"
+            "a second drop 31 s later is INSIDE the 60 s window, so it says nothing new"
         );
 
-        // A batch that drops nothing ends the streak, so a later drop is loud again.
-        t.upsert(
-            "liverow",
-            "leg-live",
-            addr(3),
-            MAC_A,
-            long(),
-            &cap(10),
-            Instant::now().into_std(),
-        );
-        assert_eq!(a.run_batch().await, Batch::Drained);
+        // 31 s further on the row's last line is 62 s old, so the window has elapsed and the
+        // line is due again. An ongoing incident re-reports rather than going silent forever --
+        // the defect revision 3 had. NOTE: nothing ends a "streak" any more; an empty pass is
+        // not evidence about any row, which is exactly the inference the window deleted.
         t.upsert(
             "exprow",
             "leg-exp",
@@ -3272,7 +3269,37 @@ mod tests {
         assert_eq!(
             said.lock().unwrap().len(),
             2,
-            "the streak reset, so it is loud again"
+            "the window elapsed (62 s since the row's last line), so it is loud again"
+        );
+    }
+
+    /// The window rule is `>=`, so a recurrence at EXACTLY `EXPIRY_LOG_WINDOW` is due, not
+    /// suppressed. Pins the boundary the other tests clear by a second.
+    ///
+    /// Regression: weaken `>=` to `>` in `note_expiries` and this goes red at one line.
+    #[tokio::test(start_paused = true)]
+    async fn a_recurrence_at_exactly_the_window_boundary_is_journaled() {
+        let t = Arc::new(NeighborTable::new());
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(MockNeighborIo::kernel("[]")),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+                woke: None,
+            }),
+        );
+
+        let now = Instant::now();
+        a.note_expiries(&["boundary".to_string()], now);
+        assert_eq!(said.lock().unwrap().len(), 1, "first line is always due");
+
+        a.note_expiries(&["boundary".to_string()], now + EXPIRY_LOG_WINDOW);
+        assert_eq!(
+            said.lock().unwrap().len(),
+            2,
+            "exactly one window later is DUE: the rule is `>=`, not `>`"
         );
     }
 
