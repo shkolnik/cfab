@@ -2122,9 +2122,17 @@ mod tests {
     /// kernel entry the host lost re-DHCPs with the SAME address and the SAME MAC. The dedupe
     /// is deleted; every admitted claim reaches the table.
     ///
-    /// Regression: gate the upsert (or the send) on a `last_ack` slot, and the second identical
-    /// ACK is silently dropped. T1 cannot see this — it uses two different MACs, which the
-    /// dedupe passed through.
+    /// Regression: gate the upsert on a `last_ack` slot and the second identical ACK never
+    /// reaches the table. T1 cannot see this — it uses two different MACs, which the dedupe
+    /// passed through.
+    ///
+    /// **The actor's take between the two ACKs is what gives this test teeth**, and is not
+    /// incidental: without it the entry the FIRST ACK left is still present and still dirty, so
+    /// every assertion below holds whether or not the second claim reached the table at all —
+    /// the test would claim to pin R2.1 and pin nothing (spec §10's defect class). Taking the
+    /// entry clears `dirty`, so only a second claim that actually reached the table can make it
+    /// dirty again. That take is also the real sequence: the actor drains, the host loses the
+    /// kernel entry, the VM re-DHCPs with the same claim, and the write must happen again.
     #[tokio::test]
     async fn a_repeated_identical_ack_still_reaches_the_table() {
         let leg = Ipv4Addr::new(127, 88, 0, 51);
@@ -2168,6 +2176,18 @@ mod tests {
 
         let sender = std::net::UdpSocket::bind((dhcp_server, 0)).unwrap();
         sender.send_to(&ack_bytes, (leg, server_port)).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The actor drains the first claim, clearing `dirty` — see this test's own doc.
+        let taken = table
+            .take_next_dirty(Instant::now())
+            .expect("the first claim must be queued for the actor");
+        assert_eq!(taken.addr, yiaddr);
+        assert!(
+            !table.entry("test-row", yiaddr).unwrap().dirty,
+            "taking an entry clears its dirty flag"
+        );
+
         sender.send_to(&ack_bytes, (leg, server_port)).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -2181,7 +2201,11 @@ mod tests {
             .entry("test-row", yiaddr)
             .expect("the repeated claim must be in the table");
         assert_eq!(entry.mac, CHADDR);
-        assert!(entry.dirty, "an upserted entry is queued for the actor");
+        assert!(
+            entry.dirty,
+            "the repeated claim must re-queue the entry the actor had already taken — this is \
+             the assertion the take above gives teeth to"
+        );
 
         // The TRANSITIONAL half, and the reason it is 1 and not 2: `Cmd::DhcpAck` is still
         // serviced by a synchronous fork on the command loop, so the `last_ack` gate stays
