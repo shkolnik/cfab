@@ -1572,6 +1572,17 @@ mod tests {
     async fn a_min_lease_entry_survives_the_full_queue_and_is_written() {
         const SIGMA_C: u32 = 512;
         let t = Arc::new(NeighborTable::new());
+        let io = MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        // Drain the actor's one-time starting burst first, so this reproduces the STEADY-STATE
+        // worst case the spec derives `MIN_LEASE` against (spec §1.2's 533 tokens / R) rather
+        // than a cold start's one-off 32-token credit, which would understate the wait by
+        // `B / R` = 3.2 s and let a shorter, unsafe `MIN_LEASE` pass this test by accident.
+        for _ in 0..BURST {
+            a.bucket.spend(Instant::now());
+        }
+
         for i in 0..SIGMA_C - 1 {
             t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
         }
@@ -1580,10 +1591,6 @@ mod tests {
         let victim_expiry =
             Instant::now().into_std() + crate::workload::table::clamp_lease(Some(1));
         t.upsert(ROW, LEG, victim, MAC_B, victim_expiry, &cap(u32::MAX));
-
-        let io = MockNeighborIo::kernel("[]");
-        let calls = io.calls();
-        let mut a = FlushActor::new(t.clone(), Box::new(io));
 
         let started = Instant::now();
         // Matches `the_nth_entry_is_written_inside_the_stated_worst_case`'s own number; task 4
