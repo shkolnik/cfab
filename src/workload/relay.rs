@@ -1656,13 +1656,19 @@ mod tests {
     async fn a_forwarded_discover_reaches_a_real_socket_standing_in_for_the_server() {
         let leg = Ipv4Addr::new(127, 0, 0, 1);
         let dhcp_server = Ipv4Addr::new(127, 0, 0, 2);
-        let fake_server = UdpSocket::from_std(bind_server(dhcp_server, PORT).unwrap()).unwrap();
+        // The fake server binds an ephemeral port, not the real `PORT` (67): 67 is privileged
+        // and CI runs unprivileged, so binding it fails EACCES. The production forward TARGET
+        // is still asserted to be `dhcp_server:67` below (that lives in `to`, not in the socket);
+        // the send/receive here only proves the bytes are a real, sendable, re-parseable payload,
+        // which is port-agnostic — hence the ephemeral port, matching every other e2e test here.
+        let fake_server = UdpSocket::from_std(bind_server(dhcp_server, 0).unwrap()).unwrap();
+        let server_addr = fake_server.local_addr().unwrap();
 
         match forward_client(DISCOVER, leg, dhcp_server) {
             Action::Forward { to, bytes } => {
                 assert_eq!(to, SocketAddrV4::new(dhcp_server, PORT));
-                let sender = UdpSocket::from_std(bind_server(leg, PORT).unwrap()).unwrap();
-                sender.send_to(&bytes, to).await.unwrap();
+                let sender = UdpSocket::from_std(bind_server(leg, 0).unwrap()).unwrap();
+                sender.send_to(&bytes, server_addr).await.unwrap();
             }
             other => panic!("expected Forward, got {other:?}"),
         }
