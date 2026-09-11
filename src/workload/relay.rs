@@ -583,6 +583,23 @@ async fn run_with_reader(
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     reader: IfindexReader,
 ) {
+    run_with_reader_via(row, shared, cmd_tx, reader, bind_pair_with_baseline).await
+}
+
+/// The actual retry loop behind `run_with_reader`, generic over how the pair gets bound for the
+/// same reason `bind_pair_with_baseline_via` is (B2, gate C fix round 1 review: real `bind_pair`
+/// needs `CAP_NET_RAW` and a privileged port, so the call-order claim below — the baseline read
+/// happens before `shared` is ever locked — had no test at all). T15 injects a `bind` that reads
+/// the baseline itself and asserts `shared.try_lock().is_ok()` at that instant.
+async fn run_with_reader_via<B>(
+    row: RelayRow,
+    shared: Arc<Mutex<Shared>>,
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    reader: IfindexReader,
+    mut bind: B,
+) where
+    B: FnMut(&RelayRow, &IfindexReader) -> io::Result<(UdpSocket, UdpSocket, Option<u32>)>,
+{
     loop {
         // S1: which cadence retries this pass, and whether the journal line prints, depend on
         // which branch below runs. A task death (the `Ok` arm: bind succeeded, `serve` later
@@ -591,7 +608,7 @@ async fn run_with_reader(
         // not built yet, hits every pass until its precondition clears — that follows
         // `metrics::BIND_RETRY`'s 60 s cadence instead (woken early by `wait_for_leg`), and logs
         // only when the standing error actually changes.
-        let bound = match bind_pair_with_baseline(&row, &reader) {
+        let bound = match bind(&row, &reader) {
             Ok((client, server, baseline)) => {
                 shared
                     .lock()
@@ -1049,6 +1066,51 @@ mod tests {
             bind_calls.load(std::sync::atomic::Ordering::SeqCst),
             BASELINE_BIND_ATTEMPTS,
             "must have actually spent every retry, not given up early"
+        );
+    }
+
+    /// T15 (B2, gate C fix round 1 review) — the baseline is read before `shared` is ever
+    /// locked. The Ok-arm comment above claims `baseline` "was already captured... before this
+    /// lock and this `eprintln!`", and that claim had no test pinning it at all. An injected
+    /// reader asserts `shared.try_lock().is_ok()` the instant it is called; `run_with_reader_via`
+    /// calls `bind` (which reads the baseline) before it ever touches `shared` in the Ok arm, so
+    /// this must never panic. A call-order claim needs an observable proxy, not a comment.
+    #[tokio::test]
+    async fn the_baseline_is_read_before_shared_is_locked() {
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let shared_for_reader = shared.clone();
+        let reader: IfindexReader = Arc::new(move |_dev: &str| {
+            assert!(
+                shared_for_reader.try_lock().is_ok(),
+                "the baseline read must happen before run_with_reader_via ever locks `shared`"
+            );
+            Some(1)
+        });
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "test-leg".to_string(),
+            leg_addr: Ipv4Addr::new(127, 88, 0, 33),
+            dhcp_server: Ipv4Addr::new(127, 88, 0, 34),
+            prefix: PREFIX,
+        };
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+
+        // `fake_bind` needs no privileges, so `bind_pair_with_baseline_via` (already proven
+        // above to call `reader` for both the pre- and post-bind reads) stands in for the real
+        // `bind_pair_with_baseline`, which needs `CAP_NET_RAW` and a privileged port this
+        // sandbox does not grant.
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_with_reader_via(row, shared, cmd_tx, reader, |r, reader| {
+                bind_pair_with_baseline_via(r, reader, fake_bind)
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a successful bind must fall through into `serve`, not return early — if this \
+             timed out for any other reason the assertion above never had a chance to run"
         );
     }
 
