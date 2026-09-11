@@ -29,6 +29,7 @@
 //! `(yiaddr, chaddr)` so a forged flood cannot drive more than one `ip neigh replace` fork per
 //! distinct claim (S-B).
 
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
@@ -310,25 +311,66 @@ pub fn forward_server(
     }
 }
 
+/// What a server→client reply teaches this relay about a VM, or why it does not.
+/// `Discovered` and `Ignore` are `ack_discovery`'s original two outcomes (spec §5.4, call 5
+/// caveat); `Refused` is new (r7 review BL-D, r8 should-fix 6) and exists so its caller can
+/// count and journal the refusal once per streak — `ack_discovery` used to fold this case into
+/// `Ignore`'s silence, and a forged-address refusal is exactly the kind of standing attacker
+/// behavior `DropReason::OutOfPrefix`'s own once-per-streak line exists for, not a one-off worth
+/// staying silent about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// A DHCPACK worth registering: `chaddr` is a 6-byte Ethernet address and `yiaddr` is set,
+    /// inside `prefix`, and not in the anti-spoof refusal set.
+    Discovered(Ipv4Addr, [u8; 6]),
+    /// A DHCPACK whose `yiaddr` names an address `fabric_addresses` (a member or `gw`) already
+    /// holds, or the row's network/broadcast address — forged, or (INFERRED inert, §5) a peer's
+    /// own resolution of `gw` echoed back — refused rather than registered. Carries the refused
+    /// address for the journal line.
+    Refused(Ipv4Addr),
+    /// Not a DHCPACK worth registering for any other reason (malformed, a NAK, `yiaddr` unset or
+    /// outside `prefix`, no 6-byte `chaddr`). Never counted, same as `DropReason`'s own
+    /// philosophy: a stray broadcast or a probing scanner must not become a journal DoS.
+    Ignore,
+}
+
 /// Whether an already-trusted server→client reply should register a VM (spec §5.4, call 5
 /// caveat): only a DHCPACK whose `chaddr` is a 6-byte Ethernet address and whose `yiaddr` is
-/// set and inside `prefix` (S3, same defense in depth as `forward_server`'s `ciaddr` check — a
-/// spoofed ACK must not earn a neighbor write for an address outside this row's own subnet). A
-/// DHCPNAK never registers — no lease was granted. Re-parses the raw buffer rather than
-/// threading the already-parsed `Bootp` through `forward_server`, so "is this reply trustworthy
-/// enough to relay" and "does it teach us a VM's address" stay two functions a reviewer can
-/// read, and mistrust, independently.
-pub fn ack_discovery(pkt: &[u8], prefix: Ipv4Prefix) -> Option<(Ipv4Addr, [u8; 6])> {
-    let p = Bootp::parse(pkt).ok()?;
+/// set, inside `prefix` (S3, same defense in depth as `forward_server`'s `ciaddr` check — a
+/// spoofed ACK must not earn a neighbor write for an address outside this row's own subnet), and
+/// refuses `fabric_addresses ∪ {network, broadcast}` **as one predicate, evaluated in one place**
+/// (r7 review BL-D, r8 should-fix 6, r14 widened it — this is the spelling already in the tree at
+/// `model.rs:1039`/`:1190`, reused rather than re-derived): a forged ACK naming the row's directed
+/// broadcast would otherwise earn a unicast neighbor entry nothing ever ARPs to correct, and one
+/// naming `gw` or a member address would earn one for an address the fabric itself owns. Composed
+/// as a single boolean expression rather than a precomputed set the caller might build from only
+/// some of its parts, so the predicate cannot be half-applied later (§5's own warning) without
+/// visibly editing this one `if`. A DHCPNAK never registers — no lease was granted. Re-parses the
+/// raw buffer rather than threading the already-parsed `Bootp` through `forward_server`, so "is
+/// this reply trustworthy enough to relay" and "does it teach us a VM's address" stay two
+/// functions a reviewer can read, and mistrust, independently.
+pub fn ack_discovery(
+    pkt: &[u8],
+    prefix: Ipv4Prefix,
+    fabric_addresses: &BTreeSet<Ipv4Addr>,
+) -> AckOutcome {
+    let Ok(p) = Bootp::parse(pkt) else {
+        return AckOutcome::Ignore;
+    };
     if p.message_type() != Some(DHCPACK) {
-        return None;
+        return AckOutcome::Ignore;
     }
     let yiaddr = p.yiaddr();
     if yiaddr.is_unspecified() || !prefix.contains(yiaddr) {
-        return None;
+        return AckOutcome::Ignore;
     }
-    let chaddr = p.chaddr6()?;
-    Some((yiaddr, chaddr))
+    if fabric_addresses.contains(&yiaddr) || yiaddr == prefix.net || yiaddr == prefix.broadcast() {
+        return AckOutcome::Refused(yiaddr);
+    }
+    let Some(chaddr) = p.chaddr6() else {
+        return AckOutcome::Ignore;
+    };
+    AckOutcome::Discovered(yiaddr, chaddr)
 }
 
 /// One `[[workload]]` row this member runs a relay for.
@@ -344,6 +386,11 @@ pub struct RelayRow {
     /// This row's own subnet (S3): a trusted reply's `ciaddr`/`yiaddr` must fall inside it, or
     /// it is refused rather than acted on.
     pub prefix: Ipv4Prefix,
+    /// The base half of `ack_discovery`'s anti-spoof predicate: `hostroutes::fabric_addresses`
+    /// (every fabric member's own address on this row, plus `gw`), computed once when the row
+    /// is built (`supervisor/mod.rs`, which has the `View` this module does not) rather than
+    /// per packet. `ack_discovery` unions in `prefix`'s network and broadcast addresses itself.
+    pub fabric_addresses: BTreeSet<Ipv4Addr>,
 }
 
 /// Bind the client-facing socket: `0.0.0.0:<port>`, restricted to `device` when given (several
@@ -465,16 +512,17 @@ fn should_log_once(previous: Option<&str>, msg: &str) -> bool {
     previous != Some(msg)
 }
 
-/// Whether an out-of-prefix drop's journal line should print this time, and updates `logged` for
-/// next time (S-C, gate C fix round 3). Deliberately NOT built on `should_log_once`: that
-/// function's key is whatever string the caller passes it, and the old bug here was passing the
-/// drop's full message — which embeds the attacker-controlled claimed address — as that key, so
-/// two forgeries claiming different addresses compared unequal and both printed. This function's
-/// signature cannot repeat that mistake: it never receives the address, or any packet content at
-/// all, only the streak's own state — there is exactly one reason a row's own prefix can be
-/// violated (the prefix does not change mid-`serve()`), so the state degenerates to "printed
-/// yet."
-fn should_log_out_of_prefix_drop(logged: &mut bool) -> bool {
+/// Whether a fixed-reason drop's journal line should print this time, and updates `logged` for
+/// next time (S-C, gate C fix round 3; widened r7/r8 to a second caller — `ack_discovery`'s
+/// anti-spoof refusal — that is the same shape). Deliberately NOT built on `should_log_once`:
+/// that function's key is whatever string the caller passes it, and the bug this fixed (for the
+/// original out-of-prefix caller) was passing the drop's full message — which embeds the
+/// attacker-controlled claimed address — as that key, so two forgeries claiming different
+/// addresses compared unequal and both printed. This function's signature cannot repeat that
+/// mistake: it never receives the address, or any packet content at all, only the streak's own
+/// state — there is exactly one reason a row's own prefix (or its refusal set) can be violated
+/// (neither changes mid-`serve()`), so the state degenerates to "printed yet."
+fn should_log_fixed_reason_drop(logged: &mut bool) -> bool {
     if *logged {
         false
     } else {
@@ -716,6 +764,11 @@ async fn serve(
     let mut last_send_drop: Option<String> = None;
     let mut last_client_send_drop: Option<String> = None;
     let mut prefix_drop_logged = false;
+    // r7/r8: same once-per-streak reasoning as `prefix_drop_logged` above — `row.prefix` and
+    // `row.fabric_addresses` are both fixed for the life of this `serve()` call, so there is
+    // exactly one reason to log, and repeating it once for every forged packet would be a
+    // self-inflicted journal DoS.
+    let mut ack_refused_logged = false;
     // S-B: the last `(yiaddr, chaddr)` a trusted ACK earned a neighbor write for. The
     // server-facing source check is routing hygiene, not a security boundary (module doc, S-B —
     // `rp_filter = 2` is loose everywhere), so a VM on this row's own VLAN can forge a BOOTREPLY
@@ -816,21 +869,44 @@ async fn serve(
                         };
                         match forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server, row.prefix) {
                             Action::Forward { to, bytes } => {
-                                if let Some((yiaddr, chaddr)) = ack_discovery(&sbuf[..n], row.prefix) {
-                                    // S-B: skip both the write and the count when this is the
-                                    // same claim as last time (see `last_ack`'s own doc above).
-                                    if last_ack != Some((yiaddr, chaddr)) {
-                                        last_ack = Some((yiaddr, chaddr));
-                                        shared.lock().unwrap().relay_event(
-                                            &row.name, row.dhcp_server, RelayEvent::Discovered,
-                                        );
-                                        let _ = cmd_tx.send(Cmd::DhcpAck {
-                                            name: row.name.clone(),
-                                            leg: row.leg.clone(),
-                                            yiaddr,
-                                            chaddr,
-                                        });
+                                match ack_discovery(&sbuf[..n], row.prefix, &row.fabric_addresses) {
+                                    AckOutcome::Discovered(yiaddr, chaddr) => {
+                                        // S-B: skip both the write and the count when this is
+                                        // the same claim as last time (`last_ack`'s own doc
+                                        // above).
+                                        if last_ack != Some((yiaddr, chaddr)) {
+                                            last_ack = Some((yiaddr, chaddr));
+                                            shared.lock().unwrap().relay_event(
+                                                &row.name, row.dhcp_server, RelayEvent::Discovered,
+                                            );
+                                            let _ = cmd_tx.send(Cmd::DhcpAck {
+                                                name: row.name.clone(),
+                                                leg: row.leg.clone(),
+                                                yiaddr,
+                                                chaddr,
+                                            });
+                                        }
                                     }
+                                    AckOutcome::Refused(addr) => {
+                                        // r7/r8: a forged ACK naming the fabric's own gateway,
+                                        // a member address, or this row's network/broadcast
+                                        // address — refused, counted, and throttled the same
+                                        // way `OutOfPrefix` is (`should_log_fixed_reason_drop`'s
+                                        // own doc: the reason is fixed for the life of this
+                                        // `serve()` call, so once printed it stays quiet).
+                                        let msg = format!(
+                                            "dhcp reply from {} claims {addr}, which the fabric \
+                                             owns or is a network/broadcast address; refused",
+                                            row.dhcp_server
+                                        );
+                                        if should_log_fixed_reason_drop(&mut ack_refused_logged) {
+                                            eprintln!("cfab: workload {}: {msg}", row.name);
+                                        }
+                                        shared.lock().unwrap().relay_event(
+                                            &row.name, row.dhcp_server, RelayEvent::Dropped,
+                                        );
+                                    }
+                                    AckOutcome::Ignore => {}
                                 }
                                 match client.send_to(&bytes, to).await {
                                     Ok(_) => {
@@ -874,7 +950,7 @@ async fn serve(
                             // (`DropReason`'s own doc: a stray broadcast or a probing scanner
                             // must not become a self-inflicted journal DoS).
                             //
-                            // S-C: `should_log_out_of_prefix_drop` decides whether to print,
+                            // S-C: `should_log_fixed_reason_drop` decides whether to print,
                             // fed only `prefix_drop_logged` — never `msg`, which embeds `addr`.
                             // The old bug used `msg` (attacker-controlled: a forged reply
                             // chooses `addr`) as the throttle key, so alternating the claimed
@@ -889,7 +965,7 @@ async fn serve(
                                     "dhcp reply from {} claims {addr}, outside {}'s prefix; refused",
                                     row.dhcp_server, row.name
                                 );
-                                if should_log_out_of_prefix_drop(&mut prefix_drop_logged) {
+                                if should_log_fixed_reason_drop(&mut prefix_drop_logged) {
                                     eprintln!("cfab: workload {}: {msg}", row.name);
                                 }
                                 shared.lock().unwrap().relay_event(
@@ -984,6 +1060,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 27),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 28),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
 
         let (_client, _server, baseline) = bind_pair_with_baseline_via(&row, &reader, |r| {
@@ -1017,6 +1094,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 29),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 30),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let bind_calls = std::sync::atomic::AtomicU32::new(0);
 
@@ -1049,6 +1127,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 31),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 32),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let bind_calls = std::sync::atomic::AtomicU32::new(0);
 
@@ -1092,6 +1171,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 33),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 34),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
@@ -1370,8 +1450,8 @@ mod tests {
     #[test]
     fn an_ack_yields_the_leased_address_and_the_clients_mac() {
         assert_eq!(
-            ack_discovery(ACK, PREFIX),
-            Some((Ipv4Addr::new(192, 168, 22, 150), CHADDR))
+            ack_discovery(ACK, PREFIX, &BTreeSet::new()),
+            AckOutcome::Discovered(Ipv4Addr::new(192, 168, 22, 150), CHADDR)
         );
     }
 
@@ -1383,19 +1463,28 @@ mod tests {
     fn a_nak_never_registers() {
         let mut p = Bootp::parse(NAK).unwrap();
         p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&Ipv4Addr::new(192, 168, 22, 150).octets());
-        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
+        assert_eq!(
+            ack_discovery(p.as_bytes(), PREFIX, &BTreeSet::new()),
+            AckOutcome::Ignore
+        );
     }
 
     #[test]
     fn an_offer_never_registers_only_an_ack_does() {
-        assert_eq!(ack_discovery(OFFER, PREFIX), None);
+        assert_eq!(
+            ack_discovery(OFFER, PREFIX, &BTreeSet::new()),
+            AckOutcome::Ignore
+        );
     }
 
     #[test]
     fn an_ack_with_no_yiaddr_does_not_register() {
         let mut p = Bootp::parse(ACK).unwrap();
         p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
+        assert_eq!(
+            ack_discovery(p.as_bytes(), PREFIX, &BTreeSet::new()),
+            AckOutcome::Ignore
+        );
     }
 
     /// Teeth (S3): the same defense in depth on `ack_discovery` — an otherwise-trusted DHCPACK
@@ -1406,7 +1495,34 @@ mod tests {
         let mut p = Bootp::parse(ACK).unwrap();
         let outsider = Ipv4Addr::new(10, 0, 0, 9);
         p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&outsider.octets());
-        assert_eq!(ack_discovery(p.as_bytes(), PREFIX), None);
+        assert_eq!(
+            ack_discovery(p.as_bytes(), PREFIX, &BTreeSet::new()),
+            AckOutcome::Ignore
+        );
+    }
+
+    /// T-BCAST (r7 review BL-D, r8 should-fix 6, r14 widened it) — `fabric_addresses ∪
+    /// {network, broadcast}` is refused as ONE predicate, tested as one: a forged ACK naming
+    /// the prefix's network address, its broadcast address, `gw`, or a member address is each
+    /// refused. `gw` and the member address come through the `fabric_addresses` parameter;
+    /// network and broadcast come from `prefix` itself, inside `ack_discovery`. §5's own warning
+    /// is that one predicate cannot be half-applied later, which a test covering only some of
+    /// these members would invite.
+    #[test]
+    fn a_forged_ack_naming_a_fabric_owned_or_broadcast_address_is_refused() {
+        let gw = Ipv4Addr::new(192, 168, 22, 1);
+        let member = Ipv4Addr::new(192, 168, 22, 5);
+        let fabric_addresses: BTreeSet<Ipv4Addr> = [gw, member].into_iter().collect();
+
+        for forged in [PREFIX.net, PREFIX.broadcast(), gw, member] {
+            let mut p = Bootp::parse(ACK).unwrap();
+            p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&forged.octets());
+            assert_eq!(
+                ack_discovery(p.as_bytes(), PREFIX, &fabric_addresses),
+                AckOutcome::Refused(forged),
+                "yiaddr {forged} must be refused, not registered"
+            );
+        }
     }
 
     // ---- sockets: SO_REUSEADDR on both, proven by binding both to the same port -----------
@@ -1509,6 +1625,7 @@ mod tests {
             leg_addr: leg,
             dhcp_server,
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
@@ -1579,6 +1696,7 @@ mod tests {
             leg_addr,
             dhcp_server,
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -1632,6 +1750,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 23),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 24),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -1673,6 +1792,7 @@ mod tests {
             leg_addr: Ipv4Addr::new(127, 88, 0, 25),
             dhcp_server: Ipv4Addr::new(127, 88, 0, 26),
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -1725,6 +1845,7 @@ mod tests {
             leg_addr: leg,
             dhcp_server,
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
@@ -1788,6 +1909,7 @@ mod tests {
             leg_addr: leg,
             dhcp_server,
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
@@ -1836,7 +1958,7 @@ mod tests {
     /// this file proves `should_log_once`-style throttles at (a pure decision function, not by
     /// capturing the process's real stderr — which the standard test harness's own output
     /// capture intercepts before it reaches a real fd, making that approach unreliable under
-    /// plain `cargo test`): `should_log_out_of_prefix_drop`'s signature cannot even see an
+    /// plain `cargo test`): `should_log_fixed_reason_drop`'s signature cannot even see an
     /// address, so calling it twice in a row (standing in for two packets claiming different
     /// addresses — the function cannot tell the difference, which is exactly the point) must
     /// print only the first time.
@@ -1844,11 +1966,11 @@ mod tests {
     fn an_out_of_prefix_drop_throttle_ignores_the_claimed_address() {
         let mut logged = false;
         assert!(
-            should_log_out_of_prefix_drop(&mut logged),
+            should_log_fixed_reason_drop(&mut logged),
             "the first refusal in a streak must print"
         );
         assert!(
-            !should_log_out_of_prefix_drop(&mut logged),
+            !should_log_fixed_reason_drop(&mut logged),
             "a second refusal in the same streak must not print again, no matter what address \
              it claims — this function never receives the address at all"
         );
@@ -1878,6 +2000,7 @@ mod tests {
             leg_addr: leg,
             dhcp_server,
             prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();

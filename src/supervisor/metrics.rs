@@ -794,10 +794,12 @@ impl FabricCollector {
         counter_family(
             enc,
             "cfab_workload_dhcp_relay_drops",
-            "DHCP packets this row's relay declined to forward since the supervisor started, \
-             without ending the relay task (gate C fix round 2): a server-facing send that \
-             failed because dhcp_server is unreachable, or a reply whose address fell outside \
-             the row's prefix. Absent under the same condition as cfab_workload_dhcp_relayed.",
+            "DHCP packets this row's relay declined to forward, or declined to register, since \
+             the supervisor started, without ending the relay task (gate C fix round 2): a \
+             server-facing or client-facing send that failed, a reply whose address fell \
+             outside the row's prefix, or a DHCPACK naming an address the fabric itself owns \
+             or the row's network/broadcast address. Absent under the same condition as \
+             cfab_workload_dhcp_relayed.",
             &dropped,
         )
     }

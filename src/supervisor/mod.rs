@@ -223,11 +223,15 @@ pub(crate) enum RelayEvent {
     /// A relayed `DHCPACK` earned a neighbor write (posted separately as `Cmd::DhcpAck`; this is
     /// the counter half, credited when the task decides to register, not when the write lands).
     Discovered,
-    /// One packet the relay declined to forward WITHOUT ending the task (should-fixes 1 and 5):
-    /// a server-facing send that failed because `dhcp_server` is unreachable, or a reply whose
-    /// `ciaddr`/`yiaddr` falls outside the row's `prefix`. Never touches `last_error` — that
-    /// field means "the socket is unhealthy," and neither of these does (the socket is fine;
-    /// the packet was refused on its own facts).
+    /// One packet the relay declined to forward, or declined to register, WITHOUT ending the
+    /// task. Four causes: a server-facing send that failed because `dhcp_server` is unreachable
+    /// (should-fix 1); a client-facing send that failed for a reason other than the leg being
+    /// rebuilt, which the presence watch already catches (S-E, gate C fix round 3); a reply
+    /// whose `ciaddr`/`yiaddr` falls outside the row's `prefix` (should-fix 5); and a DHCPACK
+    /// whose `yiaddr` names an address the fabric itself owns or the row's network/broadcast
+    /// address (r7 review BL-D, r8 should-fix 6). Never touches `last_error` — that field means
+    /// "the socket is unhealthy," and none of these four does (the socket is fine; the packet
+    /// was refused on its own facts).
     Dropped,
 }
 
@@ -929,12 +933,18 @@ pub(crate) async fn run_with(
             );
             continue;
         };
+        // r7/r8: the base half of `ack_discovery`'s anti-spoof predicate is fixed for the row's
+        // whole life (it derives only from the declaration), so it is computed once here rather
+        // than once per packet; `ack_discovery` unions in the row's network/broadcast addresses
+        // itself.
+        let fabric_addresses = crate::workload::hostroutes::fabric_addresses(view, row.wl);
         let relay_row = crate::workload::relay::RelayRow {
             name: row.wl.name.clone(),
             leg: row.wl.leg_ifname(),
             leg_addr,
             dhcp_server,
             prefix: row.wl.prefix,
+            fabric_addresses,
         };
         tokio::spawn(crate::workload::relay::run(
             relay_row,

@@ -142,7 +142,10 @@ pub fn local_vms(
 /// row (fabric-wide, not just this member — `View::workload_rows` is this-member-only) and the
 /// anycast `gw`. Without it a peer's own resolution of the gateway
 /// would read as a VM, and this member would originate a /32 for an address every member holds.
-fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
+/// `pub(crate)`: also the base set `relay::ack_discovery`'s anti-spoof refusal is built from
+/// (r7 review BL-D, r8 should-fix 6), unioned there with the row's own network and broadcast
+/// addresses.
+pub(crate) fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
     let mut out: BTreeSet<Ipv4Addr> = view
         .fabric
         .members
