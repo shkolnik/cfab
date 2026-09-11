@@ -383,9 +383,11 @@ fn bind_pair(row: &RelayRow) -> io::Result<(UdpSocket, UdpSocket)> {
 }
 
 /// How many times `bind_pair_with_baseline` will redo the bind when the leg's identity moved
-/// during it (S-A belt-and-braces), before giving up and trusting the last attempt. Bounds a
-/// pathological flapping leg to a handful of syscalls rather than looping forever; three is
-/// already generous for a race whose window is a handful of instructions.
+/// during it (S-A belt-and-braces), before giving up and returning an error (B3, gate C fix
+/// round 3 review: the earlier code trusted the last attempt's baseline whether or not it
+/// matched, which on a flapping leg reaches the exact permanent deafness this function exists
+/// to prevent). Bounds a pathological flapping leg to a handful of syscalls rather than looping
+/// forever; three is already generous for a race whose window is a handful of instructions.
 const BASELINE_BIND_ATTEMPTS: u32 = 3;
 
 /// Bind the pair and capture the leg's ifindex baseline at the same instant (S-A, gate C fix
@@ -403,7 +405,9 @@ const BASELINE_BIND_ATTEMPTS: u32 = 3;
 /// leg moved sometime during the bind and we cannot tell whether `bind_client` resolved the name
 /// to the old device or the new one — so the sockets we just opened are untrustworthy and are
 /// dropped, and the bind is redone against whatever is current now, up to
-/// `BASELINE_BIND_ATTEMPTS` times.
+/// `BASELINE_BIND_ATTEMPTS` times. Exhausting every attempt returns an error (B3) rather than
+/// trusting whichever baseline the last attempt happened to read; `run_with_reader`'s `Err` arm
+/// throttles a journal line and retries via `wait_for_leg` the same as any other bind failure.
 fn bind_pair_with_baseline(
     row: &RelayRow,
     reader: &IfindexReader,
@@ -423,17 +427,20 @@ where
     F: FnMut(&RelayRow) -> io::Result<(UdpSocket, UdpSocket)>,
 {
     let mut pre = reader(&row.leg);
-    for attempt in 1..=BASELINE_BIND_ATTEMPTS {
+    for _ in 0..BASELINE_BIND_ATTEMPTS {
         let (client, server) = bind(row)?;
         let post = reader(&row.leg);
-        if attempt == BASELINE_BIND_ATTEMPTS || pre == post {
+        if pre == post {
             return Ok((client, server, post));
         }
         drop(client);
         drop(server);
         pre = post;
     }
-    unreachable!("loop above always returns on its last attempt")
+    Err(io::Error::other(format!(
+        "leg {} kept changing identity across {BASELINE_BIND_ATTEMPTS} bind attempts",
+        row.leg
+    )))
 }
 
 /// DHCP messages this relay forwards fit in far less; 1500 gives headroom for a heavily
@@ -1004,6 +1011,45 @@ mod tests {
 
         assert_eq!(bind_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(baseline, Some(42));
+    }
+
+    /// T14 (B3, gate C fix round 3 review) — a leg that never stops moving exhausts every
+    /// `BASELINE_BIND_ATTEMPTS` retry and the function returns an `Err`, not the last attempt's
+    /// baseline trusted on faith. The reader disagrees with itself on every single read, so no
+    /// attempt's pre/post pair can ever match. `run_with_reader`'s existing `Err` arm is what
+    /// turns this into a throttled retry via `wait_for_leg` rather than a permanently wrong
+    /// baseline glued to a socket the caller never rebinds.
+    #[tokio::test]
+    async fn bind_exhaustion_returns_an_error_not_a_guessed_baseline() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let reader: IfindexReader = Arc::new(move |_dev: &str| {
+            // Every read disagrees with the one before it, so pre != post on every attempt.
+            Some(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        });
+        let row = RelayRow {
+            name: "test-row".to_string(),
+            leg: "test-leg".to_string(),
+            leg_addr: Ipv4Addr::new(127, 88, 0, 31),
+            dhcp_server: Ipv4Addr::new(127, 88, 0, 32),
+            prefix: PREFIX,
+        };
+        let bind_calls = std::sync::atomic::AtomicU32::new(0);
+
+        let result = bind_pair_with_baseline_via(&row, &reader, |r| {
+            bind_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fake_bind(r)
+        });
+
+        assert!(
+            result.is_err(),
+            "exhausting every retry on a leg that never settles must be an error, not a \
+             trusted-on-faith Ok(..) carrying whichever baseline the last attempt happened to see"
+        );
+        assert_eq!(
+            bind_calls.load(std::sync::atomic::Ordering::SeqCst),
+            BASELINE_BIND_ATTEMPTS,
+            "must have actually spent every retry, not given up early"
+        );
     }
 
     // ---- Bootp parse, over the real captured packets --------------------------------------
