@@ -207,6 +207,11 @@ impl Bucket {
 /// implementer could read the depth, keep the guard, sleep for a full bucket and release before
 /// spending, leaving the ordering test green and DHCP forwarding stalled.
 pub trait ActorObserver: Send {
+    /// The actor woke and is starting a drain batch. The only hook here that is not about the
+    /// table lock: it exists because "a quiet host performs no periodic work" is otherwise
+    /// unobservable — an idle batch returns before it forks anything, so a polling loop in
+    /// place of the sleep costs wakeups that no fork count can see.
+    fn batch_start(&self) {}
     /// The actor is about to decide whether to wait for tokens — the wait site the batching
     /// rule created.
     fn wait_decision(&self) {}
@@ -445,6 +450,7 @@ impl FlushActor {
     /// One batch: wait for the tokens this batch intends to spend, read the kernel once, then
     /// drain in queue order.
     pub async fn run_batch(&mut self) -> Batch {
+        self.obs.batch_start();
         // Under the lock for exactly this long. The wait below is NOT.
         let depth = self.table.dirty_depth();
         if depth == 0 {
@@ -1274,6 +1280,7 @@ mod tests {
             Box::new(RecordingObserver {
                 said: said.clone(),
                 table: None,
+                woke: None,
             }),
         );
         assert_eq!(a.run_batch().await, Batch::ReadFailed);
@@ -1339,6 +1346,9 @@ mod tests {
     struct RecordingObserver {
         said: Arc<Mutex<Vec<String>>>,
         table: Option<Arc<NeighborTable>>,
+        /// Set when a test counts how often the actor woke to try a batch, which is the only
+        /// way to see idle cost that forks nothing.
+        woke: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl RecordingObserver {
@@ -1355,6 +1365,12 @@ mod tests {
     }
 
     impl ActorObserver for RecordingObserver {
+        fn batch_start(&self) {
+            self.check("the batch start");
+            if let Some(w) = &self.woke {
+                w.lock().unwrap().push("batch".to_string());
+            }
+        }
         fn wait_decision(&self) {
             self.check("the wait decision");
         }
@@ -1410,6 +1426,7 @@ mod tests {
             Box::new(RecordingObserver {
                 said: said.clone(),
                 table: Some(t.clone()),
+                woke: None,
             }),
         );
         // Two batches: the first spends the burst and the second must WAIT, which is the site
@@ -1670,6 +1687,7 @@ mod tests {
             Box::new(RecordingObserver {
                 said: said.clone(),
                 table: None,
+                woke: None,
             }),
         );
         // Ten consecutive failures for the SAME row are one journal line.
@@ -1893,15 +1911,27 @@ mod tests {
     /// periodic work" is overstated and is corrected here to its true form — a sleeping actor
     /// does no periodic work of its own, and a coherent sweep does no writes (T11a).
     ///
-    /// Regression: poll the table on a timer instead of sleeping on `wait_dirty` (e.g. replace
-    /// the `select!` in `run` with a short `sleep`), and watch the fork or wakeup count climb
-    /// with the polling rate rather than staying at one per `SWEEP`.
+    /// Two regressions, because the two halves hide from each other. **Forks:** drop the
+    /// `next_sweep` check from `step` so every iteration sweeps — the fork count goes from 4 to
+    /// the bucket's whole output. **Wakeups:** poll the table on a timer instead of sleeping on
+    /// `wait_dirty` (replace the `select!` in `run` with `sleep(100ms)`) — the fork count does
+    /// NOT move, because an idle batch returns before forking anything, which is why this test
+    /// counts batch starts as well.
     #[tokio::test(start_paused = true)]
     async fn an_idle_actor_wakes_only_for_the_sweep() {
         let t = table_with(0);
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
-        let a = FlushActor::new(t.clone(), Box::new(io));
+        let woke = Arc::new(Mutex::new(Vec::new()));
+        let a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: woke.clone(),
+                table: Some(t.clone()),
+                woke: Some(woke.clone()),
+            }),
+        );
         let h = tokio::spawn(a.run());
 
         tokio::time::sleep(SWEEP * 4 + SWEEP / 2).await;
@@ -1912,9 +1942,17 @@ mod tests {
         assert_eq!(
             calls.len(),
             4,
-            "four sweep periods, four read forks, and no other wakeup did anything: {calls:?}"
+            "four sweep periods, four read forks, and nothing else forked: {calls:?}"
         );
         assert!(calls.iter().all(|c| c.as_slice() == READ_ARGV));
+        // One batch attempt per sweep wakeup, plus the one at start. A polling loop in place
+        // of the sleep multiplies this by the polling rate and forks nothing extra at all.
+        assert!(
+            woke.lock().unwrap().len() <= 5,
+            "the actor woke {} times in four sweep periods; a sleeping actor does no periodic \
+             work of its own",
+            woke.lock().unwrap().len()
+        );
     }
 
     /// **The sweep's read spends a token like every other fork** (spec §4.2; plan §1.2). This
@@ -2074,6 +2112,7 @@ mod tests {
             Box::new(RecordingObserver {
                 said: said.clone(),
                 table: Some(t.clone()),
+                woke: None,
             }),
         );
         while a.run_batch().await != Batch::Idle {}
