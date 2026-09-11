@@ -527,8 +527,15 @@ impl FlushActor {
             seen.insert(row.as_str());
         }
         self.counts.expiries += rows.len() as u64;
-        // A row that dropped nothing this pass has ended its streak and may speak again.
-        self.expiring.retain(|row| seen.contains(row.as_str()));
+        // The streak ends only on a pass that dropped NOTHING. A row absent from THIS pass is not
+        // evidence it recovered — `dropped` is FIFO by upsert time, so drops cluster by row, and
+        // clearing on absence lets an attacker alternating two rows re-arm the line every batch:
+        // `R` = 10 a second, on demand. `write_failing` can key on the row because a completed
+        // write IS positive evidence about that row; nothing here carries the same news.
+        if seen.is_empty() {
+            self.expiring.clear();
+            return;
+        }
         let fresh: Vec<&str> = seen
             .into_iter()
             .filter(|row| !self.expiring.contains(*row))
@@ -536,13 +543,16 @@ impl FlushActor {
         if fresh.is_empty() {
             return;
         }
+        // The count and the row list must describe the SAME set, or a reader attributes every
+        // drop this pass to whichever row happened to be new.
+        let counted = rows.iter().filter(|r| fresh.contains(&r.as_str())).count();
         for row in &fresh {
             self.expiring.insert((*row).to_string());
         }
         self.obs.journal(&format!(
             "cfab: dhcp neighbor actor: {} table entry/entries expired before the write; \
              the workload row(s): {}",
-            rows.len(),
+            counted,
             fresh.join(", ")
         ));
     }
@@ -2795,6 +2805,64 @@ mod tests {
         assert!(!sizes.contains_key("exprow"), "the expired row is gone");
     }
 
+    /// **Alternating rows must not re-arm the throttle.** The per-row set fixed one row silencing
+    /// another, and broke the property the throttle exists for: clearing a row because it dropped
+    /// nothing *this pass* treats "row B's turn" as evidence that row A recovered. `dropped` is
+    /// FIFO by upsert time, so drops cluster by row and an attacker flooding A, then B, then A
+    /// gets a fresh line every pass — batches are bucket-bounded at `R`, so that is **10 lines a
+    /// second, sustained, on demand**. Spec §6 T-THROTTLE: the rate is attacker-chosen, so an
+    /// unthrottled line is a log flood on demand. The streak now ends only on a pass that dropped
+    /// nothing at all, which is positive evidence and cannot be manufactured by feeding the actor
+    /// a different row.
+    ///
+    /// Regression: clear a row from `expiring` when it is absent from a pass (`retain(|row|
+    /// seen.contains(...))`) and this goes red at the line count while every counter stays green.
+    #[tokio::test(start_paused = true)]
+    async fn alternating_rows_do_not_re_arm_the_expiry_throttle() {
+        let t = Arc::new(NeighborTable::new());
+        let io = MockNeighborIo::kernel("[]");
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+                woke: None,
+            }),
+        );
+
+        // Twenty passes, one row each, alternating: the shape a flood clustered by row produces.
+        for i in 0..20u32 {
+            let row = if i % 2 == 0 { "rowa" } else { "rowb" };
+            let leg = if i % 2 == 0 { "leg-a" } else { "leg-b" };
+            let now = Instant::now().into_std();
+            t.upsert(
+                row,
+                leg,
+                addr(i),
+                MAC_A,
+                now + Duration::from_secs(30),
+                &cap(10),
+                now,
+            );
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert_eq!(a.run_batch().await, Batch::Drained);
+        }
+
+        assert_eq!(a.counts.expiries, 20, "every drop is still counted");
+        let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
+        assert_eq!(row("rowa").expiries, 10);
+        assert_eq!(row("rowb").expiries, 10);
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one line per row that started, not one per pass: {lines:?}"
+        );
+    }
+
     /// **One row's expiry streak must not silence another row's FIRST line.** `write_failing`
     /// keys its throttle per row; this one was host-wide, so a row dropping entries continuously
     /// held the flag set and a second row's first-ever drop produced **no line at all** — not
@@ -2818,7 +2886,7 @@ mod tests {
             Box::new(io),
             Box::new(RecordingObserver {
                 said: said.clone(),
-                table: None,
+                table: Some(t.clone()),
                 woke: None,
             }),
         );
@@ -2857,6 +2925,26 @@ mod tests {
             "rowa is mid-streak and does not repeat itself: {}",
             lines[1]
         );
+        assert!(
+            lines[1].starts_with("cfab: dhcp neighbor actor: 1 table"),
+            "the count describes the rows the line NAMES, not every drop in the pass — \
+             rowa lost one too and is not on this line: {}",
+            lines[1]
+        );
+
+        // Two drops of ONE row in ONE pass count twice: a flood on a single row is the dominant
+        // case, and counting rows instead of drops would under-report it by up to `C`.
+        let now = Instant::now().into_std();
+        t.upsert("rowb", "leg-b", addr(3), MAC_A, soon(now), &cap(10), now);
+        t.upsert("rowb", "leg-b", addr(4), MAC_A, soon(now), &cap(10), now);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        assert_eq!(
+            a.per_row.get("rowb").copied().unwrap_or_default().expiries,
+            3,
+            "two drops in one pass, counted twice"
+        );
+        assert_eq!(a.counts.expiries, 5);
     }
 
     /// **Expiry on the DRAIN path is counted and said.** The test above drives every expiry
