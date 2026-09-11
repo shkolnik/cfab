@@ -804,6 +804,140 @@ impl FabricCollector {
         )
     }
 
+    /// Gate C's DHCP neighbor write pipeline (spec §4.5): per-row counters, sourced from
+    /// `components.neighbor_rows` and joined against `ws` by name exactly the way the DHCP
+    /// relay series above are, plus the flush actor's host-wide state from
+    /// `components.neighbor`. **Nothing here acts on anything it reports**: the claimed MAC and
+    /// address are attacker-controlled, so an "abnormal activity ⇒ throttle it" rule built on
+    /// one of these numbers would be an attack primitive — forge a legitimate VM's MAC to get
+    /// that VM throttled.
+    fn neighbor_pipeline(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
+        let ws = &self.snap.model.workloads;
+        let mut table_size: Vec<(Labels, i64)> = Vec::new();
+        let mut writes: Vec<(Labels, u64)> = Vec::new();
+        let mut write_failures: Vec<(Labels, u64)> = Vec::new();
+        let mut read_failures: Vec<(Labels, u64)> = Vec::new();
+        let mut cap_refusals: Vec<(Labels, u64)> = Vec::new();
+        let mut expiries: Vec<(Labels, u64)> = Vec::new();
+        let mut skips: Vec<(Labels, u64)> = Vec::new();
+        if let Some(c) = &self.snap.model.components {
+            for w in ws {
+                let Some(r) = c.neighbor_rows.iter().find(|r| r.name == w.name) else {
+                    continue;
+                };
+                let l = lbl(&[("name", w.name.as_str())]);
+                table_size.push((l.clone(), i64::from(r.table_size)));
+                writes.push((l.clone(), r.writes));
+                write_failures.push((l.clone(), r.write_failures));
+                read_failures.push((l.clone(), r.read_failures));
+                cap_refusals.push((l.clone(), r.cap_refusals));
+                expiries.push((l.clone(), r.expiries));
+                skips.push((l, r.skips));
+            }
+        }
+        family(
+            enc,
+            "cfab_workload_neighbor_table_size",
+            "Addresses this row currently holds in cfab's own DHCP neighbor write table (gate \
+             C spec §4.5) — never the kernel's own table, which this pipeline only ever \
+             restores absence in. Absent for a row the flush actor has not touched yet.",
+            &table_size,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_writes",
+            "Neighbor entries this row's claims have written to the kernel since the \
+             supervisor started (gate C spec §4.1.1): the kernel did not already hold this \
+             address, or held it with no lladdr. Absent under the same condition as \
+             cfab_workload_neighbor_table_size.",
+            &writes,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_write_failures",
+            "Writes this row attempted that the kernel refused, since the supervisor started; \
+             the entry is re-queued and retried on a later batch, with no backoff (gate C spec \
+             §4.1.1). A steady trickle here is EEXIST races the actor's own re-dirty resolves \
+             on its own; a rising rate is a real fault. Absent under the same condition as \
+             cfab_workload_neighbor_table_size.",
+            &write_failures,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_read_failures",
+            "How many times the flush actor's own pre-drain kernel read has failed since the \
+             supervisor started (gate C spec §4.5) — host-wide (one read drains every row's \
+             dirty entries at once) and repeated here under every row on purpose: a coherent \
+             host and a host that silently wrote nothing because its reads keep failing look \
+             identical from every OTHER counter in this row. Absent under the same condition \
+             as cfab_workload_neighbor_table_size.",
+            &read_failures,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_cap_refusals",
+            "Claims this row has had refused since the supervisor started because the row was \
+             already at its gate C §4.1.4 cap. Nothing here acts on this number: the claimed \
+             address is attacker-controlled, so throttling on it would let a forged claim get a \
+             real VM throttled. Absent under the same condition as \
+             cfab_workload_neighbor_table_size.",
+            &cap_refusals,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_expiries",
+            "Rows this member's own DHCP neighbor table has dropped because their lease ran \
+             out, since the supervisor started (gate C spec §4.1.3); cfab deletes no kernel \
+             entry when this moves, the kernel keeps whatever it holds. Absent under the same \
+             condition as cfab_workload_neighbor_table_size.",
+            &expiries,
+        )?;
+        counter_family(
+            enc,
+            "cfab_workload_neighbor_skips",
+            "Claims this row's flush actor found the kernel already held a valid entry for, so \
+             nothing was written — the healthy steady state under gate C spec §4.1.1 (R2.2: a \
+             MAC the kernel learned beats a DHCP claim). Absent under the same condition as \
+             cfab_workload_neighbor_table_size.",
+            &skips,
+        )?;
+
+        let host = self
+            .snap
+            .model
+            .components
+            .as_ref()
+            .and_then(|c| c.neighbor.as_ref());
+        if let Some(h) = host {
+            scalar(
+                enc,
+                "cfab_neighbor_dirty_depth",
+                "Entries waiting for the flush actor right now, host-wide (gate C spec §4.5): \
+                 one queue for the whole member, never one per row. Absent while no relay row \
+                 runs an actor.",
+                i64::try_from(h.dirty_depth).unwrap_or(i64::MAX),
+            )?;
+            scalar(
+                enc,
+                "cfab_neighbor_token_level",
+                "Tokens the host-wide fork bucket holds right now, out of its burst (gate C \
+                 spec §4.2.2). Absent under the same condition as cfab_neighbor_dirty_depth.",
+                i64::from(h.token_level),
+            )?;
+            if let Some(age) = h.oldest_dirty_age_seconds {
+                scalar(
+                    enc,
+                    "cfab_neighbor_oldest_dirty_age_seconds",
+                    "Seconds since the oldest entry still waiting for the flush actor was \
+                     queued (gate C spec §4.5): observability, not fairness — fairness is queue \
+                     position, decided by FIFO order alone. Absent while nothing is dirty.",
+                    age,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn components(&self, enc: &mut DescriptorEncoder<'_>) -> Res {
         let Some(c) = &self.snap.model.components else {
             return Ok(());
@@ -973,6 +1107,7 @@ impl Collector for FabricCollector {
         self.ingress(&mut enc)?;
         self.host_default(&mut enc)?;
         self.workloads(&mut enc)?;
+        self.neighbor_pipeline(&mut enc)?;
         self.components(&mut enc)?;
         self.telemetry(&mut enc)
     }
@@ -1194,8 +1329,8 @@ mod tests {
     use crate::model::MemberKind;
     use crate::supervisor::child::{ExitCause, State as ChildState};
     use crate::supervisor::report::{
-        Component, Components, ProbedPort, RelayInfo, SupervisorInfo, WatchdogInfo,
-        WorkloadAnnounce,
+        Component, Components, NeighborActorInfo, NeighborRowInfo, ProbedPort, RelayInfo,
+        SupervisorInfo, WatchdogInfo, WorkloadAnnounce,
     };
 
     fn component(
@@ -1261,8 +1396,21 @@ mod tests {
             }],
             relays: Vec::new(),
             metrics_error: None,
-            neighbor_rows: Vec::new(),
-            neighbor: None,
+            neighbor_rows: vec![NeighborRowInfo {
+                name: "vms".to_string(),
+                table_size: 12,
+                writes: 9,
+                write_failures: 2,
+                read_failures: 1,
+                cap_refusals: 3,
+                expiries: 4,
+                skips: 20,
+            }],
+            neighbor: Some(NeighborActorInfo {
+                dirty_depth: 5,
+                oldest_dirty_age_seconds: Some(1.5),
+                token_level: 27,
+            }),
         }
     }
 
@@ -1909,6 +2057,16 @@ mod tests {
             "cfab_workload_dhcp_relayed_total",
             "cfab_workload_vms_discovered_total",
             "cfab_workload_dhcp_relay_drops_total",
+            "cfab_workload_neighbor_table_size",
+            "cfab_workload_neighbor_writes_total",
+            "cfab_workload_neighbor_write_failures_total",
+            "cfab_workload_neighbor_read_failures_total",
+            "cfab_workload_neighbor_cap_refusals_total",
+            "cfab_workload_neighbor_expiries_total",
+            "cfab_workload_neighbor_skips_total",
+            "cfab_neighbor_dirty_depth",
+            "cfab_neighbor_token_level",
+            "cfab_neighbor_oldest_dirty_age_seconds",
             "cfab_wire_present",
             "cfab_bond_home_carrier",
             "cfab_component_state",
