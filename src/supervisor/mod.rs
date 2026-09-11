@@ -1017,8 +1017,6 @@ pub(crate) async fn run_with(
     let relay_row_count = relay_row_list.len() as u32;
     if relay_row_count > 0 {
         publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
-    }
-    if relay_row_count > 0 {
         // The flush actor (gate C spec §4.2): ONE for the whole member, on its own task. Not on
         // this loop — a fork here stalls the watchdog feed, the `cfab.sock` accept and every
         // tick while it blocks, which is the harm this gate exists to remove. It sleeps until an
