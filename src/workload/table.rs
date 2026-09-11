@@ -407,6 +407,13 @@ impl NeighborTable {
         g.entries.values().filter(|e| e.dirty).count()
     }
 
+    /// How many keys sit in the dirty queue, duplicates and stale keys included. Distinct from
+    /// `dirty_depth`, which counts entries: the difference is exactly what re-enqueueing an
+    /// already-dirty entry would grow without bound under a flood.
+    pub fn queued_len(&self) -> usize {
+        self.inner.lock().unwrap().queue.len()
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().entries.len()
     }
@@ -918,5 +925,46 @@ mod tests {
                 "one sysctl is named, by its own name: {line}"
             );
         }
+    }
+    // ---- re_dirty's own two guards ---------------------------------------------------------
+
+    /// **T5a, resurrection half — `re_dirty` never brings an expired entry back.** Tested here
+    /// rather than through the actor: expiry is enforced at take as well, so in any actor-level
+    /// test the take arm fires first and this one is never reached. It is still reachable in
+    /// production — a batch of 31 writes each wedged to `WRITE_DEADLINE` = 2 s spans 62 s,
+    /// past `MIN_LEASE` — so it is a guard, and a guard needs a test that reaches it.
+    ///
+    /// Regression: drop `re_dirty`'s `e.expires_at <= now` arm and watch the entry come back.
+    #[test]
+    fn re_dirty_does_not_resurrect_an_expired_entry() {
+        let t = NeighborTable::new();
+        let t0 = Instant::now();
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            t0 + Duration::from_secs(60),
+            &cap(10),
+        );
+        assert!(t.take_next_dirty(t0).is_some());
+        t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(61));
+        assert_eq!(t.len(), 0, "expiry wins over the retry");
+        assert!(t.take_next_dirty(t0 + Duration::from_secs(61)).is_none());
+    }
+
+    /// `re_dirty` on an entry an upsert already re-queued adds no second key — the same
+    /// unbounded-growth guard `upsert` carries, on the other write path into the queue.
+    #[test]
+    fn re_dirty_of_an_already_queued_entry_enqueues_nothing() {
+        let t = NeighborTable::new();
+        let t0 = Instant::now();
+        let exp = t0 + Duration::from_secs(600);
+        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10));
+        assert!(t.take_next_dirty(t0).is_some());
+        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10));
+        assert_eq!(t.queued_len(), 1);
+        t.re_dirty(ROW, addr(1), t0);
+        assert_eq!(t.queued_len(), 1, "already queued: no second key");
     }
 }

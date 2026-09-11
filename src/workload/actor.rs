@@ -846,21 +846,38 @@ mod tests {
         assert!(started.elapsed() <= deadline, "{:?}", started.elapsed());
     }
 
-    /// **T4a — a re-upsert does not refresh queue position.** An address upserted faster than
-    /// `R` does not starve itself.
+    /// **T4a — a re-upsert of an already-dirty entry enqueues nothing.** An address upserted
+    /// faster than `R` does not starve itself, and — the half that is actually observable —
+    /// the dirty queue does not grow by one key per packet.
+    ///
+    /// **Honest scope, recorded rather than overclaimed.** The stated regression for this rule
+    /// ("re-enqueue on every upsert") does NOT change the service order: the earlier key is
+    /// still at the front and `take_next_dirty` walks past the duplicates as stale, so a test
+    /// that asserts only order passes under the regression. What the guard genuinely prevents
+    /// is unbounded growth — at wire-rate forged ACKs for one address the queue would grow by
+    /// one key per packet, forever, on a member whose whole table is capped at `C`. So that is
+    /// what this asserts.
     ///
     /// Regression: in `upsert`'s existing-entry arm, `queue.push_back(key)` unconditionally
     /// instead of only when the entry was clean.
     #[tokio::test(start_paused = true)]
-    async fn a_re_upsert_does_not_refresh_queue_position() {
+    async fn a_re_upsert_of_a_dirty_entry_enqueues_nothing() {
         let t = table_with(0);
         t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
         for i in 1..5 {
             t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(10));
         }
-        for _ in 0..20 {
+        assert_eq!(t.queued_len(), 5);
+        for _ in 0..500 {
             t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
         }
+        assert_eq!(
+            t.queued_len(),
+            5,
+            "500 re-claims of one dirty address must add no queue keys"
+        );
+
+        // And the order the rule is named for still holds.
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         FlushActor::new(t, Box::new(io)).run_batch().await;
@@ -930,22 +947,21 @@ mod tests {
         assert_eq!(writes(&calls.lock().unwrap()).len(), 2);
     }
 
-    /// **T5a — the failure path goes to the BACK and resurrects nothing.** An entry an unrelated
-    /// kernel failure put back must not jump ahead of a claim made after it; an entry whose
-    /// lease ran out mid-write must not come back at all.
+    /// **T5a — the failure path goes to the BACK of the queue.** An entry an unrelated kernel
+    /// failure put back must not jump ahead of a claim that was already waiting behind it.
     ///
-    /// Regression (position): `queue.push_front` instead of `push_back` in `re_dirty` — the
-    /// failed entry then outranks the newer legitimate claim made while the batch was running,
-    /// forever if it keeps failing.
-    /// Regression (resurrection): drop `re_dirty`'s expiry arm and watch the expired entry come
-    /// back and be written.
+    /// The batch cap is what makes this observable at all: with `B - 1` = 31 entries handled per
+    /// batch and 33 queued, entry 32 is still waiting when the first entry's failure is put back
+    /// — so the next batch's ORDER is the whole assertion.
+    ///
+    /// Regression: `queue.push_front` instead of `push_back` in `re_dirty`. The failed entry
+    /// then outranks everything already waiting, forever if it keeps failing — one wedged
+    /// address starving the queue behind it, which is R3.
     #[tokio::test(start_paused = true)]
-    async fn the_failure_path_goes_to_the_back_and_does_not_resurrect() {
-        // Resurrection: the entry's lease runs out while the fork is in flight.
-        let t = table_with(0);
-        let soon = Instant::now().into_std() + Duration::from_millis(1);
-        t.upsert(ROW, LEG, addr(0), MAC_A, soon, &cap(10));
-        let io = MockNeighborIo::new(move |argv, _| {
+    async fn a_failed_write_goes_to_the_back_of_the_queue() {
+        const N: u32 = 33;
+        let t = table_with(N);
+        let io = MockNeighborIo::new(|argv, nth| {
             if argv.contains(&"show") {
                 return Ok(crate::sys::Output {
                     status: 0,
@@ -954,73 +970,31 @@ mod tests {
                 });
             }
             Ok(crate::sys::Output {
-                status: 1,
+                status: i32::from(nth == 1),
                 stdout: String::new(),
                 stderr: "ENOBUFS".to_string(),
-            })
-        });
-        let mut a = FlushActor::new(t.clone(), Box::new(io));
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        a.run_batch().await;
-        assert_eq!(
-            t.len(),
-            0,
-            "expiry wins over the retry: the failure path resurrects nothing"
-        );
-
-        // Position: addr(0)'s write fails; addr(2) is claimed while the batch is still running,
-        // so it is queued AFTER the failure and must be served BEFORE the retry.
-        let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
-        t.upsert(ROW, LEG, addr(1), MAC_A, long(), &cap(10));
-        let t_write = t.clone();
-        let io = MockNeighborIo::new(move |argv, nth| {
-            if argv.contains(&"show") {
-                return Ok(crate::sys::Output {
-                    status: 0,
-                    stdout: "[]".to_string(),
-                    stderr: String::new(),
-                });
-            }
-            if nth == 1 {
-                return Ok(crate::sys::Output {
-                    status: 1,
-                    stdout: String::new(),
-                    stderr: "ENOBUFS".to_string(),
-                });
-            }
-            if nth == 2 {
-                // A relayed ACK for a new address lands while this batch is still draining.
-                t_write.upsert(
-                    ROW,
-                    LEG,
-                    addr(2),
-                    MAC_B,
-                    Instant::now().into_std() + Duration::from_secs(3600),
-                    &cap(10),
-                );
-            }
-            Ok(crate::sys::Output {
-                status: 0,
-                stdout: String::new(),
-                stderr: String::new(),
             })
         });
         let calls = io.calls();
         let mut a = FlushActor::new(t.clone(), Box::new(io));
         a.run_batch().await;
+        assert_eq!(a.counts.write_failures, 1);
         a.run_batch().await;
         let w = writes(&calls.lock().unwrap());
-        let order: Vec<String> = w.iter().map(|c| c[3].clone()).collect();
+        // Batch 1 handled entries 0..30 (31 of them, `B - 1`); 31 and 32 were still queued when
+        // entry 0's failure was put back, so batch 2 serves 31, 32, then the retry of 0.
+        let tail: Vec<String> = w[BURST as usize - 1..]
+            .iter()
+            .map(|c| c[3].clone())
+            .collect();
         assert_eq!(
-            order,
+            tail,
             vec![
-                addr(0).to_string(),
-                addr(1).to_string(),
-                addr(2).to_string(),
+                addr(31).to_string(),
+                addr(32).to_string(),
                 addr(0).to_string()
             ],
-            "the failed entry went to the BACK, behind the claim made after it: {w:?}"
+            "the retry went behind what was already waiting: {w:?}"
         );
     }
 
@@ -1123,17 +1097,18 @@ mod tests {
 
     /// **T-DEADLINE, read half.** The pre-drain read is wedged (the deadline kills it and the
     /// writer returns `Err`): nothing is written, no `add` is guessed, `read_failures` ticks,
-    /// one journal line is emitted for the streak, and the entry **keeps its queue position**
-    /// because take follows the read and it was never taken.
+    /// one journal line is emitted for the streak, and every entry **keeps its queue position**
+    /// because take follows the read and nothing was taken.
     ///
-    /// Regression: take the entry before the read and re-dirty it on failure — the position
-    /// assertion below then fails while the rest of this test stays green, which is the half
-    /// the r15 review found missing.
+    /// Three entries, not two, and the ORDER is asserted over the whole queue: with two entries
+    /// and two failed batches a take-before-read implementation rotates the queue exactly twice
+    /// and lands back where it started, so the position assertion reads green while the rule is
+    /// violated — the defect class spec §10 names, in the test written to pin it.
+    ///
+    /// Regression: take the entry before the read and re-dirty it on failure.
     #[tokio::test(start_paused = true)]
     async fn a_failed_read_writes_nothing_and_keeps_queue_position() {
-        let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
-        t.upsert(ROW, LEG, addr(1), MAC_A, long(), &cap(10));
+        let t = table_with(3);
         let said = Arc::new(Mutex::new(Vec::new()));
         let io = MockNeighborIo::new(|argv, _| {
             if argv.contains(&"show") {
@@ -1161,16 +1136,21 @@ mod tests {
             writes(&calls.lock().unwrap()).is_empty(),
             "nothing is guessed"
         );
-        assert_eq!(t.dirty_depth(), 2, "nothing was taken");
+        assert_eq!(t.dirty_depth(), 3, "nothing was taken");
         assert_eq!(
             said.lock().unwrap().len(),
             1,
             "one line per streak, not per read"
         );
 
-        // And the position survives: the first-dirtied address is still first.
-        let taken = t.take_next_dirty(Instant::now().into_std()).unwrap();
-        assert_eq!(taken.addr, addr(0), "the failed read moved nothing");
+        let now = Instant::now().into_std();
+        let order: Vec<Ipv4Addr> =
+            std::iter::from_fn(|| t.take_next_dirty(now).map(|x| x.addr)).collect();
+        assert_eq!(
+            order,
+            vec![addr(0), addr(1), addr(2)],
+            "a failed read moved nothing in the queue"
+        );
     }
 
     /// A document that does not parse is a **read failure**, never an empty kernel. "Failed
