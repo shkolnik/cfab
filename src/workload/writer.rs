@@ -23,6 +23,7 @@
 
 use std::io::Read;
 use std::net::Ipv4Addr;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -132,13 +133,21 @@ fn run_with_deadline(argv: &[&str], deadline: Duration) -> Result<Output> {
     if argv.is_empty() {
         return Err(Error::fatal("cannot exec: empty argv"));
     }
+    // Its own process group, so the deadline below can kill the whole tree. MEASURED on this
+    // tree: killing only the direct child leaves a grandchild holding the pipe write ends, and
+    // the drain threads' `read_to_end` then blocks until that grandchild exits on its own — a
+    // 200 ms deadline took 60 s. `ip` forks no grandchild, but a deadline that holds only for
+    // well-behaved children is not a bound on the actor, and the actor's whole fork budget is
+    // derived from one.
     let mut child = Command::new(argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| Error::fatal(format!("cannot exec {}: {e}", argv[0])))?;
+    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
 
     // Drained on their own threads, never in the poll loop below: a child that writes enough
     // to fill a pipe buffer before exiting would otherwise block forever on a write() nobody
@@ -183,7 +192,8 @@ fn run_with_deadline(argv: &[&str], deadline: Duration) -> Result<Output> {
         // The child never told us anything, so no exit status can represent this: `Err`, the
         // same shape as "could not exec at all", not a scripted nonzero `Output`.
         None => {
-            let _ = child.kill();
+            // The GROUP, not the child: see the spawn above.
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
             let _ = child.wait();
             let _ = stdout_thread.join();
             let _ = stderr_thread.join();
@@ -258,6 +268,29 @@ mod tests {
         let mut io = ForkNeighborIo::default();
         let out = io.run(&["sh", "-c", "exit 0"]).unwrap();
         assert!(out.ok());
+    }
+
+    /// **T-DEADLINE, grandchild half.** `sh -c 'sleep 60'` — no `exec`, so `sh` FORKS and the
+    /// grandchild inherits the pipe write ends. Killing only `sh` leaves those ends open and the
+    /// drain threads' `read_to_end` blocks until the grandchild exits on its own: MEASURED at
+    /// 60.0 s against a 200 ms deadline before this was fixed. The child is spawned into its own
+    /// process group and the whole group is killed, so the pipes close and the deadline holds.
+    ///
+    /// `ip` forks no grandchild, so this is not a live path today — but `WRITE_DEADLINE` is what
+    /// bounds every fork the actor makes, and the fork budget `MIN_LEASE` is derived from
+    /// assumes that bound is real rather than conditional on the callee's behavior.
+    #[test]
+    fn write_deadline_kills_a_grandchild_holding_the_pipes() {
+        let deadline = Duration::from_millis(200);
+        let mut io = ForkNeighborIo::with_deadline(deadline);
+        let started = Instant::now();
+        let r = io.run(&["sh", "-c", "sleep 60"]);
+        let elapsed = started.elapsed();
+        assert!(r.is_err(), "a killed child is Err, got {r:?}");
+        assert!(
+            elapsed < deadline * 10,
+            "the deadline must bound the CALL, not just signal the direct child: {elapsed:?}"
+        );
     }
 
     // ---- T-DEADLINE (write half): a child that never returns is killed ---------------------
