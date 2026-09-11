@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -273,6 +273,19 @@ pub struct Counts {
     pub expiries: u64,
 }
 
+/// The counters `Counts` cannot break down, because they happen inside the per-entry loop
+/// where the row is known (spec §4.5's per-row export): `reads` and `read_failures` are not
+/// here on purpose — the pre-drain read is one fork for the whole host, so there is no row to
+/// credit it to, and `/metrics` instead repeats the host-wide `read_failures` under every row's
+/// label (spec §4.5's own words: "export per row: `read_failures`").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowCounts {
+    pub writes: u64,
+    pub write_failures: u64,
+    pub skips: u64,
+    pub expiries: u64,
+}
+
 /// What one iteration of the actor's life did — a sweep, or one drain batch. Returned so a
 /// test can drive the real cadence (sweeps included, and they cost tokens) one step at a time
 /// on a paused clock, rather than re-implementing the cadence beside it.
@@ -300,6 +313,15 @@ pub struct FlushActor {
     /// that had to wait for a token cannot make the next one due the instant it finishes.
     next_sweep: Instant,
     pub counts: Counts,
+    /// The per-row half of `counts` (spec §4.5). Kept alongside it rather than instead of it:
+    /// `counts` is the host-wide total every earlier task's tests already assert against, and
+    /// splitting it by row here is additive, not a replacement.
+    per_row: std::collections::BTreeMap<String, RowCounts>,
+    /// Where this actor republishes its state for `/metrics` (spec §4.5), if anywhere. `None`
+    /// in every test that does not call `with_shared` — every test but the two in this module
+    /// that construct a `Shared` on purpose to check what lands in it — so the whole rest of
+    /// this file's tests, which drive `step`/`run_batch`/`sweep` directly, are unaffected.
+    shared: Option<Arc<Mutex<crate::supervisor::Shared>>>,
 }
 
 impl FlushActor {
@@ -322,7 +344,17 @@ impl FlushActor {
             write_failing: std::collections::BTreeSet::new(),
             next_sweep: now + SWEEP,
             counts: Counts::default(),
+            per_row: std::collections::BTreeMap::new(),
+            shared: None,
         }
+    }
+
+    /// Wire in where `run` republishes this actor's counters (spec §4.5). Additive on the
+    /// builder so every existing constructor call and every test that never calls this keeps
+    /// building the exact `FlushActor` it always has.
+    pub(crate) fn with_shared(mut self, shared: Arc<Mutex<crate::supervisor::Shared>>) -> Self {
+        self.shared = Some(shared);
+        self
     }
 
     /// The actor's whole life: sweep when one is due, drain when anything is dirty, and sleep
@@ -330,7 +362,9 @@ impl FlushActor {
     /// Never returns.
     pub async fn run(mut self) {
         loop {
-            if let Step::Batch(Batch::Idle) = self.step().await {
+            let step = self.step().await;
+            self.publish();
+            if let Step::Batch(Batch::Idle) = step {
                 let table = self.table.clone();
                 let next_sweep = self.next_sweep;
                 tokio::select! {
@@ -339,6 +373,69 @@ impl FlushActor {
                 }
             }
         }
+    }
+
+    /// Republish this actor's state into `Shared` for `/metrics` (spec §4.5), after every batch
+    /// and every sweep. A no-op unless production wired a `Shared` in via `with_shared`.
+    ///
+    /// The row list is the union of every row `per_row` has touched (a write, a write failure,
+    /// a skip or an expiry) and every row the table currently has entries or cap refusals for —
+    /// a row that has done none of those legitimately reports nothing, the same absence
+    /// convention every other row-keyed `/metrics` family in this codebase uses. `read_failures`
+    /// is host-wide (one pre-drain read per batch, for every row at once) and is repeated under
+    /// every row in the union, which is what spec §4.5 asks for by naming it "per row" even
+    /// though nothing about the read itself is row-scoped.
+    fn publish(&mut self) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let sizes = self.table.row_sizes();
+        let refusals = self.table.cap_refusals_snapshot();
+        let mut rows: std::collections::BTreeMap<
+            String,
+            crate::supervisor::report::NeighborRowInfo,
+        > = std::collections::BTreeMap::new();
+        for name in sizes
+            .keys()
+            .chain(refusals.keys())
+            .chain(self.per_row.keys())
+        {
+            rows.entry(name.clone()).or_insert_with(|| {
+                crate::supervisor::report::NeighborRowInfo {
+                    name: name.clone(),
+                    ..Default::default()
+                }
+            });
+        }
+        for (name, size) in &sizes {
+            rows.get_mut(name).unwrap().table_size = *size;
+        }
+        for (name, n) in &refusals {
+            rows.get_mut(name).unwrap().cap_refusals = *n;
+        }
+        for (name, c) in &self.per_row {
+            let r = rows.get_mut(name).unwrap();
+            r.writes = c.writes;
+            r.write_failures = c.write_failures;
+            r.skips = c.skips;
+            r.expiries = c.expiries;
+        }
+        for r in rows.values_mut() {
+            r.read_failures = self.counts.read_failures;
+        }
+        let now = Instant::now();
+        let host = crate::supervisor::report::NeighborActorInfo {
+            dirty_depth: self.table.dirty_depth() as u64,
+            oldest_dirty_age_seconds: self
+                .table
+                .oldest_dirty_age(now.into_std())
+                .map(|d| d.as_secs_f64()),
+            token_level: self.bucket.level(now),
+        };
+        shared
+            .lock()
+            .unwrap()
+            .publish_neighbor(rows.into_values().collect(), host);
     }
 
     /// One iteration: the sweep if it is due, otherwise one drain batch. The sweep runs **on
@@ -370,8 +467,12 @@ impl FlushActor {
         // Expiry is cfab's own clock, not the kernel's: it is reaped before the read and
         // therefore even when the read fails. A row whose lease ran out must not hold its slot
         // against the cap for as long as the kernel happens to be unreadable.
-        let expired = self.table.remove_expired(Instant::now().into_std());
+        let expired_rows = self.table.remove_expired(Instant::now().into_std());
+        let expired = expired_rows.len();
         self.counts.expiries += expired as u64;
+        for row in &expired_rows {
+            self.per_row.entry(row.clone()).or_default().expiries += 1;
+        }
 
         self.wait_and_spend(1).await;
         let Some(doc) = self.read_kernel() else {
@@ -499,6 +600,7 @@ impl FlushActor {
             let verb = match doc.classify(&t.leg, t.addr) {
                 Class::Skip => {
                     self.counts.skips += 1;
+                    self.per_row.entry(t.row.clone()).or_default().skips += 1;
                     continue;
                 }
                 Class::Add => WriteVerb::Add,
@@ -526,10 +628,15 @@ impl FlushActor {
             match failure {
                 None => {
                     self.counts.writes += 1;
+                    self.per_row.entry(t.row.clone()).or_default().writes += 1;
                     self.write_failing.remove(&t.row);
                 }
                 Some(why) => {
                     self.counts.write_failures += 1;
+                    self.per_row
+                        .entry(t.row.clone())
+                        .or_default()
+                        .write_failures += 1;
                     if self.write_failing.insert(t.row.clone()) {
                         self.obs.journal(&format!(
                             "cfab: workload {}: neighbor write for {} failed: {why}",
@@ -584,7 +691,15 @@ mod tests {
     fn table_with(n: u32) -> Arc<NeighborTable> {
         let t = Arc::new(NeighborTable::new());
         for i in 0..n {
-            t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(i),
+                MAC_A,
+                long(),
+                &cap(u32::MAX),
+                Instant::now().into_std(),
+            );
         }
         t
     }
@@ -635,7 +750,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_kernels_valid_entry_always_wins() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_B,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let doc = kernel_doc(&[(LEG, addr(0), Some("aa:bb:cc:dd:ee:ff"))]);
         let io = MockNeighborIo::kernel(&doc);
         let calls = io.calls();
@@ -661,7 +784,15 @@ mod tests {
     async fn a_non_valid_entry_is_absent_and_the_verb_says_which() {
         // FAILED -> replace.
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel(&kernel_doc(&[(LEG, addr(0), None)]));
         let calls = io.calls();
         FlushActor::new(t, Box::new(io)).run_batch().await;
@@ -672,7 +803,15 @@ mod tests {
 
         // Absent -> add.
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         FlushActor::new(t, Box::new(io)).run_batch().await;
@@ -691,7 +830,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_entry_with_no_lladdr_is_treated_as_absent() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let doc = format!(r#"[{{"dst":"{}","dev":"{LEG}"}}]"#, addr(0));
         let io = MockNeighborIo::kernel(&doc);
         let calls = io.calls();
@@ -713,7 +860,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_noarp_entry_is_never_touched() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_B,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let doc = format!(
             r#"[{{"dst":"{}","dev":"{LEG}","lladdr":"aa:bb:cc:dd:ee:ff","state":["NOARP"]}}]"#,
             addr(0)
@@ -755,7 +910,15 @@ mod tests {
     async fn one_unfiltered_read_fork_per_batch_across_legs() {
         let t = Arc::new(NeighborTable::new());
         for (row, leg) in [("a", "leg-a"), ("b", "leg-b"), ("c", "leg-c")] {
-            t.upsert(row, leg, addr(0), MAC_A, long(), &cap(10));
+            t.upsert(
+                row,
+                leg,
+                addr(0),
+                MAC_A,
+                long(),
+                &cap(10),
+                Instant::now().into_std(),
+            );
         }
         let doc = kernel_doc(&[
             ("leg-a", addr(0), Some("aa:bb:cc:dd:ee:01")),
@@ -803,8 +966,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_absent_leg_is_the_add_branch_and_schedules_no_retry() {
         let t = Arc::new(NeighborTable::new());
-        t.upsert("busy", "leg-busy", addr(5), MAC_B, long(), &cap(10));
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            "busy",
+            "leg-busy",
+            addr(5),
+            MAC_B,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let doc = kernel_doc(&[("leg-busy", addr(5), Some("aa:bb:cc:dd:ee:01"))]);
         let io = MockNeighborIo::kernel(&doc);
         let calls = io.calls();
@@ -853,7 +1032,15 @@ mod tests {
         for _ in 0..BATCHES {
             // The queue never empties: the relay keeps claiming what the kernel already holds.
             for i in 0..n {
-                t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+                t.upsert(
+                    ROW,
+                    LEG,
+                    addr(i),
+                    MAC_A,
+                    long(),
+                    &cap(u32::MAX),
+                    Instant::now().into_std(),
+                );
             }
             a.run_batch().await;
         }
@@ -976,9 +1163,25 @@ mod tests {
         let victim = addr(SIGMA_C);
         let t = Arc::new(NeighborTable::new());
         // Dirtied FIRST, so FIFO reaches it after at most the other 511.
-        t.upsert(ROW, LEG, victim, MAC_B, long(), &cap(u32::MAX));
+        t.upsert(
+            ROW,
+            LEG,
+            victim,
+            MAC_B,
+            long(),
+            &cap(u32::MAX),
+            Instant::now().into_std(),
+        );
         for i in 0..SIGMA_C - 1 {
-            t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(i),
+                MAC_A,
+                long(),
+                &cap(u32::MAX),
+                Instant::now().into_std(),
+            );
         }
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
@@ -1003,7 +1206,15 @@ mod tests {
             );
             // The attacker keeps every other address dirty.
             for i in 0..SIGMA_C - 1 {
-                t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+                t.upsert(
+                    ROW,
+                    LEG,
+                    addr(i),
+                    MAC_A,
+                    long(),
+                    &cap(u32::MAX),
+                    Instant::now().into_std(),
+                );
             }
         }
         assert!(started.elapsed() <= deadline, "{:?}", started.elapsed());
@@ -1026,13 +1237,37 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_re_upsert_of_a_dirty_entry_enqueues_nothing() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         for i in 1..5 {
-            t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(10));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(i),
+                MAC_A,
+                long(),
+                &cap(10),
+                Instant::now().into_std(),
+            );
         }
         assert_eq!(t.queued_len(), 5);
         for _ in 0..500 {
-            t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(0),
+                MAC_B,
+                long(),
+                &cap(10),
+                Instant::now().into_std(),
+            );
         }
         assert_eq!(
             t.queued_len(),
@@ -1061,8 +1296,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn one_actor_serves_both_rows_in_first_dirty_order() {
         let t = Arc::new(NeighborTable::new());
-        t.upsert("zz", "leg-z", addr(0), MAC_A, long(), &cap(10));
-        t.upsert("aa", "leg-a", addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            "zz",
+            "leg-z",
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        t.upsert(
+            "aa",
+            "leg-a",
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         FlushActor::new(t, Box::new(io)).run_batch().await;
@@ -1081,7 +1332,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_write_is_retried() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::new(|argv, nth| {
             if argv.contains(&"show") {
                 return Ok(crate::sys::Output {
@@ -1172,7 +1431,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_in_flight_write_does_not_swallow_an_upsert() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let t_write = t.clone();
         let io = MockNeighborIo::new(move |argv, nth| {
             if argv.contains(&"show") {
@@ -1190,6 +1457,7 @@ mod tests {
                     MAC_B,
                     Instant::now().into_std() + Duration::from_secs(3600),
                     &cap(10),
+                    Instant::now().into_std(),
                 );
             }
             Ok(crate::sys::Output {
@@ -1224,8 +1492,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coalesced_claims_are_one_write_carrying_the_last_mac() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
-        t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_B,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         FlushActor::new(t, Box::new(io)).run_batch().await;
@@ -1247,8 +1531,24 @@ mod tests {
     async fn an_expired_entry_is_never_written() {
         let t = table_with(0);
         let soon = Instant::now().into_std() + Duration::from_millis(10);
-        t.upsert(ROW, LEG, addr(0), MAC_A, soon, &cap(10));
-        t.upsert(ROW, LEG, addr(1), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            soon,
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1495,7 +1795,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_lone_vm_on_a_quiet_host_is_written_immediately() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         let mut a = FlushActor::new(t, Box::new(io));
@@ -1537,6 +1845,7 @@ mod tests {
                 MAC_A,
                 Instant::now().into_std() + Duration::from_secs(3600),
                 &cap(10),
+                Instant::now().into_std(),
             );
         });
         tokio::time::timeout(Duration::from_secs(30), t.wait_dirty())
@@ -1641,7 +1950,15 @@ mod tests {
             a.run_batch().await;
             // Keep feeding the actor real work every tick, so several ticks actually run
             // something rather than idling after the first.
-            t.upsert(ROW, LEG, addr(tick + 100), MAC_B, long(), &cap(u32::MAX));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(tick + 100),
+                MAC_B,
+                long(),
+                &cap(u32::MAX),
+                Instant::now().into_std(),
+            );
         }
         let orphan_str = orphan.to_string();
         for c in calls.lock().unwrap().iter() {
@@ -1668,7 +1985,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_persistently_failing_write_journals_once_per_streak_then_resets() {
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let said = Arc::new(Mutex::new(Vec::new()));
         let succeed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let succeed_in_io = succeed.clone();
@@ -1718,7 +2043,15 @@ mod tests {
 
         // A fresh claim that fails again starts a NEW streak, and it is loud again.
         succeed.store(false, std::sync::atomic::Ordering::SeqCst);
-        t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_B,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         for _ in 0..10 {
             a.run_batch().await;
         }
@@ -1760,13 +2093,29 @@ mod tests {
         }
 
         for i in 0..SIGMA_C - 1 {
-            t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+            t.upsert(
+                ROW,
+                LEG,
+                addr(i),
+                MAC_A,
+                long(),
+                &cap(u32::MAX),
+                Instant::now().into_std(),
+            );
         }
         // Dirtied LAST: the genuine worst FIFO position, behind all 511 others.
         let victim = addr(SIGMA_C);
         let victim_expiry =
             Instant::now().into_std() + crate::workload::table::clamp_lease(Some(1));
-        t.upsert(ROW, LEG, victim, MAC_B, victim_expiry, &cap(u32::MAX));
+        t.upsert(
+            ROW,
+            LEG,
+            victim,
+            MAC_B,
+            victim_expiry,
+            &cap(u32::MAX),
+            Instant::now().into_std(),
+        );
 
         let started = Instant::now();
         // Matches `the_nth_entry_is_written_inside_the_stated_worst_case`'s own number and
@@ -1880,7 +2229,15 @@ mod tests {
     async fn the_sweep_restores_an_entry_the_kernel_silently_lost() {
         let doc = Arc::new(Mutex::new(kernel_doc(&[])));
         let t = table_with(0);
-        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = changing_kernel(&doc);
         let calls = io.calls();
         let mut a = FlushActor::new(t.clone(), Box::new(io));
@@ -2172,8 +2529,24 @@ mod tests {
     async fn a_sweep_removes_expired_table_rows_and_deletes_no_kernel_entry() {
         let t = table_with(0);
         let soon = Instant::now().into_std() + Duration::from_secs(60);
-        t.upsert(ROW, LEG, addr(0), MAC_A, soon, &cap(10));
-        t.upsert(ROW, LEG, addr(1), MAC_A, long(), &cap(10));
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            soon,
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
         let io = MockNeighborIo::kernel("[]");
         let calls = io.calls();
         let mut a = FlushActor::new(t.clone(), Box::new(io));
@@ -2196,6 +2569,201 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains(&"del".to_string())),
             "cfab deletes no kernel neighbor entry, ever: {calls:?}"
+        );
+    }
+
+    // ---- Task 5: observability — each counter moves on its own path, and no other ---------
+
+    /// **The named counters test (plan §4 task 5).** `skips`, `write_failures`, cap refusals
+    /// and expiries each have a distinct trigger, and this proves none of the four fires on any
+    /// of the others' — the shape spec §4.5 asks for, because a counter that moves on the wrong
+    /// trigger defeats "a coherent host and a host that silently wrote nothing must not look
+    /// the same" just as surely as one that never moves at all.
+    ///
+    /// Five rows, five disjoint triggers, asserted in full for every row and not just the one
+    /// each name suggests: `skiprow` (the kernel already holds a valid MAC), `addrow` (a plain
+    /// successful write, the control), `failrow` (the write fails), `caprow` (a second claim
+    /// refused at `C` = 1), `exprow` (its lease runs out before the actor ever reads the
+    /// kernel). A `skips` that also ticked `caprow`'s cap-refusal counter would pass an
+    /// assertion that only checks `skiprow`, so every row checks every counter.
+    ///
+    /// Regressions proved by hand against this test (each turns exactly one assertion red):
+    /// crediting a skip's row instead of the caller's addr's row; counting a cap refusal
+    /// against every row instead of the one refused; using `remove_expired`'s scalar count
+    /// instead of its per-row breakdown, which would credit expiries to the wrong row entirely;
+    /// and folding `write_failures` into `skips` (or vice versa) in the per-row map.
+    #[tokio::test(start_paused = true)]
+    async fn skips_write_failures_cap_refusals_and_expiries_each_move_on_their_own_path() {
+        let t = Arc::new(NeighborTable::new());
+        let now = Instant::now().into_std();
+
+        t.upsert("skiprow", "leg-skip", addr(0), MAC_A, long(), &cap(10), now);
+        t.upsert("addrow", "leg-add", addr(0), MAC_A, long(), &cap(10), now);
+        t.upsert("failrow", "leg-fail", addr(0), MAC_A, long(), &cap(10), now);
+        t.upsert("caprow", "leg-cap", addr(0), MAC_A, long(), &cap(1), now);
+        t.upsert("caprow", "leg-cap", addr(1), MAC_A, long(), &cap(1), now);
+        t.upsert(
+            "exprow",
+            "leg-exp",
+            addr(0),
+            MAC_A,
+            now + Duration::from_secs(60),
+            &cap(10),
+            now,
+        );
+
+        // The kernel already holds `skiprow`'s address with a valid MAC; `addrow` and `failrow`
+        // are absent, so both are a plain `add`.
+        let doc = kernel_doc(&[("leg-skip", addr(0), Some("aa:bb:cc:dd:ee:ff"))]);
+        let io = MockNeighborIo::new(move |argv, _| {
+            if argv.contains(&"show") {
+                return Ok(crate::sys::Output {
+                    status: 0,
+                    stdout: doc.clone(),
+                    stderr: String::new(),
+                });
+            }
+            if argv.contains(&"leg-fail") {
+                return Ok(crate::sys::Output {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "RTNETLINK answers: File exists".to_string(),
+                });
+            }
+            Ok(crate::sys::Output {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+
+        // The expiry fires on the sweep, before anything is read for the drain: `exprow` never
+        // reaches classification at all.
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let swept = a.sweep().await;
+        assert!(
+            matches!(swept, Sweep::Diffed { expired: 1, .. }),
+            "{swept:?}"
+        );
+        assert_eq!(a.counts.expiries, 1, "exprow's lease ran out");
+
+        // One batch is enough: four entries are dirty (`exprow` already expired above) and
+        // `BURST - 1` = 31 handles all four. Looping to `Idle` would be wrong here — `failrow`
+        // fails and re-dirties itself every time, so a caller draining until idle would retry
+        // it forever (correct production behavior, no backoff exists) rather than reach it.
+        a.run_batch().await;
+
+        assert_eq!(a.counts.skips, 1);
+        assert_eq!(
+            a.counts.writes, 2,
+            "addrow's write succeeded, and so does caprow's ADMITTED claim — the cap refuses \
+             the second address, not the row's first write"
+        );
+        assert_eq!(a.counts.write_failures, 1, "failrow's write failed");
+
+        let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
+        assert_eq!(row("skiprow").skips, 1);
+        assert_eq!(row("skiprow").writes, 0);
+        assert_eq!(row("skiprow").write_failures, 0);
+        assert_eq!(row("skiprow").expiries, 0);
+
+        assert_eq!(row("addrow").writes, 1);
+        assert_eq!(row("addrow").skips, 0);
+        assert_eq!(row("addrow").write_failures, 0);
+        assert_eq!(row("addrow").expiries, 0);
+
+        assert_eq!(row("failrow").write_failures, 1);
+        assert_eq!(row("failrow").skips, 0);
+        assert_eq!(row("failrow").writes, 0);
+        assert_eq!(row("failrow").expiries, 0);
+
+        assert_eq!(row("exprow").expiries, 1);
+        assert_eq!(row("exprow").skips, 0);
+        assert_eq!(row("exprow").writes, 0);
+        assert_eq!(row("exprow").write_failures, 0);
+
+        assert_eq!(row("caprow").writes, 1, "the first, admitted claim");
+        assert_eq!(row("caprow").skips, 0);
+        assert_eq!(row("caprow").write_failures, 0);
+        assert_eq!(row("caprow").expiries, 0);
+
+        let refusals = t.cap_refusals_snapshot();
+        assert_eq!(refusals.get("caprow").copied().unwrap_or(0), 1);
+        assert_eq!(refusals.get("skiprow").copied().unwrap_or(0), 0);
+        assert_eq!(refusals.get("addrow").copied().unwrap_or(0), 0);
+        assert_eq!(refusals.get("failrow").copied().unwrap_or(0), 0);
+        assert_eq!(refusals.get("exprow").copied().unwrap_or(0), 0);
+
+        let sizes = t.row_sizes();
+        assert_eq!(
+            sizes.get("caprow").copied().unwrap_or(0),
+            1,
+            "the admitted claim stays; the refused one never entered the table"
+        );
+        assert!(!sizes.contains_key("exprow"), "the expired row is gone");
+    }
+
+    /// **`read_failures` above all (plan §4 task 5)** — the counter spec §4.5 says would have
+    /// caught r10's defect six reviews earlier, because a host whose reads are silently failing
+    /// looks exactly like a coherent one from every OTHER counter here: nothing is dirtied
+    /// wrong, nothing is written wrong, there is just nothing written at all. Proved both
+    /// directions: a write failure must not move it, and a read failure must not move
+    /// `write_failures` (a failed read attempts no write).
+    ///
+    /// Regression proved by hand: incrementing `read_failures` inside the write-failure arm (or
+    /// vice versa) turns one of this test's two assertions red while leaving T3c/T-THROTTLE,
+    /// which only ever exercise one of the two failures per test, green.
+    #[tokio::test(start_paused = true)]
+    async fn read_failures_moves_only_on_a_failed_kernel_read_never_on_a_write_failure() {
+        let t = table_with(0);
+        t.upsert(
+            ROW,
+            LEG,
+            addr(0),
+            MAC_A,
+            long(),
+            &cap(10),
+            Instant::now().into_std(),
+        );
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = failing.clone();
+        let io = MockNeighborIo::new(move |argv, _| {
+            if argv.contains(&"show") {
+                if f.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::error::Error::fatal("kernel read failed"));
+                }
+                return Ok(crate::sys::Output {
+                    status: 0,
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            // Every write fails, so the first batch below exercises write_failures alone.
+            Ok(crate::sys::Output {
+                status: 2,
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            })
+        });
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+
+        a.run_batch().await;
+        assert_eq!(a.counts.write_failures, 1);
+        assert_eq!(
+            a.counts.read_failures, 0,
+            "a write failure is not a read failure"
+        );
+
+        // The entry the failed write put back is still dirty, so this batch reads again — and
+        // this time the read itself fails.
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        a.run_batch().await;
+        assert_eq!(a.counts.read_failures, 1);
+        assert_eq!(
+            a.counts.write_failures, 1,
+            "a failed read attempts no write at all, so the count from the first batch must \
+             not move"
         );
     }
 }

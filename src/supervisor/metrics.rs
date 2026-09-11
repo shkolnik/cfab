@@ -1261,6 +1261,8 @@ mod tests {
             }],
             relays: Vec::new(),
             metrics_error: None,
+            neighbor_rows: Vec::new(),
+            neighbor: None,
         }
     }
 

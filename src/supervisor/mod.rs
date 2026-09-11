@@ -164,6 +164,14 @@ pub(crate) struct Shared {
     /// the workload tick — one source, one cadence — and published here because the relay's ACK
     /// path already takes this lock and must have a valid `C` before it accepts its first ACK.
     neighbor_cap: crate::workload::table::CapSource,
+    /// The DHCP neighbor write pipeline's per-row counters (gate C spec §4.5), republished by
+    /// the flush actor after every batch and sweep. The flush actor task writes this directly
+    /// through the mutex, the same convention `relays` uses, and for the same reason: a plain
+    /// counter needs no round trip through the main loop.
+    neighbor_rows: Vec<report::NeighborRowInfo>,
+    /// The flush actor's host-wide state (gate C spec §4.5): `None` until the actor's first
+    /// publish (there is no actor at all on a member with no relay row).
+    neighbor: Option<report::NeighborActorInfo>,
 }
 
 /// One relay's counters and last error, as `Shared` holds them.
@@ -260,7 +268,20 @@ impl Shared {
                 gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
                 rows: 1,
             },
+            neighbor_rows: Vec::new(),
+            neighbor: None,
         }
+    }
+
+    /// Republish the DHCP neighbor write pipeline's state (gate C spec §4.5). Called by the
+    /// flush actor task after every batch and sweep, never from the main loop.
+    pub(crate) fn publish_neighbor(
+        &mut self,
+        rows: Vec<report::NeighborRowInfo>,
+        host: report::NeighborActorInfo,
+    ) {
+        self.neighbor_rows = rows;
+        self.neighbor = Some(host);
     }
 
     /// A copy of the cap source. Deliberately by value: the caller derives its row's `C` from
@@ -397,6 +418,8 @@ impl Shared {
             workloads: self.workloads.clone(),
             metrics_error: self.metrics_error.clone(),
             relays: self.relay_infos(),
+            neighbor_rows: self.neighbor_rows.clone(),
+            neighbor: self.neighbor.clone(),
         }
     }
 
@@ -1025,7 +1048,11 @@ pub(crate) async fn run_with(
         let io: Box<dyn crate::workload::writer::NeighborIo> = hooks
             .neighbor_io
             .unwrap_or_else(|| Box::new(crate::workload::writer::ForkNeighborIo::default()));
-        tokio::spawn(crate::workload::actor::FlushActor::new(neigh_table.clone(), io).run());
+        tokio::spawn(
+            crate::workload::actor::FlushActor::new(neigh_table.clone(), io)
+                .with_shared(shared.clone())
+                .run(),
+        );
     }
     for relay_row in relay_row_list {
         tokio::spawn(crate::workload::relay::run(
@@ -2353,6 +2380,7 @@ mod tests {
                     rows: 1,
                 }
                 .for_prefix(crate::model::Ipv4Prefix::parse("192.168.20.0/24").unwrap()),
+                Instant::now(),
             );
             let wrote = until(2000, || {
                 c.lock().unwrap().iter().any(|a| {

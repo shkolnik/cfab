@@ -225,13 +225,19 @@ type Key = (String, Ipv4Addr);
 #[derive(Default)]
 struct Inner {
     entries: BTreeMap<Key, Entry>,
-    /// The host-wide dirty queue, oldest first. It shares the table's lock on purpose (spec
-    /// §4.2.3): one lock, one FIFO, one actor. Keys of entries that were removed stay here
-    /// until a take walks past them — cheaper than a scan, and a stale key is unambiguous
-    /// because the entry it names is gone.
-    queue: VecDeque<Key>,
+    /// The host-wide dirty queue, oldest first, each key with the instant it was queued. It
+    /// shares the table's lock on purpose (spec §4.2.3): one lock, one FIFO, one actor. Keys of
+    /// entries that were removed stay here until a take walks past them — cheaper than a scan,
+    /// and a stale key is unambiguous because the entry it names is gone. The timestamp is
+    /// observability only (spec §4.5's oldest-dirty-age gauge), never fairness — fairness is
+    /// queue position, which the FIFO order alone decides.
+    queue: VecDeque<(Key, Instant)>,
     /// Rows in an ongoing refusal streak.
     refusing: BTreeSet<String>,
+    /// Cumulative admissions refused because the row was at `C` (spec §4.1.4), by row. Counted
+    /// on every refusal, not just the first of a streak: `refusing` throttles the JOURNAL line,
+    /// this counts the real rate for `/metrics` (spec §4.5).
+    cap_refusals: BTreeMap<String, u64>,
 }
 
 /// The table. Host-wide: one per member, shared by every relay task and the flush actor.
@@ -258,6 +264,11 @@ impl NeighborTable {
     /// already dirty, so re-upserting faster than the actor drains cannot push an entry to the
     /// back of its own queue. The cap is checked only for a NEW key: coalescing onto an entry
     /// the row already holds adds nothing to the kernel's table.
+    ///
+    /// `now` times the queue entry for spec §4.5's oldest-dirty-age gauge only — it decides no
+    /// admission, cap or expiry outcome here (this table's own rule: time is a parameter,
+    /// never `Instant::now()` read in here).
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         row: &str,
@@ -266,6 +277,7 @@ impl NeighborTable {
         mac: [u8; 6],
         expires_at: Instant,
         cap: &RowCap,
+        now: Instant,
     ) -> Upsert {
         let key = (row.to_string(), addr);
         let outcome = {
@@ -274,6 +286,7 @@ impl NeighborTable {
                 entries,
                 queue,
                 refusing,
+                cap_refusals,
             } = &mut *g;
             match entries.get_mut(&key) {
                 Some(e) => {
@@ -282,7 +295,7 @@ impl NeighborTable {
                     e.expires_at = expires_at;
                     if !e.dirty {
                         e.dirty = true;
-                        queue.push_back(key);
+                        queue.push_back((key, now));
                     }
                     refusing.remove(row);
                     Upsert::Admitted
@@ -290,6 +303,7 @@ impl NeighborTable {
                 None => {
                     if row_len(entries, row) >= cap.value {
                         let first_of_streak = refusing.insert(row.to_string());
+                        *cap_refusals.entry(row.to_string()).or_default() += 1;
                         Upsert::Refused { first_of_streak }
                     } else {
                         entries.insert(
@@ -301,7 +315,7 @@ impl NeighborTable {
                                 dirty: true,
                             },
                         );
-                        queue.push_back(key);
+                        queue.push_back((key, now));
                         refusing.remove(row);
                         Upsert::Admitted
                     }
@@ -339,7 +353,7 @@ impl NeighborTable {
                 Some(e) if e.dirty => false,
                 Some(e) => {
                     e.dirty = true;
-                    queue.push_back(key);
+                    queue.push_back((key, now));
                     true
                 }
             }
@@ -372,7 +386,7 @@ impl NeighborTable {
     pub fn take_next_dirty(&self, now: Instant) -> Option<Taken> {
         let mut g = self.inner.lock().unwrap();
         let Inner { entries, queue, .. } = &mut *g;
-        while let Some(key) = queue.pop_front() {
+        while let Some((key, _enqueued_at)) = queue.pop_front() {
             let Some(e) = entries.get_mut(&key) else {
                 continue;
             };
@@ -397,13 +411,20 @@ impl NeighborTable {
 
     /// Drop every entry whose lease has run out, freeing its slot against the cap. Nothing in
     /// this table extends an expiry and nothing here reads the kernel: the kernel entry cfab
-    /// wrote is left exactly where it is — cfab deletes no neighbor entry, ever. Returns how
-    /// many rows were dropped.
-    pub fn remove_expired(&self, now: Instant) -> usize {
+    /// wrote is left exactly where it is — cfab deletes no neighbor entry, ever. Returns the
+    /// workload row of every entry dropped, one name per entry (so `.len()` is the old scalar
+    /// count and a caller wanting the per-row breakdown for spec §4.5 can tally the names).
+    pub fn remove_expired(&self, now: Instant) -> Vec<String> {
         let mut g = self.inner.lock().unwrap();
-        let before = g.entries.len();
-        g.entries.retain(|_, e| e.expires_at > now);
-        before - g.entries.len()
+        let mut dropped = Vec::new();
+        g.entries.retain(|(row, _), e| {
+            let live = e.expires_at > now;
+            if !live {
+                dropped.push(row.clone());
+            }
+            live
+        });
+        dropped
     }
 
     /// How many entries are queued for the actor. Read under the lock and returned — the caller
@@ -453,6 +474,40 @@ impl NeighborTable {
             .entries
             .get(&(row.to_string(), addr))
             .cloned()
+    }
+
+    /// How many entries each row currently holds — spec §4.5's per-row "table size". A row
+    /// with zero entries is simply absent from the map, the same absence convention every
+    /// other row-keyed export in this codebase uses.
+    pub fn row_sizes(&self) -> BTreeMap<String, u32> {
+        let mut sizes = BTreeMap::new();
+        for (row, _) in self.inner.lock().unwrap().entries.keys() {
+            *sizes.entry(row.clone()).or_insert(0) += 1;
+        }
+        sizes
+    }
+
+    /// Cumulative cap refusals per row since this table was created (spec §4.5). Never reset —
+    /// the same monotonic-counter shape every other `/metrics` counter in this codebase has.
+    pub fn cap_refusals_snapshot(&self) -> BTreeMap<String, u64> {
+        self.inner.lock().unwrap().cap_refusals.clone()
+    }
+
+    /// Age of the oldest entry still waiting for the actor (spec §4.5): observability, not
+    /// fairness — fairness is queue position, which the FIFO order alone decides. `None` while
+    /// nothing is dirty. Walks past queue keys that are stale or no longer dirty (an upsert can
+    /// re-dirty an entry the queue already names, and `remove_expired` drops entries without
+    /// touching the queue) rather than trusting the raw head, which a moment ago might have
+    /// been exactly one of those.
+    pub fn oldest_dirty_age(&self, now: Instant) -> Option<Duration> {
+        let g = self.inner.lock().unwrap();
+        for (key, enqueued_at) in &g.queue {
+            match g.entries.get(key) {
+                Some(e) if e.dirty => return Some(now.saturating_duration_since(*enqueued_at)),
+                _ => continue,
+            }
+        }
+        None
     }
 }
 
@@ -507,9 +562,10 @@ mod tests {
     #[test]
     fn coalescing_performs_the_last_update() {
         let t = NeighborTable::new();
-        let exp = Instant::now() + Duration::from_secs(600);
-        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10));
-        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10));
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(600);
+        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10), now);
+        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10), now);
 
         let taken = t
             .take_next_dirty(Instant::now())
@@ -539,8 +595,9 @@ mod tests {
             MAC_A,
             t0 + Duration::from_secs(60),
             &cap(10),
+            t0,
         );
-        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)), 1);
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)).len(), 1);
 
         t.upsert(
             ROW,
@@ -549,6 +606,7 @@ mod tests {
             MAC_A,
             t0 + Duration::from_secs(3600),
             &cap(10),
+            t0,
         );
         assert_eq!(
             t.entry(ROW, addr(1)).map(|e| e.mac),
@@ -571,7 +629,7 @@ mod tests {
 
         // The take half: the entry expires while it sits in the queue.
         let t = NeighborTable::new();
-        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
         assert!(
             t.take_next_dirty(t0 + Duration::from_secs(31)).is_none(),
             "an entry that expired in the queue is dropped at take, not written"
@@ -580,9 +638,9 @@ mod tests {
 
         // The sweep half: an entry nothing ever takes still leaves the table.
         let t = NeighborTable::new();
-        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
-        t.upsert(ROW, LEG, addr(2), MAC_A, live, &cap(10));
-        assert_eq!(t.remove_expired(t0 + Duration::from_secs(31)), 1);
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
+        t.upsert(ROW, LEG, addr(2), MAC_A, live, &cap(10), t0);
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(31)).len(), 1);
         assert!(t.entry(ROW, addr(1)).is_none());
         assert!(t.entry(ROW, addr(2)).is_some(), "a live entry is untouched");
     }
@@ -603,16 +661,16 @@ mod tests {
         let after = t0 + Duration::from_secs(31);
 
         let t = NeighborTable::new();
-        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
         assert!(t.entry(ROW, addr(1)).unwrap().dirty);
         assert_eq!(
-            t.remove_expired(after),
+            t.remove_expired(after).len(),
             1,
             "a queued entry expires on schedule like any other"
         );
 
         let t = NeighborTable::new();
-        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
         let taken = t.take_next_dirty(t0).expect("taken while still live");
         assert_eq!(taken.addr, addr(1));
         assert_eq!(
@@ -621,7 +679,7 @@ mod tests {
             "taking an entry does not move its expiry"
         );
         assert_eq!(
-            t.remove_expired(after),
+            t.remove_expired(after).len(),
             1,
             "nor does having been written: an expiry is the lease, and only a new ACK sets it"
         );
@@ -700,21 +758,22 @@ mod tests {
         // And the cap actually refuses: the row stops admitting at C.
         let t = NeighborTable::new();
         let c = two.for_prefix(p22());
-        let exp = Instant::now() + Duration::from_secs(600);
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(600);
         for n in 0..c.value {
             assert_eq!(
-                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &c),
+                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &c, now),
                 Upsert::Admitted
             );
         }
         assert!(matches!(
-            t.upsert(ROW, LEG, addr(c.value), MAC_A, exp, &c),
+            t.upsert(ROW, LEG, addr(c.value), MAC_A, exp, &c, now),
             Upsert::Refused { .. }
         ));
         assert_eq!(t.len(), c.value as usize);
         // Per ROW, not per table: a second row has its own C.
         assert_eq!(
-            t.upsert(OTHER, LEG, addr(0), MAC_A, exp, &c),
+            t.upsert(OTHER, LEG, addr(0), MAC_A, exp, &c, now),
             Upsert::Admitted
         );
     }
@@ -790,12 +849,13 @@ mod tests {
     #[test]
     fn lowering_the_cap_refuses_rather_than_evicts() {
         let t = NeighborTable::new();
-        let exp = Instant::now() + Duration::from_secs(600);
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(600);
         for n in 0..4 {
-            t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(4));
+            t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(4), now);
         }
         assert!(matches!(
-            t.upsert(ROW, LEG, addr(9), MAC_A, exp, &cap(2)),
+            t.upsert(ROW, LEG, addr(9), MAC_A, exp, &cap(2), now),
             Upsert::Refused { .. }
         ));
         assert_eq!(t.len(), 4, "the four already admitted stay");
@@ -812,15 +872,16 @@ mod tests {
     #[test]
     fn admission_at_a_full_cap_is_plain_fifo() {
         let t = NeighborTable::new();
-        let exp = Instant::now() + Duration::from_secs(600);
+        let now = Instant::now();
+        let exp = now + Duration::from_secs(600);
         for n in 0..3 {
             assert_eq!(
-                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(3)),
+                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(3), now),
                 Upsert::Admitted
             );
         }
         assert!(matches!(
-            t.upsert(ROW, LEG, addr(3), MAC_A, exp, &cap(3)),
+            t.upsert(ROW, LEG, addr(3), MAC_A, exp, &cap(3), now),
             Upsert::Refused { .. }
         ));
         for n in 0..3 {
@@ -831,7 +892,7 @@ mod tests {
         }
         assert!(t.entry(ROW, addr(3)).is_none());
         assert_eq!(
-            t.upsert(ROW, LEG, addr(0), MAC_B, exp, &cap(3)),
+            t.upsert(ROW, LEG, addr(0), MAC_B, exp, &cap(3), now),
             Upsert::Admitted,
             "a claim for an address the row already holds is a coalesce, not an admission: \
              refusing it would freeze a full row's MACs at whatever they were"
@@ -852,12 +913,12 @@ mod tests {
         let t = NeighborTable::new();
         let t0 = Instant::now();
         let short = t0 + Duration::from_secs(30);
-        t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1));
+        t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1), t0);
 
         let firsts = (0..10)
             .filter(|n| {
                 matches!(
-                    t.upsert(ROW, LEG, addr(100 + n), MAC_A, short, &cap(1)),
+                    t.upsert(ROW, LEG, addr(100 + n), MAC_A, short, &cap(1), t0),
                     Upsert::Refused {
                         first_of_streak: true
                     }
@@ -869,7 +930,7 @@ mod tests {
         // A second row refusing is its own streak: one row's flood must not silence another's
         // first line.
         assert_eq!(
-            t.upsert(OTHER, LEG, addr(0), MAC_A, short, &cap(0)),
+            t.upsert(OTHER, LEG, addr(0), MAC_A, short, &cap(0), t0),
             Upsert::Refused {
                 first_of_streak: true
             }
@@ -878,11 +939,11 @@ mod tests {
         // The streak ends when the row admits again, and the next refusal is loud.
         t.remove_expired(t0 + Duration::from_secs(31));
         assert_eq!(
-            t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1)),
+            t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1), t0),
             Upsert::Admitted
         );
         assert_eq!(
-            t.upsert(ROW, LEG, addr(1), MAC_A, short, &cap(1)),
+            t.upsert(ROW, LEG, addr(1), MAC_A, short, &cap(1), t0),
             Upsert::Refused {
                 first_of_streak: true
             }
@@ -969,6 +1030,7 @@ mod tests {
             MAC_A,
             t0 + Duration::from_secs(60),
             &cap(10),
+            t0,
         );
         assert!(t.take_next_dirty(t0).is_some());
         t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(61));
@@ -983,9 +1045,9 @@ mod tests {
         let t = NeighborTable::new();
         let t0 = Instant::now();
         let exp = t0 + Duration::from_secs(600);
-        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10), t0);
         assert!(t.take_next_dirty(t0).is_some());
-        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10), t0);
         assert_eq!(t.queued_len(), 1);
         t.re_dirty(ROW, addr(1), t0);
         assert_eq!(t.queued_len(), 1, "already queued: no second key");

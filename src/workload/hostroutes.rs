@@ -754,11 +754,12 @@ mod tests {
                 gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
                 rows: 1,
             },
+            t0,
         );
         assert_eq!(t.len(), 1);
 
         // The lease elapses; cfab's OWN bookkeeping loses the row.
-        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)), 1);
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)).len(), 1);
         assert_eq!(t.len(), 0, "cfab's own table has forgotten the row");
 
         // But cfab never touched the kernel, so the SAME kernel document `hostroutes` reads

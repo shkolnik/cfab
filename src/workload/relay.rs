@@ -883,10 +883,11 @@ async fn serve(
                                         // §4.2.3).
                                         let cap =
                                             shared.lock().unwrap().neighbor_cap().for_prefix(row.prefix);
-                                        let expires_at =
-                                            Instant::now() + table::clamp_lease(lease);
+                                        let now = Instant::now();
+                                        let expires_at = now + table::clamp_lease(lease);
                                         match table.upsert(
                                             &row.name, &row.leg, yiaddr, chaddr, expires_at, &cap,
+                                            now,
                                         ) {
                                             table::Upsert::Admitted => {
                                                 shared.lock().unwrap().relay_event(
