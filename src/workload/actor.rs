@@ -60,6 +60,19 @@ pub const BURST: u32 = 32;
 /// for when an event trigger is missing" (spec §4.3 item 4, call 5 RULED).
 pub const SWEEP: Duration = Duration::from_secs(15);
 
+/// How long one row's "entry expired before the actor reached it" journal line is suppressed
+/// after it fires, per row (James, 2026-09-11, option (b)). This bounds the line at
+/// declared-rows-per-window, which is the whole point: it needs no judgment about whether a row
+/// "recovered", because there is no recovery inference here at all — only elapsed time. Three
+/// earlier revisions each tried to infer a negative ("this row stopped expiring") from a row's
+/// absence in `run_batch`'s necessarily-partial dropped list, and each was wrong in a different
+/// way (host-wide flag silenced an unrelated row's first line; clearing on per-pass absence let
+/// an attacker alternating two rows re-arm the line every batch; clearing only on a
+/// nothing-dropped-host-wide pass let one chronically sick row mask every other row forever). A
+/// time window makes both failure shapes unrepresentable: it neither over-attributes recovery
+/// nor waits forever for a global "all clear" that a partial view can never honestly report.
+const EXPIRY_LOG_WINDOW: Duration = Duration::from_secs(60);
+
 /// One token's worth of time at `R`. Integer arithmetic on purpose: a float accumulator drifts,
 /// and this rate is the bound `MIN_LEASE` is derived against.
 const TOKEN_INTERVAL: Duration = Duration::from_millis(1_000 / REFILL_PER_SEC as u64);
@@ -316,11 +329,15 @@ pub struct FlushActor {
     write_failing: std::collections::BTreeSet<String>,
     /// The same, per row, for entries dropped because their lease ran out before the actor
     /// reached them. `MIN_LEASE` is derived so this cannot happen on a table within `Sigma C_i`,
-    /// so it is loud — and loud once per streak, because the trigger is attacker-reachable.
-    /// **Per row, not host-wide, for the same reason `write_failing` is:** one row in a
-    /// continuous streak must not swallow another row's first line, which is the whole signal
-    /// that a second row started losing entries.
-    expiring: std::collections::BTreeSet<String>,
+    /// so it is loud — and loud at most once per `EXPIRY_LOG_WINDOW` per row, because the
+    /// trigger is attacker-reachable. **Per row, not host-wide, for the same reason
+    /// `write_failing` is:** one row in a continuous streak must not swallow another row's first
+    /// line, which is the whole signal that a second row started losing entries.
+    ///
+    /// Maps row -> the time its line was last journaled. A time window, not a streak flag or a
+    /// set cleared on absence: see `EXPIRY_LOG_WINDOW` for why every absence-based shape tried
+    /// here before was wrong.
+    expiring: std::collections::BTreeMap<String, Instant>,
     /// When the next coherence sweep is due. Measured from the end of the last one, so a sweep
     /// that had to wait for a token cannot make the next one due the instant it finishes.
     next_sweep: Instant,
@@ -354,7 +371,7 @@ impl FlushActor {
             bucket: Bucket::new(now),
             read_failing: false,
             write_failing: std::collections::BTreeSet::new(),
-            expiring: std::collections::BTreeSet::new(),
+            expiring: std::collections::BTreeMap::new(),
             next_sweep: now + SWEEP,
             counts: Counts::default(),
             per_row: std::collections::BTreeMap::new(),
@@ -485,11 +502,12 @@ impl FlushActor {
 
         self.wait_and_spend(1).await;
         let Some(doc) = self.read_kernel() else {
-            self.note_expiries(&dropped);
+            self.note_expiries(&dropped, Instant::now());
             return Sweep::ReadFailed;
         };
 
-        let now_std = Instant::now().into_std();
+        let now = Instant::now();
+        let now_std = now.into_std();
         let mut dirtied = 0usize;
         for (row, addr, leg) in self.table.list_entries() {
             match doc.classify(&leg, addr) {
@@ -506,48 +524,47 @@ impl FlushActor {
                 }
             }
         }
-        self.note_expiries(&dropped);
+        self.note_expiries(&dropped, now);
         Sweep::Diffed { dirtied, expired }
     }
 
-    /// Credit every entry that left the table because its lease ran out, and say so **once per
-    /// streak**. Both places an entry can expire report here: the sweep's `remove_expired`, and
-    /// the drain's own take and put-back — a drop on the drain path used to be credited nowhere
-    /// at all, so `cfab_workload_neighbor_expiries` was blind to exactly the path a flood
-    /// travels and a row could vanish with no counter and no line.
+    /// Credit every entry that left the table because its lease ran out, and say so **at most
+    /// once per `EXPIRY_LOG_WINDOW` per row**. Both places an entry can expire report here: the
+    /// sweep's `remove_expired`, and the drain's own take and put-back — a drop on the drain
+    /// path used to be credited nowhere at all, so `cfab_workload_neighbor_expiries` was blind
+    /// to exactly the path a flood travels and a row could vanish with no counter and no line.
     ///
     /// `MIN_LEASE` is derived so that an entry inside `Sigma C_i` cannot expire before the
     /// actor reaches it, which makes this loud by construction: if it moves on the drain path,
-    /// a premise of that derivation is wrong. Once per streak, not once per entry, because the
-    /// trigger is attacker-reachable.
-    fn note_expiries(&mut self, rows: &[String]) {
+    /// a premise of that derivation is wrong. Throttled by row and by time, never by inferring a
+    /// row "recovered" from its absence in this pass's necessarily-partial `rows` list — the
+    /// window needs no such judgment at all, which is the entire point of `EXPIRY_LOG_WINDOW`.
+    fn note_expiries(&mut self, rows: &[String], now: Instant) {
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for row in rows {
             self.per_row.entry(row.clone()).or_default().expiries += 1;
             seen.insert(row.as_str());
         }
         self.counts.expiries += rows.len() as u64;
-        // The streak ends only on a pass that dropped NOTHING. A row absent from THIS pass is not
-        // evidence it recovered — `dropped` is FIFO by upsert time, so drops cluster by row, and
-        // clearing on absence lets an attacker alternating two rows re-arm the line every batch:
-        // `R` = 10 a second, on demand. `write_failing` can key on the row because a completed
-        // write IS positive evidence about that row; nothing here carries the same news.
-        if seen.is_empty() {
-            self.expiring.clear();
-            return;
-        }
+        // A row is fresh iff it has never been journaled, or its last line is at least a full
+        // window old. `duration_since` saturates rather than panicking when `now` is not after
+        // `last` (tokio's guarantee), so equal instants read as "not yet due" rather than
+        // underflowing.
         let fresh: Vec<&str> = seen
             .into_iter()
-            .filter(|row| !self.expiring.contains(*row))
+            .filter(|row| match self.expiring.get(*row) {
+                None => true,
+                Some(last) => now.duration_since(*last) >= EXPIRY_LOG_WINDOW,
+            })
             .collect();
         if fresh.is_empty() {
             return;
         }
         // The count and the row list must describe the SAME set, or a reader attributes every
-        // drop this pass to whichever row happened to be new.
+        // drop this pass to whichever row happened to be fresh.
         let counted = rows.iter().filter(|r| fresh.contains(&r.as_str())).count();
         for row in &fresh {
-            self.expiring.insert((*row).to_string());
+            self.expiring.insert((*row).to_string(), now);
         }
         self.obs.journal(&format!(
             "cfab: dhcp neighbor actor: {} table entry/entries expired before the write; \
@@ -714,11 +731,12 @@ impl FlushActor {
         // Put everything back AFTER the batch, never during it: an entry re-dirtied here is
         // queued for the next read, and an entry an upsert already re-queued keeps the place
         // that upsert gave it.
-        let now_std = Instant::now().into_std();
+        let now = Instant::now();
+        let now_std = now.into_std();
         for (row, addr) in put_back {
             dropped.extend(self.table.re_dirty(&row, addr, now_std));
         }
-        self.note_expiries(&dropped);
+        self.note_expiries(&dropped, now);
         Batch::Drained
     }
 }
@@ -2805,20 +2823,23 @@ mod tests {
         assert!(!sizes.contains_key("exprow"), "the expired row is gone");
     }
 
-    /// **Alternating rows must not re-arm the throttle.** The per-row set fixed one row silencing
-    /// another, and broke the property the throttle exists for: clearing a row because it dropped
-    /// nothing *this pass* treats "row B's turn" as evidence that row A recovered. `dropped` is
-    /// FIFO by upsert time, so drops cluster by row and an attacker flooding A, then B, then A
-    /// gets a fresh line every pass — batches are bucket-bounded at `R`, so that is **10 lines a
-    /// second, sustained, on demand**. Spec §6 T-THROTTLE: the rate is attacker-chosen, so an
-    /// unthrottled line is a log flood on demand. The streak now ends only on a pass that dropped
-    /// nothing at all, which is positive evidence and cannot be manufactured by feeding the actor
-    /// a different row.
+    /// **Alternating rows must not re-arm the throttle.** Revision 2 cleared a row's entry
+    /// whenever it was absent from a pass, which treats "row B's turn" as evidence that row A
+    /// recovered. `dropped` is FIFO by upsert time, so drops cluster by row and an attacker
+    /// flooding A, then B, then A gets a fresh line every pass — batches are bucket-bounded at
+    /// `R`, so that is **10 lines a second, sustained, on demand**, MEASURED at 20 passes = 20
+    /// lines. Spec §6 T-THROTTLE: the rate is attacker-chosen, so an unthrottled line is a log
+    /// flood on demand.
     ///
-    /// Regression: clear a row from `expiring` when it is absent from a pass (`retain(|row|
-    /// seen.contains(...))`) and this goes red at the line count while every counter stays green.
+    /// The per-row time window fixes this with no recovery inference at all: every pass here
+    /// lands inside one `EXPIRY_LOG_WINDOW`, so each row's line fires once (its first incident)
+    /// and every later incident of that same row, no matter which row took the turn in between,
+    /// is still within its own window and stays silent.
+    ///
+    /// Regression: clear a row's entry when it is absent from a pass (revision 2's shape) and
+    /// this goes red at the line count (20, not 2) while every counter assertion stays green.
     #[tokio::test(start_paused = true)]
-    async fn alternating_rows_do_not_re_arm_the_expiry_throttle() {
+    async fn alternating_rows_cannot_re_arm_the_expiry_line_every_batch() {
         let t = Arc::new(NeighborTable::new());
         let io = MockNeighborIo::kernel("[]");
         let said = Arc::new(Mutex::new(Vec::new()));
@@ -2832,7 +2853,8 @@ mod tests {
             }),
         );
 
-        // Twenty passes, one row each, alternating: the shape a flood clustered by row produces.
+        // Twenty passes, one row each, alternating, each entry already expired by the time its
+        // batch runs — small advances so all twenty land inside one 60 s window.
         for i in 0..20u32 {
             let row = if i % 2 == 0 { "rowa" } else { "rowb" };
             let leg = if i % 2 == 0 { "leg-a" } else { "leg-b" };
@@ -2842,13 +2864,14 @@ mod tests {
                 leg,
                 addr(i),
                 MAC_A,
-                now + Duration::from_secs(30),
+                now + Duration::from_millis(1),
                 &cap(10),
                 now,
             );
-            tokio::time::advance(Duration::from_secs(31)).await;
+            tokio::time::advance(Duration::from_secs(2)).await;
             assert_eq!(a.run_batch().await, Batch::Drained);
         }
+        // 20 passes x 2 s = 40 s of simulated time, inside one 60 s window.
 
         assert_eq!(a.counts.expiries, 20, "every drop is still counted");
         let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
@@ -2864,16 +2887,18 @@ mod tests {
     }
 
     /// **One row's expiry streak must not silence another row's FIRST line.** `write_failing`
-    /// keys its throttle per row; this one was host-wide, so a row dropping entries continuously
-    /// held the flag set and a second row's first-ever drop produced **no line at all** — not
-    /// attributed to the wrong row, simply absent. The per-row counters stayed right, so the
-    /// only signal that a second row had started losing entries was the one that went missing.
+    /// keys its throttle per row; revision 1 made this one host-wide, so a row dropping entries
+    /// continuously held the single flag set and a second row's first-ever drop produced **no
+    /// line at all** — not attributed to the wrong row, simply absent. The per-row counters
+    /// stayed right, so the only signal that a second row had started losing entries was the one
+    /// that went missing. The per-row time window keeps this fixed: each row has its own entry
+    /// and its own clock, so one row being mid-window says nothing about any other row.
     ///
-    /// Regression: make `expiring` a `bool` again (set it on any non-empty pass, clear it only
-    /// on an empty one) and the second assertion goes red while every counter assertion stays
-    /// green — which is exactly how it shipped.
+    /// Regression: make `expiring` host-wide again (a single bool/flag, revision 1's shape) and
+    /// the second assertion goes red while every counter assertion stays green — which is
+    /// exactly how it shipped.
     #[tokio::test(start_paused = true)]
-    async fn one_rows_expiry_streak_does_not_silence_another_rows_first_line() {
+    async fn one_rows_expiry_streak_never_silences_another_rows_first_line() {
         let t = Arc::new(NeighborTable::new());
         let now = Instant::now().into_std();
         let soon = |base: std::time::Instant| base + Duration::from_secs(30);
@@ -2945,6 +2970,186 @@ mod tests {
             "two drops in one pass, counted twice"
         );
         assert_eq!(a.counts.expiries, 5);
+    }
+
+    /// **A row's own repeat incident inside the window stays silent.** This is the base case
+    /// `EXPIRY_LOG_WINDOW` exists for: the same row expiring twice a second apart must not
+    /// double the line, or the throttle does nothing at all against a row an attacker floods.
+    ///
+    /// Regression: drop the window check in `note_expiries` so every row is always "fresh" (a
+    /// row journals on every incident) and this goes red at the line count (2, not 1) while
+    /// every counter assertion stays green.
+    #[tokio::test(start_paused = true)]
+    async fn a_rows_repeat_expiry_inside_the_window_is_not_journaled() {
+        let t = Arc::new(NeighborTable::new());
+        let io = MockNeighborIo::kernel("[]");
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+                woke: None,
+            }),
+        );
+
+        let now = Instant::now().into_std();
+        t.upsert(
+            "rowa",
+            "leg-a",
+            addr(0),
+            MAC_A,
+            now + Duration::from_millis(1),
+            &cap(10),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        // Second incident, 1 s later: well inside the 60 s window.
+        let now = Instant::now().into_std();
+        t.upsert(
+            "rowa",
+            "leg-a",
+            addr(1),
+            MAC_A,
+            now + Duration::from_millis(1),
+            &cap(10),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        assert_eq!(a.counts.expiries, 2, "both incidents are counted");
+        assert_eq!(
+            a.per_row.get("rowa").copied().unwrap_or_default().expiries,
+            2
+        );
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the second incident is inside the window: {lines:?}"
+        );
+    }
+
+    /// **An ongoing incident must not go silent forever.** This is what revision 3 broke: it
+    /// ended a row's streak only on a pass that dropped nothing host-wide, so one chronically
+    /// sick row masked every later incident of every row — MEASURED zero lines for the
+    /// recurrence. A time window has no such failure mode: once `EXPIRY_LOG_WINDOW` elapses
+    /// since the row's last line, the next incident is fresh again, unconditionally.
+    ///
+    /// Regression: make the window infinite (once a row has an entry in `expiring`, never
+    /// re-journal it — revision 3's masking, generalized to a single row) and this goes red at
+    /// the line count (1, not 2) while every counter assertion stays green.
+    #[tokio::test(start_paused = true)]
+    async fn a_rows_expiry_is_journaled_again_once_the_window_passes() {
+        let t = Arc::new(NeighborTable::new());
+        let io = MockNeighborIo::kernel("[]");
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+                woke: None,
+            }),
+        );
+
+        let now = Instant::now().into_std();
+        t.upsert(
+            "rowa",
+            "leg-a",
+            addr(0),
+            MAC_A,
+            now + Duration::from_millis(1),
+            &cap(10),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        // Second incident at +61 s from the first line: outside the 60 s window.
+        let now = Instant::now().into_std();
+        t.upsert(
+            "rowa",
+            "leg-a",
+            addr(1),
+            MAC_A,
+            now + Duration::from_millis(1),
+            &cap(10),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        assert_eq!(a.counts.expiries, 2, "both incidents are counted");
+        assert_eq!(
+            a.per_row.get("rowa").copied().unwrap_or_default().expiries,
+            2
+        );
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the window passed, so the recurrence is loud again: {lines:?}"
+        );
+    }
+
+    /// **The metric is never throttled, only the line.** `note_expiries` must credit
+    /// `per_row[..].expiries` and `counts.expiries` for every expiry it is handed, independent
+    /// of whether that row's line is inside its window. A fix that moved the counting inside the
+    /// `fresh` branch would under-report every throttled incident — exactly the blind spot
+    /// `cfab_workload_neighbor_expiries` exists to not have.
+    #[tokio::test(start_paused = true)]
+    async fn every_expiry_is_counted_even_when_the_line_is_throttled() {
+        let t = Arc::new(NeighborTable::new());
+        let io = MockNeighborIo::kernel("[]");
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+                woke: None,
+            }),
+        );
+
+        for i in 0..3u32 {
+            let now = Instant::now().into_std();
+            t.upsert(
+                "rowa",
+                "leg-a",
+                addr(i),
+                MAC_A,
+                now + Duration::from_millis(1),
+                &cap(10),
+                now,
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(a.run_batch().await, Batch::Drained);
+        }
+
+        assert_eq!(
+            a.counts.expiries, 3,
+            "the metric counts every expiry, never throttled"
+        );
+        assert_eq!(
+            a.per_row.get("rowa").copied().unwrap_or_default().expiries,
+            3
+        );
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the journal line is throttled: {lines:?}"
+        );
     }
 
     /// **Expiry on the DRAIN path is counted and said.** The test above drives every expiry
