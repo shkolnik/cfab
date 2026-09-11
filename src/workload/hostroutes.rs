@@ -43,15 +43,19 @@ const FWD_TABLE: (&str, &str) = ("inet", "cfab-fwd");
 /// tick at or after the deadline: 5 s plus at most one tick, never less than 5 s.
 pub const HOLDDOWN: Duration = PERIOD;
 
-/// The neighbor states that mean "this address resolved to a MAC" (gate M1 review I1, research
-/// `0e9bced`: a static neighbor is a resolved host too). NOARP, FAILED and INCOMPLETE carry no
-/// usable lladdr and are not a VM being here.
+/// The neighbor states worth routing a VM's traffic to (gate M1 review I1, research `0e9bced`:
+/// a static neighbor is a resolved host too). **Not** "the states that carry no usable
+/// `lladdr`" — corrected, gate C fix round 1 review S-7: §2 MEASURED a NOARP entry carrying a
+/// real MAC, so that reason was factually wrong. `NOARP`, `FAILED` and `INCOMPLETE` are excluded
+/// because none of the three is a live VM worth originating a /32 for (an operator's hand-pinned
+/// neighbor, a resolution that failed, or one still in flight) — a decision about what to
+/// *route* to, not a claim about what the kernel happens to populate `lladdr` with.
 const RESOLVED: &[&str] = &["REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"];
 
 /// The addresses on `wl`'s leg that are VMs living on THIS host.
 ///
-/// The join spec §5.2 asks for, in one place: an `ip -j neigh show dev <leg>` entry counts when
-/// it is inside the row's prefix, resolved, not an address the fabric itself owns (any member's
+/// The join spec §5.2 asks for, in one place: an `ip -j neigh show nud all dev <leg>` entry
+/// counts when it is inside the row's prefix, resolved, not an address the fabric itself owns (any member's
 /// declared address on this row, `gw`, `router`), AND its MAC appears in `bridge -j fdb show br
 /// <uplink>` on a port that is not one of the bridge's uplink ports. That last clause is the
 /// whole point: without it every VM in the VLAN — including the ones on peer hosts, learned
@@ -102,11 +106,14 @@ pub fn local_vms(
     let mut out = BTreeSet::new();
     let mut understood = 0usize;
     for e in neigh {
-        // The shape test, and why it is `dst` + `state` and not the address parsing: an entry
-        // for an IPv6 neighbor (every leg has fe80::) carries both keys and is simply not ours
-        // to route, and an entry with no `lladdr` is a real unresolved neighbor. Only an
-        // iproute2 that spells these two otherwise leaves us with nothing to read.
-        let (Some(dst), Some(state)) = (e["dst"].as_str(), e["state"].as_array()) else {
+        // The shape test is `dst` alone, not `dst` + `state` (r10 review should-fix 5): a
+        // NUD_NONE entry is `{"dst": …}` with no `state` key and no `lladdr` at all (§2
+        // measured) — a real, understood answer ("not currently resolved"), not a foreign
+        // iproute2 spelling. Only an entry with no `dst` at all means "we cannot read this
+        // document." An IPv6 neighbor (every leg has fe80::) carries `dst` too and is simply
+        // not ours to route — filtered out below by the failed `Ipv4Addr` parse, not by this
+        // shape test.
+        let Some(dst) = e["dst"].as_str() else {
             continue;
         };
         understood += 1;
@@ -116,6 +123,14 @@ pub fn local_vms(
         if !wl.prefix.contains(dst) || exclude.contains(&dst) {
             continue;
         }
+        // A NUD_NONE entry (no `state` key) is understood but is not a VM: no resolution at
+        // all means nothing to route to. Falling through this `continue` to the `state.iter()`
+        // check below is exactly the false fault this fix removes — a leg holding only NONE
+        // entries would otherwise leave `understood` at 0 and trip the fail-loud read-failure
+        // path below on a perfectly healthy leg, every tick.
+        let Some(state) = e["state"].as_array() else {
+            continue;
+        };
         if !state
             .iter()
             .filter_map(|s| s.as_str())
@@ -256,8 +271,21 @@ pub fn read_local_vms(sys: &mut dyn Sys, view: &View, wl: &Workload) -> Option<B
     let ports = uplink::identify_declared(&*sys, &wl.uplink, wl.vid)
         .ok()?
         .ports;
+    // r10 review should-fix 5: `nud all` — without it a NUD_NONE entry is invisible to this
+    // read entirely (§2 measured), which is the false-fault path the `understood` fix above
+    // exists to close; `local_vms`'s output is unchanged either way, since `RESOLVED` already
+    // excludes NUD_NONE and NOARP.
     let neigh = sys
-        .run(&["ip", "-j", "neigh", "show", "dev", &wl.leg_ifname()])
+        .run(&[
+            "ip",
+            "-j",
+            "neigh",
+            "show",
+            "nud",
+            "all",
+            "dev",
+            &wl.leg_ifname(),
+        ])
         .ok()?;
     let fdb = sys
         .run(&["bridge", "-j", "fdb", "show", "br", &wl.uplink])
@@ -368,7 +396,10 @@ impl HostRoutes {
             return None;
         };
         let ports = up.ports;
-        let neigh = sys.run(&["ip", "-j", "neigh", "show", "dev", &leg]).ok()?;
+        // r10 review should-fix 5: `nud all`, same reasoning as `read_local_vms` above.
+        let neigh = sys
+            .run(&["ip", "-j", "neigh", "show", "nud", "all", "dev", &leg])
+            .ok()?;
         if !neigh.ok() {
             self.fail(
                 &name,
@@ -778,6 +809,59 @@ mod tests {
         );
     }
 
+    /// T-NONE (r7 should-fix 8) — a `dst`-only entry (the NUD_NONE shape `nud all` surfaces,
+    /// §2 measured: no `state` key and no `lladdr` at all) counts as understood and is skipped
+    /// as not-a-VM, not read as a failed document. Regression: leave the old shape test
+    /// (`dst` + `state` both required) as is, and this goes from `Some(empty)` to `None` — the
+    /// exact false fault the fix removes, since a leg holding only NONE entries would then
+    /// report "unreadable" every tick on a perfectly healthy leg.
+    #[test]
+    fn a_dst_only_entry_counts_as_understood_not_a_read_failure() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        let fdb = r#"[{"mac":"02:cf:ab:00:00:09","ifname":"tap100i0","master":"primary"}]"#;
+        assert_eq!(
+            local_vms(
+                r#"[{"dst":"192.168.20.106"}]"#,
+                fdb,
+                &v,
+                wl,
+                &["eth0".to_string()]
+            ),
+            Some(BTreeSet::new()),
+            "a NUD_NONE entry is an understood 'not a VM', never an unreadable document"
+        );
+    }
+
+    /// T-NONE-ARGV (r10 review should-fix 5) — `nud all` appears in BOTH neighbor-read argvs,
+    /// `read_local_vms` (feeding `apply`'s seed and `status`'s count) and `HostRoutes::observe`
+    /// (the supervisor tick). The plan states in the same breath that `local_vms`'s output is
+    /// unchanged either way (`RESOLVED` already excludes NUD_NONE and NOARP), which means
+    /// dropping `nud all` is otherwise invisible to every other test — this is the only thing
+    /// standing between the fix and a silent revert.
+    #[test]
+    fn both_neighbor_reads_ask_for_nud_all() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+
+        let mut seed_sys = tick_sys("");
+        let _ = seed_locals(&mut seed_sys, &v);
+        assert!(
+            seed_sys.ran("ip -j neigh show nud all dev cfab-work-vms"),
+            "read_local_vms must ask for nud all: {:?}",
+            seed_sys.calls
+        );
+
+        let mut observe_sys = tick_sys("");
+        let _ = HostRoutes::new().tick(&mut observe_sys, &v, Instant::now());
+        assert!(
+            observe_sys.ran("ip -j neigh show nud all dev cfab-work-vms"),
+            "HostRoutes::observe must ask for nud all: {:?}",
+            observe_sys.calls
+        );
+    }
+
     /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
     /// workload must never read as a VM here (a 3-host testbed would otherwise count peers).
     #[test]
@@ -870,7 +954,10 @@ mod tests {
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
-            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], neigh)
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "nud", "all", "dev", "cfab-work-vms"],
+                neigh,
+            )
             .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb)
             .on_stdout(
                 &["nft", "-j", "list", "set", "inet", "cfab-fwd"],
@@ -1097,7 +1184,16 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys("").on_fail(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             1,
             "Cannot talk to rtnetlink",
         );

@@ -2530,7 +2530,7 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip rule show pref ",
         "ip -4 -br addr show dev ",
         "ip -br link show dev ",
-        "ip -j neigh show dev ",
+        "ip -j neigh show nud all dev ",
         // The FDB half of the local-VM join (conflict 12). The `-j` is part of the prefix on
         // purpose: `bridge` is otherwise a write tool (`fdb del`, `vlan add`), so the
         // allowlist names the one document `status` reads and nothing else.
@@ -3706,7 +3706,16 @@ mod tests {
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3730,7 +3739,16 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([]).to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -4789,7 +4807,16 @@ table bridge cfab {
             .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1234\n")
             .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "5678\n")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &[
+                    "ip",
+                    "-j",
+                    "neigh",
+                    "show",
+                    "nud",
+                    "all",
+                    "dev",
+                    "cfab-work-vms",
+                ],
                 &neigh_json,
             );
         let expected = expected_links(&view).unwrap();
@@ -4825,7 +4852,16 @@ table bridge cfab {
         .to_string();
         let mut sys = wl_status_sys(&f, &view)
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &[
+                    "ip",
+                    "-j",
+                    "neigh",
+                    "show",
+                    "nud",
+                    "all",
+                    "dev",
+                    "cfab-work-vms",
+                ],
                 &neigh_json,
             )
             .on_stdout(
@@ -4907,7 +4943,7 @@ table bridge cfab {
     /// write) is still refused.
     #[test]
     fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
-        assert!(is_read_only("ip -j neigh show dev cfab-work-vms"));
+        assert!(is_read_only("ip -j neigh show nud all dev cfab-work-vms"));
         assert!(!is_read_only("ip neigh flush dev cfab-work-vms"));
         // The FDB half of the same join (conflict 12) is a read; every other `bridge` verb is
         // a write and stays refused.
