@@ -1573,6 +1573,48 @@ mod tests {
         }
     }
 
+    /// **T-THROTTLE, `ack_discovery`'s refusal half.** `serve`'s `AckOutcome::Refused` arm
+    /// (`:915-931`) journals through `should_log_fixed_reason_drop(&mut ack_refused_logged)` —
+    /// the SAME function already proven generic to its caller by
+    /// `an_out_of_prefix_drop_throttle_ignores_the_claimed_address`, "widened r7/r8 to a second
+    /// caller" per that function's own doc. This test composes the two REAL functions the call
+    /// site actually calls — `ack_discovery` and `should_log_fixed_reason_drop`, not a
+    /// reimplementation of either — driven across VARYING forged addresses, which is the exact
+    /// historical bug shape (S-C, gate C fix round 3): the old `OutOfPrefix` throttle keyed on
+    /// the drop's own message, which embeds the attacker-chosen address, so alternating the
+    /// claimed address made every packet compare unequal to the last and defeated the throttle.
+    /// A streak here can never reset mid-`serve()` by design (`row.prefix` and
+    /// `row.fabric_addresses` are both fixed for the call's life, so there is exactly one
+    /// reason to refuse) — unlike the cap's or a write's streak, there is no recovery case to
+    /// prove.
+    ///
+    /// Regression: swap `should_log_fixed_reason_drop(&mut ack_refused_logged)` for
+    /// `should_log_once(previous.as_deref(), &msg)` keyed on the refusal's own message (the
+    /// historical bug, reapplied to this caller) — printed count goes from 1 to 4, one per
+    /// distinct forged address.
+    #[test]
+    fn ack_discoverys_refusal_journals_once_per_streak_across_varying_forged_addresses() {
+        let gw = Ipv4Addr::new(192, 168, 22, 1);
+        let member = Ipv4Addr::new(192, 168, 22, 5);
+        let fabric_addresses: BTreeSet<Ipv4Addr> = [gw, member].into_iter().collect();
+
+        let mut ack_refused_logged = false;
+        let mut printed = 0;
+        for forged in [PREFIX.net, PREFIX.broadcast(), gw, member] {
+            let mut p = Bootp::parse(ACK).unwrap();
+            p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&forged.octets());
+            if let AckOutcome::Refused(_) = ack_discovery(p.as_bytes(), PREFIX, &fabric_addresses)
+                && should_log_fixed_reason_drop(&mut ack_refused_logged)
+            {
+                printed += 1;
+            }
+        }
+        assert_eq!(
+            printed, 1,
+            "four forged packets naming four different addresses, in one streak, print once"
+        );
+    }
+
     // ---- sockets: SO_REUSEADDR on both, proven by binding both to the same port -----------
 
     /// An ephemeral port nobody else holds right now: bind to port 0, read back what the

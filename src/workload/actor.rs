@@ -1369,4 +1369,248 @@ mod tests {
             .await
             .expect("the upsert must wake the actor");
     }
+
+    // ---- task 3c guard tests: T13, T14b, T-THROTTLE (write half), T-MINLEASE (second half) --
+
+    /// **T13 — the fork rate is a CONSTANT under every input, never derived from anything
+    /// measured at runtime** (spec §4.2.2: not autotuned, because the attacker sits inside any
+    /// feedback loop that measures cost — a flood would shrink the very budget meant to absorb
+    /// it). A failed write still spends exactly one token, the same as a successful one (spec
+    /// §4.2, "a write spends one"), so the elapsed simulated time to exhaust the SAME token
+    /// budget must be bit-for-bit identical whether every write in it succeeds or every one
+    /// fails. `N` = 200 keeps `dirty_depth` above `B - 1` for both scenarios across the
+    /// compared batches, so `want` never diverges between them for a reason that has nothing to
+    /// do with the rate.
+    ///
+    /// Regression: add ANY runtime-derived slowdown to the wait — e.g. sleep an extra interval
+    /// after a write failure ("back off under load"), which is exactly what §5 item 9's "no
+    /// backoff, the bucket is the bound" forbids. That change makes the two runs' elapsed times
+    /// unequal, which is the only thing this test checks.
+    #[tokio::test(start_paused = true)]
+    async fn the_fork_rate_never_varies_with_success_or_failure() {
+        const N: u32 = 200;
+        const BATCHES: u32 = 3;
+
+        async fn run_batches(succeed: bool) -> Duration {
+            let t = table_with(N);
+            let io = MockNeighborIo::new(move |argv, _| {
+                if argv.contains(&"show") {
+                    return Ok(crate::sys::Output {
+                        status: 0,
+                        stdout: "[]".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(crate::sys::Output {
+                    status: i32::from(!succeed),
+                    stdout: String::new(),
+                    stderr: if succeed {
+                        String::new()
+                    } else {
+                        "ENOBUFS".to_string()
+                    },
+                })
+            });
+            let mut a = FlushActor::new(t.clone(), Box::new(io));
+            let started = Instant::now();
+            for _ in 0..BATCHES {
+                a.run_batch().await;
+            }
+            Instant::now() - started
+        }
+
+        let succeeded = run_batches(true).await;
+        let failed = run_batches(false).await;
+        assert_eq!(
+            succeeded, failed,
+            "the same number of forks took different simulated wall time depending on \
+             success or failure ({succeeded:?} vs {failed:?}) — something is deriving the \
+             rate from a runtime observation"
+        );
+    }
+
+    /// **T14b — the orphan case, which T-NODEL's expiry case does not cover.** An address the
+    /// kernel holds that cfab's own table has NEVER claimed (another host's static entry, say)
+    /// is touched by NOTHING cfab does, on the first batch or any later one. `WriteVerb` has
+    /// only `Add` and `Replace` (writer.rs) — there is structurally no way to build a delete
+    /// argv through it — but the pre-drain read is unfiltered and host-wide (spec §4.1.1), so
+    /// nothing in the TYPE SYSTEM stops a future change from walking the read DOCUMENT instead
+    /// of the table's own dirty queue and "cleaning up" what it does not recognize. This test
+    /// pins the actual behavior across several ticks, not just the type shape.
+    ///
+    /// Regression: in `run_batch`, after classifying the queue's own entries, also walk
+    /// `doc`'s raw entries and delete anything absent from `self.table` — a "clean up what I
+    /// don't recognize" pass that reads as reasonable and is exactly what spec §5 item 10
+    /// forbids.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_kernel_entry_is_never_touched_at_start_or_on_any_tick() {
+        let t = table_with(1);
+        let orphan = Ipv4Addr::new(10, 9, 99, 99);
+        let io = MockNeighborIo::new(move |argv, _| {
+            if argv.contains(&"show") {
+                // The unfiltered, host-wide read surfaces the orphan alongside cfab's own row.
+                return Ok(crate::sys::Output {
+                    status: 0,
+                    stdout: kernel_doc(&[(LEG, orphan, Some("aa:bb:cc:dd:ee:ff"))]),
+                    stderr: String::new(),
+                });
+            }
+            Ok(crate::sys::Output {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        for tick in 0..5 {
+            a.run_batch().await;
+            // Keep feeding the actor real work every tick, so several ticks actually run
+            // something rather than idling after the first.
+            t.upsert(ROW, LEG, addr(tick + 100), MAC_B, long(), &cap(u32::MAX));
+        }
+        let orphan_str = orphan.to_string();
+        for c in calls.lock().unwrap().iter() {
+            assert!(
+                !c.iter().any(|a| a == "del"),
+                "cfab issues no `ip neigh del`, ever: {c:?}"
+            );
+            assert!(
+                !c.contains(&orphan_str),
+                "the orphan address is named in an argv cfab ran: {c:?}"
+            );
+        }
+    }
+
+    /// **T-THROTTLE, write-failure half.** A row whose write keeps failing journals ONCE per
+    /// failure streak, not once per attempt — the failure rate is whatever the kernel does on
+    /// each retry, and with retries bounded only by the bucket (no backoff, spec §5 item 9) a
+    /// persistent EEXIST/ENOBUFS race would otherwise print `R` = 10 lines a second forever.
+    /// A recovery ends the streak, and the next failure is loud again — proven in the same test
+    /// so the reset half cannot be "fixed" by never resetting at all.
+    ///
+    /// Regression: drop the `write_failing.insert(...)` guard in `run_batch` and journal on
+    /// every failed write.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistently_failing_write_journals_once_per_streak_then_resets() {
+        let t = table_with(0);
+        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let succeed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let succeed_in_io = succeed.clone();
+        let io = MockNeighborIo::new(move |argv, _| {
+            if argv.contains(&"show") {
+                return Ok(crate::sys::Output {
+                    status: 0,
+                    stdout: "[]".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            let ok = succeed_in_io.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::sys::Output {
+                status: i32::from(!ok),
+                stdout: String::new(),
+                stderr: if ok {
+                    String::new()
+                } else {
+                    "ENOBUFS".to_string()
+                },
+            })
+        });
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: None,
+            }),
+        );
+        // Ten consecutive failures for the SAME row are one journal line.
+        for _ in 0..10 {
+            a.run_batch().await;
+        }
+        assert_eq!(a.counts.write_failures, 10, "every attempt is counted");
+        assert_eq!(
+            said.lock().unwrap().len(),
+            1,
+            "ten failures in one streak are one journal line"
+        );
+
+        // The write succeeds: the streak ends.
+        succeed.store(true, std::sync::atomic::Ordering::SeqCst);
+        a.run_batch().await;
+        assert_eq!(a.counts.writes, 1);
+
+        // A fresh claim that fails again starts a NEW streak, and it is loud again.
+        succeed.store(false, std::sync::atomic::Ordering::SeqCst);
+        t.upsert(ROW, LEG, addr(0), MAC_B, long(), &cap(10));
+        for _ in 0..10 {
+            a.run_batch().await;
+        }
+        assert_eq!(
+            said.lock().unwrap().len(),
+            2,
+            "a recovery resets the streak; the next failure streak is loud once, not zero \
+             times and not ten"
+        );
+    }
+
+    /// **T-MINLEASE, second half.** The first half (table.rs) proves `clamp_lease` raises a
+    /// `lease = 1` ACK to `MIN_LEASE` = 60 s; this half is the only place that floor is checked
+    /// against the mechanism it exists to survive, because task 2 has no queue to check it
+    /// against. Placed at the genuine BACK of a full `Σ C_i` = 512 queue (dirtied LAST, unlike
+    /// `the_nth_entry_is_written_inside_the_stated_worst_case`'s fairness case, which dirties
+    /// its victim FIRST), the clamped entry must still be unexpired — and WRITTEN, not silently
+    /// dropped at take — when the actor finally reaches it at the stated worst case.
+    ///
+    /// Regression: shrink `MIN_LEASE` toward the naive 51.2 s = `Σ C_i / R`, the bound that
+    /// ignores the drain's own read forks (spec §1's own erratum over call 10's ruling). The
+    /// victim then expires in the queue before the actor reaches it and is silently dropped by
+    /// `take_next_dirty`'s expiry arm — invisible to T3, T3a, T3b, T4 and T4a, all of which use
+    /// `long()` (effectively infinite) expiries and cannot see a floor that is too low.
+    #[tokio::test(start_paused = true)]
+    async fn a_min_lease_entry_survives_the_full_queue_and_is_written() {
+        const SIGMA_C: u32 = 512;
+        let t = Arc::new(NeighborTable::new());
+        for i in 0..SIGMA_C - 1 {
+            t.upsert(ROW, LEG, addr(i), MAC_A, long(), &cap(u32::MAX));
+        }
+        // Dirtied LAST: the genuine worst FIFO position, behind all 511 others.
+        let victim = addr(SIGMA_C);
+        let victim_expiry =
+            Instant::now().into_std() + crate::workload::table::clamp_lease(Some(1));
+        t.upsert(ROW, LEG, victim, MAC_B, victim_expiry, &cap(u32::MAX));
+
+        let io = MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+
+        let started = Instant::now();
+        // Matches `the_nth_entry_is_written_inside_the_stated_worst_case`'s own number; task 4
+        // moves both to 53.3 s when the sweep starts spending tokens on the actor too.
+        let deadline = Duration::from_millis(52_900);
+        let victim_str = victim.to_string();
+        loop {
+            a.run_batch().await;
+            if calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.get(3) == Some(&victim_str))
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() <= deadline,
+                "the victim was not reached within the worst-case window: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                t.dirty_depth() > 0 || t.entry(ROW, victim).is_some(),
+                "the queue drained to nothing without ever writing the victim — it must have \
+                 expired in the queue and been silently dropped"
+            );
+        }
+        assert!(started.elapsed() <= deadline, "{:?}", started.elapsed());
+    }
 }

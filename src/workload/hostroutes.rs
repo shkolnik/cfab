@@ -721,6 +721,76 @@ mod tests {
         );
     }
 
+    /// **T-NODEL — a row expires while the kernel holds what cfab wrote.** cfab's own table
+    /// loses the row at expiry (`remove_expired`, task 2's sweep-side enforcement), but cfab
+    /// deletes no kernel neighbor entry, ever (spec §5 item 10) — `WriteVerb` (writer.rs) has
+    /// no delete variant at all, so the kernel entry cfab wrote while the lease was live is left
+    /// exactly where it is. This is the cross-module consequence that makes the rule matter:
+    /// `hostroutes` reads the KERNEL, never cfab's own table, so it still originates the VM's
+    /// /32 from the untouched entry — `NEIGH`/`FDB` above are exactly that state, one address
+    /// (`.103`) resolved and on a tap. The harm this pins is invisible to any test that checks
+    /// only `NeighborTable::len()` (which reads as success — "the row is gone") without also
+    /// checking that `local_vms` still sees the VM: losing BOTH would silently treat an
+    /// internal bookkeeping expiry as if the VM itself had gone dark.
+    ///
+    /// Regression: this test would go red for the WRONG reason if a future change taught the
+    /// actor to `ip neigh del` an expired row's kernel entry (forbidden by spec §5 item 10) —
+    /// simulated here by using a `NEIGH` document with `.103`'s entry removed, which is what
+    /// that kernel state would look like after such a delete.
+    #[test]
+    fn an_expired_rows_kernel_entry_still_originates_its_32() {
+        let t = crate::workload::table::NeighborTable::new();
+        let t0 = std::time::Instant::now();
+        let vm = addr("192.168.20.103");
+        t.upsert(
+            "vms",
+            "cfab-work-vms",
+            vm,
+            [0x02, 0xcf, 0xab, 0, 0, 0x01],
+            t0 + Duration::from_secs(60),
+            &crate::workload::table::RowCap {
+                value: u32::MAX,
+                bound_by: crate::workload::table::CapBound::Prefix,
+                gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                rows: 1,
+            },
+        );
+        assert_eq!(t.len(), 1);
+
+        // The lease elapses; cfab's OWN bookkeeping loses the row.
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)), 1);
+        assert_eq!(t.len(), 0, "cfab's own table has forgotten the row");
+
+        // But cfab never touched the kernel, so the SAME kernel document `hostroutes` reads
+        // still carries the entry cfab wrote — and still originates the /32.
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        assert_eq!(
+            local_vms(NEIGH, FDB, &v, wl, &["eth0".to_string()]).unwrap(),
+            set(&["192.168.20.103"]),
+            "the kernel entry cfab wrote outlives cfab's own row, and the VM's /32 keeps \
+             routing on kernel truth alone"
+        );
+
+        // The regression this test is meant to catch: if cfab HAD deleted the kernel entry,
+        // the document would look like this, and the VM's /32 would be gone too.
+        let after_a_forbidden_delete: &str = r#"[
+          {"dst":"192.168.20.2","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:02","state":["PERMANENT"]},
+          {"dst":"192.168.20.3","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:03","state":["STALE"]},
+          {"dst":"192.168.20.1","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:04","state":["REACHABLE"]},
+          {"dst":"10.99.0.4","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:05","state":["REACHABLE"]},
+          {"dst":"192.168.20.104","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:06","state":["REACHABLE"]}
+        ]"#;
+        assert!(
+            local_vms(after_a_forbidden_delete, FDB, &v, wl, &["eth0".to_string()])
+                .unwrap()
+                .is_empty(),
+            "sanity check on the fixture itself: with the entry actually gone, the /32 is too — \
+             which is exactly the outcome the no-delete rule exists to prevent"
+        );
+    }
+
     /// The restart case: the leg now outlives a `systemctl restart cfab`, so its neighbor
     /// entries do too — and an entry nothing has touched for 30 s is STALE, not REACHABLE. An
     /// idle VM must still be a VM on the first tick after the restart, with no new traffic from
