@@ -232,6 +232,12 @@ struct Inner {
 #[derive(Default)]
 pub struct NeighborTable {
     inner: std::sync::Mutex<Inner>,
+    /// How a newly dirtied entry wakes the flush actor, so a quiet host costs no polling tick.
+    /// Outside the mutex, and notified only after the guard has dropped: the table lock is a
+    /// leaf and nothing — not even a wakeup — happens under it. `Notify::notify_one` stores a
+    /// permit when no one is waiting, so an upsert that races the actor's own dirty-depth check
+    /// cannot be lost.
+    dirty: tokio::sync::Notify,
 }
 
 impl NeighborTable {
@@ -256,41 +262,99 @@ impl NeighborTable {
         cap: &RowCap,
     ) -> Upsert {
         let key = (row.to_string(), addr);
-        let mut g = self.inner.lock().unwrap();
-        let Inner {
-            entries,
-            queue,
-            refusing,
-        } = &mut *g;
-        match entries.get_mut(&key) {
-            Some(e) => {
-                e.leg = leg.to_string();
-                e.mac = mac;
-                e.expires_at = expires_at;
-                if !e.dirty {
+        let outcome = {
+            let mut g = self.inner.lock().unwrap();
+            let Inner {
+                entries,
+                queue,
+                refusing,
+            } = &mut *g;
+            match entries.get_mut(&key) {
+                Some(e) => {
+                    e.leg = leg.to_string();
+                    e.mac = mac;
+                    e.expires_at = expires_at;
+                    if !e.dirty {
+                        e.dirty = true;
+                        queue.push_back(key);
+                    }
+                    refusing.remove(row);
+                    Upsert::Admitted
+                }
+                None => {
+                    if row_len(entries, row) >= cap.value {
+                        let first_of_streak = refusing.insert(row.to_string());
+                        Upsert::Refused { first_of_streak }
+                    } else {
+                        entries.insert(
+                            key.clone(),
+                            Entry {
+                                leg: leg.to_string(),
+                                mac,
+                                expires_at,
+                                dirty: true,
+                            },
+                        );
+                        queue.push_back(key);
+                        refusing.remove(row);
+                        Upsert::Admitted
+                    }
+                }
+            }
+        };
+        // The guard is gone by here on purpose: the actor must never be woken from under this
+        // lock, because the first thing it does on waking is take it.
+        if matches!(outcome, Upsert::Admitted) {
+            self.dirty.notify_one();
+        }
+        outcome
+    }
+
+    /// Put back an entry the actor took and could not write. The rules it encodes are §4.1.2's,
+    /// and each one is a defect some round shipped:
+    ///
+    /// - An entry an upsert re-dirtied *during* the write is already queued and **keeps its
+    ///   position** — an unrelated kernel failure must not push a newer legitimate claim to the
+    ///   back of the FIFO.
+    /// - An entry whose lease ran out between take and completion is **not resurrected**;
+    ///   expiry wins over the retry.
+    /// - Anything else goes to the **back**, so one failing address cannot hold the queue.
+    pub fn re_dirty(&self, row: &str, addr: Ipv4Addr, now: Instant) {
+        let key = (row.to_string(), addr);
+        let woke = {
+            let mut g = self.inner.lock().unwrap();
+            let Inner { entries, queue, .. } = &mut *g;
+            match entries.get_mut(&key) {
+                None => false,
+                Some(e) if e.expires_at <= now => {
+                    entries.remove(&key);
+                    false
+                }
+                Some(e) if e.dirty => false,
+                Some(e) => {
                     e.dirty = true;
                     queue.push_back(key);
+                    true
                 }
             }
-            None => {
-                if row_len(entries, row) >= cap.value {
-                    let first_of_streak = refusing.insert(row.to_string());
-                    return Upsert::Refused { first_of_streak };
-                }
-                entries.insert(
-                    key.clone(),
-                    Entry {
-                        leg: leg.to_string(),
-                        mac,
-                        expires_at,
-                        dirty: true,
-                    },
-                );
-                queue.push_back(key);
-            }
+        };
+        if woke {
+            self.dirty.notify_one();
         }
-        refusing.remove(row);
-        Upsert::Admitted
+    }
+
+    /// Sleep until something is dirty. The actor's only idle path: a quiet host runs no timer
+    /// and does no work at all here (R4).
+    pub async fn wait_dirty(&self) {
+        self.dirty.notified().await;
+    }
+
+    /// Whether this lock is free *right now*, from the calling thread. `std::sync::Mutex` is
+    /// not reentrant, so a thread already holding the guard gets `false` — which is what makes
+    /// this an observable proxy for "no I/O, no `Shared`, no token spend under the table lock"
+    /// (spec §4.2.3), whose live symptom is otherwise a hang rather than a wrong answer.
+    pub fn lock_is_free(&self) -> bool {
+        self.inner.try_lock().is_ok()
     }
 
     /// The next dirty entry in host-wide FIFO order, cleared of its dirty flag.

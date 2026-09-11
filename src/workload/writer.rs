@@ -205,6 +205,71 @@ fn run_with_deadline(argv: &[&str], deadline: Duration) -> Result<Output> {
     }
 }
 
+/// The scriptable `NeighborIo` the flush actor's tests drive. One mock covers every case the
+/// actor has: what the kernel holds, a write that fails, a read that never returns, and the
+/// fork counting the token bucket's whole guarantee is stated in — because each of those is
+/// just a different answer to "what did this argv do?".
+#[cfg(test)]
+pub mod mock {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Answer = dyn FnMut(&[&str], usize) -> Result<Output> + Send;
+
+    pub struct MockNeighborIo {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        answer: Box<Answer>,
+    }
+
+    impl MockNeighborIo {
+        /// `answer` is handed the argv and the 1-based number of *this kind* of call so far
+        /// (reads and writes counted separately), which is how a test scripts "the first write
+        /// fails" without matching on text.
+        pub fn new(answer: impl FnMut(&[&str], usize) -> Result<Output> + Send + 'static) -> Self {
+            MockNeighborIo {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                answer: Box::new(answer),
+            }
+        }
+
+        /// The common case: every read returns `kernel`, every write succeeds.
+        pub fn kernel(kernel: &str) -> Self {
+            let kernel = kernel.to_string();
+            Self::new(move |argv, _| {
+                Ok(Output {
+                    status: 0,
+                    stdout: if argv.contains(&"show") {
+                        kernel.clone()
+                    } else {
+                        String::new()
+                    },
+                    stderr: String::new(),
+                })
+            })
+        }
+
+        /// Every argv this io was asked to run, in order. Shared, so a test can read it while
+        /// the actor still owns the io.
+        pub fn calls(&self) -> Arc<Mutex<Vec<Vec<String>>>> {
+            self.calls.clone()
+        }
+    }
+
+    impl NeighborIo for MockNeighborIo {
+        fn run(&mut self, argv: &[&str]) -> Result<Output> {
+            let is_read = argv.contains(&"show");
+            let nth = {
+                let mut c = self.calls.lock().unwrap();
+                c.push(argv.iter().map(|s| s.to_string()).collect());
+                c.iter()
+                    .filter(|p| p.iter().any(|w| w == "show") == is_read)
+                    .count()
+            };
+            (self.answer)(argv, nth)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

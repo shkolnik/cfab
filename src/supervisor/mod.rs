@@ -112,16 +112,6 @@ pub(crate) enum Cmd {
     /// working must never keep claiming it is the live one (ruling 12: `status` says which
     /// path is active).
     NeighWatchDied(String),
-    /// A DHCP relay task relayed a `DHCPACK` (spec §5.4, r3 review N2c): the actual `ip neigh
-    /// replace` cannot happen in the relay task itself, because `Sys` is owned by this main
-    /// loop and is not `Send`. `leg` and `name` travel with it so the loop needs no lookup by
-    /// name to build the argv or to journal which row.
-    DhcpAck {
-        name: String,
-        leg: String,
-        yiaddr: Ipv4Addr,
-        chaddr: [u8; 6],
-    },
 }
 
 /// A child's exit, reported by its `wait` task to the main loop.
@@ -165,8 +155,7 @@ pub(crate) struct Shared {
     metrics_gather_failing: bool,
     /// One row per `[[workload]]` DHCP relay this member runs (spec §5.4/§6), keyed by workload
     /// name. The relay task writes this directly through the mutex — plain counters, never a
-    /// `Sys` action, so unlike the neighbor write (`Cmd::DhcpAck`) it needs no round trip through
-    /// the main loop. A row with no `dhcp_server` never gets an entry; a row that has one but
+    /// `Sys` action, so it needs no round trip through the main loop. A row with no `dhcp_server` never gets an entry; a row that has one but
     /// whose task has not bound yet is absent until its first `RelayEvent`, exactly like
     /// `workloads` before the first announcer trigger fires.
     relays: BTreeMap<String, RelayReport>,
@@ -225,8 +214,9 @@ pub(crate) enum RelayEvent {
     Request,
     /// A server→client packet was forwarded.
     Reply,
-    /// A relayed `DHCPACK` earned a neighbor write (posted separately as `Cmd::DhcpAck`; this is
-    /// the counter half, credited when the task decides to register, not when the write lands).
+    /// A relayed `DHCPACK` earned a neighbor write (the claim went into the host-wide neighbor
+    /// table; this is the counter half, credited when the task registers the claim, not when the
+    /// flush actor's write lands).
     Discovered,
     /// One packet the relay declined to forward, or declined to register, WITHOUT ending the
     /// task. Four causes: a server-facing send that failed because `dhcp_server` is unreachable
@@ -489,6 +479,15 @@ pub(crate) struct Hooks {
     /// Where the announcers' frames go. `None` ⇒ the production `AF_PACKET` socket (the
     /// prober's `PacketIo`); a test installs a recorder, so no test ever opens a real socket.
     pub announce_io: Option<Box<dyn crate::workload::announce::AnnounceIo + Send>>,
+    /// What the flush actor forks through. `None` ⇒ the production `ForkNeighborIo`; a test
+    /// installs a recorder, so no test ever forks `ip`. The actor is spawned only for a member
+    /// that declares at least one relay row, so most tests never reach either.
+    pub neighbor_io: Option<Box<dyn crate::workload::writer::NeighborIo>>,
+    /// The neighbor table the relay tasks and the flush actor share. `None` ⇒ the supervisor
+    /// makes its own; a test passes one in so it can upsert a claim and watch the actor write
+    /// it — the only way to see that the actor is spawned and wired at all, which every test in
+    /// `workload::actor` would stay green without.
+    pub neighbor_table: Option<Arc<crate::workload::table::NeighborTable>>,
 }
 
 impl Hooks {
@@ -510,6 +509,8 @@ impl Hooks {
             }),
             neigh_watch: Arc::new(spawn_neigh_watch),
             announce_io: None,
+            neighbor_io: None,
+            neighbor_table: None,
         }
     }
 }
@@ -1006,7 +1007,9 @@ pub(crate) async fn run_with(
     let relay_row_list = relay_rows(view);
     // The neighbor write table (gate C spec §4.1): host-wide, shared by every relay task and
     // (from the flush actor on) by the actor that drains it.
-    let neigh_table = Arc::new(crate::workload::table::NeighborTable::new());
+    let neigh_table = hooks
+        .neighbor_table
+        .unwrap_or_else(|| Arc::new(crate::workload::table::NeighborTable::new()));
     // `C` must be valid before any relay can accept its first ACK, so the sysctl is read here,
     // ahead of the spawn loop. A member with no relay row has no table to cap, so it reads
     // nothing.
@@ -1015,11 +1018,20 @@ pub(crate) async fn run_with(
     if relay_row_count > 0 {
         publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
     }
+    if relay_row_count > 0 {
+        // The flush actor (gate C spec §4.2): ONE for the whole member, on its own task. Not on
+        // this loop — a fork here stalls the watchdog feed, the `cfab.sock` accept and every
+        // tick while it blocks, which is the harm this gate exists to remove. It sleeps until an
+        // upsert wakes it, so a member whose VMs never DHCP costs nothing.
+        let io: Box<dyn crate::workload::writer::NeighborIo> = hooks
+            .neighbor_io
+            .unwrap_or_else(|| Box::new(crate::workload::writer::ForkNeighborIo::default()));
+        tokio::spawn(crate::workload::actor::FlushActor::new(neigh_table.clone(), io).run());
+    }
     for relay_row in relay_row_list {
         tokio::spawn(crate::workload::relay::run(
             relay_row,
             shared.clone(),
-            cmd_tx.clone(),
             neigh_table.clone(),
         ));
     }
@@ -1172,29 +1184,6 @@ pub(crate) async fn run_with(
                     Cmd::NeighWatchDied(why) => {
                         workloads.watch_died(&why);
                         workloads.publish(&shared);
-                        continue;
-                    }
-                    // A relayed DHCPACK (spec §5.4, r3 review N2c): the write happens here,
-                    // where `&mut sys` lives, never in the relay task itself. Never fatal — a
-                    // failed write costs one journal line and the VM is discovered on its next
-                    // non-DHCP packet instead (spec §5.6), same as any silent VM.
-                    Cmd::DhcpAck { name, leg, yiaddr, chaddr } => {
-                        let mac = crate::workload::relay::mac_str(chaddr);
-                        let yiaddr = yiaddr.to_string();
-                        let argv = [
-                            "ip", "neigh", "replace", &yiaddr, "lladdr", &mac, "dev", &leg,
-                            "nud", "stale",
-                        ];
-                        match sys.run(&argv) {
-                            Ok(o) if o.ok() => {}
-                            Ok(o) => eprintln!(
-                                "cfab: workload {name}: dhcp ack neighbor write failed: {}",
-                                o.stderr
-                            ),
-                            Err(e) => eprintln!(
-                                "cfab: workload {name}: dhcp ack neighbor write failed: {e}"
-                            ),
-                        }
                         continue;
                     }
                 };
@@ -2191,6 +2180,8 @@ mod tests {
             feed: Arc::new(|| {}),
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         }
     }
 
@@ -2325,44 +2316,64 @@ mod tests {
         );
     }
 
-    /// Teeth: the ACK's neighbor write must go through `Cmd::DhcpAck` and land on `&mut sys` in
-    /// the main loop, never inside the relay task itself (`Sys` is not `Send`). Posting the
-    /// command directly, with no relay task involved at all, proves the loop's own handling: the
-    /// exact `ip neigh replace` argv must reach `sys`.
+    /// **The flush actor is spawned and wired to the table the relay tasks upsert into.** Every
+    /// test in `workload::actor` drives the actor directly, so all of them stay green if the
+    /// supervisor never spawns it at all and no neighbor is ever written — the defect class
+    /// spec §10 names. This is the one test that can see that: inject the shared table, upsert a
+    /// claim the way a relayed ACK does, and watch the write reach the injected io.
+    ///
+    /// The write is asserted on the injected `NeighborIo`, never on `sys`: the actor does not go
+    /// through `Sys` at all, which is the whole reason it is its own task.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_posted_dhcp_ack_writes_the_neighbor_through_sys() {
+    async fn the_flush_actor_is_spawned_and_writes_what_the_relay_upserts() {
         let tmp = tempfile::tempdir().unwrap();
-        let f = wl_fabric_at(tmp.path());
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
         let view = View::new(&f, "pve1-tb").unwrap();
-        let mut sys = wl_fresh_sys(&view, tmp.path());
+        let mut sys = wl_fresh_sys(&view, tmp.path()).file(CONFIG, &decl);
         let (mut spawner, _recs) = rec();
         let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let table = Arc::new(crate::workload::table::NeighborTable::new());
+        let io = crate::workload::writer::mock::MockNeighborIo::kernel("[]");
+        let calls = io.calls();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let driver_tx = cmd_tx.clone();
+        let t = table.clone();
+        let c = calls.clone();
         let driver = tokio::spawn(async move {
             ready_rx.await.ok();
-            // Sent as two distinct messages on the same unbounded (FIFO) channel: the loop
-            // drains one `Cmd` per select iteration, so DhcpAck is guaranteed to be handled
-            // before Terminate is even looked at.
-            driver_tx
-                .send(Cmd::DhcpAck {
-                    name: "vms".to_string(),
-                    leg: "cfab-work-vms".to_string(),
-                    yiaddr: "192.168.20.150".parse().unwrap(),
-                    chaddr: [0x4e, 0x48, 0xe9, 0x89, 0x2e, 0xe5],
+            t.upsert(
+                "vms",
+                "cfab-work-vms",
+                "192.168.20.150".parse().unwrap(),
+                [0x4e, 0x48, 0xe9, 0x89, 0x2e, 0xe5],
+                Instant::now() + Duration::from_secs(600),
+                &crate::workload::table::CapSource {
+                    gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                    rows: 1,
+                }
+                .for_prefix(crate::model::Ipv4Prefix::parse("192.168.20.0/24").unwrap()),
+            );
+            let wrote = until(2000, || {
+                c.lock().unwrap().iter().any(|a| {
+                    a.first().is_some_and(|w| w == "ip") && a.get(2).is_some_and(|v| v == "add")
                 })
-                .ok();
+            })
+            .await;
             driver_tx.send(Cmd::Terminate).ok();
+            wrote
         });
-        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.neighbor_io = Some(Box::new(io));
+        hooks.neighbor_table = Some(table);
         let code = run_with(
             &mut sys,
             &view,
             &mut spawner,
             EXE,
             CONFIG,
-            &wl_decl_text(tmp.path()),
+            &decl,
             &no_pmx(tmp.path()),
             cmd_tx,
             cmd_rx,
@@ -2370,14 +2381,15 @@ mod tests {
         )
         .await;
         assert_eq!(code, 0);
-        driver.await.unwrap();
-        assert!(
-            sys.ran(
-                "ip neigh replace 192.168.20.150 lladdr 4e:48:e9:89:2e:e5 dev cfab-work-vms nud \
-                 stale"
-            ),
-            "{:?}",
-            sys.calls
+        assert!(driver.await.unwrap(), "{:?}", calls.lock().unwrap());
+        let calls = calls.lock().unwrap().clone();
+        let write = calls
+            .iter()
+            .find(|a| a.get(2).is_some_and(|v| v == "add"))
+            .expect("the actor must have written the claim");
+        assert_eq!(
+            write.join(" "),
+            "ip neigh add 192.168.20.150 lladdr 4e:48:e9:89:2e:e5 dev cfab-work-vms nud stale"
         );
     }
 
@@ -2775,6 +2787,8 @@ mod tests {
                 feed: Arc::new(|| {}),
                 neigh_watch: no_neigh_watch(),
                 announce_io: Some(Box::new(RecordingIo::default())),
+                neighbor_io: None,
+                neighbor_table: None,
             },
         )
         .await;
@@ -3009,6 +3023,8 @@ mod tests {
                 feed: Arc::new(|| {}),
                 neigh_watch: no_neigh_watch(),
                 announce_io: Some(Box::new(RecordingIo::default())),
+                neighbor_io: None,
+                neighbor_table: None,
             },
         )
         .await;
@@ -4080,6 +4096,8 @@ mod tests {
             feed: Arc::new(|| {}),
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         };
         let code = run_with(
             &mut sys,
@@ -4216,6 +4234,8 @@ mod tests {
             feed,
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         };
         let code = run_with(
             &mut sys,

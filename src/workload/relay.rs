@@ -3,8 +3,9 @@
 //! the RFC 1542 forwarding decision — and is unit-tested against the real packets captured off
 //! the testbed wire (`tests/fixtures/dhcp-*.bin`); the task itself is a thin two-socket async
 //! loop around that pure core, plus the one place it must NOT act directly: the kernel neighbor
-//! write a relayed ACK earns, which crosses to the supervisor's main loop as `Cmd::DhcpAck`
-//! because `Sys` is owned there and is not `Send` (spec §5.4, r3 review N2c).
+//! write a relayed ACK earns. The relay upserts the claim into the host-wide `NeighborTable` and
+//! returns; the flush actor (`workload::actor`) spends a token, reads the kernel and performs the
+//! write off this task entirely (gate C spec §4.1, §4.2).
 //!
 //! **Never an option rewriter.** RFC 1542 forwarding touches exactly `hops`, `giaddr`, and (to
 //! pick where a reply goes) reads `ciaddr`; every byte of `sname`, `file` and the option area
@@ -37,12 +38,11 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 
 use crate::model::Ipv4Prefix;
 use crate::supervisor::child::BACKOFF;
 use crate::supervisor::metrics::BIND_RETRY;
-use crate::supervisor::{Cmd, RelayEvent, Shared};
+use crate::supervisor::{RelayEvent, Shared};
 use crate::workload::table::{self, NeighborTable};
 
 /// BOOTP opcodes (RFC 2131 §2).
@@ -634,23 +634,17 @@ async fn wait_for_leg(leg: &str, reader: &IfindexReader, poll: Duration, retry: 
 /// changes (S1). Neither is ever fatal to the member — a leg that does not exist yet (a deferred
 /// row, a watchdog rebuild in progress) is indistinguishable in kind from a port transiently held
 /// by something else: both clear themselves the moment the precondition does.
-pub(crate) async fn run(
-    row: RelayRow,
-    shared: Arc<Mutex<Shared>>,
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
-    table: Arc<NeighborTable>,
-) {
-    run_with_reader(row, shared, cmd_tx, table, default_ifindex_reader()).await
+pub(crate) async fn run(row: RelayRow, shared: Arc<Mutex<Shared>>, table: Arc<NeighborTable>) {
+    run_with_reader(row, shared, table, default_ifindex_reader()).await
 }
 
 async fn run_with_reader(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
     table: Arc<NeighborTable>,
     reader: IfindexReader,
 ) {
-    run_with_reader_via(row, shared, cmd_tx, table, reader, bind_pair_with_baseline).await
+    run_with_reader_via(row, shared, table, reader, bind_pair_with_baseline).await
 }
 
 /// The actual retry loop behind `run_with_reader`, generic over how the pair gets bound for the
@@ -661,7 +655,6 @@ async fn run_with_reader(
 async fn run_with_reader_via<B>(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
     table: Arc<NeighborTable>,
     reader: IfindexReader,
     mut bind: B,
@@ -697,7 +690,7 @@ async fn run_with_reader_via<B>(
                     reader: reader.clone(),
                     poll: IFINDEX_POLL,
                 };
-                let why = serve(&client, &server, &row, &shared, &cmd_tx, &table, &watch).await;
+                let why = serve(&client, &server, &row, &shared, &table, &watch).await;
                 eprintln!(
                     "cfab: workload {}: dhcp relay socket lost ({why}); retrying in {}s",
                     row.name,
@@ -764,7 +757,6 @@ async fn serve(
     server: &UdpSocket,
     row: &RelayRow,
     shared: &Arc<Mutex<Shared>>,
-    cmd_tx: &mpsc::UnboundedSender<Cmd>,
     table: &NeighborTable,
     watch: &LegWatch,
 ) -> String {
@@ -790,11 +782,6 @@ async fn serve(
     // exactly one reason to log, and repeating it once for every forged packet would be a
     // self-inflicted journal DoS.
     let mut ack_refused_logged = false;
-    // TRANSITIONAL (plan §3), deleted in task 3b with `Cmd::DhcpAck`: the last claim this
-    // row sent to the command loop, which services each send with a synchronous
-    // `ip neigh replace` fork. Bounds a VM forging BOOTREPLYs on this VLAN to one fork per
-    // distinct claim rather than one per packet, exactly as it did before the table existed.
-    let mut last_ack: Option<(Ipv4Addr, [u8; 6])> = None;
     loop {
         tokio::select! {
             _ = poll.tick() => {
@@ -907,24 +894,6 @@ async fn serve(
                                                     row.dhcp_server,
                                                     RelayEvent::Discovered,
                                                 );
-                                                // TRANSITIONAL (plan §3), deleted with
-                                                // `Cmd::DhcpAck` itself in task 3b: the command
-                                                // loop still services this send with a
-                                                // synchronous fork, so until the actor exists
-                                                // the gate stays around the SEND and keeps this
-                                                // branch's fork behavior identical to `p2c`'s.
-                                                // The upsert above is outside it, so the table
-                                                // sees every claim (the R2.1 hole the gate used
-                                                // to open).
-                                                if last_ack != Some((yiaddr, chaddr)) {
-                                                    last_ack = Some((yiaddr, chaddr));
-                                                    let _ = cmd_tx.send(Cmd::DhcpAck {
-                                                        name: row.name.clone(),
-                                                        leg: row.leg.clone(),
-                                                        yiaddr,
-                                                        chaddr,
-                                                    });
-                                                }
                                             }
                                             table::Upsert::Refused { first_of_streak } => {
                                                 if first_of_streak {
@@ -1229,7 +1198,6 @@ mod tests {
             prefix: PREFIX,
             fabric_addresses: BTreeSet::new(),
         };
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         // `fake_bind` needs no privileges, so `bind_pair_with_baseline_via` (already proven
         // above to call `reader` for both the pre- and post-bind reads) stands in for the real
@@ -1240,7 +1208,6 @@ mod tests {
             run_with_reader_via(
                 row,
                 shared,
-                cmd_tx,
                 Arc::new(NeighborTable::new()),
                 reader,
                 |r, reader| bind_pair_with_baseline_via(r, reader, fake_bind),
@@ -1712,7 +1679,6 @@ mod tests {
         let shared_task = shared.clone();
         let table = Arc::new(NeighborTable::new());
         let table_task = table.clone();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
             serve(
@@ -1720,7 +1686,6 @@ mod tests {
                 &server,
                 &row,
                 &shared_task,
-                &cmd_tx,
                 &table_task,
                 &no_watch(),
             )
@@ -1791,7 +1756,6 @@ mod tests {
             fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1800,7 +1764,6 @@ mod tests {
                 &server,
                 &row,
                 &shared,
-                &cmd_tx,
                 &NeighborTable::new(),
                 &watch,
             ),
@@ -1853,7 +1816,6 @@ mod tests {
             fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         // 30 ms is 6 polls at 5 ms each; if the unknown-baseline race were mishandled, `serve`
         // would have returned long before this deadline.
@@ -1864,7 +1826,6 @@ mod tests {
                 &server,
                 &row,
                 &shared,
-                &cmd_tx,
                 &NeighborTable::new(),
                 &watch,
             ),
@@ -1903,7 +1864,6 @@ mod tests {
             fabric_addresses: BTreeSet::new(),
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1912,7 +1872,6 @@ mod tests {
                 &server,
                 &row,
                 &shared,
-                &cmd_tx,
                 &NeighborTable::new(),
                 &watch,
             ),
@@ -1967,7 +1926,6 @@ mod tests {
         let shared_task = shared.clone();
         let table = Arc::new(NeighborTable::new());
         let table_task = table.clone();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
             serve(
@@ -1975,7 +1933,6 @@ mod tests {
                 &server,
                 &row,
                 &shared_task,
-                &cmd_tx,
                 &table_task,
                 &no_watch(),
             )
@@ -2042,7 +1999,6 @@ mod tests {
         let shared_task = shared.clone();
         let table = Arc::new(NeighborTable::new());
         let table_task = table.clone();
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
             serve(
@@ -2050,7 +2006,6 @@ mod tests {
                 &server,
                 &row,
                 &shared_task,
-                &cmd_tx,
                 &table_task,
                 &no_watch(),
             )
@@ -2117,7 +2072,7 @@ mod tests {
     // ---- serve: T1a, a repeated identical claim still reaches the table -------------------
 
     /// **T1a.** Round 3 deduplicated the neighbor write per `(yiaddr, chaddr)` and gated the
-    /// `Cmd::DhcpAck` send itself on it, so a repeat of a claim cfab had already seen could
+    /// neighbor write's own dispatch on it, so a repeat of a claim cfab had already seen could
     /// never restore an address — and the case that matters is exactly a repeat: a VM whose
     /// kernel entry the host lost re-DHCPs with the SAME address and the SAME MAC. The dedupe
     /// is deleted; every admitted claim reaches the table.
@@ -2154,7 +2109,6 @@ mod tests {
         let shared_task = shared.clone();
         let table = Arc::new(NeighborTable::new());
         let table_task = table.clone();
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
             serve(
@@ -2162,7 +2116,6 @@ mod tests {
                 &server,
                 &row,
                 &shared_task,
-                &cmd_tx,
                 &table_task,
                 &no_watch(),
             )
@@ -2205,21 +2158,6 @@ mod tests {
             entry.dirty,
             "the repeated claim must re-queue the entry the actor had already taken — this is \
              the assertion the take above gives teeth to"
-        );
-
-        // The TRANSITIONAL half, and the reason it is 1 and not 2: `Cmd::DhcpAck` is still
-        // serviced by a synchronous fork on the command loop, so the `last_ack` gate stays
-        // around the send until task 3b deletes both (plan §3 — no intermediate commit on this
-        // branch is worse than `p2c` on the fork axis). The rule this test exists for is the
-        // assertion above: the gate no longer stands between a claim and the TABLE. When 3b
-        // removes `Cmd::DhcpAck`, this assertion goes with it.
-        let mut acks_received = 0;
-        while cmd_rx.try_recv().is_ok() {
-            acks_received += 1;
-        }
-        assert_eq!(
-            acks_received, 1,
-            "the transitional send gate still collapses an identical repeat"
         );
 
         assert!(!handle.is_finished(), "the loop must still be serving");

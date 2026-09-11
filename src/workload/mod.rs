@@ -8,6 +8,7 @@ use std::fmt;
 use crate::derive::View;
 use crate::sys::Sys;
 
+pub mod actor;
 pub mod announce;
 pub mod hostroutes;
 pub mod leg;
