@@ -615,6 +615,40 @@ pub fn run(
     Ok(code)
 }
 
+/// The DHCP relay rows this member runs, one per declared row that names a `dhcp_server`.
+///
+/// Split out of `run_inner`'s spawn loop so the wiring itself is testable: `fabric_addresses` is
+/// the base half of `ack_discovery`'s anti-spoof predicate, and a row built with an empty set
+/// there would let a forged ACK name this member's own address or the anycast `gw` while every
+/// unit test of `ack_discovery` (which builds its own set) stayed green. Fixed for the row's
+/// whole life — it derives only from the declaration — so it is computed once here rather than
+/// once per packet; `ack_discovery` unions in the row's network/broadcast addresses itself.
+fn relay_rows(view: &View) -> Vec<crate::workload::relay::RelayRow> {
+    let mut rows = Vec::new();
+    for row in view.workload_rows() {
+        let Some(dhcp_server) = row.wl.dhcp_server else {
+            continue;
+        };
+        let Some(leg_addr) = row.address.split('/').next().and_then(|a| a.parse().ok()) else {
+            eprintln!(
+                "cfab: workload {}: cannot parse this member's own address {} as IPv4; dhcp \
+                 relay not started",
+                row.wl.name, row.address
+            );
+            continue;
+        };
+        rows.push(crate::workload::relay::RelayRow {
+            name: row.wl.name.clone(),
+            leg: row.wl.leg_ifname(),
+            leg_addr,
+            dhcp_server,
+            prefix: row.wl.prefix,
+            fabric_addresses: crate::workload::hostroutes::fabric_addresses(view, row.wl),
+        });
+    }
+    rows
+}
+
 /// Forward SIGHUP → `Hangup`, SIGTERM/SIGINT → `Terminate` onto the command channel. Each
 /// listener is a task that only sends on a channel — it spawns nothing, so it never forks a
 /// child off a worker thread.
@@ -921,31 +955,7 @@ pub(crate) async fn run_with(
     // same schedule as any other bind failure, so no second "is this row ready" check needs to
     // agree with the announcer's — one fewer place for that fact to drift (spec §3.1,
     // availability first: a relay that cannot bind is a degraded row, never a dead member).
-    for row in view.workload_rows() {
-        let Some(dhcp_server) = row.wl.dhcp_server else {
-            continue;
-        };
-        let Some(leg_addr) = row.address.split('/').next().and_then(|a| a.parse().ok()) else {
-            eprintln!(
-                "cfab: workload {}: cannot parse this member's own address {} as IPv4; dhcp \
-                 relay not started",
-                row.wl.name, row.address
-            );
-            continue;
-        };
-        // r7/r8: the base half of `ack_discovery`'s anti-spoof predicate is fixed for the row's
-        // whole life (it derives only from the declaration), so it is computed once here rather
-        // than once per packet; `ack_discovery` unions in the row's network/broadcast addresses
-        // itself.
-        let fabric_addresses = crate::workload::hostroutes::fabric_addresses(view, row.wl);
-        let relay_row = crate::workload::relay::RelayRow {
-            name: row.wl.name.clone(),
-            leg: row.wl.leg_ifname(),
-            leg_addr,
-            dhcp_server,
-            prefix: row.wl.prefix,
-            fabric_addresses,
-        };
+    for relay_row in relay_rows(view) {
         tokio::spawn(crate::workload::relay::run(
             relay_row,
             shared.clone(),
@@ -2300,6 +2310,32 @@ mod tests {
             ),
             "{:?}",
             sys.calls
+        );
+    }
+
+    /// T-BCAST-WIRING — the row the supervisor hands `relay::run` carries the real
+    /// `fabric_addresses`, not an empty set. `ack_discovery`'s anti-spoof predicate refuses
+    /// `fabric_addresses ∪ {network, broadcast}`, and T-BCAST proves the predicate; but T-BCAST
+    /// builds its own set, so wiring an empty one here would silently drop the member/`gw` half
+    /// — a forged ACK naming this member's own leg address would be accepted — with every
+    /// `ack_discovery` test still green. That is the defect class this design has paid for
+    /// repeatedly (spec §10): a load-bearing rule invisible to the test claiming to pin it.
+    #[test]
+    fn a_spawned_relay_row_carries_the_real_fabric_addresses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let rows = relay_rows(&view);
+        assert_eq!(rows.len(), 1, "one row declares dhcp_server: {rows:?}");
+        let want: std::collections::BTreeSet<Ipv4Addr> =
+            ["192.168.20.2", "192.168.20.3", "192.168.20.254"]
+                .iter()
+                .map(|a| a.parse().unwrap())
+                .collect();
+        assert_eq!(
+            rows[0].fabric_addresses, want,
+            "both members' addresses and the anycast gw must reach ack_discovery"
         );
     }
 
