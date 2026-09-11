@@ -2438,8 +2438,15 @@ mod tests {
     /// transient error (spec §4.1.1(c)). Nothing in spec §6 could see this; T-DEADLINE's read
     /// half wedges the PRE-DRAIN read, not the sweep's.
     ///
-    /// Regression: in `sweep`, treat the `None` from `read_kernel` as an empty document
+    /// It also pins the other half of that rule: expiry is cfab's own clock, so it is reaped
+    /// **before** the read and therefore even when the read fails. A row whose lease ran out
+    /// must not hold its slot against the cap for as long as the kernel happens to be
+    /// unreadable — which is a table that fills, and a cap that refuses live VMs, on exactly
+    /// the degraded path.
+    ///
+    /// Regression 1: in `sweep`, treat the `None` from `read_kernel` as an empty document
     /// (`KernelNeighbors::parse("[]").unwrap()`) and diff against it. Every entry then dirties.
+    /// Regression 2: move the `remove_expired` call below the read-failure early return.
     #[tokio::test(start_paused = true)]
     async fn a_sweep_whose_read_fails_dirties_nothing() {
         const N: u32 = 32;
@@ -2514,6 +2521,29 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(a.sweep().await, Sweep::ReadFailed);
         assert_eq!(said.lock().unwrap().len(), 2);
+
+        // And a row whose lease runs out while the kernel is unreadable still leaves the table.
+        let before = t.len();
+        t.upsert(
+            ROW,
+            LEG,
+            addr(N),
+            MAC_A,
+            Instant::now().into_std() + Duration::from_secs(30),
+            &cap(u32::MAX),
+            Instant::now().into_std(),
+        );
+        assert_eq!(t.len(), before + 1);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.sweep().await, Sweep::ReadFailed);
+        assert_eq!(
+            t.len(),
+            before,
+            "expiry is reaped before the read, and therefore even when the read fails: an \
+             expired row must not hold its slot against the cap for as long as the kernel \
+             happens to be unreadable"
+        );
+        assert_eq!(t.dirty_depth(), 0, "and it is not queued on its way out");
     }
 
     /// The sweep removes expired **table rows** and deletes no kernel entry — the second of the
