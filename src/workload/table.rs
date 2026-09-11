@@ -653,7 +653,10 @@ mod tests {
     /// being queued, having been taken, or being about to be written changes nothing.
     ///
     /// Regression: any "keep it a bit longer because …" clause in `remove_expired` — e.g.
-    /// `&& !e.dirty`, the shape an in-flight-entry exemption takes.
+    /// `&& !e.dirty`, the shape an in-flight-entry exemption takes. Or, in `re_dirty`'s
+    /// re-queue arm, `e.expires_at = now + …`: that is the third and last write path to
+    /// `expires_at`, and a failed write putting an entry back would then renew the lease of
+    /// exactly the address whose write keeps failing.
     #[test]
     fn nothing_extends_an_expiry() {
         let t0 = Instant::now();
@@ -682,6 +685,22 @@ mod tests {
             t.remove_expired(after).len(),
             1,
             "nor does having been written: an expiry is the lease, and only a new ACK sets it"
+        );
+
+        let t = NeighborTable::new();
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10), t0);
+        assert!(t.take_next_dirty(t0).is_some(), "taken while still live");
+        t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(1));
+        assert!(t.entry(ROW, addr(1)).unwrap().dirty, "it went back on");
+        assert_eq!(
+            t.entry(ROW, addr(1)).unwrap().expires_at,
+            dead,
+            "putting a failed write back does not move its expiry"
+        );
+        assert_eq!(
+            t.remove_expired(after).len(),
+            1,
+            "a re-queued entry expires on schedule like any other"
         );
     }
 
