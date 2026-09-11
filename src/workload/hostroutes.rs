@@ -1023,10 +1023,11 @@ mod tests {
         );
     }
 
-    /// The ordering hazard between a relayed DHCPACK's `Cmd::DhcpAck` neighbor write and this
-    /// tick's own FDB-gated `local_vms` read (gate C fix round 2, reviewer note 6). The ACK
-    /// write is `ip neigh replace` (`supervisor/mod.rs`'s `Cmd::DhcpAck` handler): it lands the
-    /// instant the ACK is relayed. `local_vms` requires MORE than a resolved neighbor, though —
+    /// The ordering hazard between the neighbor write a relayed DHCPACK earns and this tick's
+    /// own FDB-gated `local_vms` read (gate C fix round 2, reviewer note 6). That write now
+    /// happens on the flush actor (`workload::actor`), so it lands within the actor's queue
+    /// wait of the ACK rather than the instant it is relayed — which only widens the gap this
+    /// test pins. `local_vms` requires MORE than a resolved neighbor, though —
     /// the same MAC must also appear in the bridge FDB on a non-uplink port
     /// (`the_gw_and_a_mac_with_no_fdb_entry_are_never_local`), which only happens once the VM
     /// has sent a bridge-visible frame. If a tick lands in that gap AND this address's
@@ -1076,7 +1077,7 @@ mod tests {
 
         // Tick 3, AT the deadline (`quiet_at + HOLDDOWN`): a fresh DHCPACK for the SAME address
         // has just been relayed — `ip -j neigh show` reports it resolved again (the write this
-        // test stands in for is `Cmd::DhcpAck`'s `ip neigh replace`) — but the bridge has not
+        // test stands in for is the flush actor's) — but the bridge has not
         // yet learned the MAC on a port, so `local_vms` still reads it as absent. The hold-down
         // was already due: withdrawn, on the very tick the ACK landed.
         let deadline = quiet_at + HOLDDOWN;
