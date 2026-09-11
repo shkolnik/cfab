@@ -45,7 +45,7 @@ pub const HOLDDOWN: Duration = PERIOD;
 
 /// The neighbor states worth routing a VM's traffic to (gate M1 review I1, research `0e9bced`:
 /// a static neighbor is a resolved host too). **Not** "the states that carry no usable
-/// `lladdr`" — corrected, gate C fix round 1 review S-7: §2 MEASURED a NOARP entry carrying a
+/// `lladdr`" — corrected, r6 review S-7: §2 MEASURED a NOARP entry carrying a
 /// real MAC, so that reason was factually wrong. `NOARP`, `FAILED` and `INCOMPLETE` are excluded
 /// because none of the three is a live VM worth originating a /32 for (an operator's hand-pinned
 /// neighbor, a resolution that failed, or one still in flight) — a decision about what to

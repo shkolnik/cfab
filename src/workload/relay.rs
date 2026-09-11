@@ -635,7 +635,7 @@ async fn run_with_reader(
 }
 
 /// The actual retry loop behind `run_with_reader`, generic over how the pair gets bound for the
-/// same reason `bind_pair_with_baseline_via` is (B2, gate C fix round 1 review: real `bind_pair`
+/// same reason `bind_pair_with_baseline_via` is (B2, gate C fix round 3 review: real `bind_pair`
 /// needs `CAP_NET_RAW` and a privileged port, so the call-order claim below — the baseline read
 /// happens before `shared` is ever locked — had no test at all). T15 injects a `bind` that reads
 /// the baseline itself and asserts `shared.try_lock().is_ok()` at that instant.
@@ -1148,7 +1148,7 @@ mod tests {
         );
     }
 
-    /// T15 (B2, gate C fix round 1 review) — the baseline is read before `shared` is ever
+    /// T15 (B2, gate C fix round 3 review) — the baseline is read before `shared` is ever
     /// locked. The Ok-arm comment above claims `baseline` "was already captured... before this
     /// lock and this `eprintln!`", and that claim had no test pinning it at all. An injected
     /// reader asserts `shared.try_lock().is_ok()` the instant it is called; `run_with_reader_via`
