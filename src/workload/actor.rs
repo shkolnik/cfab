@@ -263,7 +263,6 @@ pub enum Sweep {
 /// nothing look identical from the outside, which is why that defect survived six reviews.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counts {
-    pub reads: u64,
     pub read_failures: u64,
     pub writes: u64,
     pub write_failures: u64,
@@ -274,10 +273,10 @@ pub struct Counts {
 }
 
 /// The counters `Counts` cannot break down, because they happen inside the per-entry loop
-/// where the row is known (spec §4.5's per-row export): `reads` and `read_failures` are not
-/// here on purpose — the pre-drain read is one fork for the whole host, so there is no row to
-/// credit it to, and `/metrics` instead repeats the host-wide `read_failures` under every row's
-/// label (spec §4.5's own words: "export per row: `read_failures`").
+/// where the row is known (spec §4.5's per-row export): `read_failures` is not here on purpose
+/// — the pre-drain read is one fork for the whole host, so there is no row to credit it to, and
+/// `/metrics` instead repeats the host-wide `read_failures` under every row's label (spec
+/// §4.5's own words: "export per row: `read_failures`").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowCounts {
     pub writes: u64,
@@ -524,7 +523,6 @@ impl FlushActor {
     /// a fast-failing read cannot spin: the bucket is the bound, and there is no backoff
     /// anywhere.
     fn read_kernel(&mut self) -> Option<KernelNeighbors> {
-        self.counts.reads += 1;
         let doc = match self.io.run(&READ_ARGV) {
             Ok(o) if o.ok() => KernelNeighbors::parse(&o.stdout)
                 .ok_or_else(|| "cannot read the neighbor document".to_string()),
