@@ -1561,15 +1561,21 @@ mod tests {
     /// one journal line is emitted for the streak, and every entry **keeps its queue position**
     /// because take follows the read and nothing was taken.
     ///
-    /// Three entries, not two, and the ORDER is asserted over the whole queue: with two entries
-    /// and two failed batches a take-before-read implementation rotates the queue exactly twice
-    /// and lands back where it started, so the position assertion reads green while the rule is
-    /// violated — the defect class spec §10 names, in the test written to pin it.
+    /// **More entries than one batch, and the ORDER is asserted over the whole queue.** A
+    /// take-first batch takes the WHOLE batch — at most `B - 1` = 31 entries — so at any count
+    /// of 31 or fewer, re-dirtying on failure puts every entry back in the same relative order
+    /// and the position assertion reads green while the rule is violated. Only a queue LONGER
+    /// than one batch can show the defect: the entries the batch could not reach stay at the
+    /// front while the ones it took go to the back. That is why this test seeds 40 — the count
+    /// is load-bearing, not arbitrary, and it is the defect class spec §10 names, in the test
+    /// written to pin it.
     ///
-    /// Regression: take the entry before the read and re-dirty it on failure.
+    /// Regression: take the entry before the read and re-dirty it on read failure.
     #[tokio::test(start_paused = true)]
     async fn a_failed_read_writes_nothing_and_keeps_queue_position() {
-        let t = table_with(3);
+        // More than `BURST - 1` = 31, so a take-first batch cannot take the whole queue.
+        const N: u32 = 40;
+        let t = table_with(N);
         let said = Arc::new(Mutex::new(Vec::new()));
         let io = MockNeighborIo::new(|argv, _| {
             if argv.contains(&"show") {
@@ -1598,7 +1604,7 @@ mod tests {
             writes(&calls.lock().unwrap()).is_empty(),
             "nothing is guessed"
         );
-        assert_eq!(t.dirty_depth(), 3, "nothing was taken");
+        assert_eq!(t.dirty_depth(), N as usize, "nothing was taken");
         assert_eq!(
             said.lock().unwrap().len(),
             1,
@@ -1610,7 +1616,7 @@ mod tests {
             std::iter::from_fn(|| t.take_next_dirty(now).map(|x| x.addr)).collect();
         assert_eq!(
             order,
-            vec![addr(0), addr(1), addr(2)],
+            (0..N).map(addr).collect::<Vec<_>>(),
             "a failed read moved nothing in the queue"
         );
     }
