@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(
             t.re_dirty(ROW, addr(1), t0 + Duration::from_secs(61)),
             Some(ROW.to_string()),
-            "and the drop is REPORTED, not swallowed: the actor credits the expiry off this              return value, so a silent drop here is a row leaving the table with no counter              and no journal line"
+            "and the drop is REPORTED, not swallowed: the actor credits the expiry off this return value, so a silent drop here is a row leaving the table with no counter              and no journal line"
         );
         assert_eq!(t.len(), 0, "expiry wins over the retry");
         assert!(

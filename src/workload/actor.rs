@@ -254,6 +254,12 @@ pub enum Sweep {
     /// The table was diffed against the kernel. `dirtied` counts the entries the kernel was
     /// missing or held with no `lladdr`; on a coherent host it is **zero**, which is what makes
     /// a 15 s period affordable at all.
+    ///
+    /// **Both numbers are best-effort and may disagree with `counts`/`per_row`**: an entry whose
+    /// lease ends between this sweep's `remove_expired` and its own `re_dirty` is credited to
+    /// `counts.expiries` but is not in `expired`, and `dirtied` counts the intent to re-queue
+    /// rather than the result, so it includes that entry too. Nothing in `run()` reads either
+    /// field — they exist for tests. Wire one to `/metrics` and this race becomes a wrong gauge.
     Diffed { dirtied: usize, expired: usize },
 }
 
@@ -308,10 +314,13 @@ pub struct FlushActor {
     /// The same, per row, for write failures. There is no backoff anywhere here — the bucket is
     /// the bound, which is what let call 10's fix close the read-failure spin for free.
     write_failing: std::collections::BTreeSet<String>,
-    /// The same, for entries dropped because their lease ran out before the actor reached them.
-    /// `MIN_LEASE` is derived so this cannot happen on a table within `Sigma C_i`, so it is
-    /// loud — and loud once per streak, because the trigger is attacker-reachable.
-    expiring: bool,
+    /// The same, per row, for entries dropped because their lease ran out before the actor
+    /// reached them. `MIN_LEASE` is derived so this cannot happen on a table within `Sigma C_i`,
+    /// so it is loud — and loud once per streak, because the trigger is attacker-reachable.
+    /// **Per row, not host-wide, for the same reason `write_failing` is:** one row in a
+    /// continuous streak must not swallow another row's first line, which is the whole signal
+    /// that a second row started losing entries.
+    expiring: std::collections::BTreeSet<String>,
     /// When the next coherence sweep is due. Measured from the end of the last one, so a sweep
     /// that had to wait for a token cannot make the next one due the instant it finishes.
     next_sweep: Instant,
@@ -345,7 +354,7 @@ impl FlushActor {
             bucket: Bucket::new(now),
             read_failing: false,
             write_failing: std::collections::BTreeSet::new(),
-            expiring: false,
+            expiring: std::collections::BTreeSet::new(),
             next_sweep: now + SWEEP,
             counts: Counts::default(),
             per_row: std::collections::BTreeMap::new(),
@@ -512,27 +521,30 @@ impl FlushActor {
     /// a premise of that derivation is wrong. Once per streak, not once per entry, because the
     /// trigger is attacker-reachable.
     fn note_expiries(&mut self, rows: &[String]) {
-        if rows.is_empty() {
-            self.expiring = false;
-            return;
-        }
-        self.counts.expiries += rows.len() as u64;
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for row in rows {
             self.per_row.entry(row.clone()).or_default().expiries += 1;
+            seen.insert(row.as_str());
         }
-        if !self.expiring {
-            self.expiring = true;
-            self.obs.journal(&format!(
-                "cfab: dhcp neighbor actor: {} table entry/entries expired before the write;                  the workload row(s): {}",
-                rows.len(),
-                {
-                    let mut names: Vec<&str> = rows.iter().map(String::as_str).collect();
-                    names.sort_unstable();
-                    names.dedup();
-                    names.join(", ")
-                }
-            ));
+        self.counts.expiries += rows.len() as u64;
+        // A row that dropped nothing this pass has ended its streak and may speak again.
+        self.expiring.retain(|row| seen.contains(row.as_str()));
+        let fresh: Vec<&str> = seen
+            .into_iter()
+            .filter(|row| !self.expiring.contains(*row))
+            .collect();
+        if fresh.is_empty() {
+            return;
         }
+        for row in &fresh {
+            self.expiring.insert((*row).to_string());
+        }
+        self.obs.journal(&format!(
+            "cfab: dhcp neighbor actor: {} table entry/entries expired before the write; \
+             the workload row(s): {}",
+            rows.len(),
+            fresh.join(", ")
+        ));
     }
 
     /// Wait until the bucket holds `want` tokens, then spend one of them for the fork that is
@@ -2783,6 +2795,70 @@ mod tests {
         assert!(!sizes.contains_key("exprow"), "the expired row is gone");
     }
 
+    /// **One row's expiry streak must not silence another row's FIRST line.** `write_failing`
+    /// keys its throttle per row; this one was host-wide, so a row dropping entries continuously
+    /// held the flag set and a second row's first-ever drop produced **no line at all** — not
+    /// attributed to the wrong row, simply absent. The per-row counters stayed right, so the
+    /// only signal that a second row had started losing entries was the one that went missing.
+    ///
+    /// Regression: make `expiring` a `bool` again (set it on any non-empty pass, clear it only
+    /// on an empty one) and the second assertion goes red while every counter assertion stays
+    /// green — which is exactly how it shipped.
+    #[tokio::test(start_paused = true)]
+    async fn one_rows_expiry_streak_does_not_silence_another_rows_first_line() {
+        let t = Arc::new(NeighborTable::new());
+        let now = Instant::now().into_std();
+        let soon = |base: std::time::Instant| base + Duration::from_secs(30);
+        t.upsert("rowa", "leg-a", addr(0), MAC_A, soon(now), &cap(10), now);
+
+        let io = MockNeighborIo::kernel("[]");
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: None,
+                woke: None,
+            }),
+        );
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "rowa opens its streak: {lines:?}");
+        assert!(lines[0].contains("rowa"), "{}", lines[0]);
+
+        // rowa keeps dropping — its streak never breaks — and rowb starts dropping too.
+        let now = Instant::now().into_std();
+        t.upsert("rowa", "leg-a", addr(1), MAC_A, soon(now), &cap(10), now);
+        t.upsert("rowb", "leg-b", addr(2), MAC_A, soon(now), &cap(10), now);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(a.run_batch().await, Batch::Drained);
+
+        assert_eq!(a.counts.expiries, 3, "every drop is still counted");
+        let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
+        assert_eq!(row("rowa").expiries, 2);
+        assert_eq!(row("rowb").expiries, 1);
+
+        let lines = said.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            2,
+            "rowb's first drop is loud even though rowa is mid-streak: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("rowb"),
+            "and the new line names the row that just started losing entries: {}",
+            lines[1]
+        );
+        assert!(
+            !lines[1].contains("rowa"),
+            "rowa is mid-streak and does not repeat itself: {}",
+            lines[1]
+        );
+    }
+
     /// **Expiry on the DRAIN path is counted and said.** The test above drives every expiry
     /// through `sweep`, and `counts.expiries` was credited there and only there — so an entry
     /// whose lease ran out while it sat in the queue left the table with **no counter and no
@@ -2834,7 +2910,7 @@ mod tests {
 
         assert_eq!(
             a.counts.expiries, 1,
-            "the entry that expired in the queue is counted on the drain path, not only in a              sweep that may not have run yet"
+            "the entry that expired in the queue is counted on the drain path, not only in a sweep that may not have run yet"
         );
         let row = |name: &str| a.per_row.get(name).copied().unwrap_or_default();
         assert_eq!(row("exprow").expiries, 1);
@@ -2954,7 +3030,7 @@ mod tests {
         assert_eq!(a.counts.write_failures, 1, "the write failed");
         assert_eq!(
             a.counts.expiries, 1,
-            "the lease ran out before the put-back, so the entry was dropped rather than              re-queued — and that drop is counted, not silent"
+            "the lease ran out before the put-back, so the entry was dropped rather than re-queued — and that drop is counted, not silent"
         );
         assert_eq!(
             a.per_row.get(ROW).copied().unwrap_or_default().expiries,
