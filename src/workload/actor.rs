@@ -17,6 +17,11 @@
 //! silently false with every other test green. Only the read-fork count over a full drain can
 //! see it, which is what `one_read_fork_per_batch_over_a_full_drain` asserts.
 //!
+//! **The sweep is the sole coherence mechanism in this gate** (spec §4.3 item 4; triggers 2 and
+//! 3 are both out of it), so `SWEEP` = 15 s is R2's bound outright. It runs here on the actor,
+//! spends a token for its read like every other fork, and is a **diff** — it dirties only what
+//! the kernel is missing or holds without an `lladdr`, so a coherent host does zero writes.
+//!
 //! **The dirty depth is read under the table lock and the SLEEP IS NOT.** Holding that guard
 //! across a wait of up to `B / R` = 3.2 s stalls every relay upsert on the host — DHCP
 //! forwarding stops (spec §4.2.3: "the relay's upsert never blocks"). The same applies to every
@@ -45,6 +50,12 @@ pub const REFILL_PER_SEC: u32 = 10;
 /// `B`: the burst. Makes R4 ("one VM booting is immediate") true on a quiet host — a lone VM
 /// needs `1 + 1` = 2 tokens and a quiet host holds all 32.
 pub const BURST: u32 = 32;
+
+/// `SWEEP`: how often the actor diffs its table against the kernel. With triggers 2 and 3 both
+/// out of this gate the sweep is the **sole** coherence mechanism, so this is R2's bound
+/// outright — how long a live VM stays dark after the kernel loses its entry — not "the backstop
+/// for when an event trigger is missing" (spec §4.3 item 4, call 5 RULED).
+pub const SWEEP: Duration = Duration::from_secs(15);
 
 /// One token's worth of time at `R`. Integer arithmetic on purpose: a float accumulator drifts,
 /// and this rate is the bound `MIN_LEASE` is derived against.
@@ -224,6 +235,20 @@ pub enum Batch {
     Drained,
 }
 
+/// What one sweep did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sweep {
+    /// The read failed. **Nothing was dirtied — not everything.** A failed read is not evidence
+    /// that the kernel is empty, and "failed read = empty document = everything is missing"
+    /// turns one transient error into a full re-write of the table, up to `Σ C_i` = 512 forks
+    /// (spec §4.1.1(c)).
+    ReadFailed,
+    /// The table was diffed against the kernel. `dirtied` counts the entries the kernel was
+    /// missing or held with no `lladdr`; on a coherent host it is **zero**, which is what makes
+    /// a 15 s period affordable at all.
+    Diffed { dirtied: usize, expired: usize },
+}
+
 /// Counters the actor keeps. Exported in task 5; kept here because the task that produces a
 /// counter is the one that can tell whether it moved for the right reason. `read_failures` is
 /// separate from `write_failures` on purpose: a coherent host and a host that silently wrote
@@ -235,6 +260,18 @@ pub struct Counts {
     pub writes: u64,
     pub write_failures: u64,
     pub skips: u64,
+    /// Table rows dropped because their lease ran out. cfab deletes no kernel entry when this
+    /// moves — the row leaves cfab's table and the kernel keeps whatever it holds.
+    pub expiries: u64,
+}
+
+/// What one iteration of the actor's life did — a sweep, or one drain batch. Returned so a
+/// test can drive the real cadence (sweeps included, and they cost tokens) one step at a time
+/// on a paused clock, rather than re-implementing the cadence beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Swept(Sweep),
+    Batch(Batch),
 }
 
 /// One per host. Owns the bucket, the writer and the classifier; the table it drains is shared
@@ -251,6 +288,9 @@ pub struct FlushActor {
     /// The same, per row, for write failures. There is no backoff anywhere here — the bucket is
     /// the bound, which is what let call 10's fix close the read-failure spin for free.
     write_failing: std::collections::BTreeSet<String>,
+    /// When the next coherence sweep is due. Measured from the end of the last one, so a sweep
+    /// that had to wait for a token cannot make the next one due the instant it finishes.
+    next_sweep: Instant,
     pub counts: Counts,
 }
 
@@ -264,22 +304,140 @@ impl FlushActor {
         io: Box<dyn NeighborIo>,
         obs: Box<dyn ActorObserver>,
     ) -> Self {
+        let now = Instant::now();
         FlushActor {
             table,
             io,
             obs,
-            bucket: Bucket::new(Instant::now()),
+            bucket: Bucket::new(now),
             read_failing: false,
             write_failing: std::collections::BTreeSet::new(),
+            next_sweep: now + SWEEP,
             counts: Counts::default(),
         }
     }
 
-    /// The actor's whole life: batch, batch, batch, sleep when clean. Never returns.
+    /// The actor's whole life: sweep when one is due, drain when anything is dirty, and sleep
+    /// otherwise — until an upsert wakes it or the next sweep falls due, whichever comes first.
+    /// Never returns.
     pub async fn run(mut self) {
         loop {
-            if let Batch::Idle = self.run_batch().await {
-                self.table.wait_dirty().await;
+            if let Step::Batch(Batch::Idle) = self.step().await {
+                let table = self.table.clone();
+                let next_sweep = self.next_sweep;
+                tokio::select! {
+                    _ = table.wait_dirty() => {}
+                    _ = tokio::time::sleep_until(next_sweep) => {}
+                }
+            }
+        }
+    }
+
+    /// One iteration: the sweep if it is due, otherwise one drain batch. The sweep runs **on
+    /// the actor** and therefore spends a token like any other fork (spec §4.2) — which is
+    /// where the four tokens separating `Σ C_i` = 529 from the true 533-token worst case come
+    /// from (plan §1.2). On the command loop via `Sys::run` it would instead be a fork on
+    /// exactly the loop this gate exists to keep clear, and would escape `WRITE_DEADLINE`,
+    /// which is scoped to every child the actor spawns.
+    pub async fn step(&mut self) -> Step {
+        if Instant::now() >= self.next_sweep {
+            let swept = self.sweep().await;
+            self.next_sweep = Instant::now() + SWEEP;
+            return Step::Swept(swept);
+        }
+        Step::Batch(self.run_batch().await)
+    }
+
+    /// The coherence sweep (trigger 4): **a DIFF, never a blind re-dirty.** r4 specified
+    /// "re-dirty every unexpired row", which on a quiet host with a full /24 is 254 forks a
+    /// minute forever and makes a VM booting just after a sweep wait behind up to 254 FIFO
+    /// entries — the table's whole steady-state cost set by the attacker's entry count.
+    ///
+    /// It issues the **same argv** as the drain's read and never the same **document**: a
+    /// sweep's document is stale by the time a drain runs, and classifying a write against it
+    /// is the exact stale-read window this design deleted the published snapshot to close
+    /// (spec §10, r13). It dirties only what the kernel is missing or holds without an
+    /// `lladdr`, removes expired **table rows**, **deletes no kernel entry**, and **extends no
+    /// expiry**.
+    pub async fn sweep(&mut self) -> Sweep {
+        // Expiry is cfab's own clock, not the kernel's: it is reaped before the read and
+        // therefore even when the read fails. A row whose lease ran out must not hold its slot
+        // against the cap for as long as the kernel happens to be unreadable.
+        let expired = self.table.remove_expired(Instant::now().into_std());
+        self.counts.expiries += expired as u64;
+
+        self.wait_and_spend(1).await;
+        let Some(doc) = self.read_kernel() else {
+            return Sweep::ReadFailed;
+        };
+
+        let now_std = Instant::now().into_std();
+        let mut dirtied = 0usize;
+        for (row, addr, leg) in self.table.list_entries() {
+            match doc.classify(&leg, addr) {
+                // R2.2 again, and for the same reason as in the drain: a MAC the kernel holds
+                // is never something cfab schedules a write over.
+                Class::Skip => {}
+                Class::Add | Class::Replace => {
+                    // The verb is not decided here. The drain re-reads and classifies at write
+                    // time; all the sweep says is "this one needs looking at".
+                    self.table.re_dirty(&row, addr, now_std);
+                    dirtied += 1;
+                }
+            }
+        }
+        Sweep::Diffed { dirtied, expired }
+    }
+
+    /// Wait until the bucket holds `want` tokens, then spend one of them for the fork that is
+    /// about to happen. **The wait is never under the table lock** — holding that guard across
+    /// a wait of up to `B / R` = 3.2 s blocks every relay upsert on the host, which is DHCP
+    /// forwarding stopping.
+    async fn wait_and_spend(&mut self, want: u32) {
+        loop {
+            self.obs.wait_decision();
+            let wait = self.bucket.wait_for(Instant::now(), want);
+            if wait.is_zero() {
+                self.obs.token_spend();
+                if self.bucket.spend(Instant::now()) {
+                    return;
+                }
+            } else {
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
+    /// One `ip -j neigh show nud all`, its failures counted and journaled once per streak.
+    ///
+    /// `None` is **"the kernel could not be read"**, and it is never the same answer as an
+    /// empty kernel — in the drain (write nothing, take nothing, keep every queue position) or
+    /// in the sweep (dirty nothing). The token for the fork is already spent by the caller, so
+    /// a fast-failing read cannot spin: the bucket is the bound, and there is no backoff
+    /// anywhere.
+    fn read_kernel(&mut self) -> Option<KernelNeighbors> {
+        self.counts.reads += 1;
+        let doc = match self.io.run(&READ_ARGV) {
+            Ok(o) if o.ok() => KernelNeighbors::parse(&o.stdout)
+                .ok_or_else(|| "cannot read the neighbor document".to_string()),
+            Ok(o) => Err(format!("ip exited {}: {}", o.status, o.stderr.trim())),
+            Err(e) => Err(e.to_string()),
+        };
+        match doc {
+            Ok(doc) => {
+                self.read_failing = false;
+                Some(doc)
+            }
+            Err(why) => {
+                self.counts.read_failures += 1;
+                if !self.read_failing {
+                    self.read_failing = true;
+                    self.obs.journal(&format!(
+                        "cfab: dhcp neighbor actor: kernel read failed: {why}; nothing written \
+                         and nothing dirtied this pass"
+                    ));
+                }
+                None
             }
         }
     }
@@ -294,49 +452,16 @@ impl FlushActor {
         }
         let want = 1 + u32::try_from(depth).unwrap_or(u32::MAX).min(BURST - 1);
 
-        loop {
-            self.obs.wait_decision();
-            let wait = self.bucket.wait_for(Instant::now(), want);
-            if wait.is_zero() {
-                break;
-            }
-            tokio::time::sleep(wait).await;
-        }
-
         // The read is a fork, so it spends a token like any other (spec §4.2). This is also
         // what makes the read-failure path below unable to spin: a batch whose read fails has
         // already paid for it.
-        self.obs.token_spend();
-        if !self.bucket.spend(Instant::now()) {
-            return Batch::Idle;
-        }
-        self.counts.reads += 1;
-        let doc = match self.io.run(&READ_ARGV) {
-            Ok(o) if o.ok() => KernelNeighbors::parse(&o.stdout)
-                .ok_or_else(|| "cannot read the neighbor document".to_string()),
-            Ok(o) => Err(format!("ip exited {}: {}", o.status, o.stderr.trim())),
-            Err(e) => Err(e.to_string()),
-        };
-        let doc = match doc {
-            Ok(doc) => {
-                self.read_failing = false;
-                doc
-            }
-            Err(why) => {
-                // Nothing was taken — **take follows the read, never precedes it** — so every
-                // entry keeps its queue position and the next batch retries. The actor does
-                // not guess: a failed read is the one case where neither `add` nor `replace`
-                // can be justified.
-                self.counts.read_failures += 1;
-                if !self.read_failing {
-                    self.read_failing = true;
-                    self.obs.journal(&format!(
-                        "cfab: dhcp neighbor actor: kernel read failed: {why}; no neighbor \
-                         written this pass"
-                    ));
-                }
-                return Batch::ReadFailed;
-            }
+        self.wait_and_spend(want).await;
+        // Nothing was taken — **take follows the read, never precedes it** — so on a failed
+        // read every entry keeps its queue position and the next batch retries. The actor does
+        // not guess: a failed read is the one case where neither `add` nor `replace` can be
+        // justified.
+        let Some(doc) = self.read_kernel() else {
+            return Batch::ReadFailed;
         };
 
         // At most `B - 1` entries per batch: that is what the batch reserved tokens for. A skip
@@ -800,9 +925,31 @@ mod tests {
 
     /// **T4 — no starvation, and the number is stated.** 511 entries are re-dirtied after every
     /// batch; the 512th (the highest address, dirtied first) must still be written inside the
-    /// true worst case `(Σ C_i + ceil(Σ C_i / (B - 1))) / R` = **(512 + 17) / 10 = 52.9 s**.
-    /// Not `Σ C_i / R` = 51.2 s, which is unachievable now that the drain also spends read
-    /// tokens.
+    /// worst case — which the sweep moved, because the sweep runs on this actor and its read
+    /// spends a token like every other fork:
+    ///
+    /// The entry at the back of a `Σ C_i` = 512 queue is reached in batch
+    /// `ceil(Σ C_i / (B - 1))` = 17, and the batching rule makes the actor **wait for that
+    /// batch's whole reservation of `B` = 32 tokens before it starts it** — including the
+    /// tokens it will spend on entries queued behind the victim. So the wait is governed by
+    /// tokens RESERVED, not by tokens spent on the victim's own path:
+    ///
+    /// `(ceil(Σ C_i / (B - 1)) x B + sweeps) / R` = `(17 x 32 + 4) / 10` = **54.8 s**, where
+    /// the 4 is one read per sweep in the window (`ceil(54.8 / SWEEP)`; self-consistent).
+    /// `MIN_LEASE` = 60 s still clears it, with an 8.7% margin.
+    ///
+    /// **This corrects plan §1.2's 533 tokens / 53.3 s, which is reported as an erratum rather
+    /// than fixed silently.** §1.2 converts tokens to seconds linearly — 512 writes + 17 drain
+    /// reads + 4 sweeps — but the batching rule §1.1 itself introduced means a batch is not
+    /// started until its full reservation is in hand. 512 does not divide by `B - 1` = 31, and
+    /// the sweep keeps `dirty_depth` above `B - 1` whenever the kernel is missing entries, so
+    /// the batch carrying the victim reserves a full 32 rather than the 17 the linear model
+    /// assumes. MEASURED on this tree at 54.7 s (three sweeps, the actor's first falling at
+    /// `SWEEP` rather than at t = 0); 54.8 s is the bound that also covers a sweep at t = 0.
+    ///
+    /// The loop drives `step`, not `run_batch`, precisely so those sweep tokens are spent: an
+    /// actor driven batch-by-batch never sweeps, and the bound it measures is one no live
+    /// member enjoys.
     ///
     /// Regression: take entries in address order (make `take_next_dirty` scan `entries` for the
     /// first dirty key instead of popping the queue) — the victim's high address is then never
@@ -822,10 +969,10 @@ mod tests {
         let mut a = FlushActor::new(t.clone(), Box::new(io));
 
         let started = Instant::now();
-        let deadline = Duration::from_millis(52_900);
+        let deadline = Duration::from_millis(54_800);
         let victim_str = victim.to_string();
         loop {
-            a.run_batch().await;
+            a.step().await;
             if calls
                 .lock()
                 .unwrap()
@@ -836,7 +983,7 @@ mod tests {
             }
             assert!(
                 started.elapsed() <= deadline,
-                "the victim was not written within (512 + 17) / 10 = 52.9 s"
+                "the victim was not written within (17 x 32 + 4) / 10 = 54.8 s"
             );
             // The attacker keeps every other address dirty.
             for i in 0..SIGMA_C - 1 {
@@ -1564,7 +1711,8 @@ mod tests {
     /// dropped at take — when the actor finally reaches it at the stated worst case.
     ///
     /// Regression: shrink `MIN_LEASE` toward the naive 51.2 s = `Σ C_i / R`, the bound that
-    /// ignores the drain's own read forks (spec §1's own erratum over call 10's ruling). The
+    /// ignores the drain's own read forks, the sweep's, and the batch reservations the
+    /// batching rule waits on (plan §1.2's erratum, and this test's own correction of it). The
     /// victim then expires in the queue before the actor reaches it and is silently dropped by
     /// `take_next_dirty`'s expiry arm — invisible to T3, T3a, T3b, T4 and T4a, all of which use
     /// `long()` (effectively infinite) expiries and cannot see a floor that is too low.
@@ -1593,12 +1741,13 @@ mod tests {
         t.upsert(ROW, LEG, victim, MAC_B, victim_expiry, &cap(u32::MAX));
 
         let started = Instant::now();
-        // Matches `the_nth_entry_is_written_inside_the_stated_worst_case`'s own number; task 4
-        // moves both to 53.3 s when the sweep starts spending tokens on the actor too.
-        let deadline = Duration::from_millis(52_900);
+        // Matches `the_nth_entry_is_written_inside_the_stated_worst_case`'s own number and
+        // derivation: `(ceil(512 / 31) x B + 4 sweeps) / R` = 54.8 s, the sweep's own read
+        // forks and the batch reservations included.
+        let deadline = Duration::from_millis(54_800);
         let victim_str = victim.to_string();
         loop {
-            a.run_batch().await;
+            a.step().await;
             if calls
                 .lock()
                 .unwrap()
@@ -1619,5 +1768,386 @@ mod tests {
             );
         }
         assert!(started.elapsed() <= deadline, "{:?}", started.elapsed());
+    }
+
+    // ---- task 4: the sweep, the sole coherence mechanism -----------------------------------
+
+    /// A kernel document the test can change between reads, so a sweep and the drain that
+    /// follows it can be given DIFFERENT answers — which is the only way to see whether the
+    /// drain re-read or reused the sweep's document.
+    fn changing_kernel(doc: &Arc<Mutex<String>>) -> MockNeighborIo {
+        let doc = doc.clone();
+        MockNeighborIo::new(move |argv, _| {
+            Ok(crate::sys::Output {
+                status: 0,
+                stdout: if argv.contains(&"show") {
+                    doc.lock().unwrap().clone()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        })
+    }
+
+    /// **T11a — a coherent sweep writes nothing, and dirties nothing.** Table and kernel agree;
+    /// the sweep costs exactly one read fork and produces no work at all. This is what makes a
+    /// 15 s period affordable, and it is the assertion r4's "re-dirty every unexpired row"
+    /// fails: at a full /24 that is 254 forks a minute forever on a quiet host.
+    ///
+    /// The sweep's argv is asserted to be `READ_ARGV` itself — the SAME ARGV as the drain's
+    /// read, never the same document (spec §4.3 item 4). Without this, a sweep that re-added
+    /// `dev <leg>` (or dropped `nud all`, whereupon every NUD_NONE entry reads as absent and
+    /// dirties forever) leaves every other test in this file green.
+    ///
+    /// Regression: in `sweep`, re-dirty every entry instead of only the `Add`/`Replace` ones —
+    /// i.e. delete the `Class::Skip => {}` arm's distinction and call `re_dirty` unconditionally.
+    #[tokio::test(start_paused = true)]
+    async fn a_coherent_sweep_writes_nothing_and_dirties_nothing() {
+        let n = 64u32;
+        let t = table_with(n);
+        let entries: Vec<(&str, Ipv4Addr, Option<&str>)> = (0..n)
+            .map(|i| (LEG, addr(i), Some("aa:bb:cc:dd:ee:ff")))
+            .collect();
+        let io = MockNeighborIo::kernel(&kernel_doc(&entries));
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        // Drain first, so the table is clean when the sweep runs: the sweep's job is to find
+        // what a clean table has silently lost, and a coherent one has lost nothing.
+        while a.run_batch().await != Batch::Idle {}
+        let before = calls.lock().unwrap().len();
+
+        let swept = a.sweep().await;
+
+        assert_eq!(
+            swept,
+            Sweep::Diffed {
+                dirtied: 0,
+                expired: 0
+            }
+        );
+        assert_eq!(t.dirty_depth(), 0, "a coherent sweep queues no work");
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len() - before,
+            1,
+            "one read fork for the whole sweep: {calls:?}"
+        );
+        assert_eq!(
+            calls.last().unwrap().as_slice(),
+            READ_ARGV,
+            "the sweep issues the SAME ARGV as the drain's read"
+        );
+    }
+
+    /// **T11 — the sweep converges on its own**, with the upsert trigger dead. The entry is
+    /// claimed once, written, and then the kernel silently loses it — no ACK, no rebind, no
+    /// netlink event, nothing that could re-dirty the row. Only the sweep can notice, and it
+    /// must, because with triggers 2 and 3 out of this gate it is the sole coherence mechanism.
+    ///
+    /// Regression: disable the sweep (make `step` never call it, or make `sweep` return
+    /// `Diffed { dirtied: 0, .. }` without diffing). The address then stays dark forever, and
+    /// every other test in this file stays green.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_restores_an_entry_the_kernel_silently_lost() {
+        let doc = Arc::new(Mutex::new(kernel_doc(&[])));
+        let t = table_with(0);
+        t.upsert(ROW, LEG, addr(0), MAC_A, long(), &cap(10));
+        let io = changing_kernel(&doc);
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+
+        a.run_batch().await;
+        assert_eq!(writes(&calls.lock().unwrap()).len(), 1, "the first write");
+        // The kernel now holds it, and the actor agrees.
+        *doc.lock().unwrap() = kernel_doc(&[(LEG, addr(0), Some("aa:bb:cc:dd:ee:ff"))]);
+        while a.run_batch().await != Batch::Idle {}
+
+        // The kernel loses it. Nothing tells cfab.
+        *doc.lock().unwrap() = kernel_doc(&[]);
+        let started = Instant::now();
+        loop {
+            if matches!(a.step().await, Step::Batch(Batch::Idle)) {
+                tokio::time::sleep(SWEEP).await;
+            }
+            if writes(&calls.lock().unwrap()).len() == 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() <= SWEEP * 3,
+                "nothing restored the lost entry within three sweep periods: {:?}",
+                started.elapsed()
+            );
+        }
+        let w = writes(&calls.lock().unwrap());
+        assert_eq!(
+            w[1][2], "add",
+            "the kernel holds nothing, so create-only applies"
+        );
+        assert_eq!(w[1][3], addr(0).to_string());
+    }
+
+    /// **T12 — idle costs almost nothing, and the sweep is the ONLY thing that wakes.** The
+    /// actor runs for four sweep periods with a clean table and a coherent kernel: exactly four
+    /// forks, all of them the sweep's read, and no writes. R4's "a quiet host performs no
+    /// periodic work" is overstated and is corrected here to its true form — a sleeping actor
+    /// does no periodic work of its own, and a coherent sweep does no writes (T11a).
+    ///
+    /// Regression: poll the table on a timer instead of sleeping on `wait_dirty` (e.g. replace
+    /// the `select!` in `run` with a short `sleep`), and watch the fork or wakeup count climb
+    /// with the polling rate rather than staying at one per `SWEEP`.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_actor_wakes_only_for_the_sweep() {
+        let t = table_with(0);
+        let io = MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let a = FlushActor::new(t.clone(), Box::new(io));
+        let h = tokio::spawn(a.run());
+
+        tokio::time::sleep(SWEEP * 4 + SWEEP / 2).await;
+        h.abort();
+
+        let calls = calls.lock().unwrap().clone();
+        assert!(writes(&calls).is_empty(), "an idle host writes nothing");
+        assert_eq!(
+            calls.len(),
+            4,
+            "four sweep periods, four read forks, and no other wakeup did anything: {calls:?}"
+        );
+        assert!(calls.iter().all(|c| c.as_slice() == READ_ARGV));
+    }
+
+    /// **The sweep's read spends a token like every other fork** (spec §4.2; plan §1.2). This
+    /// is the assertion that makes the four tokens separating call 10's 529 from the true 533
+    /// real: without it the sweep is a fork the bucket does not govern, at 4 per minute per
+    /// member, and `the_nth_entry_is_written_inside_the_stated_worst_case`'s 53.3 s becomes an
+    /// over-estimate that hides an ungoverned fork path rather than a bound.
+    ///
+    /// Regression: delete the `wait_and_spend(1)` call from `sweep`. The sweep then forks with
+    /// an empty bucket and this test's wait collapses to zero.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_spends_a_token_for_its_read() {
+        let t = table_with(0);
+        let io = MockNeighborIo::kernel("[]");
+        let mut a = FlushActor::new(t, Box::new(io));
+        for _ in 0..BURST {
+            a.bucket.spend(Instant::now());
+        }
+        let started = Instant::now();
+        a.sweep().await;
+        assert_eq!(
+            started.elapsed(),
+            TOKEN_INTERVAL,
+            "an empty bucket must make the sweep WAIT for its one token"
+        );
+    }
+
+    /// **T-REBUILD — a leg rebuild actually restores every entry.** The table is populated by
+    /// ACK and drained; the leg is then rebuilt, so the kernel holds nothing for any of those
+    /// addresses and nothing tells cfab. A sweep, then a drain, must write every one of them.
+    ///
+    /// Regression: classify against anything other than a read taken inside the drain — any
+    /// cached or published kernel state reintroduces r10's defect, under which the rebuild
+    /// produced ZERO writes on the happy path, six reviews deep.
+    #[tokio::test(start_paused = true)]
+    async fn a_leg_rebuild_restores_every_entry() {
+        const N: u32 = 20;
+        let entries: Vec<(&str, Ipv4Addr, Option<&str>)> = (0..N)
+            .map(|i| (LEG, addr(i), Some("aa:bb:cc:dd:ee:ff")))
+            .collect();
+        let doc = Arc::new(Mutex::new(kernel_doc(&entries)));
+        let t = table_with(N);
+        let io = changing_kernel(&doc);
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        while a.run_batch().await != Batch::Idle {}
+        assert!(
+            writes(&calls.lock().unwrap()).is_empty(),
+            "the kernel already held every address"
+        );
+
+        // The leg is rebuilt: every neighbor entry on it is gone.
+        *doc.lock().unwrap() = kernel_doc(&[]);
+        let swept = a.sweep().await;
+        assert_eq!(
+            swept,
+            Sweep::Diffed {
+                dirtied: N as usize,
+                expired: 0
+            }
+        );
+        while a.run_batch().await != Batch::Idle {}
+
+        let w = writes(&calls.lock().unwrap());
+        assert_eq!(w.len(), N as usize, "every entry restored: {w:?}");
+        assert!(w.iter().all(|c| c[2] == "add"));
+    }
+
+    /// **T-REBUILD-C — the drain does not reuse the sweep's document.** T-REBUILD alone CANNOT
+    /// see this: its sweep runs after the rebuild, so the sweep's document and the drain's own
+    /// read both say "absent" and the forbidden convention produces identical writes. §10
+    /// records that T-REBUILD passed under two opposite conventions once.
+    ///
+    /// So: sweep against an empty kernel (the entry dirties), **then let the VM's entry appear
+    /// REACHABLE**, then drain. The actor must SKIP it, because it re-read and saw a real
+    /// `lladdr`.
+    ///
+    /// Regression: classify from the sweep's document — hand `run_batch` the document `sweep`
+    /// last read instead of calling `read_kernel` again. The actor then writes over a MAC the
+    /// kernel learned from the VM itself, which is the R2.2 violation create-only exists to
+    /// prevent, reachable in a millisecond.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_re_reads_and_does_not_reuse_the_sweeps_document() {
+        let doc = Arc::new(Mutex::new(kernel_doc(&[])));
+        let t = table_with(1);
+        let io = changing_kernel(&doc);
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        while a.run_batch().await != Batch::Idle {}
+        let written_before = writes(&calls.lock().unwrap()).len();
+
+        // The kernel holds nothing, so the sweep dirties the row.
+        let swept = a.sweep().await;
+        assert_eq!(
+            swept,
+            Sweep::Diffed {
+                dirtied: 1,
+                expired: 0
+            }
+        );
+        assert_eq!(t.dirty_depth(), 1);
+
+        // Between the sweep and the drain the VM speaks for itself and the kernel resolves it.
+        *doc.lock().unwrap() = kernel_doc(&[(LEG, addr(0), Some("aa:bb:cc:dd:ee:ff"))]);
+        a.run_batch().await;
+
+        assert_eq!(
+            writes(&calls.lock().unwrap()).len(),
+            written_before,
+            "the drain re-read, saw an lladdr, and skipped — it must never write over a MAC \
+             the kernel learned from the VM itself"
+        );
+        assert_eq!(a.counts.skips, 1);
+    }
+
+    /// **T-SWEEPREAD — a sweep whose read fails dirties NOTHING.** Not everything: "failed read
+    /// = empty document = every entry is missing" is a natural implementation that turns one
+    /// transient error into a full re-write of the table — up to `Σ C_i` = 512 forks on one
+    /// transient error (spec §4.1.1(c)). Nothing in spec §6 could see this; T-DEADLINE's read
+    /// half wedges the PRE-DRAIN read, not the sweep's.
+    ///
+    /// Regression: in `sweep`, treat the `None` from `read_kernel` as an empty document
+    /// (`KernelNeighbors::parse("[]").unwrap()`) and diff against it. Every entry then dirties.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_whose_read_fails_dirties_nothing() {
+        const N: u32 = 32;
+        let n_entries: Vec<(&str, Ipv4Addr, Option<&str>)> = (0..N)
+            .map(|i| (LEG, addr(i), Some("aa:bb:cc:dd:ee:ff")))
+            .collect();
+        let t = table_with(N);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_io = fail.clone();
+        let coherent = kernel_doc(&n_entries);
+        let io = MockNeighborIo::new(move |argv, _| {
+            if argv.contains(&"show") && fail_io.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(crate::sys::Output {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Cannot bind netlink socket: Address family not supported".to_string(),
+                });
+            }
+            Ok(crate::sys::Output {
+                status: 0,
+                stdout: if argv.contains(&"show") {
+                    coherent.clone()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+            })
+        });
+        let calls = io.calls();
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FlushActor::with_observer(
+            t.clone(),
+            Box::new(io),
+            Box::new(RecordingObserver {
+                said: said.clone(),
+                table: Some(t.clone()),
+            }),
+        );
+        while a.run_batch().await != Batch::Idle {}
+        assert_eq!(t.dirty_depth(), 0);
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            assert_eq!(a.sweep().await, Sweep::ReadFailed);
+        }
+
+        assert_eq!(
+            t.dirty_depth(),
+            0,
+            "a failed read is not an empty kernel: a transient error must not queue the whole \
+             table for rewriting"
+        );
+        assert!(writes(&calls.lock().unwrap()).is_empty());
+        assert_eq!(a.counts.read_failures, 10, "every failure is counted");
+        assert_eq!(
+            said.lock().unwrap().len(),
+            1,
+            "ten failures in one streak are ONE journal line, not ten: the rate is \
+             attacker-reachable"
+        );
+
+        // And the streak resets, so a later failure is loud again.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            a.sweep().await,
+            Sweep::Diffed {
+                dirtied: 0,
+                expired: 0
+            }
+        );
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a.sweep().await, Sweep::ReadFailed);
+        assert_eq!(said.lock().unwrap().len(), 2);
+    }
+
+    /// The sweep removes expired **table rows** and deletes no kernel entry — the second of the
+    /// two places expiry is enforced (the drain's take is the first, and it only catches rows
+    /// the drain actually reaches). Without this a row nothing ever re-dirties holds its slot
+    /// against the cap forever.
+    ///
+    /// Regression: delete the `remove_expired` call from `sweep`. The expired row then stays in
+    /// the table, and the sweep goes on re-dirtying it against a kernel that still holds it.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_removes_expired_table_rows_and_deletes_no_kernel_entry() {
+        let t = table_with(0);
+        let soon = Instant::now().into_std() + Duration::from_secs(60);
+        t.upsert(ROW, LEG, addr(0), MAC_A, soon, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_A, long(), &cap(10));
+        let io = MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let mut a = FlushActor::new(t.clone(), Box::new(io));
+        while a.run_batch().await != Batch::Idle {}
+
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let swept = a.sweep().await;
+
+        assert_eq!(
+            swept,
+            Sweep::Diffed {
+                dirtied: 1,
+                expired: 1
+            }
+        );
+        assert_eq!(a.counts.expiries, 1);
+        assert_eq!(t.len(), 1, "the expired row is gone from cfab's table");
+        assert!(t.entry(ROW, addr(0)).is_none());
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|c| c.contains(&"del".to_string())),
+            "cfab deletes no kernel neighbor entry, ever: {calls:?}"
+        );
     }
 }

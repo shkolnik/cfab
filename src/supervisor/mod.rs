@@ -1020,7 +1020,8 @@ pub(crate) async fn run_with(
         // The flush actor (gate C spec §4.2): ONE for the whole member, on its own task. Not on
         // this loop — a fork here stalls the watchdog feed, the `cfab.sock` accept and every
         // tick while it blocks, which is the harm this gate exists to remove. It sleeps until an
-        // upsert wakes it, so a member whose VMs never DHCP costs nothing.
+        // upsert wakes it or its next coherence sweep falls due, so a member whose VMs never
+        // DHCP costs one `ip neigh show` every `SWEEP` = 15 s and no writes at all.
         let io: Box<dyn crate::workload::writer::NeighborIo> = hooks
             .neighbor_io
             .unwrap_or_else(|| Box::new(crate::workload::writer::ForkNeighborIo::default()));

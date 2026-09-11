@@ -422,6 +422,23 @@ impl NeighborTable {
         self.len() == 0
     }
 
+    /// Every entry the table holds, as `(row, addr, leg)`, copied out.
+    ///
+    /// Copied rather than iterated under the guard because the one caller — the sweep — then
+    /// classifies each of these against a kernel document and calls back into `re_dirty`. The
+    /// table lock is a leaf: it is taken here, released, and taken again per re-dirty, which
+    /// costs one uncontended lock per entry and buys the rule that nothing at all happens under
+    /// it (spec §4.2.3).
+    pub fn list_entries(&self) -> Vec<(String, Ipv4Addr, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|((row, addr), e)| (row.clone(), *addr, e.leg.clone()))
+            .collect()
+    }
+
     /// A copy of one entry, for the sweep and for tests.
     pub fn entry(&self, row: &str, addr: Ipv4Addr) -> Option<Entry> {
         self.inner
