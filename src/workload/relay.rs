@@ -2208,6 +2208,214 @@ mod tests {
         handle.abort();
     }
 
+    // ---- serve: what the call site PASSES into the accept path ----------------------------
+
+    /// The captured ACK with its option 51 rewritten. Located by scanning for the option the
+    /// capture actually carries, not at a fixed offset, and the result is re-parsed so a
+    /// mis-patched packet fails here rather than as a confusing assertion downstream.
+    fn ack_with_lease(secs: u32) -> Vec<u8> {
+        let mut bytes = ACK.to_vec();
+        let at = bytes
+            .windows(6)
+            .position(|w| w == [51, 4, 0, 0, 0, 240])
+            .expect("the capture carries option 51 = 240");
+        bytes[at + 2..at + 6].copy_from_slice(&secs.to_be_bytes());
+        assert_eq!(Bootp::parse(&bytes).unwrap().lease_time(), Some(secs));
+        bytes
+    }
+
+    /// The captured ACK with a different `yiaddr` planted, so one test can send two claims.
+    fn ack_claiming(addr: Ipv4Addr) -> Vec<u8> {
+        let mut p = Bootp::parse(ACK).unwrap();
+        p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&addr.octets());
+        p.into_bytes()
+    }
+
+    /// One `serve` loop over a real socket pair, driven by real server-side packets.
+    ///
+    /// Every test using this is about an ARGUMENT `serve` passes into the accept path — the
+    /// fabric address set, the published cap, the lease clamp. Each of those is pinned as a
+    /// pure function elsewhere, and no test of a pure function can see whether its call site
+    /// passes the right thing or calls it at all: spec §10's defect class, at the one place in
+    /// this gate where a packet from the wire becomes a table row.
+    fn spawn_serve(
+        row: RelayRow,
+        shared: &Arc<Mutex<Shared>>,
+        table: &Arc<NeighborTable>,
+    ) -> (
+        std::net::UdpSocket,
+        SocketAddr,
+        tokio::task::JoinHandle<String>,
+    ) {
+        let leg = row.leg_addr;
+        let dhcp_server = row.dhcp_server;
+        let client = UdpSocket::from_std(bind_client(0, None).unwrap()).unwrap();
+        let server = UdpSocket::from_std(bind_server(leg, 0).unwrap()).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let shared_task = shared.clone();
+        let table_task = table.clone();
+        let handle = tokio::spawn(async move {
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared_task,
+                &table_task,
+                &no_watch(),
+            )
+            .await
+        });
+        let sender = std::net::UdpSocket::bind((dhcp_server, 0)).unwrap();
+        (sender, SocketAddr::from((leg, port)), handle)
+    }
+
+    fn serve_row(name: &str, leg: Ipv4Addr, dhcp_server: Ipv4Addr) -> RelayRow {
+        RelayRow {
+            name: name.to_string(),
+            leg: "lo".to_string(),
+            leg_addr: leg,
+            dhcp_server,
+            prefix: PREFIX,
+            fabric_addresses: BTreeSet::new(),
+        }
+    }
+
+    /// **The row's fabric addresses reach the accept test.**
+    /// `a_forged_ack_naming_a_fabric_owned_or_broadcast_address_is_refused` proves
+    /// `ack_discovery` refuses them; nothing proved `serve` hands it the set. A VM that forges
+    /// a BOOTREPLY claiming a fabric-owned address would be admitted and written, and
+    /// `hostroutes` would then originate that /32 toward the attacker.
+    ///
+    /// Regression: pass `&std::collections::BTreeSet::new()` at the call site.
+    #[tokio::test]
+    async fn serve_refuses_an_ack_claiming_a_fabric_owned_address() {
+        let leg = Ipv4Addr::new(127, 88, 0, 61);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 62);
+        // The capture's own `yiaddr`, declared as an address the fabric owns.
+        let owned = Ipv4Addr::new(192, 168, 22, 150);
+
+        let mut row = serve_row("test-row", leg, dhcp_server);
+        row.fabric_addresses = [owned].into_iter().collect();
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let table = Arc::new(NeighborTable::new());
+        let (sender, dest, handle) = spawn_serve(row, &shared, &table);
+
+        let mut p = Bootp::parse(ACK).unwrap();
+        p.set_giaddr(leg);
+        sender.send_to(p.as_bytes(), dest).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert!(
+            table.entry("test-row", owned).is_none(),
+            "a claim on a fabric-owned address must never reach the table"
+        );
+        assert_eq!(table.len(), 0);
+        assert_eq!(shared.lock().unwrap().relay_discovered("test-row"), 0);
+        assert_eq!(
+            shared.lock().unwrap().relay_drops("test-row"),
+            1,
+            "refused, counted, and the loop keeps serving"
+        );
+        assert!(!handle.is_finished());
+        handle.abort();
+    }
+
+    /// **The published cap reaches the upsert.** `Sigma C_i` = 512 is what `MIN_LEASE`'s
+    /// derivation rests on, so a call site that passes a cap the row never hits — or omits it —
+    /// lets the table grow past the bound with every cap test still green.
+    ///
+    /// Regression: pass `RowCap { value: u32::MAX, .. }` at the call site.
+    #[tokio::test]
+    async fn serve_applies_the_published_cap() {
+        let leg = Ipv4Addr::new(127, 88, 0, 63);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 64);
+
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        // C = min(254 prefix hosts, min(2, 1024) / 2 / 1 row) = 1.
+        shared
+            .lock()
+            .unwrap()
+            .set_neighbor_cap(crate::workload::table::CapSource {
+                gc_thresh3: 2,
+                rows: 1,
+            });
+        let table = Arc::new(NeighborTable::new());
+        let (sender, dest, handle) =
+            spawn_serve(serve_row("test-row", leg, dhcp_server), &shared, &table);
+
+        for addr in [
+            Ipv4Addr::new(192, 168, 22, 150),
+            Ipv4Addr::new(192, 168, 22, 151),
+        ] {
+            let mut p = Bootp::parse(&ack_claiming(addr)).unwrap();
+            p.set_giaddr(leg);
+            sender.send_to(p.as_bytes(), dest).unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        assert_eq!(
+            table.len(),
+            1,
+            "the row holds C = 1 claim; the second is refused at the table, not admitted"
+        );
+        assert!(
+            table
+                .entry("test-row", Ipv4Addr::new(192, 168, 22, 150))
+                .is_some()
+        );
+        assert!(
+            table
+                .entry("test-row", Ipv4Addr::new(192, 168, 22, 151))
+                .is_none()
+        );
+        assert_eq!(shared.lock().unwrap().relay_drops("test-row"), 1);
+        assert!(!handle.is_finished());
+        handle.abort();
+    }
+
+    /// **The lease clamp reaches the expiry.** Option 51 is written by whoever sent the ACK, so
+    /// an unclamped call site turns one forged packet carrying RFC 2132's `0xFFFFFFFF` into a
+    /// cap slot held for ~136 years; a one-second lease at the other end expires in the actor's
+    /// queue and the write silently never happens. Both ends, because clamping one is a
+    /// one-liner that leaves the other open.
+    ///
+    /// Regression: use the claimant's option 51 verbatim at the call site.
+    #[tokio::test]
+    async fn serve_clamps_the_claimed_lease_at_both_ends() {
+        let leg = Ipv4Addr::new(127, 88, 0, 65);
+        let dhcp_server = Ipv4Addr::new(127, 88, 0, 66);
+        let forever = Ipv4Addr::new(192, 168, 22, 150);
+        let blink = Ipv4Addr::new(192, 168, 22, 151);
+
+        let shared = Arc::new(Mutex::new(Shared::new(1)));
+        let table = Arc::new(NeighborTable::new());
+        let (sender, dest, handle) =
+            spawn_serve(serve_row("test-row", leg, dhcp_server), &shared, &table);
+
+        let sent_at = Instant::now();
+        for (addr, secs) in [(forever, u32::MAX), (blink, 1)] {
+            let mut p = Bootp::parse(&ack_with_lease(secs)).unwrap();
+            p.0[YIADDR_OFF..YIADDR_OFF + 4].copy_from_slice(&addr.octets());
+            p.set_giaddr(leg);
+            sender.send_to(p.as_bytes(), dest).unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        assert_eq!(table.len(), 2, "both claims are legitimate and admitted");
+        assert!(
+            table.entry("test-row", forever).unwrap().expires_at
+                <= Instant::now() + table::MAX_LEASE,
+            "an infinite lease is clamped down: it must not hold a cap slot for ~136 years"
+        );
+        assert!(
+            table.entry("test-row", blink).unwrap().expires_at >= sent_at + table::MIN_LEASE,
+            "a one-second lease is clamped up: below MIN_LEASE it expires in the actor's \
+             queue and the write silently never happens"
+        );
+        assert!(!handle.is_finished());
+        handle.abort();
+    }
+
     // ---- wait_for_leg: the bind-failure wait wakes early (should-fix 8, folded in free) ----
 
     /// Should-fix 8, closed as a side effect of B1's reader: a bind failure whose cause is "the
