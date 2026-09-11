@@ -790,6 +790,11 @@ async fn serve(
     // exactly one reason to log, and repeating it once for every forged packet would be a
     // self-inflicted journal DoS.
     let mut ack_refused_logged = false;
+    // TRANSITIONAL (plan §3), deleted in task 3b with `Cmd::DhcpAck`: the last claim this
+    // row sent to the command loop, which services each send with a synchronous
+    // `ip neigh replace` fork. Bounds a VM forging BOOTREPLYs on this VLAN to one fork per
+    // distinct claim rather than one per packet, exactly as it did before the table existed.
+    let mut last_ack: Option<(Ipv4Addr, [u8; 6])> = None;
     loop {
         tokio::select! {
             _ = poll.tick() => {
@@ -902,12 +907,24 @@ async fn serve(
                                                     row.dhcp_server,
                                                     RelayEvent::Discovered,
                                                 );
-                                                let _ = cmd_tx.send(Cmd::DhcpAck {
-                                                    name: row.name.clone(),
-                                                    leg: row.leg.clone(),
-                                                    yiaddr,
-                                                    chaddr,
-                                                });
+                                                // TRANSITIONAL (plan §3), deleted with
+                                                // `Cmd::DhcpAck` itself in task 3b: the command
+                                                // loop still services this send with a
+                                                // synchronous fork, so until the actor exists
+                                                // the gate stays around the SEND and keeps this
+                                                // branch's fork behavior identical to `p2c`'s.
+                                                // The upsert above is outside it, so the table
+                                                // sees every claim (the R2.1 hole the gate used
+                                                // to open).
+                                                if last_ack != Some((yiaddr, chaddr)) {
+                                                    last_ack = Some((yiaddr, chaddr));
+                                                    let _ = cmd_tx.send(Cmd::DhcpAck {
+                                                        name: row.name.clone(),
+                                                        leg: row.leg.clone(),
+                                                        yiaddr,
+                                                        chaddr,
+                                                    });
+                                                }
                                             }
                                             table::Upsert::Refused { first_of_streak } => {
                                                 if first_of_streak {
@@ -2166,13 +2183,19 @@ mod tests {
         assert_eq!(entry.mac, CHADDR);
         assert!(entry.dirty, "an upserted entry is queued for the actor");
 
+        // The TRANSITIONAL half, and the reason it is 1 and not 2: `Cmd::DhcpAck` is still
+        // serviced by a synchronous fork on the command loop, so the `last_ack` gate stays
+        // around the send until task 3b deletes both (plan §3 — no intermediate commit on this
+        // branch is worse than `p2c` on the fork axis). The rule this test exists for is the
+        // assertion above: the gate no longer stands between a claim and the TABLE. When 3b
+        // removes `Cmd::DhcpAck`, this assertion goes with it.
         let mut acks_received = 0;
         while cmd_rx.try_recv().is_ok() {
             acks_received += 1;
         }
         assert_eq!(
-            acks_received, 2,
-            "neither claim is gated on the one before it"
+            acks_received, 1,
+            "the transitional send gate still collapses an identical repeat"
         );
 
         assert!(!handle.is_finished(), "the loop must still be serving");
