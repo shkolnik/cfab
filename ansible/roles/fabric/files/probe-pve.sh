@@ -96,61 +96,50 @@ if [ ! -f "$CONF" ]; then
   echo "  $CONF absent"
   WLIFS=""
 else
-  # M5 (whole-branch review): the old `$1=="ifname"` field-position match needed a space either
-  # side of `=` (legal TOML with none, e.g. `ifname="primary.3"`, silently produced ONE field
-  # and no match at all) — match the key by regex instead of by field count.
-  WLIFS=$(awk '/^\[\[workload\]\]/{w=1; next} /^\[/{w=0} w && /^ifname[ \t]*=/{
-    line=$0
-    sub(/^ifname[ \t]*=[ \t]*"/, "", line)
-    sub(/".*/, "", line)
-    print line
-  }' "$CONF")
-  [ -z "$WLIFS" ] && echo "  no [[workload]] rows in $CONF"
+  # 0.6.0 [[workload]] rows carry `uplink = "<bridge>"` and `vid = <tag>` (the retired
+  # `ifname = "primary.3"` sub-interface key is gone). The cfab leg `cfab-work-<name>` does not
+  # exist until apply; what MUST pre-exist is the host-provided uplink bridge, carrying `vid`.
+  # Match keys by regex, not field count: `uplink="primary"` with no spaces is legal TOML that a
+  # `$1==` field match would miss (the M5 whole-branch-review lesson, kept). Flush on the next
+  # `[[workload]]` too, so a second row is not swallowed by the first.
+  WL=$(awk '
+    /^\[\[workload\]\]/{ if(w && up!=""){print up" "vid}; w=1; up=""; vid=""; next }
+    /^\[/{ if(w && up!=""){print up" "vid}; w=0 }
+    w && /^uplink[ \t]*=/{ line=$0; sub(/^uplink[ \t]*=[ \t]*"/, "", line); sub(/".*/, "", line); up=line }
+    w && /^vid[ \t]*=/{ line=$0; sub(/^vid[ \t]*=[ \t]*/, "", line); sub(/[^0-9].*/, "", line); vid=line }
+    END{ if(w && up!=""){print up" "vid} }
+  ' "$CONF")
+  [ -z "$WL" ] && echo "  no [[workload]] rows in $CONF"
 fi
-for ifn in $WLIFS; do
-  echo "  -- $ifn"
-  if ! ip link show "$ifn" >/dev/null 2>&1; then
-    echo "    MISSING (precondition unmet: the interface must exist before apply)"
+printf '%s\n' "$WL" | while read -r br vid; do
+  [ -n "$br" ] || continue
+  echo "  -- workload uplink $br (vid $vid)"
+  if ! ip link show "$br" >/dev/null 2>&1; then
+    echo "    MISSING (precondition unmet: the uplink bridge must exist before apply)"
     continue
   fi
-  ip -d -br link show dev "$ifn" 2>&1 | sed 's/^/    /'
-  ip -4 -br addr show dev "$ifn" 2>&1 | sed 's/^/    /'
-  if [ -f /proc/net/vlan/"$ifn" ]; then
-    awk '/^Device:|VID:/{print "    " $0}' /proc/net/vlan/"$ifn"
-  else
-    echo "    /proc/net/vlan/$ifn absent (not an 802.1q sub-interface, or 8021q not loaded)"
+  if [ ! -d /sys/class/net/"$br"/bridge ]; then
+    echo "    $br is not a bridge (the workload uplink must be a vlan-aware bridge)"
+    continue
   fi
-  lowers=$(ls -d /sys/class/net/"$ifn"/lower_* 2>/dev/null | sed 's|.*/lower_||')
-  nlow=$(printf '%s' "$lowers" | grep -c '^.')
-  if [ "$nlow" -ne 1 ]; then
-    echo "    lower: $nlow links, expected exactly one"
+  # stp_state: 0=off, 1=kernel STP, 2=user-space STP (e.g. mstpd). vlan_filtering must be 1.
+  echo "    bridge $br: vlan_filtering=$(cat /sys/class/net/"$br"/bridge/vlan_filtering 2>/dev/null) (1 = vlan-aware, required for the vid $vid leg) stp=$(cat /sys/class/net/"$br"/bridge/stp_state 2>/dev/null) forward_delay=$(cat /sys/class/net/"$br"/bridge/forward_delay 2>/dev/null)"
+  ip -d -br link show dev "$br" 2>&1 | sed 's/^/    /'
+  ip -4 -br addr show dev "$br" 2>&1 | sed 's/^/    /'
+  for p in /sys/class/net/"$br"/brif/*; do
+    [ -e "$p" ] || continue
+    p=${p##*/}
+    sfile=/sys/class/net/"$br"/brif/"$p"/state
+    if [ -f "$sfile" ]; then pstate=$(cat "$sfile" 2>/dev/null); else pstate=MISSING; fi
+    # state 3 = forwarding (the port passes traffic); anything else blocks it.
+    echo "    port $p state=$pstate"
+  done
+  if have bridge; then
+    # The uplink's vlan set: `vid` must appear for the VM leg to pass. `dev $br` scopes it to this
+    # bridge and its ports, so the port tagging that proves vid actually reaches it shows too.
+    bridge -c=never vlan show dev "$br" 2>&1 | sed 's/^/    /'
   else
-    low=$(printf '%s' "$lowers" | head -1)
-    if [ ! -d /sys/class/net/"$low"/bridge ]; then
-      echo "    lower $low is not a bridge"
-    else
-      echo "    lower: $low"
-      # stp_state: 0=off, 1=kernel STP, 2=user-space STP (e.g. mstpd).
-      echo "    bridge $low: stp=$(cat /sys/class/net/"$low"/bridge/stp_state 2>/dev/null) (0=off, 1=kernel, 2=user) forward_delay=$(cat /sys/class/net/"$low"/bridge/forward_delay 2>/dev/null)"
-      for p in /sys/class/net/"$low"/brif/*; do
-        [ -e "$p" ] || continue
-        p=${p##*/}
-        pdev=/sys/class/net/"$p"/device
-        dev=no; { [ -e "$pdev" ] || [ -L "$pdev" ]; } && dev=yes
-        plow=$(ls -d /sys/class/net/"$p"/lower_* 2>/dev/null | sed 's|.*/lower_||' | tr '\n' ' ')
-        sfile=/sys/class/net/"$low"/brif/"$p"/state
-        if [ -f "$sfile" ]; then pstate=$(cat "$sfile" 2>/dev/null); else pstate=MISSING; fi
-        # state 3 = forwarding (the port passes traffic); anything else blocks it.
-        echo "    port $p state=$pstate device=$dev lowers=${plow:-none}"
-      done
-      if have bridge; then
-        # Unfiltered: shows the bridge AND every port's own VLAN membership (the uplink port's
-        # tagging is what proves vid 3 actually reaches it, not just the bridge's config).
-        bridge -c=never vlan show 2>&1 | sed 's/^/    /'
-      else
-        echo "    bridge: command absent"
-      fi
-    fi
+    echo "    bridge: command absent"
   fi
 done
 echo "  net.ipv4.conf.all.arp_ignore = $(sysctl -n net.ipv4.conf.all.arp_ignore 2>/dev/null || echo absent)"
