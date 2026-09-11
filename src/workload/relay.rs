@@ -1489,6 +1489,26 @@ mod tests {
         );
     }
 
+    // ---- T7b: option 51 off the real wire -------------------------------------------------
+
+    /// **T7b.** `lease_time` parses the captured ACK's option 51 — a real value off the testbed
+    /// wire (240 s), not a placeholder — with the same bounds-checked scan `message_type` uses:
+    /// a truncated option area ends the scan rather than indexing past it.
+    ///
+    /// Regression: read option 51 at a fixed offset, or drop the length check in `option`.
+    #[test]
+    fn lease_time_parses_the_captured_acks_option_51() {
+        assert_eq!(Bootp::parse(ACK).unwrap().lease_time(), Some(240));
+        // A DISCOVER carries no option 51 at all: absent, not zero. `clamp_lease` is what turns
+        // that into the stated default.
+        assert_eq!(Bootp::parse(DISCOVER).unwrap().lease_time(), None);
+        // Truncated in the middle of the option area: the scan stops, it does not panic.
+        let ack = Bootp::parse(ACK).unwrap().into_bytes();
+        for cut in [MIN_LEN, MIN_LEN + 3, MIN_LEN + 8] {
+            let _ = Bootp::parse(&ack[..cut]).unwrap().lease_time();
+        }
+    }
+
     // ---- ack_discovery: what registers a VM, and what must not ---------------------------
 
     #[test]

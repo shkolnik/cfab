@@ -369,3 +369,490 @@ fn row_len(entries: &BTreeMap<Key, Entry>, row: &str) -> u32 {
     let hi = (row.to_string(), Ipv4Addr::BROADCAST);
     u32::try_from(entries.range(lo..=hi).count()).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::mock::MockSys;
+
+    const ROW: &str = "vms";
+    const OTHER: &str = "lab";
+    const LEG: &str = "cfab-work-vms";
+    const MAC_A: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
+    const MAC_B: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
+
+    fn p22() -> Ipv4Prefix {
+        Ipv4Prefix::parse("10.9.0.0/22").unwrap()
+    }
+
+    fn p24() -> Ipv4Prefix {
+        Ipv4Prefix::parse("192.168.20.0/24").unwrap()
+    }
+
+    /// A cap of `value`, shaped however the test needs; the derivation itself is T8's subject.
+    fn cap(value: u32) -> RowCap {
+        RowCap {
+            value,
+            bound_by: CapBound::GcThresh3,
+            gc_thresh3: GC_THRESH3_DEFAULT,
+            rows: 1,
+        }
+    }
+
+    fn addr(n: u32) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(Ipv4Addr::new(10, 9, 0, 0)) + n + 1)
+    }
+
+    // ---- T1: coalescing performs the LAST update -----------------------------------------
+
+    /// **T1 (table half).** Two claims for one address between takes leave the SECOND MAC in
+    /// the table and produce exactly one entry to write. Round 3's dedupe performed the FIRST
+    /// update and dropped the rest, which on a VM that changed MAC writes the stale binding.
+    ///
+    /// Regression: in `upsert`'s existing-entry arm, leave `e.mac` alone.
+    #[test]
+    fn coalescing_performs_the_last_update() {
+        let t = NeighborTable::new();
+        let exp = Instant::now() + Duration::from_secs(600);
+        t.upsert(ROW, LEG, addr(1), MAC_A, exp, &cap(10));
+        t.upsert(ROW, LEG, addr(1), MAC_B, exp, &cap(10));
+
+        let taken = t
+            .take_next_dirty(Instant::now())
+            .expect("one entry to write");
+        assert_eq!(taken.mac, MAC_B, "the LAST claim is the one written");
+        assert_eq!(taken.addr, addr(1));
+        assert_eq!(taken.leg, LEG, "the entry carries the leg the write needs");
+        assert!(
+            t.take_next_dirty(Instant::now()).is_none(),
+            "two claims for one address are one write, not two"
+        );
+    }
+
+    /// **T1a (table half).** The same claim twice with the row expiring in between: the second
+    /// is a fresh admission, not a repeat the table already knows about. `serve`'s own half is
+    /// `a_repeated_identical_ack_still_reaches_the_table` in `relay.rs`.
+    ///
+    /// Regression: gate `upsert` on "this row already claimed this (address, mac)".
+    #[test]
+    fn a_repeated_identical_claim_after_expiry_is_admitted_again() {
+        let t = NeighborTable::new();
+        let t0 = Instant::now();
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            t0 + Duration::from_secs(60),
+            &cap(10),
+        );
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)), 1);
+
+        t.upsert(
+            ROW,
+            LEG,
+            addr(1),
+            MAC_A,
+            t0 + Duration::from_secs(3600),
+            &cap(10),
+        );
+        assert_eq!(
+            t.entry(ROW, addr(1)).map(|e| e.mac),
+            Some(MAC_A),
+            "an identical claim is exactly what a VM whose entry was lost re-sends"
+        );
+    }
+
+    // ---- T7 / T7c: expiry, in both of its places ------------------------------------------
+
+    /// **T7 (table half).** An expired entry is removed by the sweep's pass and is dropped at
+    /// take rather than written — the two places expiry is enforced, and neither is the other.
+    ///
+    /// Regression: ignore `expires_at` in `remove_expired`, or in `take_next_dirty`.
+    #[test]
+    fn an_expired_entry_is_removed_and_is_never_taken_for_a_write() {
+        let t0 = Instant::now();
+        let live = t0 + Duration::from_secs(600);
+        let dead = t0 + Duration::from_secs(30);
+
+        // The take half: the entry expires while it sits in the queue.
+        let t = NeighborTable::new();
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        assert!(
+            t.take_next_dirty(t0 + Duration::from_secs(31)).is_none(),
+            "an entry that expired in the queue is dropped at take, not written"
+        );
+        assert_eq!(t.len(), 0, "and it frees its slot against the cap");
+
+        // The sweep half: an entry nothing ever takes still leaves the table.
+        let t = NeighborTable::new();
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        t.upsert(ROW, LEG, addr(2), MAC_A, live, &cap(10));
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(31)), 1);
+        assert!(t.entry(ROW, addr(1)).is_none());
+        assert!(t.entry(ROW, addr(2)).is_some(), "a live entry is untouched");
+    }
+
+    /// **T7c.** NOTHING extends a row's expiry. r6 extended it while the kernel held the entry
+    /// (one forgery burst becomes immortal); r7 extended it while the entry's `used` counter
+    /// was fresh (working VMs get expired instead). Two failed mechanisms, and the measurement
+    /// that killed the second showed no third could work — for a genuinely idle VM there is no
+    /// liveness signal on this host to condition on. So the table takes no input but `now`:
+    /// being queued, having been taken, or being about to be written changes nothing.
+    ///
+    /// Regression: any "keep it a bit longer because …" clause in `remove_expired` — e.g.
+    /// `&& !e.dirty`, the shape an in-flight-entry exemption takes.
+    #[test]
+    fn nothing_extends_an_expiry() {
+        let t0 = Instant::now();
+        let dead = t0 + Duration::from_secs(30);
+        let after = t0 + Duration::from_secs(31);
+
+        let t = NeighborTable::new();
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        assert!(t.entry(ROW, addr(1)).unwrap().dirty);
+        assert_eq!(
+            t.remove_expired(after),
+            1,
+            "a queued entry expires on schedule like any other"
+        );
+
+        let t = NeighborTable::new();
+        t.upsert(ROW, LEG, addr(1), MAC_A, dead, &cap(10));
+        let taken = t.take_next_dirty(t0).expect("taken while still live");
+        assert_eq!(taken.addr, addr(1));
+        assert_eq!(
+            t.entry(ROW, addr(1)).unwrap().expires_at,
+            dead,
+            "taking an entry does not move its expiry"
+        );
+        assert_eq!(
+            t.remove_expired(after),
+            1,
+            "nor does having been written: an expiry is the lease, and only a new ACK sets it"
+        );
+    }
+
+    // ---- T7a / T-MINLEASE: the lease clamp ------------------------------------------------
+
+    /// **T7a.** Option 51 is written by whoever sent the ACK and anyone on the VLAN can send
+    /// one, so RFC 2132's `0xFFFFFFFF` ("infinite") must not become an entry that never
+    /// expires; an absent option 51 gets a stated default, never "forever".
+    ///
+    /// Regression: take option 51 verbatim.
+    #[test]
+    fn the_lease_is_clamped_at_both_ends() {
+        assert_eq!(clamp_lease(Some(u32::MAX)), MAX_LEASE);
+        assert_eq!(clamp_lease(None), NO_LEASE_DEFAULT);
+        assert_eq!(clamp_lease(Some(240)), Duration::from_secs(240));
+        assert!(
+            NO_LEASE_DEFAULT <= MAX_LEASE && NO_LEASE_DEFAULT >= MIN_LEASE,
+            "the stated default must itself be a legal lease"
+        );
+    }
+
+    /// **T-MINLEASE (first half).** A `lease = 1` ACK is raised to `MIN_LEASE`. Without the
+    /// floor such an ACK is admitted, queued, and expires before the actor reaches it under
+    /// boot-storm load: the write silently never happens and R2.1 is false with every other
+    /// test green. The second half — that the floor outlives the worst-case queue — is the
+    /// actor's, in task 3b.
+    ///
+    /// Regression: clamp only the upper bound.
+    #[test]
+    fn a_one_second_lease_is_raised_to_the_floor() {
+        assert_eq!(clamp_lease(Some(1)), MIN_LEASE);
+        assert_eq!(clamp_lease(Some(0)), MIN_LEASE);
+    }
+
+    // ---- T8 / T8c: the cap ----------------------------------------------------------------
+
+    /// **T8.** `C = min(prefix hosts, min(gc_thresh3, 1024) / 2 / rows)`. The TWO-ROW case is
+    /// the point: without the divisor two rows can hold the whole kernel ceiling between them.
+    /// The /22 fixture is deliberate — it is the only shape where the cap bites at all, since
+    /// at the /24 a real site declares the prefix binds.
+    ///
+    /// Regression 1: cap per row without dividing (two rows read 512 each).
+    /// Regression 2: cap at the prefix host count alone — the tautology that can never refuse
+    /// anything, because `ack_discovery`'s prefix check already bounds the keys.
+    #[test]
+    fn the_cap_is_the_smaller_of_the_prefix_and_the_kernels_share() {
+        let one = CapSource {
+            gc_thresh3: 1024,
+            rows: 1,
+        };
+        assert_eq!(
+            one.for_prefix(p22()),
+            RowCap {
+                value: 512,
+                bound_by: CapBound::GcThresh3,
+                gc_thresh3: 1024,
+                rows: 1
+            }
+        );
+        let two = CapSource {
+            gc_thresh3: 1024,
+            rows: 2,
+        };
+        assert_eq!(
+            two.for_prefix(p22()).value,
+            256,
+            "the rows share the ceiling"
+        );
+
+        let c24 = one.for_prefix(p24());
+        assert_eq!(c24.value, 254, "at a /24 the prefix binds, not the sysctl");
+        assert_eq!(c24.bound_by, CapBound::Prefix);
+
+        // And the cap actually refuses: the row stops admitting at C.
+        let t = NeighborTable::new();
+        let c = two.for_prefix(p22());
+        let exp = Instant::now() + Duration::from_secs(600);
+        for n in 0..c.value {
+            assert_eq!(
+                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &c),
+                Upsert::Admitted
+            );
+        }
+        assert!(matches!(
+            t.upsert(ROW, LEG, addr(c.value), MAC_A, exp, &c),
+            Upsert::Refused { .. }
+        ));
+        assert_eq!(t.len(), c.value as usize);
+        // Per ROW, not per table: a second row has its own C.
+        assert_eq!(
+            t.upsert(OTHER, LEG, addr(0), MAC_A, exp, &c),
+            Upsert::Admitted
+        );
+    }
+
+    /// **T8 (read-failure case).** A `gc_thresh3` cfab cannot read is treated as the kernel's
+    /// documented default of 1024 — NOT as `C` = 1024, which would double the cap at one row
+    /// and quadruple it at two, on exactly the degraded path. cfab journals and carries on; it
+    /// never refuses to start over a sysctl it could not read, and it never writes one.
+    ///
+    /// Regression: fall back to `C` = 1024, or return an error.
+    #[test]
+    fn an_unreadable_gc_thresh3_falls_back_to_the_kernel_default() {
+        let sys = MockSys::default();
+        let (src, why) = CapSource::read(&sys, 2);
+        assert_eq!(src.gc_thresh3, GC_THRESH3_DEFAULT);
+        assert!(
+            why.expect("a failed read must be journaled, never silent")
+                .contains(GC_THRESH3_PATH)
+        );
+        assert_eq!(src.for_prefix(p22()).value, 256, "512 / rows, not 1024");
+
+        let sys = MockSys::default().file(GC_THRESH3_PATH, "not-a-number\n");
+        let (src, why) = CapSource::read(&sys, 1);
+        assert_eq!(src.gc_thresh3, GC_THRESH3_DEFAULT);
+        assert!(why.is_some(), "an unparsable value is a failed read");
+
+        let sys = MockSys::default().file(GC_THRESH3_PATH, "512\n");
+        let (src, why) = CapSource::read(&sys, 1);
+        assert_eq!(src.gc_thresh3, 512);
+        assert!(why.is_none());
+    }
+
+    /// **T8c (derivation half).** `C` follows the sysctl DOWN and never above the kernel
+    /// default. Raising `gc_thresh3` past 1024 leaves `C` alone: `Σ C_i` is what `MIN_LEASE`
+    /// is derived against, and there is no human in the loop to re-derive it when an operator
+    /// raises a threshold on a live member. Lowering it DOES lower `C` — an operator shrinking
+    /// the kernel table under cfab must not be ignored.
+    ///
+    /// Regression 1: drop the `min(gc_thresh3, 1024)` clamp — `Σ C_i` then grows past 512 and
+    /// `MIN_LEASE` is silently false, which no other test can see.
+    /// Regression 2: clamp to a constant 1024 instead of to the live value.
+    #[test]
+    fn the_cap_follows_the_sysctl_down_but_never_above_the_kernel_default() {
+        let raised = CapSource {
+            gc_thresh3: 16384,
+            rows: 1,
+        };
+        assert_eq!(
+            raised.for_prefix(p22()).value,
+            512,
+            "a raised sysctl buys cfab nothing: the ceiling is the kernel default"
+        );
+        assert_eq!(
+            raised.for_prefix(p22()).gc_thresh3,
+            16384,
+            "but the journal line still states what the operator actually set"
+        );
+
+        let lowered = CapSource {
+            gc_thresh3: 256,
+            rows: 1,
+        };
+        assert_eq!(
+            lowered.for_prefix(p22()).value,
+            128,
+            "a lowered sysctl lowers C on the next tick"
+        );
+    }
+
+    /// A cap lowered below a row's current occupancy evicts NOTHING: it refuses new admissions
+    /// until expiry shrinks the row. Eviction would be cfab deleting rows it promised to
+    /// restore. Regression: drop entries down to the new `C` on refresh.
+    #[test]
+    fn lowering_the_cap_refuses_rather_than_evicts() {
+        let t = NeighborTable::new();
+        let exp = Instant::now() + Duration::from_secs(600);
+        for n in 0..4 {
+            t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(4));
+        }
+        assert!(matches!(
+            t.upsert(ROW, LEG, addr(9), MAC_A, exp, &cap(2)),
+            Upsert::Refused { .. }
+        ));
+        assert_eq!(t.len(), 4, "the four already admitted stay");
+    }
+
+    // ---- T-FIFO-ADMIT ---------------------------------------------------------------------
+
+    /// **T-FIFO-ADMIT.** Admission at a full cap is plain FIFO: whoever arrived first keeps the
+    /// slot and the newcomer is refused. r8 preferred addresses the kernel already held, which
+    /// is self-validating in exactly the way its expiry rule was — a booting VM loses its slot
+    /// to an attacker's earlier forgery, which by then the kernel does hold.
+    ///
+    /// Regression: evict to admit (drop the oldest entry and let the newcomer in).
+    #[test]
+    fn admission_at_a_full_cap_is_plain_fifo() {
+        let t = NeighborTable::new();
+        let exp = Instant::now() + Duration::from_secs(600);
+        for n in 0..3 {
+            assert_eq!(
+                t.upsert(ROW, LEG, addr(n), MAC_A, exp, &cap(3)),
+                Upsert::Admitted
+            );
+        }
+        assert!(matches!(
+            t.upsert(ROW, LEG, addr(3), MAC_A, exp, &cap(3)),
+            Upsert::Refused { .. }
+        ));
+        for n in 0..3 {
+            assert!(
+                t.entry(ROW, addr(n)).is_some(),
+                "an earlier arrival is never displaced by a later one"
+            );
+        }
+        assert!(t.entry(ROW, addr(3)).is_none());
+        assert_eq!(
+            t.upsert(ROW, LEG, addr(0), MAC_B, exp, &cap(3)),
+            Upsert::Admitted,
+            "a claim for an address the row already holds is a coalesce, not an admission: \
+             refusing it would freeze a full row's MACs at whatever they were"
+        );
+        assert_eq!(t.entry(ROW, addr(0)).unwrap().mac, MAC_B);
+    }
+
+    // ---- T-THROTTLE, cap half -------------------------------------------------------------
+
+    /// **T-THROTTLE (cap half).** The refusal rate is attacker-chosen, so the line is once per
+    /// refusal STREAK per row, not once per refused packet. A successful admission ends the
+    /// streak; the next refusal starts a new one.
+    ///
+    /// Regression: report every refusal as the first of its streak (drop `refusing` and return
+    /// `first_of_streak: true`) — a log flood on demand.
+    #[test]
+    fn the_cap_refusal_is_journaled_once_per_streak_per_row() {
+        let t = NeighborTable::new();
+        let t0 = Instant::now();
+        let short = t0 + Duration::from_secs(30);
+        t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1));
+
+        let firsts = (0..10)
+            .filter(|n| {
+                matches!(
+                    t.upsert(ROW, LEG, addr(100 + n), MAC_A, short, &cap(1)),
+                    Upsert::Refused {
+                        first_of_streak: true
+                    }
+                )
+            })
+            .count();
+        assert_eq!(firsts, 1, "ten refusals in one streak are one journal line");
+
+        // A second row refusing is its own streak: one row's flood must not silence another's
+        // first line.
+        assert_eq!(
+            t.upsert(OTHER, LEG, addr(0), MAC_A, short, &cap(0)),
+            Upsert::Refused {
+                first_of_streak: true
+            }
+        );
+
+        // The streak ends when the row admits again, and the next refusal is loud.
+        t.remove_expired(t0 + Duration::from_secs(31));
+        assert_eq!(
+            t.upsert(ROW, LEG, addr(0), MAC_A, short, &cap(1)),
+            Upsert::Admitted
+        );
+        assert_eq!(
+            t.upsert(ROW, LEG, addr(1), MAC_A, short, &cap(1)),
+            Upsert::Refused {
+                first_of_streak: true
+            }
+        );
+    }
+
+    /// The refusal line's CONTENT is normative, not just its cadence: it states `gc_thresh3`
+    /// (that name alone — the published recipes raise all three together and `gc_thresh1` is a
+    /// different decision), the derived `C`, and WHICH TERM bound `C`. At the /24 a real site
+    /// declares the prefix is the binding term, so a line telling the operator to raise a
+    /// sysctl that changes `C` by exactly zero is the failure CLAUDE.md's "verify the remedy
+    /// actually works" rule exists to prevent.
+    ///
+    /// Regression: collapse the arms of `refusal_line` to one that always names the sysctl, or
+    /// say "the thresholds" instead of `gc_thresh3`.
+    #[test]
+    fn the_cap_refusal_line_names_the_remedy_that_actually_works() {
+        let prefix_bound = CapSource {
+            gc_thresh3: 1024,
+            rows: 1,
+        }
+        .for_prefix(p24());
+        let line = prefix_bound.refusal_line(ROW, addr(7), p24());
+        assert!(line.contains("C = 254"), "{line}");
+        assert!(line.contains("192.168.20.0/24"), "the binding term: {line}");
+        assert!(line.contains("gc_thresh3 = 1024"), "{line}");
+        assert!(
+            line.contains("does not raise C"),
+            "at a /24 raising the sysctl changes C by zero and the line must say so: {line}"
+        );
+
+        let sysctl_bound = CapSource {
+            gc_thresh3: 256,
+            rows: 2,
+        }
+        .for_prefix(p22());
+        let line = sysctl_bound.refusal_line(ROW, addr(7), p22());
+        assert_eq!(sysctl_bound.value, 64);
+        assert!(line.contains("C = 64"), "{line}");
+        assert!(line.contains("gc_thresh3 = 256"), "{line}");
+        assert!(
+            line.contains("raise gc_thresh3"),
+            "here the sysctl IS the binding term and raising it does work: {line}"
+        );
+
+        // At or above the kernel default the sysctl is no longer a remedy either: C is at
+        // cfab's own ceiling. Naming it would be the same wrong advice in the other direction.
+        let at_ceiling = CapSource {
+            gc_thresh3: 1024,
+            rows: 4,
+        }
+        .for_prefix(p22());
+        let line = at_ceiling.refusal_line(ROW, addr(7), p22());
+        assert!(line.contains("does not raise C"), "{line}");
+
+        for line in [
+            prefix_bound.refusal_line(ROW, addr(7), p24()),
+            sysctl_bound.refusal_line(ROW, addr(7), p22()),
+            at_ceiling.refusal_line(ROW, addr(7), p22()),
+        ] {
+            assert!(
+                !line.contains("thresholds") && !line.contains("gc_thresh1"),
+                "one sysctl is named, by its own name: {line}"
+            );
+        }
+    }
+}

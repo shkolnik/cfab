@@ -2469,6 +2469,97 @@ mod tests {
         assert!(err.is_some(), "{err:?}");
     }
 
+    /// Run a member that declares a DHCP relay, with `gc_thresh3` answering `seq` (the last
+    /// entry repeating), until `done` holds of `Shared` or 8 s pass. Hands back the mock kernel
+    /// it ran against and what it published — the shape both cap-wiring tests need, and the
+    /// only way to see a sysctl CHANGE under a running supervisor.
+    async fn run_relay_member(
+        seq: &[&str],
+        done: impl Fn(&Shared) -> bool + Send + Sync + 'static,
+    ) -> (MockSys, crate::workload::table::CapSource) {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path())
+            .file(CONFIG, &decl)
+            .file_sequence(crate::workload::table::GC_THRESH3_PATH, seq);
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            until(8000, || done(&sh.lock().unwrap())).await;
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        driver.await.unwrap();
+        let cap = shared.lock().unwrap().neighbor_cap();
+        (sys, cap)
+    }
+
+    /// **T8c (the tick half).** `C` is computed at start AND refreshed by the workload tick's
+    /// publication — one source, one cadence — so an operator who lowers `gc_thresh3` under a
+    /// running member sees `C` follow it down without a restart. A start-only `C` is a
+    /// different mechanism from the one specified and passes every other test in this suite,
+    /// which is why the sysctl has to CHANGE mid-run here.
+    ///
+    /// Regression: read `gc_thresh3` only before the spawn loop and never again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_neighbor_cap_is_refreshed_by_the_workload_tick() {
+        let (_sys, cap) = run_relay_member(&["1024", "256"], |sh| {
+            sh.neighbor_cap().gc_thresh3 != crate::workload::table::GC_THRESH3_DEFAULT
+        })
+        .await;
+        assert_eq!(
+            cap.gc_thresh3, 256,
+            "the tick must republish what the sysctl says NOW, not what it said at start"
+        );
+        assert_eq!(cap.rows, 1, "one declared row shares the kernel allowance");
+    }
+
+    /// **T8b.** cfab reads `gc_thresh3` and caps itself; it writes NO `gc_thresh`, at start or
+    /// on any tick. There is no per-device knob, so the blast radius of such a write is the
+    /// whole host — and, since the neighbor table is not namespaced, every container and pod on
+    /// it. Raising `gc_thresh1` is also precisely the operation that stops the kernel's own GC
+    /// from running below that number, so the write would preserve an attacker's parked entries
+    /// for the sake of idle entries this pipeline does not owe. A guard test, because the write
+    /// is cheap to re-add and its harm is invisible to every other test here.
+    ///
+    /// Regression: write any `gc_thresh` derived from the declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cfab_writes_no_gc_thresh_sysctl() {
+        // Runs long enough for the workload tick to have fired at least once, so this covers
+        // "on any tick" and not merely "at start".
+        let (sys, _cap) = run_relay_member(&["1024", "256"], |sh| {
+            sh.neighbor_cap().gc_thresh3 != crate::workload::table::GC_THRESH3_DEFAULT
+        })
+        .await;
+        let offenders: Vec<_> = sys
+            .writes
+            .iter()
+            .filter(|(p, _)| p.contains("gc_thresh"))
+            .collect();
+        assert!(offenders.is_empty(), "{offenders:?}");
+    }
+
     /// Poll `ready` until it holds or the deadline passes; the answer is whether it holds.
     async fn until(ms: u64, mut ready: impl FnMut() -> bool) -> bool {
         let end = std::time::Instant::now() + Duration::from_millis(ms);
