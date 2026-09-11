@@ -131,6 +131,36 @@ cfab_workload_announces_total{name="vms"} 42
 # HELP cfab_workload_bursts Re-announce bursts this row's announcer has sent; a rising rate is flapping (MAC churn, watch deaths); absent under the same condition as cfab_workload_announces.
 # TYPE cfab_workload_bursts counter
 cfab_workload_bursts_total{name="vms"} 1
+# HELP cfab_workload_neighbor_table_size Addresses this row currently holds in cfab's own DHCP neighbor write table (gate C spec §4.5) — never the kernel's own table, which this pipeline only ever restores absence in. Absent for a row the flush actor has not touched yet.
+# TYPE cfab_workload_neighbor_table_size gauge
+cfab_workload_neighbor_table_size{name="vms"} 12
+# HELP cfab_workload_neighbor_writes Neighbor entries this row's claims have written to the kernel since the supervisor started (gate C spec §4.1.1): the kernel did not already hold this address, or held it with no lladdr. Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_writes counter
+cfab_workload_neighbor_writes_total{name="vms"} 9
+# HELP cfab_workload_neighbor_write_failures Writes this row attempted that the kernel refused, since the supervisor started; the entry is re-queued and retried on a later batch, with no backoff (gate C spec §4.1.1). A steady trickle here is EEXIST races the actor's own re-dirty resolves on its own; a rising rate is a real fault. Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_write_failures counter
+cfab_workload_neighbor_write_failures_total{name="vms"} 2
+# HELP cfab_workload_neighbor_read_failures How many times the flush actor's own pre-drain kernel read has failed since the supervisor started (gate C spec §4.5) — host-wide (one read drains every row's dirty entries at once) and repeated here under every row on purpose: a coherent host and a host that silently wrote nothing because its reads keep failing look identical from every OTHER counter in this row. Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_read_failures counter
+cfab_workload_neighbor_read_failures_total{name="vms"} 1
+# HELP cfab_workload_neighbor_cap_refusals Claims this row has had refused since the supervisor started because the row was already at its gate C §4.1.4 cap. Nothing here acts on this number: the claimed address is attacker-controlled, so throttling on it would let a forged claim get a real VM throttled. Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_cap_refusals counter
+cfab_workload_neighbor_cap_refusals_total{name="vms"} 3
+# HELP cfab_workload_neighbor_expiries Rows this member's own DHCP neighbor table has dropped because their lease ran out, since the supervisor started (gate C spec §4.1.3); cfab deletes no kernel entry when this moves, the kernel keeps whatever it holds. Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_expiries counter
+cfab_workload_neighbor_expiries_total{name="vms"} 4
+# HELP cfab_workload_neighbor_skips Claims this row's flush actor found the kernel already held a valid entry for, so nothing was written — the healthy steady state under gate C spec §4.1.1 (R2.2: a MAC the kernel learned beats a DHCP claim). Absent under the same condition as cfab_workload_neighbor_table_size.
+# TYPE cfab_workload_neighbor_skips counter
+cfab_workload_neighbor_skips_total{name="vms"} 20
+# HELP cfab_neighbor_dirty_depth Entries waiting for the flush actor right now, host-wide (gate C spec §4.5): one queue for the whole member, never one per row. Absent while no relay row runs an actor.
+# TYPE cfab_neighbor_dirty_depth gauge
+cfab_neighbor_dirty_depth 5
+# HELP cfab_neighbor_token_level Tokens the host-wide fork bucket holds right now, out of its burst (gate C spec §4.2.2). Absent under the same condition as cfab_neighbor_dirty_depth.
+# TYPE cfab_neighbor_token_level gauge
+cfab_neighbor_token_level 27
+# HELP cfab_neighbor_oldest_dirty_age_seconds Seconds since the oldest entry still waiting for the flush actor was queued (gate C spec §4.5): observability, not fairness — fairness is queue position, decided by FIFO order alone. Absent while nothing is dirty.
+# TYPE cfab_neighbor_oldest_dirty_age_seconds gauge
+cfab_neighbor_oldest_dirty_age_seconds 1.5
 # HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.
 # TYPE cfab_component_state gauge
 cfab_component_state{component="engine",state="starting"} 0

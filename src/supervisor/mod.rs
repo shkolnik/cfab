@@ -34,6 +34,8 @@ pub mod report;
 pub mod sock;
 mod workload;
 
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -151,10 +153,93 @@ pub(crate) struct Shared {
     /// Set while a run of consecutive metrics-gather failures is ongoing, so the journal line
     /// is printed once per streak rather than once per `metrics::REFRESH` tick.
     metrics_gather_failing: bool,
+    /// One row per `[[workload]]` DHCP relay this member runs (spec §5.4/§6), keyed by workload
+    /// name. The relay task writes this directly through the mutex — plain counters, never a
+    /// `Sys` action, so it needs no round trip through the main loop. A row with no `dhcp_server` never gets an entry; a row that has one but
+    /// whose task has not bound yet is absent until its first `RelayEvent`, exactly like
+    /// `workloads` before the first announcer trigger fires.
+    relays: BTreeMap<String, RelayReport>,
+    /// The host-wide half of the DHCP neighbor table's per-row cap (gate C spec §4.1.4): the
+    /// kernel's `gc_thresh3` and how many workload rows share it. Read at start and refreshed by
+    /// the workload tick — one source, one cadence — and published here because the relay's ACK
+    /// path already takes this lock and must have a valid `C` before it accepts its first ACK.
+    neighbor_cap: crate::workload::table::CapSource,
+    /// The DHCP neighbor write pipeline's per-row counters (gate C spec §4.5), republished by
+    /// the flush actor after every batch and sweep. The flush actor task writes this directly
+    /// through the mutex, the same convention `relays` uses, and for the same reason: a plain
+    /// counter needs no round trip through the main loop.
+    neighbor_rows: Vec<report::NeighborRowInfo>,
+    /// The flush actor's host-wide state (gate C spec §4.5): `None` until the actor's first
+    /// publish (there is no actor at all on a member with no relay row).
+    neighbor: Option<report::NeighborActorInfo>,
+}
+
+/// One relay's counters and last error, as `Shared` holds them.
+struct RelayReport {
+    server: Ipv4Addr,
+    requests: u64,
+    replies: u64,
+    discovered: u64,
+    /// Packets this relay declined to forward without ending the task (gate C fix round 2,
+    /// should-fixes 1 and 5): a server-facing send that failed because `dhcp_server` is
+    /// unreachable, or a reply whose `ciaddr`/`yiaddr` claims an address outside the row's own
+    /// `prefix`. Both are routing/configuration facts, not socket death, so they are counted
+    /// here rather than costing the relay a rebind (should-fix 1) or a silent forward
+    /// (should-fix 5); `relay.rs`'s own journal line explains which, throttled per streak.
+    drops: u64,
+    last_error: Option<String>,
+}
+
+impl RelayReport {
+    fn new(server: Ipv4Addr) -> Self {
+        RelayReport {
+            server,
+            requests: 0,
+            replies: 0,
+            discovered: 0,
+            drops: 0,
+            last_error: None,
+        }
+    }
+}
+
+/// A fact the relay task reports about one row (spec §5.4). Kept as an enum rather than letting
+/// the task poke `Shared`'s fields directly: `relay.rs` never needs to know the report's shape,
+/// only that these facts can happen.
+pub(crate) enum RelayEvent {
+    /// The two sockets bound: clears any standing bind error.
+    Bound,
+    /// `run`'s own bind attempt failed (the leg or its address is not there yet). Carries the
+    /// message `status`/`/metrics` show as the row's standing error.
+    BindError(String),
+    /// A live relay's socket died (a `recv`/`send` on a device-bound socket failed, or `serve`'s
+    /// presence watch caught the leg being deleted and rebuilt — gate C fix round 2, B1): the
+    /// task is about to retry from scratch. Distinct from `BindError` so the name matches what
+    /// happened — this relay WAS bound and something after that killed it, not that binding
+    /// itself failed (should-fix 2). Carries the message `status`/`/metrics` show.
+    SocketError(String),
+    /// A client→server packet was forwarded.
+    Request,
+    /// A server→client packet was forwarded.
+    Reply,
+    /// A relayed `DHCPACK` earned a neighbor write (the claim went into the host-wide neighbor
+    /// table; this is the counter half, credited when the task registers the claim, not when the
+    /// flush actor's write lands).
+    Discovered,
+    /// One packet the relay declined to forward, or declined to register, WITHOUT ending the
+    /// task. Four causes: a server-facing send that failed because `dhcp_server` is unreachable
+    /// (should-fix 1); a client-facing send that failed for a reason other than the leg being
+    /// rebuilt, which the presence watch already catches (S-E, gate C fix round 3); a reply
+    /// whose `ciaddr`/`yiaddr` falls outside the row's `prefix` (should-fix 5); and a DHCPACK
+    /// whose `yiaddr` names an address the fabric itself owns or the row's network/broadcast
+    /// address (r7 review BL-D, r8 should-fix 6). Never touches `last_error` — that field means
+    /// "the socket is unhealthy," and none of these four does (the socket is fine; the packet
+    /// was refused on its own facts).
+    Dropped,
 }
 
 impl Shared {
-    fn new(pid: u32) -> Self {
+    pub(crate) fn new(pid: u32) -> Self {
         Shared {
             pid,
             started_at: Instant::now(),
@@ -176,7 +261,103 @@ impl Shared {
             metrics_error: None,
             metrics_collect_failures: 0,
             metrics_gather_failing: false,
+            relays: BTreeMap::new(),
+            // Until `run_with` reads the sysctl. Never a larger cap than a successful read
+            // could produce: the kernel default is also this design's ceiling.
+            neighbor_cap: crate::workload::table::CapSource {
+                gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                rows: 1,
+            },
+            neighbor_rows: Vec::new(),
+            neighbor: None,
         }
+    }
+
+    /// Republish the DHCP neighbor write pipeline's state (gate C spec §4.5). Called by the
+    /// flush actor task after every batch and sweep, never from the main loop.
+    pub(crate) fn publish_neighbor(
+        &mut self,
+        rows: Vec<report::NeighborRowInfo>,
+        host: report::NeighborActorInfo,
+    ) {
+        self.neighbor_rows = rows;
+        self.neighbor = Some(host);
+    }
+
+    /// A copy of the cap source. Deliberately by value: the caller derives its row's `C` from
+    /// the copy with this lock already dropped, because the neighbor table's lock is a leaf and
+    /// the two are never held at once (spec §4.2.3).
+    pub(crate) fn neighbor_cap(&self) -> crate::workload::table::CapSource {
+        self.neighbor_cap
+    }
+
+    /// Republish the cap source. The only writer is the command loop: at start, and on each
+    /// workload tick, so an operator who lowers `gc_thresh3` sees `C` follow it down without a
+    /// restart.
+    pub(crate) fn set_neighbor_cap(&mut self, cap: crate::workload::table::CapSource) {
+        self.neighbor_cap = cap;
+    }
+
+    /// Record one relay fact for `name` (spec §5.4/§6). Initializes the row's entry with
+    /// `server` on first use, so a row with `dhcp_server` set appears in `components`/`status`
+    /// from the task's first tick, before any packet has crossed it.
+    pub(crate) fn relay_event(&mut self, name: &str, server: Ipv4Addr, ev: RelayEvent) {
+        let r = self
+            .relays
+            .entry(name.to_string())
+            .or_insert_with(|| RelayReport::new(server));
+        match ev {
+            RelayEvent::Bound => r.last_error = None,
+            RelayEvent::BindError(e) => r.last_error = Some(e),
+            RelayEvent::SocketError(e) => r.last_error = Some(e),
+            RelayEvent::Request => r.requests += 1,
+            RelayEvent::Reply => r.replies += 1,
+            RelayEvent::Discovered => r.discovered += 1,
+            RelayEvent::Dropped => r.drops += 1,
+        }
+    }
+
+    /// One row's standing error, if any (S1): `relay.rs`'s own retry loop reads this back
+    /// before printing a bind-failure line, so a repeat of the same error stays silent instead
+    /// of restating it every retry (spec's self-inflicted-DoS-on-the-journal hazard, §5.4).
+    /// Also `workload::relay`'s own test module's window into `Shared` — a sibling, not a
+    /// descendant, of this one, so `relays` stays field-private otherwise.
+    pub(crate) fn relay_last_error(&self, name: &str) -> Option<String> {
+        self.relays.get(name).and_then(|r| r.last_error.clone())
+    }
+
+    /// One row's dropped-without-ending-the-task count (gate C fix round 2, should-fixes 1/5):
+    /// the same sibling relationship `relay_last_error` documents — `workload::relay`'s own test
+    /// module reads this back to prove a send failure or an out-of-prefix reply is counted
+    /// without stopping the task. `0` for a row with no entry yet, same as a fresh `RelayReport`.
+    /// `#[cfg(test)]`, unlike `relay_last_error`: nothing in production reads this back today
+    /// (`status`/metrics read the published `RelayInfo.drops` instead), only the test module.
+    #[cfg(test)]
+    pub(crate) fn relay_drops(&self, name: &str) -> u64 {
+        self.relays.get(name).map_or(0, |r| r.drops)
+    }
+
+    /// Test/S-B support: how many `DHCPACK`s this row's relay has decided to register a
+    /// neighbor entry for (`RelayEvent::Discovered`; see its own doc for what "decided" means).
+    #[cfg(test)]
+    pub(crate) fn relay_discovered(&self, name: &str) -> u64 {
+        self.relays.get(name).map_or(0, |r| r.discovered)
+    }
+
+    /// The `components` document's relay rows (spec §6), in name order (`BTreeMap` iteration).
+    fn relay_infos(&self) -> Vec<report::RelayInfo> {
+        self.relays
+            .iter()
+            .map(|(name, r)| report::RelayInfo {
+                name: name.clone(),
+                server: r.server,
+                requests: r.requests,
+                replies: r.replies,
+                discovered: r.discovered,
+                drops: r.drops,
+                last_error: r.last_error.clone(),
+            })
+            .collect()
     }
 
     fn child(&self, name: &str) -> &Child {
@@ -236,6 +417,9 @@ impl Shared {
             fallback: self.probed.fallback.clone(),
             workloads: self.workloads.clone(),
             metrics_error: self.metrics_error.clone(),
+            relays: self.relay_infos(),
+            neighbor_rows: self.neighbor_rows.clone(),
+            neighbor: self.neighbor.clone(),
         }
     }
 
@@ -318,6 +502,15 @@ pub(crate) struct Hooks {
     /// Where the announcers' frames go. `None` ⇒ the production `AF_PACKET` socket (the
     /// prober's `PacketIo`); a test installs a recorder, so no test ever opens a real socket.
     pub announce_io: Option<Box<dyn crate::workload::announce::AnnounceIo + Send>>,
+    /// What the flush actor forks through. `None` ⇒ the production `ForkNeighborIo`; a test
+    /// installs a recorder, so no test ever forks `ip`. The actor is spawned only for a member
+    /// that declares at least one relay row, so most tests never reach either.
+    pub neighbor_io: Option<Box<dyn crate::workload::writer::NeighborIo>>,
+    /// The neighbor table the relay tasks and the flush actor share. `None` ⇒ the supervisor
+    /// makes its own; a test passes one in so it can upsert a claim and watch the actor write
+    /// it — the only way to see that the actor is spawned and wired at all, which every test in
+    /// `workload::actor` would stay green without.
+    pub neighbor_table: Option<Arc<crate::workload::table::NeighborTable>>,
 }
 
 impl Hooks {
@@ -339,6 +532,8 @@ impl Hooks {
             }),
             neigh_watch: Arc::new(spawn_neigh_watch),
             announce_io: None,
+            neighbor_io: None,
+            neighbor_table: None,
         }
     }
 }
@@ -467,6 +662,63 @@ pub fn run(
         .await
     });
     Ok(code)
+}
+
+/// The DHCP relay rows this member runs, one per declared row that names a `dhcp_server`.
+///
+/// Split out of `run_inner`'s spawn loop so the wiring itself is testable: `fabric_addresses` is
+/// the base half of `ack_discovery`'s anti-spoof predicate, and a row built with an empty set
+/// there would let a forged ACK name this member's own address or the anycast `gw` while every
+/// unit test of `ack_discovery` (which builds its own set) stayed green. Fixed for the row's
+/// whole life — it derives only from the declaration — so it is computed once here rather than
+/// once per packet; `ack_discovery` unions in the row's network/broadcast addresses itself.
+fn relay_rows(view: &View) -> Vec<crate::workload::relay::RelayRow> {
+    let mut rows = Vec::new();
+    for row in view.workload_rows() {
+        let Some(dhcp_server) = row.wl.dhcp_server else {
+            continue;
+        };
+        let Some(leg_addr) = row.address.split('/').next().and_then(|a| a.parse().ok()) else {
+            eprintln!(
+                "cfab: workload {}: cannot parse this member's own address {} as IPv4; dhcp \
+                 relay not started",
+                row.wl.name, row.address
+            );
+            continue;
+        };
+        rows.push(crate::workload::relay::RelayRow {
+            name: row.wl.name.clone(),
+            leg: row.wl.leg_ifname(),
+            leg_addr,
+            dhcp_server,
+            prefix: row.wl.prefix,
+            fabric_addresses: crate::workload::hostroutes::fabric_addresses(view, row.wl),
+        });
+    }
+    rows
+}
+
+/// Read `gc_thresh3` and publish the neighbor table's cap source (spec §4.1.4).
+///
+/// cfab **writes no `gc_thresh`**: it reads one and caps itself. A read that fails costs the
+/// kernel default — which is also the ceiling `C` is never allowed above, so the degraded path
+/// and the ceiling are one number — plus one journal line per failure streak, never a refusal to
+/// start.
+fn publish_neighbor_cap(sys: &dyn Sys, rows: u32, shared: &Arc<Mutex<Shared>>, failing: &mut bool) {
+    let (cap, why) = crate::workload::table::CapSource::read(sys, rows);
+    match why {
+        Some(why) => {
+            if !*failing {
+                *failing = true;
+                eprintln!(
+                    "cfab: dhcp neighbor table: {why}; assuming gc_thresh3 = {}",
+                    cap.gc_thresh3
+                );
+            }
+        }
+        None => *failing = false,
+    }
+    shared.lock().unwrap().set_neighbor_cap(cap);
 }
 
 /// Forward SIGHUP → `Hangup`, SIGTERM/SIGINT → `Terminate` onto the command channel. Each
@@ -767,6 +1019,49 @@ pub(crate) async fn run_with(
     );
     workloads.publish(&shared);
 
+    // 5c-bis. The DHCP relay (spec §5.4, call 2 RULED `dhcp_server`): one task per row that
+    // declares it, spawned once at start (never re-spawned per apply/reload, since a row's
+    // `dhcp_server` cannot change without a new fabric this process exits to pick up). A row
+    // `apply` left deferred, or whose leg the watchdog has not built yet, is not special-cased
+    // here: its own bind simply fails (the leg's address is not yet local) and retries on the
+    // same schedule as any other bind failure, so no second "is this row ready" check needs to
+    // agree with the announcer's — one fewer place for that fact to drift (spec §3.1,
+    // availability first: a relay that cannot bind is a degraded row, never a dead member).
+    let relay_row_list = relay_rows(view);
+    // The neighbor write table (gate C spec §4.1): host-wide, shared by every relay task and
+    // (from the flush actor on) by the actor that drains it.
+    let neigh_table = hooks
+        .neighbor_table
+        .unwrap_or_else(|| Arc::new(crate::workload::table::NeighborTable::new()));
+    // `C` must be valid before any relay can accept its first ACK, so the sysctl is read here,
+    // ahead of the spawn loop. A member with no relay row has no table to cap, so it reads
+    // nothing.
+    let mut cap_read_failing = false;
+    let relay_row_count = relay_row_list.len() as u32;
+    if relay_row_count > 0 {
+        publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
+        // The flush actor (gate C spec §4.2): ONE for the whole member, on its own task. Not on
+        // this loop — a fork here stalls the watchdog feed, the `cfab.sock` accept and every
+        // tick while it blocks, which is the harm this gate exists to remove. It sleeps until an
+        // upsert wakes it or its next coherence sweep falls due, so a member whose VMs never
+        // DHCP costs one `ip neigh show` every `SWEEP` = 15 s and no writes at all.
+        let io: Box<dyn crate::workload::writer::NeighborIo> = hooks
+            .neighbor_io
+            .unwrap_or_else(|| Box::new(crate::workload::writer::ForkNeighborIo::default()));
+        tokio::spawn(
+            crate::workload::actor::FlushActor::new(neigh_table.clone(), io)
+                .with_shared(shared.clone())
+                .run(),
+        );
+    }
+    for relay_row in relay_row_list {
+        tokio::spawn(crate::workload::relay::run(
+            relay_row,
+            shared.clone(),
+            neigh_table.clone(),
+        ));
+    }
+
     // 5d. The additive host default (spec §6). `apply` installed it optimistically; from here
     // the prober's router-reachability fact drives it — the prober tick on an edge, the
     // forwarding-watchdog tick at level.
@@ -993,6 +1288,13 @@ pub(crate) async fn run_with(
             _ = wl_tick.tick(), if workload_active => {
                 workloads.tick(sys, view, &mut *announce_io, Instant::now());
                 workloads.publish(&shared);
+                // §4.1.4: `C` is refreshed by the workload tick's publication — one source, one
+                // cadence — so an operator who lowers `gc_thresh3` under a running member sees
+                // `C` follow it down. A tick that lowers `C` below a row's current occupancy
+                // evicts nothing; it refuses new admissions until expiry shrinks the row.
+                if relay_row_count > 0 {
+                    publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
+                }
             }
             _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
                 if let Ok(l) = metrics::bind(hooks.metrics_port) {
@@ -1909,6 +2211,8 @@ mod tests {
             feed: Arc::new(|| {}),
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         }
     }
 
@@ -1921,6 +2225,21 @@ mod tests {
 
     fn wl_fabric_at(run_dir: &Path) -> Fabric {
         Fabric::from_decl(&Declaration::parse(&wl_decl_text(run_dir)).unwrap()).unwrap()
+    }
+
+    /// `wl_decl_text` with `dhcp_server = <addr>` added to the "vms" row, for the relay tests
+    /// below. `decl.rs` is not mine to edit, so this is a plain string edit of the fixture's own
+    /// text rather than a second fixture constant living there.
+    fn wl_decl_text_with_relay(run_dir: &Path, dhcp_server: &str) -> String {
+        let text = wl_decl_text(run_dir);
+        let with_gw = "gw = \"192.168.20.254\"\nallow = [\"storage\"]\n";
+        assert!(text.contains(with_gw), "fixture text changed shape: {text}");
+        text.replace(
+            with_gw,
+            &format!(
+                "gw = \"192.168.20.254\"\ndhcp_server = \"{dhcp_server}\"\nallow = [\"storage\"]\n"
+            ),
+        )
     }
 
     /// `fresh_sys` plus the host facts a workload row needs (the same shape as
@@ -2025,6 +2344,276 @@ mod tests {
                     .to_string()
             ),
             "{said:?}"
+        );
+    }
+
+    /// **The flush actor is spawned and wired to the table the relay tasks upsert into.** Every
+    /// test in `workload::actor` drives the actor directly, so all of them stay green if the
+    /// supervisor never spawns it at all and no neighbor is ever written — the defect class
+    /// spec §10 names. This is the one test that can see that: inject the shared table, upsert a
+    /// claim the way a relayed ACK does, and watch the write reach the injected io.
+    ///
+    /// The write is asserted on the injected `NeighborIo`, never on `sys`: the actor does not go
+    /// through `Sys` at all, which is the whole reason it is its own task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_flush_actor_is_spawned_and_writes_what_the_relay_upserts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path()).file(CONFIG, &decl);
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let table = Arc::new(crate::workload::table::NeighborTable::new());
+        let io = crate::workload::writer::mock::MockNeighborIo::kernel("[]");
+        let calls = io.calls();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let t = table.clone();
+        let c = calls.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            t.upsert(
+                "vms",
+                "cfab-work-vms",
+                "192.168.20.150".parse().unwrap(),
+                [0x4e, 0x48, 0xe9, 0x89, 0x2e, 0xe5],
+                Instant::now() + Duration::from_secs(600),
+                &crate::workload::table::CapSource {
+                    gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                    rows: 1,
+                }
+                .for_prefix(crate::model::Ipv4Prefix::parse("192.168.20.0/24").unwrap()),
+                Instant::now(),
+            );
+            let wrote = until(2000, || {
+                c.lock().unwrap().iter().any(|a| {
+                    a.first().is_some_and(|w| w == "ip") && a.get(2).is_some_and(|v| v == "add")
+                })
+            })
+            .await;
+            driver_tx.send(Cmd::Terminate).ok();
+            wrote
+        });
+        let mut hooks = quiet_hooks(shared.clone(), ready_tx);
+        hooks.neighbor_io = Some(Box::new(io));
+        hooks.neighbor_table = Some(table);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(driver.await.unwrap(), "{:?}", calls.lock().unwrap());
+        let calls = calls.lock().unwrap().clone();
+        let write = calls
+            .iter()
+            .find(|a| a.get(2).is_some_and(|v| v == "add"))
+            .expect("the actor must have written the claim");
+        assert_eq!(
+            write.join(" "),
+            "ip neigh add 192.168.20.150 lladdr 4e:48:e9:89:2e:e5 dev cfab-work-vms nud stale"
+        );
+    }
+
+    /// T-BCAST-WIRING — the row the supervisor hands `relay::run` carries the real
+    /// `fabric_addresses`, not an empty set. `ack_discovery`'s anti-spoof predicate refuses
+    /// `fabric_addresses ∪ {network, broadcast}`, and T-BCAST proves the predicate; but T-BCAST
+    /// builds its own set, so wiring an empty one here would silently drop the member/`gw` half
+    /// — a forged ACK naming this member's own leg address would be accepted — with every
+    /// `ack_discovery` test still green. That is the defect class this design has paid for
+    /// repeatedly (spec §10): a load-bearing rule invisible to the test claiming to pin it.
+    #[test]
+    fn a_spawned_relay_row_carries_the_real_fabric_addresses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let rows = relay_rows(&view);
+        assert_eq!(rows.len(), 1, "one row declares dhcp_server: {rows:?}");
+        let want: std::collections::BTreeSet<Ipv4Addr> =
+            ["192.168.20.2", "192.168.20.3", "192.168.20.254"]
+                .iter()
+                .map(|a| a.parse().unwrap())
+                .collect();
+        assert_eq!(
+            rows[0].fabric_addresses, want,
+            "both members' addresses and the anycast gw must reach ack_discovery"
+        );
+    }
+
+    /// A row declaring `dhcp_server` gets a relay task spawned for it, and a bind failure (this
+    /// sandbox has no local address `192.168.20.2`, so the server-facing bind fails for real) is
+    /// recorded in `Shared` for `status`/metrics to read, and never fatal: the member still
+    /// comes up (spec §3.1, availability first: "a relay that cannot bind is a degraded row, not
+    /// a dead host"). `relay.rs` journals the same fact with a plain `eprintln!` straight to
+    /// stderr (spec: never `tracing`), by design outside the `Hooks::trace` test-only wire the
+    /// announcer's `journal()` helper uses — verified by reading `relay::run`, not asserted here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_relay_spawns_and_a_bind_failure_is_loud_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path()).file(CONFIG, &decl);
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            let bound = until(2000, || {
+                sh.lock()
+                    .unwrap()
+                    .relays
+                    .get("vms")
+                    .is_some_and(|r| r.last_error.is_some())
+            })
+            .await;
+            let err = sh
+                .lock()
+                .unwrap()
+                .relays
+                .get("vms")
+                .and_then(|r| r.last_error.clone());
+            driver_tx.send(Cmd::Terminate).ok();
+            (bound, err)
+        });
+        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(
+            code, 0,
+            "a relay bind failure must never take the member down"
+        );
+        let (bound, err) = driver.await.unwrap();
+        assert!(bound, "the relay must record its bind failure in Shared");
+        assert!(err.is_some(), "{err:?}");
+    }
+
+    /// Run a member that declares a DHCP relay, with `gc_thresh3` answering `seq` (the last
+    /// entry repeating), until `done` holds of `Shared` or 8 s pass. Hands back the mock kernel
+    /// it ran against and what it published — the shape both cap-wiring tests need, and the
+    /// only way to see a sysctl CHANGE under a running supervisor.
+    async fn run_relay_member(
+        seq: &[&str],
+        done: impl Fn(&Shared) -> bool + Send + Sync + 'static,
+    ) -> (MockSys, crate::workload::table::CapSource) {
+        let tmp = tempfile::tempdir().unwrap();
+        let decl = wl_decl_text_with_relay(tmp.path(), "192.168.10.11");
+        let f = Fabric::from_decl(&Declaration::parse(&decl).unwrap()).unwrap();
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let mut sys = wl_fresh_sys(&view, tmp.path())
+            .file(CONFIG, &decl)
+            .file_sequence(crate::workload::table::GC_THRESH3_PATH, seq);
+        let (mut spawner, _recs) = rec();
+        let shared = Arc::new(Mutex::new(Shared::new(std::process::id())));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let driver_tx = cmd_tx.clone();
+        let sh = shared.clone();
+        let driver = tokio::spawn(async move {
+            ready_rx.await.ok();
+            until(8000, || done(&sh.lock().unwrap())).await;
+            driver_tx.send(Cmd::Terminate).ok();
+        });
+        let hooks = quiet_hooks(shared.clone(), ready_tx);
+        let code = run_with(
+            &mut sys,
+            &view,
+            &mut spawner,
+            EXE,
+            CONFIG,
+            &decl,
+            &no_pmx(tmp.path()),
+            cmd_tx,
+            cmd_rx,
+            hooks,
+        )
+        .await;
+        assert_eq!(code, 0);
+        driver.await.unwrap();
+        let cap = shared.lock().unwrap().neighbor_cap();
+        (sys, cap)
+    }
+
+    /// **T8c (the tick half).** `C` is computed at start AND refreshed by the workload tick's
+    /// publication — one source, one cadence — so an operator who lowers `gc_thresh3` under a
+    /// running member sees `C` follow it down without a restart. A start-only `C` is a
+    /// different mechanism from the one specified and passes every other test in this suite,
+    /// which is why the sysctl has to CHANGE mid-run here.
+    ///
+    /// Regression: read `gc_thresh3` only before the spawn loop and never again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_neighbor_cap_is_refreshed_by_the_workload_tick() {
+        let (_sys, cap) = run_relay_member(&["1024", "256"], |sh| {
+            sh.neighbor_cap().gc_thresh3 != crate::workload::table::GC_THRESH3_DEFAULT
+        })
+        .await;
+        assert_eq!(
+            cap.gc_thresh3, 256,
+            "the tick must republish what the sysctl says NOW, not what it said at start"
+        );
+        assert_eq!(cap.rows, 1, "one declared row shares the kernel allowance");
+    }
+
+    /// **T8b.** cfab reads `gc_thresh3` and caps itself; it writes NO `gc_thresh`, at start or
+    /// on any tick. There is no per-device knob, so the blast radius of such a write is the
+    /// whole host — and, since the neighbor table is not namespaced, every container and pod on
+    /// it. Raising `gc_thresh1` is also precisely the operation that stops the kernel's own GC
+    /// from running below that number, so the write would preserve an attacker's parked entries
+    /// for the sake of idle entries this pipeline does not owe. A guard test, because the write
+    /// is cheap to re-add and its harm is invisible to every other test here.
+    ///
+    /// Regression: write any `gc_thresh` derived from the declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cfab_writes_no_gc_thresh_sysctl() {
+        // Runs long enough for the workload tick to have fired at least once, so this covers
+        // "on any tick" and not merely "at start".
+        let (sys, _cap) = run_relay_member(&["1024", "256"], |sh| {
+            sh.neighbor_cap().gc_thresh3 != crate::workload::table::GC_THRESH3_DEFAULT
+        })
+        .await;
+        // Both ways a process can set a sysctl, because the rule is "cfab writes no
+        // gc_thresh", not "cfab does not write this file": a `sysctl -w` fork sets it just as
+        // host-globally and would otherwise pass this test.
+        let written: Vec<_> = sys
+            .writes
+            .iter()
+            .filter(|(p, _)| p.contains("gc_thresh"))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let forked: Vec<_> = sys
+            .calls
+            .iter()
+            .filter(|c| c.contains("gc_thresh"))
+            .cloned()
+            .collect();
+        assert!(
+            written.is_empty() && forked.is_empty(),
+            "wrote {written:?}, ran {forked:?}"
         );
     }
 
@@ -2230,6 +2819,8 @@ mod tests {
                 feed: Arc::new(|| {}),
                 neigh_watch: no_neigh_watch(),
                 announce_io: Some(Box::new(RecordingIo::default())),
+                neighbor_io: None,
+                neighbor_table: None,
             },
         )
         .await;
@@ -2464,6 +3055,8 @@ mod tests {
                 feed: Arc::new(|| {}),
                 neigh_watch: no_neigh_watch(),
                 announce_io: Some(Box::new(RecordingIo::default())),
+                neighbor_io: None,
+                neighbor_table: None,
             },
         )
         .await;
@@ -3535,6 +4128,8 @@ mod tests {
             feed: Arc::new(|| {}),
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         };
         let code = run_with(
             &mut sys,
@@ -3671,6 +4266,8 @@ mod tests {
             feed,
             neigh_watch: no_neigh_watch(),
             announce_io: Some(Box::new(RecordingIo::default())),
+            neighbor_io: None,
+            neighbor_table: None,
         };
         let code = run_with(
             &mut sys,

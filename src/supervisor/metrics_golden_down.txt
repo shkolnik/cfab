@@ -14,6 +14,15 @@ cfab_fabric_state{state="DOWN"} 1
 # TYPE cfab_conditions gauge
 cfab_conditions{class="settling"} 0
 cfab_conditions{class="standing"} 0
+# HELP cfab_neighbor_dirty_depth Entries waiting for the flush actor right now, host-wide (gate C spec §4.5): one queue for the whole member, never one per row. Absent while no relay row runs an actor.
+# TYPE cfab_neighbor_dirty_depth gauge
+cfab_neighbor_dirty_depth 5
+# HELP cfab_neighbor_token_level Tokens the host-wide fork bucket holds right now, out of its burst (gate C spec §4.2.2). Absent under the same condition as cfab_neighbor_dirty_depth.
+# TYPE cfab_neighbor_token_level gauge
+cfab_neighbor_token_level 27
+# HELP cfab_neighbor_oldest_dirty_age_seconds Seconds since the oldest entry still waiting for the flush actor was queued (gate C spec §4.5): observability, not fairness — fairness is queue position, decided by FIFO order alone. Absent while nothing is dirty.
+# TYPE cfab_neighbor_oldest_dirty_age_seconds gauge
+cfab_neighbor_oldest_dirty_age_seconds 1.5
 # HELP cfab_component_state The supervisor's state for this child; exactly one series is 1.
 # TYPE cfab_component_state gauge
 cfab_component_state{component="engine",state="starting"} 0

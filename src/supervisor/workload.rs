@@ -480,7 +480,7 @@ mod tests {
             .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
             .file("/sys/class/net/primary/bridge/ageing_time", "30000\n")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &["ip", "-j", "neigh", "show", "nud", "all", "dev", "cfab-work-vms"],
                 r#"[{"dst":"192.168.20.103","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:01","state":["REACHABLE"]}]"#,
             )
             .on_stdout(
@@ -632,7 +632,16 @@ mod tests {
     fn what_the_host_route_reconcile_says_reaches_the_journal_once() {
         let (sys, view) = wl(None);
         let mut sys = sys.on_fail(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             1,
             "Cannot talk to rtnetlink",
         );

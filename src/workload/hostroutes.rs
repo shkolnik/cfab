@@ -52,15 +52,19 @@ const FWD_TABLE: (&str, &str) = ("inet", "cfab-fwd");
 /// tick at or after the deadline: 5 s plus at most one tick, never less than 5 s.
 pub const HOLDDOWN: Duration = PERIOD;
 
-/// The neighbor states that mean "this address resolved to a MAC" (gate M1 review I1, research
-/// `0e9bced`: a static neighbor is a resolved host too). NOARP, FAILED and INCOMPLETE carry no
-/// usable lladdr and are not a VM being here.
+/// The neighbor states worth routing a VM's traffic to (gate M1 review I1, research `0e9bced`:
+/// a static neighbor is a resolved host too). **Not** "the states that carry no usable
+/// `lladdr`" — corrected, r6 review S-7: §2 MEASURED a NOARP entry carrying a
+/// real MAC, so that reason was factually wrong. `NOARP`, `FAILED` and `INCOMPLETE` are excluded
+/// because none of the three is a live VM worth originating a /32 for (an operator's hand-pinned
+/// neighbor, a resolution that failed, or one still in flight) — a decision about what to
+/// *route* to, not a claim about what the kernel happens to populate `lladdr` with.
 const RESOLVED: &[&str] = &["REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"];
 
 /// The addresses on `wl`'s leg that are VMs living on THIS host.
 ///
-/// The join spec §5.2 asks for, in one place: an `ip -j neigh show dev <leg>` entry counts when
-/// it is inside the row's prefix, resolved, not an address the fabric itself owns (any member's
+/// The join spec §5.2 asks for, in one place: an `ip -j neigh show nud all dev <leg>` entry
+/// counts when it is inside the row's prefix, resolved, not an address the fabric itself owns (any member's
 /// declared address on this row, `gw`, `router`), AND its MAC appears in `bridge -j fdb show br
 /// <uplink>` on a port that is not one of the bridge's uplink ports. That last clause is the
 /// whole point: without it every VM in the VLAN — including the ones on peer hosts, learned
@@ -129,11 +133,14 @@ fn local_vm_macs(
     let mut out: BTreeMap<Ipv4Addr, [u8; 6]> = BTreeMap::new();
     let mut understood = 0usize;
     for e in neigh {
-        // The shape test, and why it is `dst` + `state` and not the address parsing: an entry
-        // for an IPv6 neighbor (every leg has fe80::) carries both keys and is simply not ours
-        // to route, and an entry with no `lladdr` is a real unresolved neighbor. Only an
-        // iproute2 that spells these two otherwise leaves us with nothing to read.
-        let (Some(dst), Some(state)) = (e["dst"].as_str(), e["state"].as_array()) else {
+        // The shape test is `dst` alone, not `dst` + `state` (r10 review should-fix 5): a
+        // NUD_NONE entry is `{"dst": …}` with no `state` key and no `lladdr` at all (§2
+        // measured) — a real, understood answer ("not currently resolved"), not a foreign
+        // iproute2 spelling. Only an entry with no `dst` at all means "we cannot read this
+        // document." An IPv6 neighbor (every leg has fe80::) carries `dst` too and is simply
+        // not ours to route — filtered out below by the failed `Ipv4Addr` parse, not by this
+        // shape test.
+        let Some(dst) = e["dst"].as_str() else {
             continue;
         };
         understood += 1;
@@ -143,6 +150,14 @@ fn local_vm_macs(
         if !wl.prefix.contains(dst) || exclude.contains(&dst) {
             continue;
         }
+        // A NUD_NONE entry (no `state` key) is understood but is not a VM: no resolution at
+        // all means nothing to route to. Falling through this `continue` to the `state.iter()`
+        // check below is exactly the false fault this fix removes — a leg holding only NONE
+        // entries would otherwise leave `understood` at 0 and trip the fail-loud read-failure
+        // path below on a perfectly healthy leg, every tick.
+        let Some(state) = e["state"].as_array() else {
+            continue;
+        };
         if !state
             .iter()
             .filter_map(|s| s.as_str())
@@ -181,7 +196,10 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// row (fabric-wide, not just this member — `View::workload_rows` is this-member-only) and the
 /// anycast `gw`. Without it a peer's own resolution of the gateway
 /// would read as a VM, and this member would originate a /32 for an address every member holds.
-fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
+/// `pub(crate)`: also the base set `relay::ack_discovery`'s anti-spoof refusal is built from
+/// (r7 review BL-D, r8 should-fix 6), unioned there with the row's own network and broadcast
+/// addresses.
+pub(crate) fn fabric_addresses(view: &View, wl: &Workload) -> BTreeSet<Ipv4Addr> {
     let mut out: BTreeSet<Ipv4Addr> = view
         .fabric
         .members
@@ -315,8 +333,21 @@ pub fn read_local_vms(sys: &mut dyn Sys, view: &View, wl: &Workload) -> Option<B
     let ports = uplink::identify_declared(&*sys, &wl.uplink, wl.vid)
         .ok()?
         .ports;
+    // r10 review should-fix 5: `nud all` — without it a NUD_NONE entry is invisible to this
+    // read entirely (§2 measured), which is the false-fault path the `understood` fix above
+    // exists to close; `local_vms`'s output is unchanged either way, since `RESOLVED` already
+    // excludes NUD_NONE and NOARP.
     let neigh = sys
-        .run(&["ip", "-j", "neigh", "show", "dev", &wl.leg_ifname()])
+        .run(&[
+            "ip",
+            "-j",
+            "neigh",
+            "show",
+            "nud",
+            "all",
+            "dev",
+            &wl.leg_ifname(),
+        ])
         .ok()?;
     let fdb = sys
         .run(&["bridge", "-j", "fdb", "show", "br", &wl.uplink])
@@ -447,7 +478,10 @@ impl HostRoutes {
             return None;
         };
         let ports = up.ports;
-        let neigh = sys.run(&["ip", "-j", "neigh", "show", "dev", &leg]).ok()?;
+        // r10 review should-fix 5: `nud all`, same reasoning as `read_local_vms` above.
+        let neigh = sys
+            .run(&["ip", "-j", "neigh", "show", "nud", "all", "dev", &leg])
+            .ok()?;
         if !neigh.ok() {
             self.fail_costing(
                 &name,
@@ -998,6 +1032,77 @@ mod tests {
         );
     }
 
+    /// **T-NODEL — a row expires while the kernel holds what cfab wrote.** cfab's own table
+    /// loses the row at expiry (`remove_expired`, task 2's sweep-side enforcement), but cfab
+    /// deletes no kernel neighbor entry, ever (spec §5 item 10) — `WriteVerb` (writer.rs) has
+    /// no delete variant at all, so the kernel entry cfab wrote while the lease was live is left
+    /// exactly where it is. This is the cross-module consequence that makes the rule matter:
+    /// `hostroutes` reads the KERNEL, never cfab's own table, so it still originates the VM's
+    /// /32 from the untouched entry — `NEIGH`/`FDB` above are exactly that state, one address
+    /// (`.103`) resolved and on a tap. The harm this pins is invisible to any test that checks
+    /// only `NeighborTable::len()` (which reads as success — "the row is gone") without also
+    /// checking that `local_vms` still sees the VM: losing BOTH would silently treat an
+    /// internal bookkeeping expiry as if the VM itself had gone dark.
+    ///
+    /// Regression: this test would go red for the WRONG reason if a future change taught the
+    /// actor to `ip neigh del` an expired row's kernel entry (forbidden by spec §5 item 10) —
+    /// simulated here by using a `NEIGH` document with `.103`'s entry removed, which is what
+    /// that kernel state would look like after such a delete.
+    #[test]
+    fn an_expired_rows_kernel_entry_still_originates_its_32() {
+        let t = crate::workload::table::NeighborTable::new();
+        let t0 = std::time::Instant::now();
+        let vm = addr("192.168.20.103");
+        t.upsert(
+            "vms",
+            "cfab-work-vms",
+            vm,
+            [0x02, 0xcf, 0xab, 0, 0, 0x01],
+            t0 + Duration::from_secs(60),
+            &crate::workload::table::RowCap {
+                value: u32::MAX,
+                bound_by: crate::workload::table::CapBound::Prefix,
+                gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                rows: 1,
+            },
+            t0,
+        );
+        assert_eq!(t.len(), 1);
+
+        // The lease elapses; cfab's OWN bookkeeping loses the row.
+        assert_eq!(t.remove_expired(t0 + Duration::from_secs(61)).len(), 1);
+        assert_eq!(t.len(), 0, "cfab's own table has forgotten the row");
+
+        // But cfab never touched the kernel, so the SAME kernel document `hostroutes` reads
+        // still carries the entry cfab wrote — and still originates the /32.
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        assert_eq!(
+            local_vms(NEIGH, FDB, &v, wl, &["eth0".to_string()]).unwrap(),
+            set(&["192.168.20.103"]),
+            "the kernel entry cfab wrote outlives cfab's own row, and the VM's /32 keeps \
+             routing on kernel truth alone"
+        );
+
+        // The regression this test is meant to catch: if cfab HAD deleted the kernel entry,
+        // the document would look like this, and the VM's /32 would be gone too.
+        let after_a_forbidden_delete: &str = r#"[
+          {"dst":"192.168.20.2","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:02","state":["PERMANENT"]},
+          {"dst":"192.168.20.3","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:03","state":["STALE"]},
+          {"dst":"192.168.20.1","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:04","state":["REACHABLE"]},
+          {"dst":"10.99.0.4","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:05","state":["REACHABLE"]},
+          {"dst":"192.168.20.104","dev":"cfab-work-vms","lladdr":"02:cf:ab:00:00:06","state":["REACHABLE"]}
+        ]"#;
+        assert!(
+            local_vms(after_a_forbidden_delete, FDB, &v, wl, &["eth0".to_string()])
+                .unwrap()
+                .is_empty(),
+            "sanity check on the fixture itself: with the entry actually gone, the /32 is too — \
+             which is exactly the outcome the no-delete rule exists to prevent"
+        );
+    }
+
     /// The restart case: the leg now outlives a `systemctl restart cfab`, so its neighbor
     /// entries do too — and an entry nothing has touched for 30 s is STALE, not REACHABLE. An
     /// idle VM must still be a VM on the first tick after the restart, with no new traffic from
@@ -1086,6 +1191,59 @@ mod tests {
         );
     }
 
+    /// T-NONE (r7 should-fix 8) — a `dst`-only entry (the NUD_NONE shape `nud all` surfaces,
+    /// §2 measured: no `state` key and no `lladdr` at all) counts as understood and is skipped
+    /// as not-a-VM, not read as a failed document. Regression: leave the old shape test
+    /// (`dst` + `state` both required) as is, and this goes from `Some(empty)` to `None` — the
+    /// exact false fault the fix removes, since a leg holding only NONE entries would then
+    /// report "unreadable" every tick on a perfectly healthy leg.
+    #[test]
+    fn a_dst_only_entry_counts_as_understood_not_a_read_failure() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let wl = &f.workloads[0];
+        let fdb = r#"[{"mac":"02:cf:ab:00:00:09","ifname":"tap100i0","master":"primary"}]"#;
+        assert_eq!(
+            local_vms(
+                r#"[{"dst":"192.168.20.106"}]"#,
+                fdb,
+                &v,
+                wl,
+                &["eth0".to_string()]
+            ),
+            Some(BTreeSet::new()),
+            "a NUD_NONE entry is an understood 'not a VM', never an unreadable document"
+        );
+    }
+
+    /// T-NONE-ARGV (r10 review should-fix 5) — `nud all` appears in BOTH neighbor-read argvs,
+    /// `read_local_vms` (feeding `apply`'s seed and `status`'s count) and `HostRoutes::observe`
+    /// (the supervisor tick). The plan states in the same breath that `local_vms`'s output is
+    /// unchanged either way (`RESOLVED` already excludes NUD_NONE and NOARP), which means
+    /// dropping `nud all` is otherwise invisible to every other test — this is the only thing
+    /// standing between the fix and a silent revert.
+    #[test]
+    fn both_neighbor_reads_ask_for_nud_all() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+
+        let mut seed_sys = tick_sys("");
+        let _ = seed_locals(&mut seed_sys, &v);
+        assert!(
+            seed_sys.ran("ip -j neigh show nud all dev cfab-work-vms"),
+            "read_local_vms must ask for nud all: {:?}",
+            seed_sys.calls
+        );
+
+        let mut observe_sys = tick_sys("");
+        let _ = HostRoutes::new().tick(&mut observe_sys, &v, &mut io(), Instant::now());
+        assert!(
+            observe_sys.ran("ip -j neigh show nud all dev cfab-work-vms"),
+            "HostRoutes::observe must ask for nud all: {:?}",
+            observe_sys.calls
+        );
+    }
+
     /// The exclusion set is fabric-wide, not this member's own row: a peer's address on the
     /// workload must never read as a VM here (a 3-host testbed would otherwise count peers).
     #[test]
@@ -1164,6 +1322,14 @@ mod tests {
     /// pve1-tb with the leg up, one VM on a tap, and an empty nft set: the tick must originate
     /// the /32 at the engine and add the element.
     fn tick_sys(elements: &str) -> MockSys {
+        tick_sys_with(NEIGH, FDB, elements)
+    }
+
+    /// `tick_sys` with the neigh/FDB documents parameterized, so a test can drive `HostRoutes`
+    /// across several ticks with a different live-VM picture each time (gate C fix round 2,
+    /// reviewer note 6: the ACK-vs-FDB ordering race needs exactly this — the same row, several
+    /// ticks, a different `local_vms` answer at each one).
+    fn tick_sys_with(neigh: &str, fdb: &str, elements: &str) -> MockSys {
         MockSys::default()
             .file("/sys/class/net/primary/bridge/stp_state", "0\n")
             .file("/sys/class/net/primary/bridge/ageing_time", "30000\n")
@@ -1171,8 +1337,11 @@ mod tests {
             .file("/sys/class/net/primary/brif/tap100i0/state", "3\n")
             .link("/sys/class/net/eth0/device", "../../../0000:01:00.0")
             .file("/sys/class/net/cfab-work-vms/ifindex", "42\n")
-            .on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], NEIGH)
-            .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], FDB)
+            .on_stdout(
+                &["ip", "-j", "neigh", "show", "nud", "all", "dev", "cfab-work-vms"],
+                neigh,
+            )
+            .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb)
             .on_stdout(
                 &["nft", "-j", "list", "set", "inet", "cfab-fwd"],
                 &format!(
@@ -1237,6 +1406,101 @@ mod tests {
         );
     }
 
+    /// The ordering hazard between the neighbor write a relayed DHCPACK earns and this tick's
+    /// own FDB-gated `local_vms` read (gate C fix round 2, reviewer note 6). That write now
+    /// happens on the flush actor (`workload::actor`), so it lands within the actor's queue
+    /// wait of the ACK rather than the instant it is relayed — which only widens the gap this
+    /// test pins. `local_vms` requires MORE than a resolved neighbor, though —
+    /// the same MAC must also appear in the bridge FDB on a non-uplink port
+    /// (`the_gw_and_a_mac_with_no_fdb_entry_are_never_local`), which only happens once the VM
+    /// has sent a bridge-visible frame. If a tick lands in that gap AND this address's
+    /// hold-down had already fully expired (a VM that went fully quiet and is now getting a
+    /// fresh lease for the SAME address), `local_vms` reports it absent exactly as if it were
+    /// still gone, and the level-triggered reconcile withdraws it — the very address the ACK
+    /// just earned a neighbor entry for. It self-heals the next tick once the FDB catches up;
+    /// this pins that shape happens and recovers, so a future change cannot silently drop the
+    /// self-heal half.
+    #[test]
+    fn an_ack_that_beats_the_fdb_is_withdrawn_once_then_self_heals() {
+        let f = wl_fabric();
+        let v = View::new(&f, "pve1-tb").unwrap();
+        let mut hr = HostRoutes::new();
+        let t0 = Instant::now();
+        let vm = "192.168.20.150";
+        let mac = "02:cf:ab:00:00:aa";
+        let resolved = format!(
+            r#"[{{"dst":"{vm}","dev":"cfab-work-vms","lladdr":"{mac}","state":["REACHABLE"]}}]"#
+        );
+        let on_tap = format!(r#"[{{"mac":"{mac}","ifname":"tap100i0","master":"primary"}}]"#);
+
+        // Tick 1 (t0): live, MAC on the tap. Wanted; the hold-down entry is armed with no
+        // deadline yet (still live).
+        let mut up = tick_sys_with(&resolved, &on_tap, "");
+        hr.tick(&mut up, &v, &mut io(), t0);
+        assert!(
+            up.ran(&format!(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.2/32 {vm}/32"
+            )),
+            "{:?}",
+            up.calls
+        );
+
+        // Tick 2 (t0 + 1s): the VM has gone fully quiet — absent from both documents. This is
+        // the FIRST tick that observes it missing, so the hold-down deadline is armed from HERE
+        // (`t0 + 1s + HOLDDOWN`), not from t0 — held for now.
+        let quiet_at = t0 + Duration::from_secs(1);
+        let mut quiet = tick_sys_with("[]", "[]", &format!(r#","elem":["{vm}"]"#));
+        hr.tick(&mut quiet, &v, &mut io(), quiet_at);
+        assert!(
+            !quiet.calls.iter().any(|c| c.contains("nft delete")),
+            "still inside the hold-down window: {:?}",
+            quiet.calls
+        );
+
+        // Tick 3, AT the deadline (`quiet_at + HOLDDOWN`): a fresh DHCPACK for the SAME address
+        // has just been relayed — `ip -j neigh show` reports it resolved again (the write this
+        // test stands in for is the flush actor's) — but the bridge has not
+        // yet learned the MAC on a port, so `local_vms` still reads it as absent. The hold-down
+        // was already due: withdrawn, on the very tick the ACK landed.
+        let deadline = quiet_at + HOLDDOWN;
+        let mut race = tick_sys_with(&resolved, "[]", &format!(r#","elem":["{vm}"]"#));
+        hr.tick(&mut race, &v, &mut io(), deadline);
+        assert!(
+            race.ran(&format!(
+                "nft delete element inet cfab-fwd cfab-work-vms-local {{ {vm} }}"
+            )),
+            "the ACK's neighbor write is not enough on its own; withdrawn: {:?}",
+            race.calls
+        );
+        assert!(
+            race.ran("unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 192.168.20.2/32"),
+            "the /32 must not still be asked for: {:?}",
+            race.calls
+        );
+
+        // Tick 4: the FDB catches up (the VM's first bridge-visible frame lands). Self-heals —
+        // re-originated with no further DHCP traffic needed.
+        let mut healed = tick_sys_with(&resolved, &on_tap, "");
+        hr.tick(
+            &mut healed,
+            &v,
+            &mut io(),
+            deadline + Duration::from_secs(1),
+        );
+        assert!(
+            healed.ran(&format!(
+                "unix_request /run/cfab/engine.sock workload-routes cfab-work-vms 42 \
+                 192.168.20.2/32 {vm}/32"
+            )),
+            "self-heal: {:?}",
+            healed.calls
+        );
+        assert!(healed.ran(&format!(
+            "nft add element inet cfab-fwd cfab-work-vms-local {{ {vm} }}"
+        )));
+    }
+
     /// Level-triggered both ways: an element nft holds that we no longer want is deleted, and
     /// an element already in place is not re-added (the diff is the whole point).
     #[test]
@@ -1260,7 +1524,19 @@ mod tests {
     /// No VM at all: an empty document in both places, the shape a bridge that has learned
     /// nothing yet, or a VM that has genuinely gone, presents.
     fn no_vm(mut sys: MockSys) -> MockSys {
-        sys = sys.on_stdout(&["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"], "[]");
+        sys = sys.on_stdout(
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
+            "[]",
+        );
         sys.on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], "[]")
     }
 
@@ -1514,7 +1790,16 @@ mod tests {
         ]"#;
         let mut sys = tick_sys("")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &[
+                    "ip",
+                    "-j",
+                    "neigh",
+                    "show",
+                    "nud",
+                    "all",
+                    "dev",
+                    "cfab-work-vms",
+                ],
                 neigh,
             )
             .on_stdout(&["bridge", "-j", "fdb", "show", "br", "primary"], fdb);
@@ -1778,7 +2063,16 @@ mod tests {
         let f = wl_fabric();
         let v = View::new(&f, "pve1-tb").unwrap();
         let mut sys = tick_sys("").on_fail(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             1,
             "Cannot talk to rtnetlink",
         );

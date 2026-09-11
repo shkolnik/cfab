@@ -296,6 +296,11 @@ pub mod mock {
         /// Ports whose state cannot be read at all (`EIO`) — the socket is there but the answer
         /// is not, which is neither "no carrier" nor "the netdev is gone".
         pub unreadable_ports: Vec<String>,
+        /// path → successive contents `read` hands back, the last repeating forever. Checked
+        /// before `files`, and the only way to test a file that CHANGES under a running
+        /// supervisor (an operator lowering a sysctl on a live member): `read` takes `&self`,
+        /// so a test cannot reach in and edit `files` while `run_with` owns the sys.
+        pub read_sequence: BTreeMap<String, std::sync::Mutex<VecDeque<String>>>,
         /// Substrings that make `run` fail the exec itself (`Err`, never a scripted `Output`)
         /// for any argv containing one of them in any position — the binary genuinely is not
         /// there, as opposed to `on_fail`'s nonzero exit (the binary ran and refused). Matches
@@ -307,6 +312,16 @@ pub mod mock {
     impl MockSys {
         pub fn file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+
+        /// A file whose content changes between reads: each call to `read` takes the next
+        /// entry, and the last one repeats forever.
+        pub fn file_sequence(mut self, path: &str, contents: &[&str]) -> Self {
+            self.read_sequence.insert(
+                path.to_string(),
+                std::sync::Mutex::new(contents.iter().map(|c| c.to_string()).collect()),
+            );
             self
         }
 
@@ -520,6 +535,15 @@ pub mod mock {
         }
 
         fn read(&self, path: &str) -> Result<String> {
+            if let Some(seq) = self.read_sequence.get(path) {
+                let mut q = seq.lock().unwrap();
+                if q.len() > 1 {
+                    return Ok(q.pop_front().expect("len > 1"));
+                }
+                if let Some(last) = q.front() {
+                    return Ok(last.clone());
+                }
+            }
             self.files
                 .get(path)
                 .cloned()

@@ -43,8 +43,8 @@ pub mod model;
 
 pub use model::{
     Adjacency, BondLeg, Bonding, Class, Condition, DefaultPath, DefaultReason, GuardDrops,
-    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, State,
-    StatusModel, WorkloadState, WorkloadStatus,
+    Headline, HomeCarrier, HostDefault, Ingress, LegKind, LegPort, MemberInfo, Reach, RelayStatus,
+    State, StatusModel, WorkloadState, WorkloadStatus,
 };
 
 pub struct StatusReport {
@@ -474,6 +474,20 @@ pub fn render_text(m: &StatusModel, permissive: bool, with_components: bool) -> 
         // Nothing appended when the forward chain carries no such rule (`None`).
         if let Some(n) = w.stray_forwards {
             let _ = write!(line, ", {n} stray forwards");
+        }
+        // The DHCP relay (spec §6): nothing appended when the row declares no `dhcp_server`.
+        // `last_error` rides on the same line rather than a separate condition — a bind failure
+        // must be loud, but a relay is a degraded row, never a member fault (spec §3.1).
+        if let Some(r) = &w.relay {
+            let _ = write!(
+                line,
+                ", relay to {} ({} requests, {} replies, {} dropped",
+                r.server, r.requests, r.replies, r.drops
+            );
+            if let Some(e) = &r.last_error {
+                let _ = write!(line, ", last error: {e}");
+            }
+            line.push(')');
         }
         let _ = writeln!(out, "{line}");
     }
@@ -1786,6 +1800,34 @@ fn return_path_and_ingress(
 /// `return_path_and_ingress` already found broken for this workload's own allowed zones
 /// (`c.broken_workloads` — never re-worded here, see that function). A member with no row has
 /// nothing to add; those checks above still ran fabric-wide and cover a leaf that carries none.
+///
+/// This row's DHCP relay fragment (spec §5.4/§6, S2): `None` when the row declares no
+/// `dhcp_server` — "absent = no relay" — never a health condition of the row itself. Built the
+/// same way whether the row is deferred or up, because the one path a bind failure is
+/// GUARANTEED on is the deferred one (the leg does not exist yet, so the server-facing bind has
+/// no address to take) — and spec §5.4 requires a bind failure to be a visible status line, not
+/// a silent one.
+fn relay_status(wl: &crate::model::Workload, comps: Option<&Components>) -> Option<RelayStatus> {
+    wl.dhcp_server.map(|server| {
+        match comps.and_then(|k| k.relays.iter().find(|r| r.name == wl.name)) {
+            Some(r) => RelayStatus {
+                server,
+                requests: r.requests,
+                replies: r.replies,
+                drops: r.drops,
+                last_error: r.last_error.clone(),
+            },
+            None => RelayStatus {
+                server,
+                requests: 0,
+                replies: 0,
+                drops: 0,
+                last_error: None,
+            },
+        }
+    })
+}
+
 fn workload_posture(
     sys: &mut dyn Sys,
     view: &View,
@@ -1872,6 +1914,9 @@ fn workload_posture(
                 guard_drops: None,
                 bytes: None,
                 stray_forwards: None,
+                // S2: the one row a bind failure is GUARANTEED on (the leg does not exist yet)
+                // must not be the one row that hides it — built the same way as the up case.
+                relay: relay_status(wl, comps),
             });
             continue;
         }
@@ -2003,6 +2048,7 @@ fn workload_posture(
         // zone and they share it, so reading only the first would under-report a row allowed
         // into two zones.
         let stray_forwards = counter_packets_sum(&fwd_chain, &format!("stray-{name}"));
+        let relay = relay_status(wl, comps);
 
         c.workload(WorkloadStatus {
             name: name.to_string(),
@@ -2021,6 +2067,7 @@ fn workload_posture(
             guard_drops,
             bytes,
             stray_forwards,
+            relay,
         });
     }
     Ok(())
@@ -2483,7 +2530,7 @@ pub(crate) fn is_read_only(call: &str) -> bool {
         "ip rule show pref ",
         "ip -4 -br addr show dev ",
         "ip -br link show dev ",
-        "ip -j neigh show dev ",
+        "ip -j neigh show nud all dev ",
         // The FDB half of the local-VM join (conflict 12). The `-j` is part of the prefix on
         // purpose: `bridge` is otherwise a write tool (`fdb del`, `vlan add`), so the
         // allowlist names the one document `status` reads and nothing else.
@@ -2880,6 +2927,17 @@ mod tests {
     /// `workloads` entry (a blank trigger, a missing announcer) never re-type the rest of the
     /// document a second time. Uptimes are 3600 s so the line renders `1h00m`.
     fn components_doc(shape_running: bool, workloads: serde_json::Value) -> String {
+        components_doc_with_relays(shape_running, workloads, serde_json::json!([]))
+    }
+
+    /// `components_doc` plus a `relays` document (S2/S5): `Components.relays` deserializes to
+    /// `Vec::new()` by `#[serde(default)]` when the key is absent, which is what every other
+    /// caller of `components_doc` still gets.
+    fn components_doc_with_relays(
+        shape_running: bool,
+        workloads: serde_json::Value,
+        relays: serde_json::Value,
+    ) -> String {
         let shape = if shape_running {
             serde_json::json!({"name": "shape-daemon", "state": "running", "pid": 1250,
                 "uptime_s": 3600, "restarts": 0, "last_exit": null})
@@ -2898,7 +2956,8 @@ mod tests {
                  "restarts": 0, "last_exit": null, "why": "not clustered"}
             ],
             "watchdog": {"last_tick_s_ago": 2, "result": "ok", "detail": null},
-            "workloads": workloads
+            "workloads": workloads,
+            "relays": relays
         })
         .to_string()
     }
@@ -3426,6 +3485,20 @@ mod tests {
         .unwrap()
     }
 
+    /// `wl_fabric` plus `dhcp_server` on the one `[[workload]]` row (S2/S5).
+    fn wl_fabric_with_relay(server: &str) -> Fabric {
+        let text = fixtures::with_workload(&fixtures::example());
+        let with_gw = "gw = \"192.168.20.254\"\nallow = [\"storage\"]\n";
+        assert!(text.contains(with_gw), "fixture text changed shape: {text}");
+        let text = text.replace(
+            with_gw,
+            &format!(
+                "gw = \"192.168.20.254\"\ndhcp_server = \"{server}\"\nallow = [\"storage\"]\n"
+            ),
+        );
+        Fabric::from_decl(&Declaration::parse(&text).unwrap()).unwrap()
+    }
+
     /// This member's identity address in the storage zone, the one every route-get proof is
     /// sourced from.
     fn identity_of(f: &Fabric, view: &View) -> String {
@@ -3530,6 +3603,97 @@ mod tests {
         );
     }
 
+    /// S5: a row with a healthy relay appends its counters to the workload line.
+    #[test]
+    fn a_relay_appends_its_status_to_the_workload_line() {
+        let f = wl_fabric_with_relay("192.168.10.11");
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let workloads = serde_json::json!([
+            {"name": "vms", "ifname": "cfab-work-vms", "trigger": "neigh events",
+             "announces": 12, "bursts": 1}
+        ]);
+        let relays = serde_json::json!([
+            {"name": "vms", "server": "192.168.10.11", "requests": 7, "replies": 5,
+             "discovered": 3, "drops": 2, "last_error": null}
+        ]);
+        let mut sys = wl_status_sys(&f, &view).socket(
+            "/run/cfab/cfab.sock",
+            &components_doc_with_relays(true, workloads, relays),
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(", relay to 192.168.10.11 (7 requests, 5 replies, 2 dropped)"),
+            "{text}"
+        );
+    }
+
+    /// S5: a bind or socket error rides on the same line, per spec §6 — a relay is a degraded
+    /// row, never a member fault, but never a silent one either.
+    #[test]
+    fn a_relay_bind_error_appends_last_error_to_the_workload_line() {
+        let f = wl_fabric_with_relay("192.168.10.11");
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let workloads = serde_json::json!([
+            {"name": "vms", "ifname": "cfab-work-vms", "trigger": "neigh events",
+             "announces": 12, "bursts": 1}
+        ]);
+        let relays = serde_json::json!([
+            {"name": "vms", "server": "192.168.10.11", "requests": 0, "replies": 0,
+             "discovered": 0, "drops": 0, "last_error": "cannot bind: address not available"}
+        ]);
+        let mut sys = wl_status_sys(&f, &view).socket(
+            "/run/cfab/cfab.sock",
+            &components_doc_with_relays(true, workloads, relays),
+        );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                ", relay to 192.168.10.11 (0 requests, 0 replies, 0 dropped, last error: cannot \
+                 bind: address not available)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// S2: the one row a bind failure is GUARANTEED on (the leg does not exist yet) must not be
+    /// the one row that hides it. A deferred row still reports its relay's standing error.
+    #[test]
+    fn a_deferred_row_still_reports_its_relay_status() {
+        let f = wl_fabric_with_relay("192.168.10.11");
+        let view = View::new(&f, "pve1-tb").unwrap();
+        let relays = serde_json::json!([
+            {"name": "vms", "server": "192.168.10.11", "requests": 0, "replies": 0,
+             "discovered": 0, "drops": 0, "last_error": "cannot bind: address not available"}
+        ]);
+        let mut sys = wl_status_sys(&f, &view)
+            .file(&format!("{}/workload-deferred", f.run_dir), "vms\n")
+            .socket(
+                "/run/cfab/cfab.sock",
+                &components_doc_with_relays(true, serde_json::json!([]), relays),
+            );
+        let expected = expected_links(&view).unwrap();
+        let m = gather(&mut sys, &view, &expected, &Ctx::default()).unwrap();
+        assert_eq!(m.workloads[0].state, WorkloadState::Deferred);
+        assert_eq!(
+            m.workloads[0].relay.as_ref().map(|r| r.server),
+            Some("192.168.10.11".parse().unwrap()),
+            "a deferred row must not report `relay: None` while its relay task has already \
+             reported a bind failure"
+        );
+        let text = render_text(&m, false, true).output;
+        assert!(
+            text.contains(
+                ", relay to 192.168.10.11 (0 requests, 0 replies, 0 dropped, last error: cannot \
+                 bind: address not available)"
+            ),
+            "{text}"
+        );
+    }
+
     /// The status-line addendum (2026-09-09): a row that read `vms_seen` appends `, N vms seen`
     /// after the trigger, one spelling for every N including 0 (never "0 vms seen" vs "1 vm
     /// seen" — scripts grep the noun).
@@ -3542,7 +3706,16 @@ mod tests {
         ])
         .to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -3566,7 +3739,16 @@ mod tests {
         let view = View::new(&f, "pve1-tb").unwrap();
         let neigh_json = serde_json::json!([]).to_string();
         let mut sys = wl_status_sys(&f, &view).on_stdout(
-            &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+            &[
+                "ip",
+                "-j",
+                "neigh",
+                "show",
+                "nud",
+                "all",
+                "dev",
+                "cfab-work-vms",
+            ],
             &neigh_json,
         );
         let expected = expected_links(&view).unwrap();
@@ -4625,7 +4807,16 @@ table bridge cfab {
             .file("/sys/class/net/cfab-work-vms/statistics/rx_bytes", "1234\n")
             .file("/sys/class/net/cfab-work-vms/statistics/tx_bytes", "5678\n")
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &[
+                    "ip",
+                    "-j",
+                    "neigh",
+                    "show",
+                    "nud",
+                    "all",
+                    "dev",
+                    "cfab-work-vms",
+                ],
                 &neigh_json,
             );
         let expected = expected_links(&view).unwrap();
@@ -4661,7 +4852,16 @@ table bridge cfab {
         .to_string();
         let mut sys = wl_status_sys(&f, &view)
             .on_stdout(
-                &["ip", "-j", "neigh", "show", "dev", "cfab-work-vms"],
+                &[
+                    "ip",
+                    "-j",
+                    "neigh",
+                    "show",
+                    "nud",
+                    "all",
+                    "dev",
+                    "cfab-work-vms",
+                ],
                 &neigh_json,
             )
             .on_stdout(
@@ -4743,7 +4943,7 @@ table bridge cfab {
     /// write) is still refused.
     #[test]
     fn is_read_only_accepts_the_neigh_read_and_still_refuses_a_flush() {
-        assert!(is_read_only("ip -j neigh show dev cfab-work-vms"));
+        assert!(is_read_only("ip -j neigh show nud all dev cfab-work-vms"));
         assert!(!is_read_only("ip neigh flush dev cfab-work-vms"));
         // The FDB half of the same join (conflict 12) is a read; every other `bridge` verb is
         // a write and stays refused.

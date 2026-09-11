@@ -33,6 +33,85 @@ pub struct Components {
     /// bound, or never asked for. `#[serde(default)]` so an older supervisor's document parses.
     #[serde(default)]
     pub metrics_error: Option<String>,
+    /// One row per `[[workload]]` DHCP relay this member runs (spec §5.4/§6). A row with no
+    /// `dhcp_server` has none; a row that has one but whose task has not bound yet has an entry
+    /// with zero counters and no error — the same "started but nothing to show yet" shape
+    /// `WorkloadAnnounce` uses. `#[serde(default)]` so an older supervisor's document parses.
+    #[serde(default)]
+    pub relays: Vec<RelayInfo>,
+    /// One row per workload row the DHCP neighbor write pipeline has touched — a write, a
+    /// write failure, a skip, an expiry, or a cap refusal — since the supervisor started (gate
+    /// C spec §4.5). A row that has done none of those is simply absent, never a fabricated
+    /// zero. `#[serde(default)]` so an older supervisor's document parses.
+    #[serde(default)]
+    pub neighbor_rows: Vec<NeighborRowInfo>,
+    /// The flush actor's host-wide state (gate C spec §4.5): `None` while no relay row runs one
+    /// (there is nothing to drain) or before its first publish. Nothing here is per row, because
+    /// the queue, the bucket and the sweep are each one instance for the whole member.
+    #[serde(default)]
+    pub neighbor: Option<NeighborActorInfo>,
+}
+
+/// One workload row's DHCP neighbor write pipeline counters, as the flush actor publishes them
+/// (gate C spec §4.5). `read_failures` is the actor's host-wide pre-drain read failure count,
+/// repeated under every row: the read is one fork for the whole host, so there is no row to
+/// credit a read failure to, but a row's own writes/skips staying flat looks identical whether
+/// the host is coherent or its reads are silently failing — the whole reason spec §4.5 asks for
+/// this counter "separately from write failures" in the first place.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NeighborRowInfo {
+    pub name: String,
+    /// How many addresses this row currently holds in cfab's own table (never the kernel's).
+    pub table_size: u32,
+    pub writes: u64,
+    pub write_failures: u64,
+    pub read_failures: u64,
+    /// Admissions refused because the row was at its §4.1.4 cap.
+    pub cap_refusals: u64,
+    /// Rows dropped because their lease ran out; cfab deletes no kernel entry when this moves.
+    pub expiries: u64,
+    /// The healthy steady state: the kernel already held a valid entry, so nothing was written.
+    pub skips: u64,
+}
+
+/// The flush actor's host-wide state (gate C spec §4.5): one queue, one bucket, one sweep for
+/// the whole member, so none of this is meaningful per row.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeighborActorInfo {
+    /// Entries waiting for the actor right now.
+    pub dirty_depth: u64,
+    /// Seconds since the oldest still-dirty entry was queued; absent while nothing is dirty.
+    /// Observability only (spec §4.5) — fairness is queue position, decided by FIFO order
+    /// alone, never by this number.
+    pub oldest_dirty_age_seconds: Option<f64>,
+    /// Tokens the host-wide bucket holds right now, out of `BURST`.
+    pub token_level: u32,
+}
+
+/// One row's DHCP relay counters and last error, as the supervisor publishes it (spec §5.4/§6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayInfo {
+    pub name: String,
+    /// The `dhcp_server` this row's relay forwards to.
+    pub server: std::net::Ipv4Addr,
+    /// Client→server packets forwarded since the supervisor started: monotonic for its life
+    /// (`Shared::relay_event` never resets it; a rebind clears only `last_error`), which is the
+    /// correct shape for a Prometheus counter (gate C fix round 2, should-fix 4 — the earlier
+    /// wording "since the task last bound" claimed a reset that never happens).
+    pub requests: u64,
+    /// Server→client packets forwarded since the supervisor started; same monotonic shape as
+    /// `requests`.
+    pub replies: u64,
+    /// Relayed `DHCPACK`s that earned a neighbor write (spec §5.4, call 5 caveat).
+    pub discovered: u64,
+    /// Packets this relay declined to forward without ending the task, since the supervisor
+    /// started (gate C fix round 2, should-fixes 1/5): a server-facing send that failed because
+    /// `dhcp_server` is unreachable, or a reply whose `ciaddr`/`yiaddr` fell outside the row's
+    /// `prefix`. `#[serde(default)]` so an older supervisor's document still parses.
+    #[serde(default)]
+    pub drops: u64,
+    /// The relay's last bind or socket error, for as long as it stands; `None` while healthy.
+    pub last_error: Option<String>,
 }
 
 /// What the prober knows about one zone's leg: where the bond sits, and whether the far end —

@@ -370,6 +370,10 @@ const IFNAME_MAX: usize = 15;
 /// Every workload leg's name starts with this; the row name fills what is left.
 const LEG_PREFIX: &str = "cfab-work-";
 
+/// The longest workload prefix `check` accepts, as a prefix LENGTH: nothing shorter than /22.
+/// The reason is the kernel's neighbor table, not addressing — see `validate`'s own check.
+pub const MIN_WORKLOAD_PREFIX_LEN: u8 = 22;
+
 /// One `[[workload]]` row, typed (spec §4): a VM workload VLAN, its anycast gateway, and the
 /// zones it may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1028,6 +1032,21 @@ impl Fabric {
                 return Err(Error::config(format!(
                     "workload {}: leg '{leg}' collides with an interface cfab creates",
                     wl.name
+                )));
+            }
+            // The kernel's stock `gc_thresh3` is 1024 neighbor entries HOST-WIDE, and a /22 is
+            // 1022 host addresses (VERIFIED on pve1-tb; gate C spec §4.1.4). So for every prefix
+            // cfab accepts, an operator is at most one ordinary sysctl adjustment away from
+            // being able to hold every address in it — and cfab never has to make that
+            // adjustment on their behalf. A /16 would put the declared prefix ~64x above the
+            // kernel's ceiling, where the table cap does all the work and the declaration is a
+            // fiction. It also makes `/0` unrepresentable rather than merely survivable.
+            if wl.prefix.len < MIN_WORKLOAD_PREFIX_LEN {
+                return Err(Error::config(format!(
+                    "workload {}: prefix {} is larger than /{MIN_WORKLOAD_PREFIX_LEN}; a \
+                     bigger workload VLAN than the kernel's own neighbor table can hold is not \
+                     a workload cfab can serve",
+                    wl.name, wl.prefix
                 )));
             }
             if !wl.prefix.contains(wl.gw) {
@@ -2125,6 +2144,48 @@ mod tests {
             e,
             "fabric.toml: workload vms: prefix 10.99.20.0/24 overlaps zone storage block \
              10.99.0.0/16"
+        );
+    }
+
+    /// **T8a.** `check` refuses a workload prefix shorter than /22. The kernel's stock
+    /// `gc_thresh3` is 1024 neighbor entries host-wide and a /22 is 1022 addresses, so every
+    /// prefix cfab accepts is at most one ordinary sysctl adjustment from being holdable —
+    /// while a /16 would sit ~64x above the kernel's ceiling, where the table cap does all the
+    /// work and the declared prefix is a fiction. It also makes `/0` unrepresentable rather
+    /// than merely survivable, which is why no separate `/0` check exists.
+    ///
+    /// Regression: drop the check, or compare the wrong way round (`>` for `<`), which admits
+    /// the /16 and refuses the /24 the site actually declares.
+    #[test]
+    fn check_refuses_a_workload_prefix_shorter_than_22() {
+        let at = |net: &str, len: u8| {
+            let net = net.to_string();
+            move |t: String| {
+                t.replace("192.168.20.2/24", &format!("192.168.20.2/{len}"))
+                    .replace("192.168.20.3/24", &format!("192.168.20.3/{len}"))
+                    .replace(
+                        "prefix = \"192.168.20.0/24\"",
+                        &format!("prefix = \"{net}/{len}\""),
+                    )
+            }
+        };
+        for (net, len) in [("192.168.16.0", 21u8), ("192.168.0.0", 16), ("0.0.0.0", 0)] {
+            assert_eq!(
+                wl_err(at(net, len)),
+                format!(
+                    "fabric.toml: workload vms: prefix {net}/{len} is larger than /22; a \
+                     bigger workload VLAN than the kernel's own neighbor table can hold is not \
+                     a workload cfab can serve"
+                )
+            );
+        }
+        assert!(
+            wl_fabric_edit(at("192.168.20.0", 22)).is_ok(),
+            "/22 itself is accepted: the bound is on prefixes SHORTER than it"
+        );
+        assert!(
+            wl_fabric_edit(|t| t).is_ok(),
+            "and the /24 the site actually declares is untouched"
         );
     }
 

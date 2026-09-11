@@ -8,11 +8,15 @@ use std::fmt;
 use crate::derive::View;
 use crate::sys::Sys;
 
+pub mod actor;
 pub mod announce;
 pub mod hostroutes;
 pub mod leg;
 pub mod neigh;
+pub mod relay;
+pub mod table;
 pub mod uplink;
+pub mod writer;
 
 /// The rows `apply` (or a previous watchdog tick) left deferred (spec addendum 2026-09-09): no
 /// gw address on the wire yet, the forwarding watchdog installs it once the uplink forwards. One

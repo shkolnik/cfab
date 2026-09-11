@@ -37,6 +37,9 @@ prometheus-client = "0.25"
 
 [dev-dependencies]
 tempfile = "3"
+# `tokio::time::pause` / `#[tokio::test(start_paused = true)]`. The flush actor's bucket tests
+# are 53 s of wall time on a real clock, which is how a suite quietly becomes one nobody runs.
+tokio = { version = "1.52", features = ["test-util"] }
 prometheus-parse = "0.2"
 
 [package.metadata.deb]
