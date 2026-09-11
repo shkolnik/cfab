@@ -13,6 +13,7 @@ pub mod hostroutes;
 pub mod leg;
 pub mod neigh;
 pub mod relay;
+pub mod table;
 pub mod uplink;
 
 /// The rows `apply` (or a previous watchdog tick) left deferred (spec addendum 2026-09-09): no

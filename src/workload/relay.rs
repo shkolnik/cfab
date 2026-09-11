@@ -25,15 +25,15 @@
 //! can source-spoof `dhcp_server`'s address and reach this socket — "only toward the declared
 //! server" is INTENDED, not kernel-enforced, exactly as `DropReason::OutOfPrefix`'s own doc
 //! comment below already conceded. What actually bounds the damage: the `prefix` check refuses a
-//! reply outside this row's own subnet, and a trusted ACK's neighbor write is deduplicated per
-//! `(yiaddr, chaddr)` so a forged flood cannot drive more than one `ip neigh replace` fork per
-//! distinct claim (S-B).
+//! reply outside this row's own subnet, and a trusted ACK does not perform a write at all — it
+//! upserts into `workload::table`, whose per-row cap bounds how many claims one row may hold and
+//! whose single flush actor bounds how fast any of them reach the kernel (gate C spec §4.1).
 
 use std::collections::BTreeSet;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -43,6 +43,7 @@ use crate::model::Ipv4Prefix;
 use crate::supervisor::child::BACKOFF;
 use crate::supervisor::metrics::BIND_RETRY;
 use crate::supervisor::{Cmd, RelayEvent, Shared};
+use crate::workload::table::{self, NeighborTable};
 
 /// BOOTP opcodes (RFC 2131 §2).
 pub const BOOTREQUEST: u8 = 1;
@@ -149,24 +150,38 @@ impl Bootp {
         }
     }
 
-    /// Option 53 (DHCP message type), scanned with bounds checks throughout: a truncated or
-    /// malformed option area ends the scan rather than indexing past it, and yields `None`
-    /// exactly as an absent option 53 would (the packet is still forwarded — this reads the
-    /// message type, it does not gate on it, spec §5.4 "no lease state").
+    /// Option 53 (DHCP message type). See `option` for the scan's own bounds discipline; this
+    /// reads the message type, it does not gate on it (spec §5.4 "no lease state").
     pub fn message_type(&self) -> Option<u8> {
+        self.option(53, 1).map(|v| v[0])
+    }
+
+    /// Option 51 (IP address lease time), seconds, big-endian — what the table clamps into an
+    /// `expires_at` (gate C spec §4.1.3). Attacker-supplied like every other byte of the option
+    /// area: `table::clamp_lease` is what makes it safe, not this accessor.
+    pub fn lease_time(&self) -> Option<u32> {
+        self.option(51, 4)
+            .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+    }
+
+    /// The value of the first option `code` carrying exactly `len` bytes, scanned with bounds
+    /// checks throughout: a truncated or malformed option area ends the scan rather than
+    /// indexing past it, and yields `None` exactly as an absent option would. An option of the
+    /// right code and the wrong length is not this option — the scan walks past it.
+    fn option(&self, code: u8, len: usize) -> Option<&[u8]> {
         let opts = &self.0[HEADER_LEN + MAGIC_COOKIE.len()..];
         let mut i = 0;
         while i < opts.len() {
             match opts[i] {
                 0 => i += 1,  // pad
                 255 => break, // end
-                code => {
-                    let len = *opts.get(i + 1)?;
+                c => {
+                    let l = *opts.get(i + 1)? as usize;
                     let start = i + 2;
-                    let end = start + len as usize;
+                    let end = start + l;
                     let val = opts.get(start..end)?;
-                    if code == 53 && len == 1 {
-                        return Some(val[0]);
+                    if c == code && l == len {
+                        return Some(val);
                     }
                     i = end;
                 }
@@ -321,8 +336,10 @@ pub fn forward_server(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckOutcome {
     /// A DHCPACK worth registering: `chaddr` is a 6-byte Ethernet address and `yiaddr` is set,
-    /// inside `prefix`, and not in the anti-spoof refusal set.
-    Discovered(Ipv4Addr, [u8; 6]),
+    /// inside `prefix`, and not in the anti-spoof refusal set. The third field is option 51 as
+    /// the packet carried it — raw and unclamped, because clamping is `table::clamp_lease`'s one
+    /// job and splitting it across two modules is how a bound gets half-applied.
+    Discovered(Ipv4Addr, [u8; 6], Option<u32>),
     /// A DHCPACK whose `yiaddr` names an address `fabric_addresses` (a member or `gw`) already
     /// holds, or the row's network/broadcast address — forged, or (INFERRED inert, §5) a peer's
     /// own resolution of `gw` echoed back — refused rather than registered. Carries the refused
@@ -370,7 +387,7 @@ pub fn ack_discovery(
     let Some(chaddr) = p.chaddr6() else {
         return AckOutcome::Ignore;
     };
-    AckOutcome::Discovered(yiaddr, chaddr)
+    AckOutcome::Discovered(yiaddr, chaddr, p.lease_time())
 }
 
 /// One `[[workload]]` row this member runs a relay for.
@@ -621,17 +638,19 @@ pub(crate) async fn run(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    table: Arc<NeighborTable>,
 ) {
-    run_with_reader(row, shared, cmd_tx, default_ifindex_reader()).await
+    run_with_reader(row, shared, cmd_tx, table, default_ifindex_reader()).await
 }
 
 async fn run_with_reader(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    table: Arc<NeighborTable>,
     reader: IfindexReader,
 ) {
-    run_with_reader_via(row, shared, cmd_tx, reader, bind_pair_with_baseline).await
+    run_with_reader_via(row, shared, cmd_tx, table, reader, bind_pair_with_baseline).await
 }
 
 /// The actual retry loop behind `run_with_reader`, generic over how the pair gets bound for the
@@ -643,6 +662,7 @@ async fn run_with_reader_via<B>(
     row: RelayRow,
     shared: Arc<Mutex<Shared>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    table: Arc<NeighborTable>,
     reader: IfindexReader,
     mut bind: B,
 ) where
@@ -677,7 +697,7 @@ async fn run_with_reader_via<B>(
                     reader: reader.clone(),
                     poll: IFINDEX_POLL,
                 };
-                let why = serve(&client, &server, &row, &shared, &cmd_tx, &watch).await;
+                let why = serve(&client, &server, &row, &shared, &cmd_tx, &table, &watch).await;
                 eprintln!(
                     "cfab: workload {}: dhcp relay socket lost ({why}); retrying in {}s",
                     row.name,
@@ -745,6 +765,7 @@ async fn serve(
     row: &RelayRow,
     shared: &Arc<Mutex<Shared>>,
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
+    table: &NeighborTable,
     watch: &LegWatch,
 ) -> String {
     let mut cbuf = [0u8; BUF_LEN];
@@ -769,15 +790,6 @@ async fn serve(
     // exactly one reason to log, and repeating it once for every forged packet would be a
     // self-inflicted journal DoS.
     let mut ack_refused_logged = false;
-    // S-B: the last `(yiaddr, chaddr)` a trusted ACK earned a neighbor write for. The
-    // server-facing source check is routing hygiene, not a security boundary (module doc, S-B —
-    // `rp_filter = 2` is loose everywhere), so a VM on this row's own VLAN can forge a BOOTREPLY
-    // and drive `Cmd::DhcpAck` on the supervisor's MAIN loop, which services it with a
-    // synchronous `ip neigh replace` subprocess fork per packet. Skipping the write (and the
-    // `Discovered` count) when the claim is unchanged bounds an attacker to one fork per distinct
-    // claim, not one per packet — and costs nothing on the honest path, since `ip neigh replace`
-    // of an identical binding is a no-op the kernel would otherwise perform over and over anyway.
-    let mut last_ack: Option<(Ipv4Addr, [u8; 6])> = None;
     loop {
         tokio::select! {
             _ = poll.tick() => {
@@ -870,21 +882,48 @@ async fn serve(
                         match forward_server(&sbuf[..n], src, row.leg_addr, row.dhcp_server, row.prefix) {
                             Action::Forward { to, bytes } => {
                                 match ack_discovery(&sbuf[..n], row.prefix, &row.fabric_addresses) {
-                                    AckOutcome::Discovered(yiaddr, chaddr) => {
-                                        // S-B: skip both the write and the count when this is
-                                        // the same claim as last time (`last_ack`'s own doc
-                                        // above).
-                                        if last_ack != Some((yiaddr, chaddr)) {
-                                            last_ack = Some((yiaddr, chaddr));
-                                            shared.lock().unwrap().relay_event(
-                                                &row.name, row.dhcp_server, RelayEvent::Discovered,
-                                            );
-                                            let _ = cmd_tx.send(Cmd::DhcpAck {
-                                                name: row.name.clone(),
-                                                leg: row.leg.clone(),
-                                                yiaddr,
-                                                chaddr,
-                                            });
+                                    AckOutcome::Discovered(yiaddr, chaddr, lease) => {
+                                        // The cap is copied out of `Shared` and that guard
+                                        // dropped before the table is touched: the table lock is
+                                        // a leaf and the two are never held at once, or the
+                                        // relay's `shared`->`table` order and the command loop's
+                                        // `table`->`shared` order are an AB/BA hang (spec
+                                        // §4.2.3).
+                                        let cap =
+                                            shared.lock().unwrap().neighbor_cap().for_prefix(row.prefix);
+                                        let expires_at =
+                                            Instant::now() + table::clamp_lease(lease);
+                                        match table.upsert(
+                                            &row.name, &row.leg, yiaddr, chaddr, expires_at, &cap,
+                                        ) {
+                                            table::Upsert::Admitted => {
+                                                shared.lock().unwrap().relay_event(
+                                                    &row.name,
+                                                    row.dhcp_server,
+                                                    RelayEvent::Discovered,
+                                                );
+                                                let _ = cmd_tx.send(Cmd::DhcpAck {
+                                                    name: row.name.clone(),
+                                                    leg: row.leg.clone(),
+                                                    yiaddr,
+                                                    chaddr,
+                                                });
+                                            }
+                                            table::Upsert::Refused { first_of_streak } => {
+                                                if first_of_streak {
+                                                    eprintln!(
+                                                        "{}",
+                                                        cap.refusal_line(
+                                                            &row.name, yiaddr, row.prefix
+                                                        )
+                                                    );
+                                                }
+                                                shared.lock().unwrap().relay_event(
+                                                    &row.name,
+                                                    row.dhcp_server,
+                                                    RelayEvent::Dropped,
+                                                );
+                                            }
                                         }
                                     }
                                     AckOutcome::Refused(addr) => {
@@ -1181,9 +1220,14 @@ mod tests {
         // sandbox does not grant.
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            run_with_reader_via(row, shared, cmd_tx, reader, |r, reader| {
-                bind_pair_with_baseline_via(r, reader, fake_bind)
-            }),
+            run_with_reader_via(
+                row,
+                shared,
+                cmd_tx,
+                Arc::new(NeighborTable::new()),
+                reader,
+                |r, reader| bind_pair_with_baseline_via(r, reader, fake_bind),
+            ),
         )
         .await;
 
@@ -1451,7 +1495,7 @@ mod tests {
     fn an_ack_yields_the_leased_address_and_the_clients_mac() {
         assert_eq!(
             ack_discovery(ACK, PREFIX, &BTreeSet::new()),
-            AckOutcome::Discovered(Ipv4Addr::new(192, 168, 22, 150), CHADDR)
+            AckOutcome::Discovered(Ipv4Addr::new(192, 168, 22, 150), CHADDR, Some(240))
         );
     }
 
@@ -1629,10 +1673,21 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
+        let table = Arc::new(NeighborTable::new());
+        let table_task = table.clone();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
-            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared_task,
+                &cmd_tx,
+                &table_task,
+                &no_watch(),
+            )
+            .await
         });
 
         let sender = UdpSocket::from_std(bind_server(dhcp_server, 0).unwrap()).unwrap();
@@ -1703,7 +1758,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            serve(&client, &server, &row, &shared, &cmd_tx, &watch),
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared,
+                &cmd_tx,
+                &NeighborTable::new(),
+                &watch,
+            ),
         )
         .await
         .expect(
@@ -1759,7 +1822,15 @@ mod tests {
         // would have returned long before this deadline.
         let result = tokio::time::timeout(
             Duration::from_millis(30),
-            serve(&client, &server, &row, &shared, &cmd_tx, &watch),
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared,
+                &cmd_tx,
+                &NeighborTable::new(),
+                &watch,
+            ),
         )
         .await;
         assert!(
@@ -1799,7 +1870,15 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            serve(&client, &server, &row, &shared, &cmd_tx, &watch),
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared,
+                &cmd_tx,
+                &NeighborTable::new(),
+                &watch,
+            ),
         )
         .await
         .expect(
@@ -1849,10 +1928,21 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
+        let table = Arc::new(NeighborTable::new());
+        let table_task = table.clone();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
-            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared_task,
+                &cmd_tx,
+                &table_task,
+                &no_watch(),
+            )
+            .await
         });
 
         // The client socket is already bound, so the kernel buffers this regardless of whether
@@ -1913,10 +2003,21 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
+        let table = Arc::new(NeighborTable::new());
+        let table_task = table.clone();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
-            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared_task,
+                &cmd_tx,
+                &table_task,
+                &no_watch(),
+            )
+            .await
         });
 
         // A DHCPOFFER from the real, trusted server, with the right giaddr, but a yiaddr this
@@ -1976,17 +2077,19 @@ mod tests {
         );
     }
 
-    // ---- serve: a repeated identical ACK claim is deduplicated (S-B) ----------------------
+    // ---- serve: T1a, a repeated identical claim still reaches the table -------------------
 
-    /// S-B, gate C fix round 3: the server-facing socket's only source check (`src ==
-    /// dhcp_server`) is routing hygiene, not a security boundary — `rp_filter = 2` is loose on
-    /// every role, so a VM on this row's own VLAN can forge that source. Each forged DHCPACK
-    /// used to drive one `Cmd::DhcpAck` (and one `ip neigh replace` subprocess fork on the
-    /// supervisor's MAIN loop) per packet, unbounded. An identical repeat of the same
-    /// `(yiaddr, chaddr)` claim must register (and fork) at most once; a genuinely new claim
-    /// must still get through.
+    /// **T1a.** Round 3 deduplicated the neighbor write per `(yiaddr, chaddr)` and gated the
+    /// `Cmd::DhcpAck` send itself on it, so a repeat of a claim cfab had already seen could
+    /// never restore an address — and the case that matters is exactly a repeat: a VM whose
+    /// kernel entry the host lost re-DHCPs with the SAME address and the SAME MAC. The dedupe
+    /// is deleted; every admitted claim reaches the table.
+    ///
+    /// Regression: gate the upsert (or the send) on a `last_ack` slot, and the second identical
+    /// ACK is silently dropped. T1 cannot see this — it uses two different MACs, which the
+    /// dedupe passed through.
     #[tokio::test]
-    async fn a_repeated_identical_ack_is_deduplicated_but_a_new_claim_still_registers() {
+    async fn a_repeated_identical_ack_still_reaches_the_table() {
         let leg = Ipv4Addr::new(127, 88, 0, 51);
         let dhcp_server = Ipv4Addr::new(127, 88, 0, 52);
 
@@ -2004,42 +2107,44 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::new(1)));
         let shared_task = shared.clone();
+        let table = Arc::new(NeighborTable::new());
+        let table_task = table.clone();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
         let handle = tokio::spawn(async move {
-            serve(&client, &server, &row, &shared_task, &cmd_tx, &no_watch()).await
+            serve(
+                &client,
+                &server,
+                &row,
+                &shared_task,
+                &cmd_tx,
+                &table_task,
+                &no_watch(),
+            )
+            .await
         });
 
         let mut p = Bootp::parse(ACK).unwrap();
         p.set_giaddr(leg);
         let ack_bytes = p.as_bytes().to_vec();
-
-        let mut different_claim = Bootp::parse(&ack_bytes).unwrap();
-        different_claim.0[CHADDR_OFF..CHADDR_OFF + 6]
-            .copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x99]);
-        let different_bytes = different_claim.into_bytes();
+        let yiaddr = Ipv4Addr::new(192, 168, 22, 150);
 
         let sender = std::net::UdpSocket::bind((dhcp_server, 0)).unwrap();
-        // Same claim, twice: must register (and forward to the client) only the first time.
         sender.send_to(&ack_bytes, (leg, server_port)).unwrap();
         sender.send_to(&ack_bytes, (leg, server_port)).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            shared.lock().unwrap().relay_discovered("test-row"),
-            1,
-            "an identical repeat ACK must not re-register"
-        );
 
-        // A different chaddr claiming the same address is a NEW claim: must still register.
-        sender
-            .send_to(&different_bytes, (leg, server_port))
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(
             shared.lock().unwrap().relay_discovered("test-row"),
             2,
-            "a genuinely different claim must still register"
+            "an identical repeat ACK must still register: the VM whose entry the host lost \
+             re-DHCPs with exactly the same claim"
         );
+        let entry = table
+            .entry("test-row", yiaddr)
+            .expect("the repeated claim must be in the table");
+        assert_eq!(entry.mac, CHADDR);
+        assert!(entry.dirty, "an upserted entry is queued for the actor");
 
         let mut acks_received = 0;
         while cmd_rx.try_recv().is_ok() {
@@ -2047,7 +2152,7 @@ mod tests {
         }
         assert_eq!(
             acks_received, 2,
-            "exactly one Cmd::DhcpAck per distinct claim, not one per packet"
+            "neither claim is gated on the one before it"
         );
 
         assert!(!handle.is_finished(), "the loop must still be serving");

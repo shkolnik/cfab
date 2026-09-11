@@ -170,6 +170,11 @@ pub(crate) struct Shared {
     /// whose task has not bound yet is absent until its first `RelayEvent`, exactly like
     /// `workloads` before the first announcer trigger fires.
     relays: BTreeMap<String, RelayReport>,
+    /// The host-wide half of the DHCP neighbor table's per-row cap (gate C spec §4.1.4): the
+    /// kernel's `gc_thresh3` and how many workload rows share it. Read at start and refreshed by
+    /// the workload tick — one source, one cadence — and published here because the relay's ACK
+    /// path already takes this lock and must have a valid `C` before it accepts its first ACK.
+    neighbor_cap: crate::workload::table::CapSource,
 }
 
 /// One relay's counters and last error, as `Shared` holds them.
@@ -259,7 +264,27 @@ impl Shared {
             metrics_collect_failures: 0,
             metrics_gather_failing: false,
             relays: BTreeMap::new(),
+            // Until `run_with` reads the sysctl. Never a larger cap than a successful read
+            // could produce: the kernel default is also this design's ceiling.
+            neighbor_cap: crate::workload::table::CapSource {
+                gc_thresh3: crate::workload::table::GC_THRESH3_DEFAULT,
+                rows: 1,
+            },
         }
+    }
+
+    /// A copy of the cap source. Deliberately by value: the caller derives its row's `C` from
+    /// the copy with this lock already dropped, because the neighbor table's lock is a leaf and
+    /// the two are never held at once (spec §4.2.3).
+    pub(crate) fn neighbor_cap(&self) -> crate::workload::table::CapSource {
+        self.neighbor_cap
+    }
+
+    /// Republish the cap source. The only writer is the command loop: at start, and on each
+    /// workload tick, so an operator who lowers `gc_thresh3` sees `C` follow it down without a
+    /// restart.
+    pub(crate) fn set_neighbor_cap(&mut self, cap: crate::workload::table::CapSource) {
+        self.neighbor_cap = cap;
     }
 
     /// Record one relay fact for `name` (spec §5.4/§6). Initializes the row's entry with
@@ -649,6 +674,29 @@ fn relay_rows(view: &View) -> Vec<crate::workload::relay::RelayRow> {
     rows
 }
 
+/// Read `gc_thresh3` and publish the neighbor table's cap source (spec §4.1.4).
+///
+/// cfab **writes no `gc_thresh`**: it reads one and caps itself. A read that fails costs the
+/// kernel default — which is also the ceiling `C` is never allowed above, so the degraded path
+/// and the ceiling are one number — plus one journal line per failure streak, never a refusal to
+/// start.
+fn publish_neighbor_cap(sys: &dyn Sys, rows: u32, shared: &Arc<Mutex<Shared>>, failing: &mut bool) {
+    let (cap, why) = crate::workload::table::CapSource::read(sys, rows);
+    match why {
+        Some(why) => {
+            if !*failing {
+                *failing = true;
+                eprintln!(
+                    "cfab: dhcp neighbor table: {why}; assuming gc_thresh3 = {}",
+                    cap.gc_thresh3
+                );
+            }
+        }
+        None => *failing = false,
+    }
+    shared.lock().unwrap().set_neighbor_cap(cap);
+}
+
 /// Forward SIGHUP → `Hangup`, SIGTERM/SIGINT → `Terminate` onto the command channel. Each
 /// listener is a task that only sends on a channel — it spawns nothing, so it never forks a
 /// child off a worker thread.
@@ -955,11 +1003,24 @@ pub(crate) async fn run_with(
     // same schedule as any other bind failure, so no second "is this row ready" check needs to
     // agree with the announcer's — one fewer place for that fact to drift (spec §3.1,
     // availability first: a relay that cannot bind is a degraded row, never a dead member).
-    for relay_row in relay_rows(view) {
+    let relay_row_list = relay_rows(view);
+    // The neighbor write table (gate C spec §4.1): host-wide, shared by every relay task and
+    // (from the flush actor on) by the actor that drains it.
+    let neigh_table = Arc::new(crate::workload::table::NeighborTable::new());
+    // `C` must be valid before any relay can accept its first ACK, so the sysctl is read here,
+    // ahead of the spawn loop. A member with no relay row has no table to cap, so it reads
+    // nothing.
+    let mut cap_read_failing = false;
+    let relay_row_count = relay_row_list.len() as u32;
+    if relay_row_count > 0 {
+        publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
+    }
+    for relay_row in relay_row_list {
         tokio::spawn(crate::workload::relay::run(
             relay_row,
             shared.clone(),
             cmd_tx.clone(),
+            neigh_table.clone(),
         ));
     }
 
@@ -1212,6 +1273,13 @@ pub(crate) async fn run_with(
             _ = wl_tick.tick(), if workload_active => {
                 workloads.tick(sys, view, &mut *announce_io, Instant::now());
                 workloads.publish(&shared);
+                // §4.1.4: `C` is refreshed by the workload tick's publication — one source, one
+                // cadence — so an operator who lowers `gc_thresh3` under a running member sees
+                // `C` follow it down. A tick that lowers `C` below a row's current occupancy
+                // evicts nothing; it refuses new admissions until expiry shrinks the row.
+                if relay_row_count > 0 {
+                    publish_neighbor_cap(&*sys, relay_row_count, &shared, &mut cap_read_failing);
+                }
             }
             _ = metrics_retry.tick(), if shared.lock().unwrap().metrics_error.is_some() => {
                 if let Ok(l) = metrics::bind(hooks.metrics_port) {

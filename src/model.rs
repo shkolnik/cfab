@@ -370,6 +370,10 @@ const IFNAME_MAX: usize = 15;
 /// Every workload leg's name starts with this; the row name fills what is left.
 const LEG_PREFIX: &str = "cfab-work-";
 
+/// The longest workload prefix `check` accepts, as a prefix LENGTH: nothing shorter than /22.
+/// The reason is the kernel's neighbor table, not addressing — see `validate`'s own check.
+pub const MIN_WORKLOAD_PREFIX_LEN: u8 = 22;
+
 /// One `[[workload]]` row, typed (spec §4): a VM workload VLAN, its anycast gateway, and the
 /// zones it may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1028,6 +1032,19 @@ impl Fabric {
                 return Err(Error::config(format!(
                     "workload {}: leg '{leg}' collides with an interface cfab creates",
                     wl.name
+                )));
+            }
+            // The kernel's stock `gc_thresh3` is 1024 neighbor entries HOST-WIDE, and a /22 is
+            // 1022 host addresses (VERIFIED on pve1-tb; gate C spec §4.1.4). So for every prefix
+            // cfab accepts, an operator is at most one ordinary sysctl adjustment away from
+            // being able to hold every address in it — and cfab never has to make that
+            // adjustment on their behalf. A /16 would put the declared prefix ~64x above the
+            // kernel's ceiling, where the table cap does all the work and the declaration is a
+            // fiction. It also makes `/0` unrepresentable rather than merely survivable.
+            if wl.prefix.len < MIN_WORKLOAD_PREFIX_LEN {
+                return Err(Error::config(format!(
+                    "workload {}: prefix {} is larger than /{MIN_WORKLOAD_PREFIX_LEN}; a bigger                      workload VLAN than the kernel's own neighbor table can hold is not a                      workload cfab can serve",
+                    wl.name, wl.prefix
                 )));
             }
             if !wl.prefix.contains(wl.gw) {
