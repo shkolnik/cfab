@@ -21,8 +21,14 @@ use crate::sys::Sys;
 /// The floor a DHCPACK's option 51 is clamped up to. Derived, not chosen (spec §8 call 9): it
 /// must exceed the worst-case wait in the flush actor's queue, or a legitimate short-lease ACK
 /// is admitted, queued, and expires before the actor reaches it — the write silently never
-/// happens. At `Σ C_i` = 512 writes plus the batch and sweep reads the worst case is 533 tokens
-/// at 10 forks/s = 53.3 s, so 60 s carries an 11.2% margin (plan §1.2).
+/// happens. MEASURED on this tree at **54.7 s** for the entry at the back of a `Σ C_i` = 512
+/// queue, against a derived bound of `(ceil(Σ C_i / (B - 1)) x B + sweeps) / R` =
+/// `(17 x 32 + 4) / 10` = **54.8 s** — so 60 s carries an 8.7% margin, and the cliff is real:
+/// `MIN_LEASE` = 54 s turns the queue half of T-MINLEASE red and 55 s turns it green. Plan
+/// §1.2's 533 tokens / 53.3 s converts tokens to seconds linearly; the batching rule waits for
+/// a batch's whole reservation before starting it, and the sweep keeps `dirty_depth` above
+/// `B - 1` whenever the kernel is missing entries, so the batch carrying the last entry
+/// reserves a full `B` rather than the remainder.
 pub const MIN_LEASE: Duration = Duration::from_secs(60);
 
 /// The ceiling option 51 is clamped down to. RFC 2132's `0xFFFFFFFF` means "infinite", and

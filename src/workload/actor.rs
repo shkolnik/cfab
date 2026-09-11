@@ -9,8 +9,8 @@
 //! skipped every time while still buying a fork: a MEASURED 874 forks/s, one fully saturated
 //! core, at zero token cost (spec §2).
 //!
-//! **The batching rule** (plan §1.1, normative, and the premise the ruling's own 529-token
-//! worst case rests on): the actor does not read until it holds `1 + min(dirty_depth, B - 1)`
+//! **The batching rule** (plan §1.1, normative, and the premise the whole worst-case
+//! derivation rests on): the actor does not read until it holds `1 + min(dirty_depth, B - 1)`
 //! tokens — the read plus every write that batch intends to fund. An actor that reads whenever
 //! it holds a single token converges to one read per write, which is 1024 tokens = 102.4 s
 //! against a 60 s `MIN_LEASE`: a legitimate short-lease ACK expires in the queue and R2.1 is
@@ -42,9 +42,12 @@ use crate::workload::writer::{NeighborIo, WriteVerb, write_argv};
 /// `R`: the refill rate, in forks per second. A CONSTANT, never autotuned — the attacker sits
 /// inside any feedback loop that measures cost, so a flood would shrink the budget under exactly
 /// the load the budget exists to absorb (spec §4.2.2). ~1% of one core at the measured 1.0 ms
-/// write (spec §2). Rack R2 may RAISE it; it may not lower it below 8.89/s without re-deriving
-/// `MIN_LEASE`, because `MIN_LEASE` = 60 s holds only while the 533-token worst case fits inside
-/// it (plan §1.2).
+/// write (spec §2). Rack R2 may RAISE it; it may not lower it below **9.14/s** without
+/// re-deriving `MIN_LEASE`, because `MIN_LEASE` = 60 s holds only while the worst-case wait
+/// fits inside it: `(ceil(Σ C_i / (B - 1)) x B + sweeps) / R ≤ MIN_LEASE` gives
+/// `R ≥ 548 / 60` = 9.14. Plan §1's floor of 8.89/s is derived from 533 tokens and is the
+/// linear-token version of the same inequality — see `MIN_LEASE` (table.rs) for why the
+/// reservation, not the token, is what the wait is made of.
 pub const REFILL_PER_SEC: u32 = 10;
 
 /// `B`: the burst. Makes R4 ("one VM booting is immediate") true on a quiet host — a lone VM
@@ -340,8 +343,7 @@ impl FlushActor {
 
     /// One iteration: the sweep if it is due, otherwise one drain batch. The sweep runs **on
     /// the actor** and therefore spends a token like any other fork (spec §4.2) — which is
-    /// where the four tokens separating `Σ C_i` = 529 from the true 533-token worst case come
-    /// from (plan §1.2). On the command loop via `Sys::run` it would instead be a fork on
+    /// where the sweep tokens in `MIN_LEASE`'s worst-case derivation come from (plan §1.2). On the command loop via `Sys::run` it would instead be a fork on
     /// exactly the loop this gate exists to keep clear, and would escape `WRITE_DEADLINE`,
     /// which is scoped to every child the actor spawns.
     pub async fn step(&mut self) -> Step {
@@ -956,6 +958,14 @@ mod tests {
     /// The loop drives `step`, not `run_batch`, precisely so those sweep tokens are spent: an
     /// actor driven batch-by-batch never sweeps, and the bound it measures is one no live
     /// member enjoys.
+    ///
+    /// **Honest scope, MEASURED rather than assumed.** The victim here is dirtied FIRST, so
+    /// FIFO reaches it in the first batch and the elapsed time is **0** — the deadline above is
+    /// the bound written down, not a bound this test exercises. What it genuinely pins is the
+    /// starvation rule: under the regression below the victim is never written at all and the
+    /// in-loop assertion fires. The test that actually measures the worst case is
+    /// `a_min_lease_entry_survives_the_full_queue_and_is_written`, whose victim is dirtied
+    /// LAST; it comes in at 54.7 s against this same 54.8 s.
     ///
     /// Regression: take entries in address order (make `take_next_dirty` scan `entries` for the
     /// first dirty key instead of popping the queue) — the victim's high address is then never
@@ -1742,7 +1752,7 @@ mod tests {
         let calls = io.calls();
         let mut a = FlushActor::new(t.clone(), Box::new(io));
         // Drain the actor's one-time starting burst first, so this reproduces the STEADY-STATE
-        // worst case the spec derives `MIN_LEASE` against (spec §1.2's 533 tokens / R) rather
+        // worst case `MIN_LEASE` is derived against (see `MIN_LEASE` in table.rs) rather
         // than a cold start's one-off 32-token credit, which would understate the wait by
         // `B / R` = 3.2 s and let a shorter, unsafe `MIN_LEASE` pass this test by accident.
         for _ in 0..BURST {
@@ -1956,10 +1966,9 @@ mod tests {
     }
 
     /// **The sweep's read spends a token like every other fork** (spec §4.2; plan §1.2). This
-    /// is the assertion that makes the four tokens separating call 10's 529 from the true 533
-    /// real: without it the sweep is a fork the bucket does not govern, at 4 per minute per
-    /// member, and `the_nth_entry_is_written_inside_the_stated_worst_case`'s 53.3 s becomes an
-    /// over-estimate that hides an ungoverned fork path rather than a bound.
+    /// is the assertion that makes the sweep's share of the worst case real: without it the
+    /// sweep is a fork the bucket does not govern, at 4 a minute per member, and the 54.8 s
+    /// bound becomes an over-estimate hiding an ungoverned fork path rather than a bound.
     ///
     /// Regression: delete the `wait_and_spend(1)` call from `sweep`. The sweep then forks with
     /// an empty bucket and this test's wait collapses to zero.
